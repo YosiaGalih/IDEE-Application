@@ -355,3 +355,35 @@ Keputusan yang perlu dicek ada di spec bagian "Keputusan saya (cek)":
 - Redis mati → 503;
 - `MAX_ACTIVE` dihitung dari semua lease yang hidup (diperketat dari §5.3);
 - marker pending 300 dtk [Menebak].
+
+**Review WP-1.1f** (`kk-backend-reviewer` + `kk-silent-failure-hunter`). Awalnya BLOCK: backend 1 CRITICAL dan 6 HIGH, silent-failure 5 HIGH. Semua ditutup di 303aa0c:
+
+| Temuan | Perbaikan | Bukti |
+|---|---|---|
+| CRITICAL: log worker dan CLI `recover` melewati redaktor | sinyal `setup_logging` + `worker_hijack_root_logger=False` + `configure_worker_logging` | `test_worker_logging_is_redacted`; worker Celery sungguhan menulis JSON |
+| HIGH: replay tanpa validasi sesi (logout → tetap di-replay); cookie palsu menulis ke Redis | validator sesi disuntikkan dari `main.py`; sesi tidak hidup → diteruskan ke auth route | `test_replay_requires_a_live_session`, `test_invalid_sessions_never_touch_the_store` |
+| HIGH: body terpotong dieksekusi; streaming membekukan loop | disconnect → tidak dieksekusi, tidak di-claim; `receive` diteruskan | test ASGI mentah (sebelumnya merah / hang) |
+| HIGH: body tanpa batas sebelum auth; query string di luar sidik jari | 413 > 10 MiB; sidik jari = query + content-type + body | 2 test |
+| HIGH: gagal simpan / body > 1 MiB / marker kedaluwarsa → eksekusi ulang | marker berpemilik (Lua CAS), diperpanjang selama berjalan; `executed` → 409; gagal simpan → marker dipertahankan | 3 test |
+| HIGH/MEDIUM: `claim_lease` mengambil task selesai; `False` ambigu | `ClaimResult` (ACQUIRED/HELD/AT_CAPACITY/BUSY/NOT_CLAIMABLE/NOT_FOUND); hanya `queued` | `test_only_queued_tasks_are_claimable`, `test_duplicate_delivery_single_execution` |
+| HIGH/MEDIUM: `running` tanpa lease tidak pernah pulih | lease NULL + tidak berubah > 60 dtk → yatim | `test_active_task_without_a_lease_is_recovered_after_a_grace_period` |
+| MEDIUM: 4xx sementara terkunci 24 jam; replay kehilangan header | 401/403/408/422/425/429 tidak disimpan; allowlist header aman | 2 test |
+| MEDIUM: sweep tanpa sinyal/timeout; `renew` mudah diabaikan; lock global | `RecoveryIncomplete` menggagalkan job; timeout 25 dtk; `expires` beat; `LeaseLost`; `lock_timeout` → `BUSY` | 4 test |
+
+Hasil akhir: `uv run pytest -q` → **673 passed**; ruff, pyright, dan lint-imports bersih.
+
+Usulan ke Lead (dokumen kontrak, belum diubah):
+- **API_CONTRACTS §1:** tambahkan perilaku Idempotency-Key:
+  - header `Idempotent-Replay`;
+  - 400/409/413/503;
+  - status yang tidak disimpan;
+  - catatan bahwa keberhasilan yang tidak tercatat menghasilkan 409, bukan eksekusi ulang.
+- **SQL claim di ARCHITECTURE §5.3:**
+  - hanya task `queued` yang bisa di-claim;
+  - kapasitas dihitung dari lease yang hidup;
+  - hasil claim bertipe.
+
+Risiko yang dicatat:
+- **Versi redis.** kombu 5.6.2 mendeklarasikan `redis<6.5` untuk extra `[redis]`, sedangkan repo memakai redis 8.1. Worker Celery sungguhan berjalan (broker round-trip lewat sweep startup), tetapi kombinasi ini di luar matriks yang didukung kombu.
+- **`visibility_timeout`.** Nilai bawaan 1 jam perlu diset di atas `TASK_MAX_DURATION_MINUTES` di WP-3.x.
+- **Task `queued` yatim** (pesan broker hilang) belum dipulihkan oleh sweep mana pun (WP-3.x).
