@@ -333,3 +333,127 @@ async def test_too_large_text_cut_inside_a_multibyte_char_stays_text(ws: Workspa
     (root / "long.txt").write_bytes(data)
     got = await ws.read_file("long.txt", Access.USER_READ, max_bytes=100)
     assert (got.too_large, got.encoding) == (True, "utf-8")
+
+
+# --- tree / disk usage --------------------------------------------------------------------------------------
+
+
+def names(entries: list[fs.TreeEntry]) -> list[str]:
+    return [e.name for e in entries]
+
+
+@pytest.fixture
+def tree_root(root: Path, tmp_path: Path) -> Path:
+    (root / "docs").mkdir()
+    (root / "docs" / "guide.md").write_text("g\n")
+    (root / "a.txt").write_text("a")
+    (root / "b.txt").write_text("bb")
+    (root / ".git").mkdir()
+    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (root / (fs.TEMP_PREFIX + "abc")).write_text("half")
+    (root / ".env").write_text("TOKEN=synthetic\n")
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (tmp_path / "outside.txt").write_text("o")
+    os.symlink("/", root / "out")
+    os.symlink("missing-target", root / "dead")
+    os.symlink("src", root / "inner")
+    os.symlink("src/a.py", root / "alias.py")
+    os.symlink(".env", root / "notes")
+    return root
+
+
+async def test_tree_sorted_dirs_first(ws: Workspace, tree_root: Path) -> None:
+    result = await ws.tree(".", Access.USER_READ)
+    assert names(result.entries) == [
+        "docs",
+        "inner",
+        "node_modules",
+        "src",
+        ".env",
+        "a.txt",
+        "alias.py",
+        "b.txt",
+        "notes",
+    ]
+    assert result.truncated is False
+    src = next(e for e in result.entries if e.name == "src")
+    assert (src.type, src.path, src.size) == ("dir", "src", None)
+    assert src.children is not None
+    assert [(c.path, c.type, c.size) for c in src.children] == [("src/a.py", "file", 19)]
+
+
+async def test_tree_hides_git_and_temp(ws: Workspace, tree_root: Path) -> None:
+    listed = names((await ws.tree(".", Access.USER_READ)).entries)
+    assert ".git" not in listed
+    assert not [n for n in listed if n.startswith(fs.TEMP_PREFIX)]
+
+
+async def test_tree_depth_limit(ws: Workspace, tree_root: Path) -> None:
+    result = await ws.tree(".", Access.USER_READ, depth=1)
+    assert all(e.children is None for e in result.entries)
+    nested = await ws.tree(".", Access.USER_READ, depth=2)
+    assert next(e for e in nested.entries if e.name == "node_modules").children == [
+        fs.TreeEntry("node_modules/pkg", "pkg", "dir", None, None)
+    ]
+
+
+async def test_tree_max_entries_truncates(ws: Workspace, root: Path) -> None:
+    flat = root / "many"
+    flat.mkdir()
+    for i in range(600):
+        (flat / f"f{i:03}.txt").write_text("x")
+    result = await ws.tree("many", Access.USER_READ, max_entries=500)
+    assert len(result.entries) == 500
+    assert result.truncated is True
+    assert result.entries[0].path == "many/f000.txt"
+
+
+async def test_tree_breadth_first_keeps_top_level(ws: Workspace, root: Path) -> None:
+    (root / "a_dir").mkdir()
+    for i in range(10):
+        (root / "a_dir" / f"x{i}").write_text("x")
+    result = await ws.tree(".", Access.USER_READ, max_entries=3)
+    assert names(result.entries) == ["a_dir", "src"]  # both top-level entries before any child
+    assert result.truncated is True
+
+
+async def test_tree_agent_hides_denied(ws: Workspace, tree_root: Path) -> None:
+    agent = names((await ws.tree(".", Access.AGENT_READ)).entries)
+    user = names((await ws.tree(".", Access.USER_READ)).entries)
+    for hidden in (".env", "node_modules", "notes"):
+        assert hidden not in agent
+        assert hidden in user
+
+
+async def test_tree_symlinks(ws: Workspace, tree_root: Path) -> None:
+    entries = {e.name: e for e in (await ws.tree(".", Access.USER_READ)).entries}
+    assert "out" not in entries  # escapes the root
+    assert "dead" not in entries  # dangling
+    assert (entries["inner"].type, entries["inner"].children) == ("dir", None)  # listed, never descended
+    assert (entries["alias.py"].type, entries["alias.py"].size) == ("file", 19)
+
+
+async def test_tree_trailing_slash(ws: Workspace, tree_root: Path) -> None:
+    assert await ws.tree("src/", Access.USER_READ) == await ws.tree("src", Access.USER_READ)
+
+
+async def test_tree_of_a_file_is_not_regular(ws: Workspace) -> None:
+    with pytest.raises(PathViolation) as caught:
+        await ws.tree("src/a.py", Access.USER_READ)
+    assert caught.value.reason == "not_regular"
+
+
+async def test_tree_limits_are_clamped(ws: Workspace, root: Path) -> None:
+    (root / "d1" / "d2").mkdir(parents=True)
+    assert (await ws.tree(".", Access.USER_READ, depth=0)).entries  # clamped to 1, not empty
+    assert len((await ws.tree(".", Access.USER_READ, max_entries=0)).entries) == 1
+
+
+async def test_disk_usage_counts_regular_files_only(ws: Workspace, root: Path, tmp_path: Path) -> None:
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"z" * 100_000)
+    before = await ws.disk_usage()
+    assert before == 19
+    os.symlink(big, root / "big-link")
+    (root / "linked-dir").symlink_to(tmp_path)
+    assert await ws.disk_usage() == before

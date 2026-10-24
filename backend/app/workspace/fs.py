@@ -26,6 +26,7 @@ import hashlib
 import os
 import secrets
 import stat
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,8 @@ USER_READ_LIMIT = 1024 * 1024  # [Menebak] what the IDE opens as text
 AGENT_READ_LIMIT = 256 * 1024  # ARCHITECTURE §7: larger files never reach the LLM
 WRITE_LIMIT = 5 * 1024 * 1024  # [Menebak] per file written through the workspace API
 AGENTIGNORE_LIMIT = 64 * 1024
+MAX_TREE_DEPTH = 10
+MAX_TREE_ENTRIES = 5000
 TEMP_PREFIX = ".kk-tmp-"
 _SNIFF_BYTES = 8192
 _CHUNK = 64 * 1024
@@ -89,6 +92,21 @@ class FileChange:
     old_sha256: str | None
     new_sha256: str | None
     size: int
+
+
+@dataclass(frozen=True)
+class TreeEntry:
+    path: str
+    name: str
+    type: Literal["file", "dir"]
+    size: int | None
+    children: list[TreeEntry] | None
+
+
+@dataclass(frozen=True)
+class TreeResult:
+    entries: list[TreeEntry]
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -219,6 +237,17 @@ class Workspace:
     async def make_dir(self, rel: str, access: Access) -> str:
         return await asyncio.to_thread(self._make_dir, rel, access)
 
+    async def tree(
+        self, rel: str = ".", access: Access = Access.USER_READ, *, depth: int = 3, max_entries: int = 500
+    ) -> TreeResult:
+        depth = min(max(depth, 1), MAX_TREE_DEPTH)
+        max_entries = min(max(max_entries, 1), MAX_TREE_ENTRIES)
+        return await asyncio.to_thread(self._tree, rel, access, depth, max_entries)
+
+    async def disk_usage(self) -> int:
+        """Bytes in regular files under the root, symlinks not followed (quota input, ADR-005)."""
+        return await asyncio.to_thread(self._disk_usage)
+
     # --- plumbing ---
 
     @contextlib.contextmanager
@@ -348,6 +377,102 @@ class Workspace:
             finally:
                 os.close(parent)
         return "/".join(parts)
+
+    def _tree(self, rel: str, access: Access, depth: int, max_entries: int) -> TreeResult:
+        """Breadth-first, so a truncated listing still shows every entry of the upper levels."""
+        with self._opened() as (root_fd, real):
+            policy = self._policy(root_fd, access)
+            start = resolve(real, rel, access, policy)
+            top: list[TreeEntry] = []
+            queue: deque[tuple[tuple[str, ...], list[TreeEntry], int]] = deque([(start, top, 1)])
+            count = 0
+            while queue:
+                parts, into, level = queue.popleft()
+                for entry, child_parts in _list_dir(root_fd, real, parts, access, policy):
+                    if count == max_entries:
+                        return TreeResult(top, truncated=True)
+                    if entry.type == "dir" and child_parts is not None and level < depth:
+                        children: list[TreeEntry] = []
+                        entry = TreeEntry(entry.path, entry.name, "dir", None, children)
+                        queue.append((child_parts, children, level + 1))
+                    into.append(entry)
+                    count += 1
+        return TreeResult(top, truncated=False)
+
+    def _disk_usage(self) -> int:
+        fd, real = open_root(self.root)  # raises WorkspaceNotFound for a missing root
+        os.close(fd)
+        total = 0
+        for folder, _dirs, files in os.walk(real, followlinks=False):
+            for name in files:
+                st = os.lstat(os.path.join(folder, name))
+                if stat.S_ISREG(st.st_mode):
+                    total += st.st_size
+        return total
+
+
+def _open_dir_at(root_fd: int, parts: tuple[str, ...]) -> int:
+    if not parts:
+        return os.dup(root_fd)
+    parent = open_parent(root_fd, parts, create=False)
+    try:
+        return os.open(parts[-1], _DIR_FLAGS, dir_fd=parent)
+    except FileNotFoundError:
+        raise WorkspaceNotFound() from None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            raise PathViolation("symlink" if stat.S_ISLNK(st.st_mode) else "not_regular") from None
+        raise
+    finally:
+        os.close(parent)
+
+
+def _list_dir(
+    root_fd: int, real: str, parts: tuple[str, ...], access: Access, policy: Policy
+) -> list[tuple[TreeEntry, tuple[str, ...] | None]]:
+    """One directory's visible entries, folders first. A child to descend into carries its parts."""
+    fd = _open_dir_at(root_fd, parts)
+    try:
+        with os.scandir(fd) as scan:
+            raw = sorted(scan, key=lambda e: e.name)
+        listed: list[tuple[TreeEntry, tuple[str, ...] | None]] = []
+        for item in raw:
+            child = (*parts, item.name)
+            if item.name.startswith(TEMP_PREFIX) or policy.denied(child, access):
+                continue
+            path = "/".join(child)
+            st = os.stat(item.name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode):
+                listed.append((TreeEntry(path, item.name, "dir", None, None), child))
+            elif stat.S_ISREG(st.st_mode):
+                listed.append((TreeEntry(path, item.name, "file", st.st_size, None), None))
+            elif stat.S_ISLNK(st.st_mode) and (target := _link_target(real, child, access, policy)):
+                kind, size = target
+                listed.append((TreeEntry(path, item.name, kind, size, None), None))  # never descended
+    finally:
+        os.close(fd)
+    return sorted(listed, key=lambda pair: pair[0].type != "dir")  # stable: names stay sorted
+
+
+def _link_target(
+    real: str, child: tuple[str, ...], access: Access, policy: Policy
+) -> tuple[Literal["file", "dir"], int | None] | None:
+    """What an in-root symlink points at; ``None`` hides escaping, dangling, or denied links."""
+    try:
+        resolved = resolve(real, "/".join(child), access, policy)
+    except PathViolation:
+        return None
+    target = os.path.join(real, *resolved)
+    try:
+        st = os.stat(target, follow_symlinks=False)  # resolved: no symlinks left in it
+    except OSError:
+        return None
+    if stat.S_ISDIR(st.st_mode):
+        return "dir", None
+    if stat.S_ISREG(st.st_mode):
+        return "file", st.st_size
+    return None
 
 
 def _read_limit(access: Access) -> int:
