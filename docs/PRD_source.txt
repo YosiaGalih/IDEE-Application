@@ -1,0 +1,2419 @@
+                                                                      KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+
+
+KODEKANTOR
+
+
+
+PRODUCT REQUIREMENTS
+DOCUMENT
+Self-Hosted Agentic Coding IDE
+Platform IDE berbasis web untuk membuat, memahami, memodifikasi, menguji, memperbaiki, mereview, dan men-
+deploy aplikasi menggunakan specialist agents dengan kontrol pengguna.
+
+
+PRODUCT                                DOCUMENT                                   STATUS
+KodeKantor                             PRD v1.0                                   Draft baseline for implementation
+
+
+
+Tanggal: 21 Oktober 2026 | Target deployment: VPS Linux mandiri | LLM runtime MVP: Claude Platform API |
+Bahasa dokumen: Indonesia
+
+Dokumen ini menetapkan baseline kebutuhan produk dan implementasi. Detail model/provider, batas concurrency,
+konfigurasi VPS, dan kebijakan remote repository dapat disesuaikan melalui keputusan desain tanpa mengubah prinsip
+dasar keamanan dan penerimaan produk.
+
+
+
+
+                           Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 1
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+Kontrol Dokumen & Isi Utama
+    Field                                                      Nilai
+
+    Nama produk                                                KodeKantor — Self-Hosted Agentic Coding IDE
+
+    Versi dokumen                                              1.0
+
+    Status                                                     Baseline PRD untuk review dan implementasi bertahap
+
+    Pemilik produk                                             Product Owner / pengelola project
+
+    Pengguna utama                                             Individual developer, tim startup IT, technical lead, QA/DevOps
+
+                                                               VPS Linux mandiri; deployment awal single-node, architecture-
+    Lingkungan
+                                                               ready untuk scale-out
+
+                                                               User intent first; evidence-based validation; least privilege; safe
+    Prinsip keputusan
+                                                               execution; incremental delivery
+
+
+
+
+Daftar Isi
+      1. Ringkasan eksekutif, visi, dan ruang lingkup
+      2. Persona, kebutuhan pengguna, dan use case utama
+      3. End-to-end workflows dan state model task
+      4. Mockup design dan spesifikasi layar
+      5. Modul aplikasi dan kebutuhan fungsional
+      6. Katalog 41 specialist agents + Orchestrator
+      7. Arsitektur sistem, teknologi, data model, dan API
+      8. Keamanan, kebijakan tools, dan approval
+      9. Non-functional requirements dan observability
+      10. Acceptance criteria, QA strategy, dan release gates
+      11. Roadmap implementasi, risiko, asumsi, dan referensi
+
+     Catatan tentang jumlah agents
+     PRD ini menetapkan 41 specialist agent profiles dan 1 Orchestrator. Angka tersebut adalah target katalog
+     kapabilitas. MVP tidak perlu menjalankan 41 LLM agents secara terpisah; beberapa fungsi diwujudkan sebagai
+     tools deterministik, subagent terpilih, atau profile khusus.
+
+
+
+
+1. Ringkasan Eksekutif
+KodeKantor adalah website IDE agentic yang berjalan di VPS milik sendiri. Pengguna dapat membuat project baru
+atau mengimpor repository, memberikan instruksi melalui chat, melihat dan mengubah kode, meminta agent
+melakukan debugging, menjalankan test di sandbox, meninjau diff, memvalidasi hasil dari perspektif pengguna, dan
+menyiapkan deployment.
+
+Pembeda utamanya adalah orkestrasi berbasis task dan bukti, bukan sekadar satu chatbot. Orchestrator memilih
+specialist sesuai kebutuhan; tool gateway menegakkan izin; sandbox menjalankan kode secara terisolasi; serta User
+Proxy Agent mengevaluasi apakah hasil aktual memenuhi requirement dan acceptance criteria.
+
+
+
+
+                             Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 2
+                                                                             KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+     North-star outcome
+     Task software development selesai dengan perubahan yang dapat ditinjau, hasil test yang dapat dibuktikan,
+     status requirement yang transparan, serta kontrol pengguna atas aksi berisiko.
+
+
+
+
+1.1 Visi Produk
+Menjadi development workspace personal/tim yang mengubah instruksi natural language menjadi perubahan
+software yang tervalidasi, dengan fleksibilitas provider AI dan kepemilikan data/workspace berada pada pengguna.
+
+1.2 Tujuan Produk
+       Mendukung lifecycle software development: plan, create, modify, debug, test, review, document, dan deploy.
+       Memusatkan kode, chat, task plan, terminal, test output, diff, dan acceptance status dalam satu IDE.
+       Memakai specialist agents yang dapat dipilih dinamis berdasarkan intent, kompleksitas, dan risiko task.
+       Memastikan User Proxy Agent memeriksa kesesuaian hasil dengan requirement pengguna.
+       Memberikan jejak audit, kontrol biaya, pembatasan resource, dan persetujuan manusia untuk operasi sensitif.
+       Memulai dari satu VPS dan memungkinkan pemisahan worker/sandbox di tahap scale-up tanpa desain ulang
+        total.
+
+1.3 Indikator Keberhasilan Produk
+    Metric                                  Definisi                                     Target awal untuk pilot
+
+                                            Task yang memenuhi acceptance criteria       Baseline diukur; target awal >=70% pada
+    Task success rate
+                                            dibagi task yang valid selesai dievaluasi.   benchmark task yang disepakati.
+
+                                            Task implementasi dengan hasil test aktual   >=95% task yang mengklaim “tested”
+    Test pass evidence
+                                            yang tersimpan.                              memiliki bukti eksekusi.
+
+                                            Requirement wajib yang terhubung dengan
+    Requirement traceability                                                             100% requirement wajib memiliki status.
+                                            test/evidence/status.
+
+                                            Aksi kategori high-risk yang melalui
+    Human approval coverage                                                              100% aksi wajib-approval.
+                                            approval server-side.
+
+                                            Task dapat dilacak dari prompt hingga        100% task menghasilkan task record dan
+    Reproducibility
+                                            commit/patch, model, tools, dan log.         audit metadata.
+
+                                                                                         Semua request model dicatat; biaya dapat
+                                            Task menampilkan estimasi/aktual token
+    Cost visibility                                                                      tidak tersedia bila provider tak mengirim
+                                            dan biaya jika provider mendukung.
+                                                                                         data.
+
+
+
+Target angka di tabel adalah sasaran pilot awal untuk divalidasi, bukan klaim performa produk yang sudah terbukti.
+Baseline harus diukur pada kumpulan task representatif.
+
+1.4 Non-Goals untuk MVP
+       Bukan pengganti penuh IDE desktop dengan seluruh ekstensi VS Code.
+       Tidak menjalankan model AI lokal secara default; runtime model menggunakan provider adapter.
+       Tidak memberi agent akses shell host atau Docker daemon tanpa perantara kebijakan.
+       Tidak melakukan production deployment, destructive migration, atau force push tanpa persetujuan eksplisit.
+       Tidak menjanjikan semua task dapat selesai sepenuhnya otonom; task ambigu atau berisiko harus dapat
+        meminta klarifikasi/approval.
+       Tidak memerlukan 41 model/agent aktif bersamaan.
+
+
+                               Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 3
+                                                                         KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+2. Persona, Kebutuhan, dan Use Cases
+Persona                                   Kebutuhan                                   Capability inti
+
+                                          Membangun MVP dengan tim kecil;             Prompt-to-code, file editor, terminal, test,
+Solo developer / founder
+                                          hemat waktu berpindah tool.                 preview, Git diff.
+
+                                          Mengubah fitur dan melakukan                Codebase Explorer, impact analysis,
+Full-stack developer
+                                          debugging di repository yang sudah ada.     specialist routing, safe patch.
+
+                                          Memastikan acceptance criteria dan user     Test matrix, unit/integration/E2E, bukti
+QA / test engineer
+                                          flows berjalan.                             hasil, regression status.
+
+                                          Mengendalikan kualitas arsitektur dan       Architecture proposal, diff review, ADR,
+Tech lead / reviewer
+                                          perubahan.                                  approval gates.
+
+                                          Menguji build, staging, deployment, logs,   CI config, sandbox, staging deployment,
+DevOps / platform engineer
+                                          dan rollback.                               observability.
+
+                                          Mengelola user, provider, policy, biaya,    RBAC, provider configuration, budgets,
+Administrator platform
+                                          dan audit.                                  quotas, audit log.
+
+
+
+
+2.1 Use Cases Utama
+ID                                        Use case                                    Hasil yang diharapkan
+
+                                                                                      Project skeleton, rencana, kode awal, dan
+UC-01                                     Create from prompt
+                                                                                      cara menjalankan.
+
+                                                                                      Workspace terindeks, stack terdeteksi,
+UC-02                                     Import repository
+                                                                                      README/run instructions diringkas.
+
+                                                                                      Impact assessment, patch scoped, test,
+UC-03                                     Modify existing feature
+                                                                                      diff, user acceptance report.
+
+                                                                                      Issue direproduksi, root cause dicatat,
+UC-04                                     Debug failing task
+                                                                                      patch dibuat, tes ulang dilakukan.
+
+                                                                                      Browser flows berjalan di
+UC-05                                     Run end-to-end tests
+                                                                                      sandbox/preview dengan screenshot/log.
+
+                                                                                      Requirement-by-requirement
+UC-06                                     Validate against user intent
+                                                                                      pass/fail/unverified disertai evidence.
+
+                                                                                      Pengguna melihat file changes, test
+UC-07                                     Review and approve changes
+                                                                                      status, risiko, dan memilih apply/reject.
+
+                                                                                      Preflight, staging, smoke tests, dan
+UC-08                                     Prepare deployment
+                                                                                      rollback plan; production gated.
+
+                                                                                      Checkpoint/task log dipulihkan dan
+UC-09                                     Resume interrupted task
+                                                                                      status dipahami setelah reconnect.
+
+                                                                                      Pilih provider/model, set task limit, dan
+UC-10                                     Control budget and providers
+                                                                                      lihat estimasi/aktual biaya.
+
+
+
+
+                             Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 4
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+3. End-to-End Workflow
+3.1 Alur create project dari awal
+1.  Pengguna login lalu memilih Create Project: template, blank, atau import repository.
+2.  Intent Classifier + Requirement Analyst menangkap tujuan, batasan, teknologi, serta acceptance criteria awal.
+3.  Codebase Explorer (untuk repository yang sudah ada) mengumpulkan konteks yang relevan; Architect dipanggil
+    bila kompleksitas memerlukan desain.
+4. Planner membuat DAG task dengan dependency, specialist assignment, batas iterasi, dan perkiraan budget.
+5. Orchestrator menjalankan task di workspace/branch terisolasi. Coding specialists membuat patch melalui Tool
+    Gateway.
+6. Test Runner mengeksekusi lint, unit test, integration test, build, dan E2E sesuai risiko dan stack.
+7. Jika test gagal, Debugger menganalisis bukti dan menghasilkan patch perbaikan dengan retry count terbatas.
+8. Code Review dan Security Agents mengevaluasi diff; User Proxy Agent memeriksa acceptance criteria dan user
+    journey.
+9. UI menampilkan ringkasan, requirement coverage, diff, test evidence, risiko, dan item yang belum diverifikasi.
+10. Pengguna meminta perbaikan, menolak, atau menyetujui penerapan perubahan. Merge/deployment tetap
+    mengikuti approval policy.
+
+3.2 Alur modify / debug
+Untuk task perubahan kecil, workflow boleh disederhanakan: intent → explore context → impact analysis bila
+berisiko → implementer/debugger → test → review → User Proxy validation → approval. Architect, migration, DevOps,
+atau specialist lanjutan hanya dipanggil bila dipicu kebutuhan atau policy.
+
+3.3 Task State Machine
+ State                                 Makna                                      Transisi yang diperbolehkan
+
+ draft                                 Task dibuat tetapi belum direncanakan.     planned, cancelled
+
+ planned                               Requirement dan execution plan tersedia.   queued, needs_clarification, cancelled
+
+ queued                                Menunggu worker/resource.                  running, cancelled
+
+                                                                                  validating, waiting_approval, failed,
+ running                               Agent/tools sedang bekerja.
+                                                                                  interrupted
+
+                                       Test/review/User Proxy sedang memeriksa    completed, needs_changes,
+ validating
+                                       hasil.                                     waiting_approval, failed
+
+ needs_changes                         Ada gap yang perlu diperbaiki.             queued, cancelled
+
+ waiting_approval                      Menunggu keputusan pengguna.               queued, completed, rejected, cancelled
+
+                                       Proses berhenti sementara atau worker
+ interrupted                                                                      queued, failed, cancelled
+                                       mati.
+
+                                       Acceptance criteria wajib terpenuhi atau
+ completed                                                                        reopened
+                                       penyelesaian parsial disetujui.
+
+                                       Gagal setelah batas retry atau kegagalan
+ failed                                                                           queued/manual retry, cancelled
+                                       fatal.
+
+ cancelled/rejected                    Task dibatalkan atau perubahan ditolak.    new task
+
+
+
+
+                          Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 5
+                                                                      KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+  Status tidak boleh dibuat-buat
+  Task tidak dapat berstatus completed hanya karena agent berkata “selesai”. Status harus didukung hasil tools,
+  acceptance criteria, artefak, dan bukti validasi yang disimpan.
+
+
+
+
+4. Mockup Design dan UX Specification
+Arah visual: tema kantor startup IT modern bernama KodeKantor. Sidebar gelap menjaga fokus; area kerja terang
+menjaga code readability; oranye menjadi warna aksi utama; biru untuk status/interaksi; hijau untuk keberhasilan.
+Mockup adalah referensi visual konseptual, bukan spesifikasi pixel-perfect atau bukti bahwa interaksi sudah
+berfungsi.
+
+
+
+
+                           Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 6
+                                                                                                                             KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+
+
+Gambar 1. Mockup konseptual KodeKantor: login, dashboard, project creation, IDE, agent team, workflow, preview, testing, diff review, dan User Proxy validation.
+
+
+
+
+                                            Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 7
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+4.1 Penjelasan layar pada mockup
+    No.                           Layar                         Komponen utama                       Interaksi wajib
+
+                                                                Brand, email/password,
+                                                                                                     Login/logout, error state, session
+    1                             Login                         remember me, SSO placeholder,
+                                                                                                     expiry, accessible form labels.
+                                                                recovery, create account.
+
+                                                                Project aktif, task
+                                                                                                     Filter/search, open project/task,
+    2                             Dashboard                     berjalan/selesai, failed tasks,
+                                                                                                     create project, activity detail.
+                                                                recent projects, agent activity.
+
+                                                                                                     Validasi input, template
+                                                                Template, import repository,
+    3                             Create Project                                                     selection, repository import
+                                                                blank project, template search.
+                                                                                                     progress.
+
+                                                                File explorer, tabs, Monaco          Read/edit file, safe apply patch,
+    4                             Project Workspace / IDE       editor, chat side panel,             autosave state, chat streaming,
+                                                                Run/Preview/Git actions.             preview.
+
+                                                                                                     View agent details,
+                                                                Search/filter specialist, status,
+    5                             AI Agents                                                          capability/permission profile,
+                                                                capabilities, create task.
+                                                                                                     task assignment.
+
+                                                                Plan, workflow, output, logs, file   Edit/approve plan, pause/cancel,
+    6                             Task Planning & Workflow      changes; detail panel, assignee,     inspect dependencies and task
+                                                                priority.                            status.
+
+                                                                Live application preview, app        Refresh preview, viewport
+    7                             Preview & Result              nav, dashboard/data                  selection, report visual issue,
+                                                                components.                          open browser tests.
+
+                                                                Unit/integration/E2E tabs,           Run/re-run tests, drill down
+    8                             Testing & Debugging           passed/failed/skipped, coverage,     failure, feed evidence to
+                                                                terminal logs.                       Debugger.
+
+                                                                                                     Inspect hunk, comment, request
+                                                                Changed file list, red/green diff,
+    9                             Code Review & Diff                                                 revision, stage/apply approved
+                                                                comments/findings, security tab.
+                                                                                                     patch.
+
+                                                                Acceptance checklist, user           Request fixes, approve after fix,
+    10                            User Proxy Validation         journey, screenshot, feedback,       defer subjective criterion, export
+                                                                gap explanation.                     report.
+
+
+
+
+4.2 Global navigation
+        Dashboard — project/task overview, activity, usage/budget, and recent work.
+        Projects — list, create, import, archive, configure, and open workspace.
+        AI Agents — catalog, profile, capability, permission, health/status, and run history.
+        Tasks — queue, workflow graph, logs, artifacts, checkpoint, retry, cancel.
+        Workspace — file tree, editor, chat, terminal, preview, Git, and diff.
+        Testing — suite management, reports, coverage, E2E screenshots, regression results.
+        Deployments — environments, preflight, release history, approval, rollback status.
+        Knowledge — project context, ADR, docs, indexed symbols, and conversation/task history.
+        Teams & Settings — users, roles, provider settings, budget, security policy, audit.
+
+4.3 UX behavior yang harus konsisten
+        Setiap aksi panjang menampilkan state: queued, running, waiting approval, validating, completed, failed,
+         cancelled.
+        Semua layar menampilkan project context aktif dan perubahan yang belum diterapkan.
+        Chat dapat merujuk file, baris kode, task ID, agent output, test report, dan diff yang nyata.
+        Output AI dipisahkan dari bukti tool aktual. UI tidak menyamarkan saran sebagai hasil yang telah
+         dieksekusi.
+
+                              Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 8
+                                                                             KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+        Perubahan file ditinjau sebagai patch. Pengguna dapat melihat old/new diff dan menolak atau meminta
+         perbaikan.
+        UI memiliki empty, loading, error, timeout, disconnected, permission denied, dan partial success states.
+        Layout harus responsif, tetapi tahap MVP mengutamakan desktop karena editor, terminal, dan diff
+         memerlukan ruang.
+
+
+5. Modul Aplikasi dan Kebutuhan Fungsional
+    ID                      Module                    Scope / fitur                  Priority                    FR mapping
+
+                                                      Login, logout, session
+                                                      management, optional
+                            Authentication & User
+    M01                                               OAuth/SSO, password            P0                          FR-001..FR-006
+                            Access
+                                                      recovery, role-based
+                                                      authorization.
+
+                                                      Metrics project/task,
+                                                      recent projects, agent
+    M02                     Dashboard                                                P0                          FR-007..FR-011
+                                                      activity, failed task queue,
+                                                      quick create.
+
+                                                      Create from
+                                                      template/blank, import
+    M03                     Project Management        repository/archive,            P0                          FR-012..FR-018
+                                                      settings, archive, project
+                                                      metadata.
+
+                                                      File tree, text/symbol
+                                                      search, stack detection,
+    M04                     Repository & Context                                     P0                          FR-019..FR-025
+                                                      indexing, entrypoints,
+                                                      context retrieval.
+
+                                                      Monaco editor, tabs,
+                                                      read/write operations,
+    M05                     Browser IDE                                              P0                          FR-026..FR-032
+                                                      syntax highlight, patch
+                                                      preview, file save state.
+
+                                                      Prompt history,
+                                                      attachments/references,
+    M06                     AI Chat Workspace         streaming, cancellation,       P0                          FR-033..FR-040
+                                                      context scope, task
+                                                      creation.
+
+                                                      Catalog, profiles,
+                                                      capabilities, model policy,
+    M07                     Agent Registry            permissions,                   P0 registry / P1 admin UI   FR-041..FR-047
+                                                      readiness/status,
+                                                      invocation logs.
+
+                                                      Intent routing, plan DAG,
+                            Orchestrator & Workflow   queues, dependencies,
+    M08                                                                              P0                          FR-048..FR-058
+                            Engine                    retry, checkpoint,
+                                                      timeout, cancel/resume.
+
+                                                      Typed tool schemas, path
+                                                      validation, allowlisted
+    M09                     Tool Gateway & Policy     commands, quota                P0 security foundation      FR-059..FR-067
+                                                      enforcement, approval
+                                                      checks.
+
+                                                      Isolated workspace,
+                                                      ephemeral execution,
+    M10                     Sandbox & Runtime                                        P0 security foundation      FR-068..FR-076
+                                                      CPU/RAM/disk/time limits,
+                                                      network policy, cleanup.
+
+
+
+
+                              Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 9
+                                                                             KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+    ID                     Module                      Scope / fitur                Priority                   FR mapping
+
+                                                       Streaming output,
+                                                       command
+                           Terminal & Command
+    M11                                                allowlist/profile, exit      P0 constrained             FR-077..FR-083
+                           Runner
+                                                       codes, timeout, working
+                                                       directory validation.
+
+                                                       Unit/integration/build/
+                                                       E2E runners, failure
+    M12                    Testing & Debugging                                      P0 core tests; E2E P1      FR-084..FR-094
+                                                       capture, debugger loop,
+                                                       retry budget.
+
+                                                       Changed files, diff hunks,
+                                                       review comments,
+    M13                    Diff & Code Review                                       P0                         FR-095..FR-102
+                                                       severity, request fix,
+                                                       apply/reject patch.
+
+                                                       Requirement baseline,
+                                                       criteria traceability,
+    M14                    User Proxy Acceptance       visual/user journey          P0                         FR-103..FR-112
+                                                       evidence, gaps,
+                                                       acceptance report.
+
+                                                       Status/diff/branch/commit
+                           Git & Remote                proposal; remote sync/PR
+    M15                                                                             P0 local Git / P2 remote   FR-113..FR-120
+                           Collaboration               behind credentials and
+                                                       approval.
+
+                                                       README/docs generation,
+                           Documentation &             ADR, repository indexing,
+    M16                                                                             P1                         FR-121..FR-127
+                           Knowledge                   memory retrieval, stale-
+                                                       index invalidation.
+
+                                                       API key secret storage,
+                                                       adapter configuration,
+    M17                    Provider & Model Settings                                P0 provider config         FR-128..FR-135
+                                                       model selection, fallback,
+                                                       token/cost limits.
+
+                                                       Docker/CI configs, staging
+                           Deployment &                deployment, preflight,
+    M18                                                                             P2                         FR-136..FR-143
+                           Environments                smoke tests, rollback;
+                                                       production gated.
+
+                                                       Structured logs, task
+                                                       timeline, usage metrics,
+                                                                                    P0 audit basics / P1
+    M19                    Observability & Audit       agent/tool traces,                                      FR-144..FR-151
+                                                                                    dashboards
+                                                       immutable security event
+                                                       trail.
+
+                                                       User/role admin, quotas,
+                                                       policy settings, data
+    M20                    Admin & Governance                                       P1                         FR-152..FR-159
+                                                       retention, provider
+                                                       allowlist, feature flags.
+
+
+
+
+5.1 Authentication & User Access
+        Login dengan email/password atau metode identity yang dipilih saat implementasi; SSO dapat menjadi fase
+         lanjut.
+        Session dibuat dengan mekanisme aman; token/session tidak pernah dimasukkan ke prompt atau log
+         mentah.
+        RBAC minimum: Owner, Admin, Developer, Reviewer, Read-only. Hak akses server-side pada setiap
+         endpoint.
+        Password recovery, logout, session expiry, rate limiting untuk login, dan audit autentikasi.
+        Definisi awal satu pengguna owner untuk private MVP tidak menghapus kebutuhan isolasi user/project
+         dalam model data.
+
+                             Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 10
+                                                                     KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+5.2 Project & Repository Management
+      Project mempunyai ID stabil, nama, stack, path internal, default branch, settings, dan owner.
+      Dukungan create blank, create template, import remote repository setelah provider credential disetujui, dan
+       upload archive yang divalidasi.
+      Archive importer mencegah path traversal, symlink escape, file terlalu besar, bomb archive, dan overwrite
+       sistem.
+      Repository diindeks per project. Pengguna dapat memicu re-index setelah perubahan atau setelah import.
+      Project lifecycle: active, archived, deleting_pending_approval, deleted. Delete harus punya kebijakan
+       retention/backup.
+
+5.3 Browser IDE
+      Layout: explorer kiri, editor tengah, AI panel kanan, panel bawah yang dapat dipilih untuk terminal/test/logs.
+      File read/write hanya melalui Workspace Service dengan root project yang tervalidasi.
+      Agent menghasilkan patch; perubahan ditampilkan dalam diff sebelum masuk ke workspace aktif bila task
+       menggunakan review-first mode.
+      Run/Preview hanya menjalankan profile yang disetujui dan menggunakan preview sandbox, bukan proses
+       host bebas.
+      File binary/terlalu besar ditampilkan sebagai metadata atau di-download sesuai policy; tidak dimasukkan ke
+       prompt secara otomatis.
+
+5.4 Chat, Context & Agent Execution
+      Chat menyimpan user message, task intent, context refs, assistant output, tool calls, dan event stream secara
+       terstruktur.
+      Context harus berisi referensi file/line yang spesifik serta ringkasan seperlunya; context budget
+       dikendalikan.
+      Sediakan stop/cancel yang menghentikan orchestration dan proses sandbox terkait, bukan hanya
+       menghentikan animasi UI.
+      Setiap invocation mencatat agent_id, model/provider, prompt version, tool calls, token usage bila ada,
+       latency, status, dan biaya bila diketahui.
+      Instruksi yang ditemukan di source code, README, log, atau hasil retrieval diperlakukan sebagai data tidak
+       tepercaya dan tidak dapat menaikkan izin.
+
+5.5 User Proxy Acceptance Module
+Modul ini adalah pembeda produk dan harus ada sejak MVP. User Proxy Agent bukan sekadar chatbot yang
+menebak apakah pengguna akan suka. Ia menerima requirement baseline yang disetujui, mengumpulkan
+evidence aktual, lalu melaporkan hasil per kriteria.
+
+    Kebutuhan                                                  Perilaku
+
+                                                               Setiap requirement menyimpan sumber, tingkat
+    Requirement baseline
+                                                               wajib/opsional, versi, serta metode verifikasi.
+
+                                                               Setiap kriteria berstatus passed, failed, unverified,
+    Criteria status
+                                                               waived_by_user, atau blocked.
+
+                                                               Evidence dapat berupa test result, API response, screenshot,
+    Evidence
+                                                               browser trace, diff, atau catatan review.
+
+                                                               Untuk “terlalu ramai”, “mudah dipakai”, atau preferensi
+    Subjective preference                                      subjektif lain, agent menjelaskan penilaiannya dan meminta
+                                                               feedback bila tidak jelas.
+
+                                                               Kegagalan objektif diarahkan ke task perbaikan yang jelas;
+    Gap routing                                                perubahan scope harus tercatat sebagai requirement
+                                                               change.
+
+
+
+
+                            Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 11
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+    Kebutuhan                                                    Perilaku
+
+                                                                 Ringkasan total kriteria, gap, risiko, confidence, evidence
+    Acceptance report
+                                                                 links, serta rekomendasi next action.
+
+                                                                 User Proxy dapat merekomendasikan acceptance, tetapi
+    Final acceptance                                             tidak menggantikan keputusan eksplisit pengguna untuk
+                                                                 approval berisiko.
+
+
+
+
+5.6 Testing & Debugging
+      Runner menggunakan project stack profile untuk mendeteksi command yang didukung, contohnya pytest,
+       npm test, lint, atau build.
+      Output test menyimpan command profile, exit code, stdout/stderr, waktu, durasi, environment ID, dan
+       artifacts.
+      Debug loop memiliki maksimal percobaan configurable; default pilot 5 attempt per task, bukan tanpa batas.
+      Gagal install dependency, timeout, runner crash, dan test assertion failure harus dibedakan statusnya.
+      Coverage dilaporkan hanya jika runner menghasilkan data; tidak boleh diestimasi oleh model.
+
+5.7 Provider & Budget Management
+      Provider adapter memisahkan business workflow dari API spesifik vendor.
+      API keys disimpan di secret store/environment server-side; UI hanya menampilkan status atau masked
+       identifier.
+      Budget controls: batas token/task jika provider mendukung, batas durasi, batas retry, concurrency, dan biaya
+       nominal yang dikonfigurasi.
+      Fallback model/provider hanya dilakukan sesuai kebijakan; perubahan model dicatat karena dapat
+       memengaruhi output.
+      Usage dashboard membedakan actual values, estimate, dan unavailable. Jangan menampilkan angka biaya
+       palsu.
+
+
+6. Katalog Specialist Agents dan Capability Functions
+Bagian ini menjadi registry awal yang bisa diturunkan ke `agents/registry.yaml` atau konfigurasi database. Nama
+capability adalah kontrak konseptual internal dan harus diimplementasikan sebagai typed functions/tools
+dengan input schema, output schema, policy check, timeout, audit logging, dan test.
+
+Planning & User Intent
+A01 — Request & Intent Classifier
+Mengklasifikasikan tujuan permintaan dan memilih workflow awal.
+
+Capability functions: intent.classify; intent.detect_stack; intent.estimate_complexity; intent.identify_constraints;
+intent.select_workflow
+Inputs / tools: Requirement text, project metadata. Output: Intent + workflow proposal. Priority / access: P0 •
+read-only.
+
+A02 — Requirement Analyst
+Mengubah prompt menjadi requirement eksplisit dan dapat diuji.
+
+Capability functions: requirements.extract; requirements.generate_acceptance_criteria; requirements.identify_edge_cases;
+requirements.check_completeness; requirements.generate_test_scenarios
+Inputs / tools: Requirement store, repository context. Output: Requirement specification + acceptance criteria.
+Priority / access: P0 • read-only.
+
+A03 — Planner & Task Decomposer
+Memecah pekerjaan menjadi task, dependensi, dan jadwal eksekusi.
+
+                            Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 12
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+Capability functions: plan.decompose; plan.define_dependencies; plan.identify_parallel_tasks; plan.assign_specialists;
+plan.generate_execution_graph
+Inputs / tools: Task API, agent registry. Output: Task DAG + completion criteria. Priority / access: P0 •
+orchestration only.
+
+A04 — Codebase Explorer & Context Engineer
+Mencari konteks relevan tanpa memuat seluruh repository ke model.
+
+Capability functions: repo.get_tree; repo.search_text; repo.search_symbol; repo.read_file; repo.detect_entrypoints;
+repo.build_dependency_map; repo.find_related_tests
+Inputs / tools: Read-only repository tools, code index. Output: Context package + source references. Priority /
+access: P0 • read-only.
+
+A05 — Software Architect
+Menentukan modul, antarmuka, kontrak, dan trade-off arsitektur.
+
+Capability functions: architecture.propose; architecture.define_modules; architecture.define_interfaces;
+architecture.define_api_contracts; architecture.evaluate_tradeoffs; architecture.create_adr
+Inputs / tools: Diagrams, repo metadata, requirements. Output: Architecture proposal + ADR. Priority / access:
+P1 • read-only/proposal.
+
+A06 — Change Impact & Risk Analyst
+Memetakan file terdampak, risiko regresi, dan rollback.
+
+Capability functions: impact.map_affected_files; impact.trace_dependencies; impact.detect_breaking_changes;
+impact.estimate_regression_risk; impact.identify_required_tests; impact.create_rollback_plan
+Inputs / tools: Git diff, dependency map, tests. Output: Impact assessment. Priority / access: P1 • read-only.
+
+A07 — User Proxy / User Intent & Acceptance
+Merepresentasikan kepentingan pengguna dan memeriksa produk aktual terhadap kebutuhan serta
+preferensinya.
+
+Capability functions: user_proxy.capture_intent; user_proxy.manage_requirements;
+user_proxy.generate_acceptance_criteria; user_proxy.validate_implementation; user_proxy.validate_user_journey;
+user_proxy.review_visual_output; user_proxy.detect_requirement_gap; user_proxy.issue_acceptance_report
+Inputs / tools: Requirement baseline, preview/browser, test evidence, feedback. Output: Acceptance report:
+pass/fail/unverified + evidence. Priority / access: P0 • mostly read-only; cannot give human approval.
+
+Software Development
+B08 — UI/UX Designer
+Menerjemahkan kebutuhan menjadi user flow, wireframe, dan design system.
+
+Capability functions: design.analyze_brief; design.create_user_flow; design.define_wireframe; design.define_components;
+design.define_design_tokens; design.check_responsive_layout
+Inputs / tools: Design tokens, screenshots, component library. Output: UI specification + component map.
+Priority / access: P1 • design artifacts.
+
+B09 — Frontend Developer
+Membangun UI, routing, state, dan integrasi API.
+
+Capability functions: frontend.create_component; frontend.create_page; frontend.configure_routing;
+frontend.manage_state; frontend.integrate_api; frontend.handle_loading_error; frontend.optimize_rendering
+Inputs / tools: Workspace patch, package scripts, browser preview. Output: Frontend patch + build evidence.
+Priority / access: P0/P1 • write scoped workspace.
+
+B10 — Backend Developer
+Membangun business logic, service layer, middleware, dan API handlers.
+
+
+
+                            Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 13
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+Capability functions: backend.create_endpoint; backend.implement_service; backend.validate_input;
+backend.handle_errors; backend.implement_background_job; backend.configure_middleware; backend.optimize_endpoint
+Inputs / tools: Workspace patch, test runner, API schema. Output: Backend patch + test evidence. Priority /
+access: P0/P1 • write scoped workspace.
+
+B11 — API & Integration Specialist
+Merancang kontrak API dan integrasi eksternal yang tahan terhadap kegagalan.
+
+Capability functions: api.define_contract; api.generate_openapi; api.implement_client; api.integrate_external_service;
+api.validate_compatibility; api.configure_retry_timeout; api.verify_webhooks
+Inputs / tools: OpenAPI tools, mock servers, secret references. Output: Contract + integration patch. Priority /
+access: P1 • sandboxed write.
+
+B12 — Database & Data Modeling Specialist
+Merancang skema, query, indeks, transaksi, dan integritas data.
+
+Capability functions: db.design_schema; db.define_relationships; db.create_query; db.optimize_query;
+db.analyze_query_plan; db.recommend_indexes; db.validate_integrity
+Inputs / tools: Migration files, local test DB, explain plans. Output: Schema proposal/query/migration +
+validation. Priority / access: P1 • no production writes.
+
+B13 — Authentication & Identity Specialist
+Membangun login, session, OAuth/SSO, RBAC, dan account recovery.
+
+Capability functions: auth.implement_login; auth.configure_session; auth.implement_rbac; auth.configure_oauth;
+auth.review_authorization; auth.implement_account_recovery; auth.audit_identity_flows
+Inputs / tools: Auth test fixtures, identity provider sandbox. Output: Identity patch + security tests. Priority /
+access: P1 • sandboxed write.
+
+B14 — General Code Implementation Agent
+Worker utama untuk membuat dan mengubah kode dalam scope task.
+
+Capability functions: code.create_file; code.apply_patch; code.modify_function; code.implement_feature;
+code.refactor_scope; code.resolve_type_errors; code.validate_patch
+Inputs / tools: Scoped filesystem, patch API, compiler/linter. Output: Patch + changed-file manifest. Priority /
+access: P0 • scoped write; no direct deploy.
+
+B15 — AI/LLM Application Specialist
+Membangun fitur aplikasi pengguna yang menggunakan model AI.
+
+Capability functions: ai.configure_provider; ai.create_prompt_template; ai.implement_tool_calling;
+ai.define_structured_output; ai.implement_rag; ai.evaluate_model_output; ai.track_token_cost; ai.configure_fallback
+Inputs / tools: Provider adapters, eval harness, vector store. Output: AI integration + evaluation report.
+Priority / access: P2 • sandboxed write.
+
+Testing & Debugging
+C16 — Test Strategy Agent
+Menetapkan strategi tes dan cakupan yang proporsional terhadap risiko.
+
+Capability functions: test.plan; test.define_test_matrix; test.map_requirements_to_tests; test.identify_coverage_gaps;
+test.prioritize_regression_tests
+Inputs / tools: Requirements, repository map, test reports. Output: Test plan + coverage matrix. Priority /
+access: P0 • read-only/planning.
+
+C17 — Unit Testing Agent
+Membuat dan menjalankan unit test.
+
+Capability functions: tests.generate_unit_tests; tests.run_unit_tests; tests.analyze_unit_failures;
+tests.identify_boundary_cases; tests.check_assertion_quality; tests.report_coverage
+
+                             Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 14
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+Inputs / tools: Approved test runner, test files. Output: Test patch + test report. Priority / access: P0 • test-only
+writes by default.
+
+C18 — Integration & API Testing Agent
+Memvalidasi kontrak serta interaksi antarmodul dan service.
+
+Capability functions: tests.generate_integration_tests; tests.run_api_tests; tests.verify_contracts;
+tests.test_database_integration; tests.simulate_dependency_failure; tests.validate_authentication_flows
+Inputs / tools: Sandbox services, fixtures, API test runner. Output: Integration report + evidence. Priority /
+access: P1 • sandbox.
+
+C19 — E2E & Browser QA Agent
+Menjalankan user journey melalui browser dan menangkap bukti UI.
+
+Capability functions: browser.open_page; browser.click_element; browser.fill_form; browser.capture_screenshot;
+browser.collect_console_errors; browser.inspect_network_failures; browser.run_user_journey; browser.compare_visual_state
+Inputs / tools: Playwright/browser sandbox, preview URL. Output: E2E report + screenshots + console/network
+logs. Priority / access: P1 • isolated browser.
+
+C20 — Debugger & Root Cause Analyst
+Menemukan akar masalah dan mengarahkan perbaikan berdasarkan bukti.
+
+Capability functions: debug.parse_stack_trace; debug.analyze_logs; debug.reproduce_issue; debug.identify_root_cause;
+debug.propose_patch; debug.compare_before_after; debug.validate_fix
+Inputs / tools: Logs, sandbox, tests, scoped patch tool. Output: Diagnosis + patch proposal + validation. Priority /
+access: P0 • scoped write after diagnosis.
+
+C21 — Environment & Build Troubleshooter
+Mendiagnosis kegagalan toolchain, dependency, config, dan build.
+
+Capability functions: env.inspect_runtime; env.detect_missing_dependency; build.run; build.diagnose_failure;
+build.resolve_configuration; build.check_version_compatibility
+Inputs / tools: Sandbox terminal, manifests, build logs. Output: Environment diagnosis + validated config patch.
+Priority / access: P1 • sandbox.
+
+Quality & Security
+D22 — Code Review Agent
+Melakukan review independen terhadap diff dan kualitas implementasi.
+
+Capability functions: review.inspect_diff; review.detect_logic_bug; review.check_conventions; review.detect_duplication;
+review.analyze_regression_risk; review.verify_acceptance_criteria; review.generate_findings
+Inputs / tools: Git diff, coding standards, test evidence. Output: Finding list with severity/location/evidence.
+Priority / access: P0 • read-only.
+
+D23 — Application Security Agent
+Menilai risiko aplikasi, akses, input validation, secrets, dan konfigurasi.
+
+Capability functions: security.scan_secrets; security.review_authorization; security.review_input_validation;
+security.detect_injection_risks; security.review_file_access; security.analyze_threat_model; security.review_security_headers
+Inputs / tools: SAST/secret scanner, source, security test tools. Output: Security findings + remediation guidance.
+Priority / access: P0 baseline • read-only, scanner execution.
+
+D24 — Dependency & Supply Chain Agent
+Menilai package, kerentanan, lisensi, dan upgrade dependency.
+
+Capability functions: deps.inventory; deps.audit_vulnerabilities; deps.check_licenses; deps.detect_unused_packages;
+deps.propose_upgrade; deps.validate_lockfile; deps.check_transitive_dependencies
+Inputs / tools: Lockfiles, advisory feeds, license scanner. Output: Dependency inventory + upgrade proposal.
+Priority / access: P1 • upgrade requires review.
+
+                            Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 15
+                                                                         KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+D25 — Performance & Scalability Agent
+Mengukur bottleneck CPU, memori, query, jaringan, atau rendering.
+
+Capability functions: performance.profile_application; performance.analyze_query; performance.detect_bottleneck;
+performance.review_memory_usage; performance.design_load_test; performance.compare_benchmark
+Inputs / tools: Profiler, benchmark runner, test environment. Output: Baseline, bottleneck findings, before/after
+metrics. Priority / access: P2 • non-production load tests.
+
+D26 — Accessibility & Compatibility Agent
+Memeriksa aksesibilitas dan konsistensi lintas browser/resolusi.
+
+Capability functions: a11y.scan; a11y.check_keyboard_navigation; a11y.review_semantics; a11y.check_contrast;
+compatibility.test_browser_matrix; compatibility.validate_responsive
+Inputs / tools: Browser runner, accessibility scanner. Output: Accessibility/compatibility report. Priority /
+access: P2 • read-only + test execution.
+
+Git & Collaboration
+E27 — Git Workflow Agent
+Mengelola branch, status, diff, dan kandidat commit.
+
+Capability functions: git.inspect_status; git.inspect_diff; git.create_task_branch; git.inspect_history; git.prepare_commit;
+git.generate_commit_message; git.inspect_untracked_files
+Inputs / tools: Git adapter, scoped repository. Output: Branch/status/diff/commit proposal. Priority / access: P0
+basic / P1 advanced; no force-push.
+
+E28 — Merge Conflict Resolution Agent
+Menganalisis dan menyelesaikan konflik secara transparan.
+
+Capability functions: git.detect_conflicts; git.explain_conflict; git.propose_resolution; git.apply_resolution;
+git.validate_merge_result; git.run_post_merge_tests
+Inputs / tools: Git adapter, diff, tests. Output: Resolution patch + tests. Priority / access: P2 • user data preserved;
+no destructive overwrite.
+
+E29 — Pull Request & Collaboration Agent
+Menyiapkan PR, ringkasan perubahan, checklist, dan feedback.
+
+Capability functions: collaboration.link_issue_to_task; collaboration.prepare_pr_description;
+collaboration.summarize_changes; collaboration.generate_review_checklist; collaboration.collect_review_feedback;
+collaboration.map_feedback_to_tasks
+Inputs / tools: Git provider adapter, issue tracker. Output: PR draft + review checklist. Priority / access: P2 •
+remote write requires authorization.
+
+DevOps & Operations
+F30 — Build & CI Agent
+Menyusun pipeline build dan menjalankan quality gates.
+
+Capability functions: ci.generate_pipeline; ci.validate_config; ci.run_local_checks; ci.analyze_pipeline_failure;
+ci.configure_test_stages; ci.verify_artifacts
+Inputs / tools: CI config files, local runners. Output: Pipeline config + validation report. Priority / access: P1 •
+config patch.
+
+F31 — Infrastructure as Code Agent
+Menulis konfigurasi Docker dan infrastruktur sebagai kode.
+
+Capability functions: infra.generate_dockerfile; infra.generate_compose; infra.generate_iac; infra.validate_configuration;
+infra.review_resource_limits; infra.check_network_policy; infra.plan_environment_changes
+Inputs / tools: Docker/Compose validators, IaC tooling. Output: Infra files + static validation. Priority / access: P1
+• no unrestricted host control.
+                              Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 16
+                                                                         KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+F32 — Deployment & Release Agent
+Menyiapkan rilis, preflight, staging, smoke tests, dan rollback.
+
+Capability functions: release.prepare; release.validate_artifact; release.run_preflight; release.deploy_staging;
+release.run_smoke_tests; release.prepare_rollback; release.deploy_production
+Inputs / tools: Deployment adapter with environment policy. Output: Release plan + deployment report. Priority
+/ access: P2; production needs explicit approval.
+
+F33 — Observability & SRE Agent
+Menganalisis telemetry, SLO, logs, metrics, dan traces.
+
+Capability functions: observability.query_logs; observability.inspect_metrics; observability.inspect_traces;
+observability.detect_anomaly; observability.evaluate_slo; observability.propose_alert_rule;
+observability.correlate_release_with_errors
+Inputs / tools: Monitoring adapters, read-only telemetry. Output: SRE report + recommended alerts. Priority /
+access: P2 • read-only by default.
+
+F34 — Incident Response & Recovery Agent
+Membantu klasifikasi insiden, mitigasi, rollback, dan postmortem.
+
+Capability functions: incident.classify_severity; incident.correlate_events; incident.identify_recent_changes;
+incident.propose_mitigation; incident.prepare_rollback; incident.verify_recovery; incident.generate_postmortem
+Inputs / tools: Logs/metrics/deploy history, approved action tools. Output: Incident timeline + recovery proposal.
+Priority / access: P2 • action requires approval.
+
+Documentation & Knowledge
+G35 — Technical Documentation Agent
+Membuat README, setup guide, arsitektur, dan changelog.
+
+Capability functions: docs.generate_readme; docs.generate_setup_guide; docs.document_architecture;
+docs.document_environment; docs.update_changelog; docs.verify_instructions
+Inputs / tools: Repository, architecture records, test results. Output: Documentation patch. Priority / access: P1 •
+scoped docs writes.
+
+G36 — API & Developer Documentation Agent
+Memastikan dokumentasi API dan contoh developer selaras dengan implementasi.
+
+Capability functions: docs.generate_api_reference; docs.generate_request_examples; docs.document_error_codes;
+docs.generate_sdk_guide; docs.check_contract_consistency; docs.update_api_examples
+Inputs / tools: OpenAPI schema, test environment. Output: API documentation + examples. Priority / access: P2
+• docs writes.
+
+G37 — Project Knowledge & Memory Agent
+Menyimpan keputusan dan mengambil konteks lintas task dengan kontrol stale data.
+
+Capability functions: memory.index_repository; memory.retrieve_context; memory.summarize_decisions;
+memory.store_architecture_decision; memory.retrieve_task_history; memory.refresh_index; memory.detect_stale_context
+Inputs / tools: Code index, task DB, ADR store. Output: Context package + memory references. Priority / access:
+P1 • never store secrets.
+
+Specialized Engineering
+H38 — Data Engineering Agent
+Membangun pipeline data dan transformasi yang dapat diuji.
+
+Capability functions: data.design_pipeline; data.implement_transform; data.validate_quality; data.configure_scheduling;
+data.check_idempotency; data.profile_dataset; data.generate_data_tests
+Inputs / tools: Sandbox, fixtures, schema tools. Output: Pipeline patch + data-quality tests. Priority / access: P2 •
+isolated data.
+                            Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 17
+                                                                      KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+H39 — Migration Specialist
+Merencanakan migrasi schema, data, framework, dan kompatibilitas.
+
+Capability functions: migration.analyze_source_target; migration.map_schema; migration.generate_migration_script;
+migration.plan_backfill; migration.run_dry_run; migration.validate_data_integrity; migration.prepare_rollback
+Inputs / tools: Temporary DB, migration runner, backups check. Output: Migration plan + dry-run report.
+Priority / access: P2 • no production mutation without approval.
+
+H40 — Legacy Modernization & Refactoring Agent
+Memodernisasi kode bertahap dengan menjaga perilaku yang disepakati.
+
+Capability functions: refactor.assess_legacy_code; refactor.identify_code_smells; refactor.propose_safe_steps;
+refactor.extract_module; refactor.remove_dead_code; refactor.update_patterns; refactor.verify_behavior
+Inputs / tools: Coverage, code index, scoped patch tools. Output: Refactor patch + behavior regression report.
+Priority / access: P2 • bounded changes.
+
+H41 — Language & Framework Specialist
+Memilih instruksi dan toolchain khusus berdasarkan bahasa/framework project.
+
+Capability functions: framework.detect_stack; framework.load_language_profile; framework.resolve_build_commands;
+framework.check_idioms; framework.check_version_compatibility; framework.resolve_framework_errors;
+framework.recommend_project_structure
+Inputs / tools: Language profile registry, linter/test/build tools. Output: Stack profile + framework-specific
+guidance. Priority / access: P1 foundation; profile-driven rather than 1 LLM per stack.
+
+6.1 Orchestrator Agent (peran pusat, bukan specialist ke-42)
+Orchestrator bertanggung jawab untuk memutuskan workflow, memilih specialist, mengatur dependensi,
+menjalankan policy checks, menyimpan checkpoint, mengonsolidasikan hasil, dan menghentikan task secara
+benar. Ia tidak boleh melewati Tool Gateway atau mengganti status dengan asumsi.
+
+Capability functions: orchestrator.route_intent; orchestrator.create_workflow; orchestrator.schedule_task;
+orchestrator.resolve_dependencies; orchestrator.invoke_agent; orchestrator.enforce_budget;
+orchestrator.handle_retry; orchestrator.pause_resume; orchestrator.collect_evidence;
+orchestrator.request_approval; orchestrator.finalize_task.
+
+6.2 Agent registry contract
+   agent_id: user_proxy
+   version: 1
+   purpose: validate delivered changes against approved user intent
+   triggers:
+     - task_implementation_finished
+     - acceptance_review_requested
+     - user_feedback_received
+   input_schema:
+     task_id: string
+     requirement_baseline_id: string
+     artifact_refs: list[string]
+     test_report_refs: list[string]
+   capabilities:
+     - user_proxy.validate_implementation
+     - user_proxy.validate_user_journey
+     - user_proxy.issue_acceptance_report
+   permissions:
+     filesystem: read_only
+     deployment: deny
+     approval_grant: deny
+   output_schema:
+     status: passed | needs_changes | blocked | unverified
+     criteria_results: list[criterion_result]
+     evidence_refs: list[string]
+     next_actions: list[string]
+   limits:
+     max_iterations: 3
+     timeout_seconds: 300
+                             Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 18
+                                                                           KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+
+
+7. Arsitektur Sistem
+Desain awal menggunakan arsitektur modular satu VPS dengan process boundaries yang jelas. API dan web UI
+boleh berjalan bersama pada satu node, tetapi eksekusi kode pengguna harus dipisahkan dari host dan dari
+service control-plane. Jika concurrency meningkat, worker dan sandbox manager dapat dipindah ke node
+terpisah.
+
+
+
+
+  Gambar 2. High-level architecture: browser → API/orchestrator → specialist agents/tools → isolated sandbox, storage, Git, dan
+                                                        observability.
+
+
+7.1 Logical components
+ Komponen                                   Tanggung jawab                                  Batas kepercayaan
+
+                                            React app: IDE, chat, project, task timeline,   Untrusted client; semua permission
+ Web UI
+                                            diff, test and acceptance view.                 divalidasi backend.
+
+                                            REST APIs, WebSocket/SSE, authentication
+ API Gateway                                middleware, rate limits, request                Public-facing control plane.
+                                            validation.
+
+                                            Task DAG, state transitions, budget, retry,
+ Orchestrator / workflow engine                                                             Tidak boleh bypass policy/tool gateway.
+                                            checkpoint, specialist dispatch.
+
+
+                                            Prompt templates, Claude Platform
+ Agent runtime                              adapter, typed agent                            LLM output dianggap untrusted.
+                                            inputs/outputs, output validation.
+
+
+
+
+                            Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 19
+                                                                           KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+Komponen                                 Tanggung jawab                               Batas kepercayaan
+
+                                         Typed tools, permission checks,
+Tool Gateway & policy                    project/path scoping, approval checks,       Satu pintu untuk side effects.
+                                         audit.
+
+                                         Membuat/menghentikan isolated runtime        Agent tidak memiliki akses langsung ke
+Sandbox manager
+                                         dan mengumpulkan artifacts.                  host daemon.
+
+                                         User, project, requirement, task, agent
+PostgreSQL                                                                            Persistent control-plane data.
+                                         run, approval, usage, audit metadata.
+
+                                         Task dispatch, event stream/pub-sub,         Tidak menjadi satu-satunya source of
+Redis/queue
+                                         short-lived cache, concurrency locks.        truth untuk task final state.
+
+                                         Project files, patch artifacts, logs, test   Isolated per user/project/task; retention
+Workspace/object storage
+                                         reports, screenshots.                        policy.
+
+
+                                         Official Anthropic Python SDK +
+                                                                                      API key server-side; HTTPS egress
+                                         Messages API, streaming, tool-use
+Claude Platform adapter                                                               allowlist; model ID dari
+                                         loop, usage, dan retry/error
+                                                                                      konfigurasi.
+                                         mapping.
+
+                                         Structured logs, metrics, traces, error      Secrets and sensitive source snippets
+Observability
+                                         reporting.                                   redacted.
+
+
+
+
+7.2 Recommended technology baseline
+Layer                                    Baseline recommendation                      Notes
+
+                                                                                      SPA dan IDE browser; gunakan
+                                         React + TypeScript + Vite; Monaco
+Frontend                                                                              design tokens serta komponen
+                                         Editor; Tailwind CSS + shadcn/ui.
+                                                                                      konsisten.
+
+
+                                                                                      Typed schemas, async I/O dan
+                                         Python + FastAPI + Pydantic;
+Backend                                                                               background worker untuk task
+                                         SQLAlchemy + Alembic.
+                                                                                      panjang.
+
+
+                                                                                      State/policy harus eksplisit;
+                                         Persistent state machine/DAG +
+Workflow                                                                              LangGraph dapat dievaluasi
+                                         Celery workers.
+                                                                                      kemudian, bukan wajib MVP.
+
+
+                                                                                      Task state/checkpoints di
+                                         PostgreSQL + migrations; Redis +
+Data                                                                                  PostgreSQL; Redis untuk
+                                         Celery.
+                                                                                      broker/cache/event delivery.
+
+
+                                         Docker sandbox per task; non-root,           No Docker socket; egress dibatasi;
+Execution                                drop capabilities, resource/time             pertimbangkan microVM untuk
+                                         limits.                                      kode untrusted multi-tenant.
+
+
+                                                                                      Remote write, merge, push dan
+                                         Git CLI via restricted worker/tool
+Git                                                                                   tindakan destruktif perlu policy
+                                         adapter.
+                                                                                      dan approval.
+
+
+
+
+                           Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 20
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+ Layer                                  Baseline recommendation                          Notes
+
+                                        SSE untuk token/progress/log
+                                                                                         Gunakan task/event sequence ID
+ Streaming                              events; WebSocket untuk terminal
+                                                                                         agar UI bisa reconnect/resume.
+                                        interaktif bila diperlukan.
+
+
+                                        Caddy atau Nginx (pilih satu) +                  DB, Redis dan management ports
+ Ingress
+                                        HTTPS + firewall.                                tetap private.
+
+
+                                        Docker Compose untuk pilot;                      Health checks, migrations,
+ Deployment                             pisahkan worker/sandbox saat                     backups, restore drills dan restart
+                                        scale-up.                                        policy.
+
+
+                                                                                         MVP hanya Claude Platform;
+                                        Official Anthropic Python SDK +
+ Model access                                                                            model ID dan pricing
+                                        Claude Platform Messages API.
+                                                                                         dikonfigurasi, bukan di-hard-code.
+
+
+
+7.2.1 Stack rinci yang ditetapkan untuk MVP
+Baseline berikut dipilih agar dapat dibangun secara iteratif dengan Claude Code, berjalan pada satu VPS Linux,
+dan memisahkan control plane dari eksekusi kode project. Versi package harus dipin lewat lockfile serta
+diverifikasi kompatibilitasnya pada awal implementasi; jangan meng-upgrade dependency secara otomatis di
+production.
+Layer                                  Teknologi baseline                              Alasan / aturan implementasi
+Frontend app                           React + TypeScript + Vite                       SPA untuk Dashboard, Projects, Browser IDE,
+                                                                                       Agents, Tasks, Testing, Diff Review,
+                                                                                       Deployments, dan User Proxy Acceptance.
+
+Routing & server state                 React Router + TanStack Query                   Routing halaman, fetching API, query cache,
+                                                                                       invalidation, retry, dan loading/error states.
+
+UI/design system                       Tailwind CSS + shadcn/ui (Radix primitives) +   Design tokens KodeKantor: dark sidebar,
+                                       Lucide                                          workspace terang, oranye untuk primary
+                                                                                       actions; reusable accessible components.
+
+Code editor                            Monaco Editor melalui @monaco-editor/react      Editor tabs, syntax highlighting, code
+                                                                                       navigation, dan DiffEditor. Editor bukan
+                                                                                       runtime eksekusi.
+
+Terminal UI                            xterm.js                                        Menampilkan input/output terminal dari
+                                                                                       sandbox melalui channel terautentikasi; tidak
+                                                                                       membuka host shell.
+
+Form & local UI state                  React Hook Form + Zod; Zustand secara           Validasi form dan state UI lokal; server state
+                                       selektif                                        tetap dikelola TanStack Query.
+
+Backend API                            Python 3.12+ (pin minor) + FastAPI + Pydantic   REST, auth middleware, schema validation,
+                                       v2                                              provider adapter, project/task services,
+                                                                                       SSE/WebSocket.
+
+ORM & migration                        SQLAlchemy 2.x async + Alembic                  Akses database, transaksi, skema bertipe, dan
+                                                                                       migration yang dapat di-review.
+
+Database                               PostgreSQL                                      Source of truth untuk users, projects,
+                                                                                       requirements, tasks, agent runs, approvals,
+                                                                                       usage, events metadata, dan audit.
+
+Queue/background worker                Redis + Celery                                  Redis broker/cache/pub-sub; worker
+                                                                                       menangani task panjang. Status
+                                                                                       final/checkpoint workflow tetap di
+                                                                                       PostgreSQL.
+
+Workflow engine                        State machine/DAG persisten buatan aplikasi     Dependency, checkpoint, pause/resume, retry
+                                                                                       cap, cancellation, approval gates, dan
+                                                                                       pemulihan task.
+
+
+                          Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 21
+                                                                          KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+Layer                                  Teknologi baseline                               Alasan / aturan implementasi
+Claude API                             Official Anthropic Python SDK (anthropic) +      MVP hanya menggunakan Claude Platform
+                                       Claude Platform Messages API                     API; model ID dipilih melalui konfigurasi
+                                                                                        server, bukan hard-code di logic.
+
+Tool-call runtime                      Claude tool-use schema + internal Tool           Validasi schema, permission, scope, risk, path
+                                       Gateway                                          dan approval sebelum tool dieksekusi oleh
+                                                                                        aplikasi.
+
+Browser event streaming                SSE untuk token/progress/log; WebSocket bila     Event punya task ID, sequence ID dan
+                                       perlu input interaktif                           timestamp agar status dapat dipulihkan
+                                                                                        setelah reconnect.
+
+Workspace/artifacts                    Filesystem/volume per project + metadata di      Quota, path isolation, artifact references, test
+                                       PostgreSQL                                       reports, screenshots, logs, dan retention
+                                                                                        policy.
+
+Code execution                         Docker Engine, container per task, image per     Non-root, drop capabilities,
+                                       stack                                            CPU/RAM/PID/disk/time limits, egress policy,
+                                                                                        cleanup; tanpa Docker socket di sandbox.
+
+Git                                    Git CLI lewat worker/tool adapter terbatas       Local branch/diff lebih dahulu.
+                                                                                        Push/merge/force-push dibatasi permission;
+                                                                                        operasi berisiko butuh approval.
+
+Authentication                         Secure session cookie + password hashing +       MVP memilih satu jalur login. OAuth/SSO
+                                       server-side RBAC                                 dapat ditambahkan setelah private pilot.
+
+Ingress/TLS                            Caddy atau Nginx (pilih satu) + HTTPS + host     Hanya web entry point dipublikasi;
+                                       firewall                                         PostgreSQL, Redis dan management ports
+                                                                                        tetap private.
+
+Testing                                Pytest + Ruff; Vitest + React Testing Library;   Unit/integration test di CI; E2E memverifikasi
+                                       Playwright                                       alur create → code → test → diff → User Proxy.
+
+Security scanning                      Secret scan, dependency audit, SAST (mis.        Finding menjadi evidence bagi Security
+                                       Semgrep), Trivy image scan                       Agent; LLM tidak menggantikan scanner
+                                                                                        deterministik.
+
+Logging/observability                  Structured JSON logs; OpenTelemetry-ready        Request/task IDs, token usage, duration, tools,
+                                       instrumentation                                  errors dan audit; secret/kode sensitif
+                                                                                        diredaksi.
+
+Deployment                             Docker Compose untuk pilot; worker/sandbox       Health checks, restart policy, backup/restore,
+                                       node terpisah saat scale-up                      disk alerts, log rotation dan runbook.
+
+
+7.2.2 Keputusan implementasi MVP
+     Frontend: React + TypeScript + Vite, Tailwind CSS, shadcn/ui, Monaco Editor, React Router, dan TanStack
+      Query.
+     Backend: Python + FastAPI, Pydantic, SQLAlchemy, Alembic; API dan worker dibuat sebagai service terpisah
+      secara logis.
+     Data dan job: PostgreSQL adalah source of truth; Redis + Celery menangani antrean dan pekerjaan
+      background.
+     Runtime AI: Claude Platform Messages API melalui official Anthropic Python SDK; tool-use loop dikendalikan
+      backend KodeKantor.
+     Execution: Docker sandbox per task; source code tidak dieksekusi pada proses API atau shell host.
+     Testing: Pytest, Ruff, Vitest, React Testing Library, Playwright dan scanner keamanan yang relevan.
+     Deployment: Docker Compose di Ubuntu Server LTS dengan TLS, private database network, backups, health
+      checks dan structured logs.
+
+7.3 Integrasi Claude Platform API
+Claude Platform API adalah provider LLM tunggal untuk MVP. Runtime menggunakan Messages API melalui
+official Anthropic Python SDK. Claude Code tetap menjadi alat development untuk membangun produk, bukan
+dependency runtime yang wajib dipasang pada server pengguna. Jangan menggunakan browser automation
+terhadap claude.ai atau session login Claude sebagai pengganti API resmi.
+
+
+
+
+                          Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 22
+                                                                  KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+Domain workflow memakai interface internal LLMProvider dengan implementasi aktif
+AnthropicClaudeProvider. Pemisahan ini menjaga workflow tidak bergantung langsung pada struktur response
+vendor, tetapi integrasi provider selain Claude tidak menjadi scope MVP.
+
+7.3.1 Konfigurasi model dan server
+   ANTHROPIC_API_KEY disimpan hanya pada backend/worker melalui secret environment/file dengan
+    permission terbatas. Jangan pernah mengirimnya ke browser, prompt, log, atau sandbox task.
+   CLAUDE_MODEL_DEFAULT menentukan model yang disetujui untuk pilot. CLAUDE_MODEL_FAST dan
+    CLAUDE_MODEL_COMPLEX bersifat opsional untuk routing setelah dievaluasi.
+   Model ID harus dipilih dari katalog resmi dan diuji pada akun Claude Platform saat deployment. Jangan
+    mengunci nama model atau tarif dalam business logic.
+   Sediakan CLAUDE_MAX_OUTPUT_TOKENS, CLAUDE_REQUEST_TIMEOUT_SECONDS,
+    CLAUDE_MAX_TOOL_ITERATIONS, TASK_MAX_COST_USD, dan/atau TASK_MAX_TOKENS.
+   Tarif model dicatat sebagai konfigurasi bertanggal dan berversi. Bedakan usage/token data aktual dari
+    estimasi biaya; perubahan tarif tidak boleh memerlukan perubahan kode.
+
+7.3.2 Siklus tool-use
+1. Orchestrator membentuk input agent berisi goal, acceptance criteria, batasan, konteks repository terpilih, tool
+    allowlist dan budget.
+2. Backend mengirim request ke Messages API dengan system instructions, riwayat percakapan yang diperlukan,
+    dan definisi tools yang relevan saja.
+3. Jika response berisi tool_use, backend memvalidasi tool name dan input schema, user/project scope,
+     workspace path, risk class, budget dan approval policy.
+4. Tool Gateway menjalankan tool yang diizinkan. Hasil aktual dikembalikan sebagai tool_result; teks model saja
+     tidak dianggap bukti tool berhasil.
+5. Loop berulang sampai jawaban selesai, terjadi refusal/error/cancel, batas iterasi atau budget tercapai, atau
+     aksi menunggu approval.
+6. State/checkpoint dan event penting disimpan agar task dapat dilanjutkan setelah worker/browser restart atau
+     koneksi terputus.
+Claude tidak diberikan akses bebas ke shell host, filesystem global, database production, Git credentials, jaringan,
+atau Docker daemon. Reviewer hanya memperoleh read-only tools; implementer mendapat patch tools pada
+workspace task; tool permissions selalu ditegakkan oleh backend, bukan hanya oleh system prompt.
+
+7.3.3 Streaming, error handling, dan recovery
+   Gunakan streaming Messages API jika didukung untuk use case; normalisasikan event di backend sebelum
+    diteruskan ke UI.
+   Tangani rate limit/HTTP 429, transient 5xx, timeout, refusal, malformed output, output terpotong, disconnect,
+    dan cancel secara eksplisit.
+   Retry kegagalan sementara dengan exponential backoff dan jitter serta hormati retry hints jika tersedia. Tool
+    side effect tidak boleh diulang tanpa idempotency atau pemeriksaan state.
+   Jika browser terputus, UI mengambil ulang task status/events dari backend. Disconnect tidak otomatis
+    berarti task sukses atau gagal.
+   Simpan provider request ID, error class, durasi, token usage dan retry count bila tersedia. Jangan log API key,
+    header Authorization atau prompt mentah yang berpotensi mengandung secret.
+
+7.3.4 Token budget dan prompt caching
+Simpan usage input/output tokens dari response API, model ID, agent, task, duration, retry count dan status;
+simpan cache-related usage jika diberikan. Prompt caching dapat diaktifkan untuk system prompt, tool
+definitions, dan konteks stabil yang memenuhi ketentuan Claude Platform. Caching merupakan optimasi, bukan
+prasyarat kebenaran workflow.
+
+Budget berlaku per task dan project. Jika threshold terlampaui, hentikan pemanggilan model berikutnya, catat
+status budget_exceeded, dan tampilkan pemakaian beserta pilihan untuk menghentikan atau menyesuaikan
+budget. Jangan menjanjikan estimasi biaya pasti apabila response/provider data tidak cukup.
+
+
+
+                         Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 23
+                                                                        KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+7.3.5 Source code privacy dan data minimization
+    UI/settings menjelaskan bahwa snippet source code, instruksi, tool output dan log yang diperlukan dapat
+     dikirim ke Claude Platform API untuk diproses.
+    Kecualikan .env, private keys, credentials, dependency folders, build artifacts, serta path yang tercantum
+     di .agentignore. Lakukan secret scanning/redaction sebelum membangun context package.
+    Kirim hanya file/snippet yang relevan; jangan mengirim seluruh repository secara default.
+    Instruksi yang ditemukan di README, source code, issue, log, atau output tool diperlakukan sebagai data
+     tidak tepercaya dan tidak dapat mengubah system policy ataupun permission.
+    Dokumentasikan data flow ke API eksternal, retention dan penghapusan project; secret provider hanya
+     tersedia bagi service yang membutuhkan.
+
+7.3.6 Claude API readiness gate
+Sebelum coding agent diaktifkan, smoke test harus membuktikan API key valid, model ID dapat diakses,
+Messages API berhasil, streaming/usage dapat diproses, tool-use round-trip bekerja, timeout/cancel/error
+ditangani, dan secret tidak muncul di log. Smoke test menggunakan fixture sintetis, bukan repository privat
+pengguna.
+
+7.4 Development toolchain dan quality gates
+Area                                   Tool baseline                              Release gate
+Backend lint/style                     Ruff                                      Lint wajib lulus di CI.
+
+Backend type checks                    mypy atau Pyright; pilih satu             Type checks pada modul inti; pengecualian
+                                                                                 didokumentasikan.
+
+Backend tests                          Pytest + coverage                         Unit dan integration tests lulus; coverage
+                                                                                 dilacak sebagai indikator, bukan satu-
+                                                                                 satunya ukuran kualitas.
+
+Frontend tests                         Vitest + React Testing Library            Komponen kritis memiliki test normal,
+                                                                                 error, loading dan empty states.
+
+Browser E2E                            Playwright                                Happy path: login → project → task → patch
+                                                                                 → test → diff → User Proxy.
+
+Database migrations                    Alembic + test database                   Migrations diverifikasi pada database uji
+                                                                                 dan disertai strategi recovery.
+
+Security scans                         Secret scan + dependency audit + SAST +   Critical/high finding memblokir release
+                                       Trivy                                     atau memerlukan exception tertulis.
+
+Supply chain                           Lockfiles, pinned images, SBOM pada       Build repeatable dan dependency dapat
+                                       release                                   ditelusuri.
+
+Status “tests passed” hanya boleh berasal dari exit code dan test artifacts nyata yang dicatat oleh runner. LLM
+dapat membantu membuat atau menganalisis test, tetapi tidak dapat mengarang bukti hasil eksekusi.
+
+7.5 Deployment topology di VPS
+    web: frontend static/app service.
+    api: FastAPI untuk REST, authentication, project/task control, dan event streaming.
+    worker: Celery worker untuk Claude calls dan workflow non-interaktif.
+    sandbox-manager: membuat/menghentikan container dan menerima perintah terkontrol dari Tool Gateway.
+    postgres: metadata/control-plane database pada private network.
+    redis: broker/cache pada private network.
+    proxy: Caddy atau Nginx untuk TLS dan routing publik; pilih satu.
+    Sandbox project berupa container task sementara, terpisah dari service control plane; tidak boleh me-mount
+     Docker socket.
+
+Wajib disiapkan: health/readiness checks, restart policies, log rotation, backup PostgreSQL dan metadata
+workspace, restore drill, disk quota/alert, patching OS/container images, firewall, dan recovery runbook. Untuk
+kode tidak tepercaya dari banyak tenant, evaluasi dedicated worker node atau microVM sebelum membuka
+platform untuk publik.
+
+                          Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 24
+                                                                           KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+7.6 Environment configuration contract
+Sediakan .env.example tanpa secret sebenarnya. Aplikasi harus gagal start dengan pesan aman dan jelas bila
+konfigurasi wajib tidak ada atau tidak valid. Pisahkan nilai development dan production; jangan menyimpan
+secret ke image atau repository.
+Group                                    Variables (example names)                        Notes
+Aplikasi                                 APP_ENV, APP_URL, SECRET_KEY,                    URL dan secret session; secret dihasilkan
+                                         LOG_LEVEL                                        secara aman.
+
+Data/queue                               DATABASE_URL, REDIS_URL                          URL private; jangan tampilkan password
+                                                                                          pada log.
+
+Claude                                   ANTHROPIC_API_KEY                                Secret API dan konfigurasi model/timeout.
+                                         CLAUDE_MODEL_DEFAULT
+                                         CLAUDE_MODEL_FAST
+                                         CLAUDE_MODEL_COMPLEX
+                                         CLAUDE_MAX_OUTPUT_TOKENS
+                                         CLAUDE_REQUEST_TIMEOUT_SECONDS
+
+Budget & loop                            CLAUDE_MAX_TOOL_ITERATIONS,                      Batas iterasi dan budget per task.
+                                         TASK_MAX_COST_USD,
+                                         TASK_MAX_TOKENS
+
+Workspace                                WORKSPACE_ROOT                                   Root path khusus project dengan izin dan
+                                                                                          quota.
+
+Sandbox                                  SANDBOX_IMAGE_PYTHON,                            Runtime profiles dan resource limits.
+                                         SANDBOX_IMAGE_NODE,
+                                         SANDBOX_CPU_LIMIT,
+                                         SANDBOX_MEMORY_LIMIT,
+                                         SANDBOX_TIMEOUT_SECONDS
+
+Concurrency                              MAX_ACTIVE_TASKS                                 Batas task aktif sesuai RAM/CPU VPS.
+
+
+7.7 Upgrade path dan scale-up
+       Jangan memperkenalkan Kubernetes, vector database, multi-provider routing, atau banyak microservices
+        pada MVP tanpa bottleneck atau kebutuhan terukur.
+       Pisahkan worker/sandbox ke host lain bila CPU, RAM, IO, atau concurrency membebani control plane.
+       Tambahkan search index atau vector retrieval hanya jika pencarian simbol/teks dan context selection belum
+        memenuhi target.
+       Tambahkan provider selain Claude hanya melalui ADR, provider contract tests, evaluasi biaya/kualitas, dan
+        keputusan product owner.
+       Evaluasi microVM/dedicated executor untuk threat model kode tidak tepercaya multi-tenant.
+       Tambahkan Prometheus/Grafana atau observability stack lebih lengkap saat kebutuhan alert dan operasi
+        menuntutnya.
+
+
+8. Data Model Minimum
+    Entity                                Field kunci (konseptual)                         Tujuan
+
+                                          id, email, display_name, status, created_at,
+    users                                                                                  Identitas pengguna.
+                                          last_login_at
+
+    roles / user_roles                    role_id, user_id, role_name, scope               RBAC dan project-scoped permissions.
+
+                                          id, owner_id, name, slug, stack,
+    projects                                                                               Metadata dan referensi workspace project.
+                                          workspace_ref, default_branch, status
+
+                                          id, project_id, provider, remote_url, branch,    Repository metadata; secret hanya berupa
+    repositories
+                                          credential_ref, sync_state                       reference.
+
+                                          id, project_id, version, source_message_id,
+    requirements                                                                           Requirement baseline dan versioning.
+                                          title, description, priority, status
+
+
+
+                            Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 25
+                                                                                KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+    Entity                                   Field kunci (konseptual)                           Tujuan
+
+                                             id, requirement_id, criterion,
+    acceptance_criteria                                                                         Traceability dari kebutuhan ke bukti.
+                                             verification_method, status, evidence_ref
+
+                                             id, project_id, user_id, role, content,
+    conversations / messages                                                                    Riwayat chat terstruktur dengan redaction.
+                                             context_refs, created_at
+
+                                             id, project_id, parent_task_id, prompt,
+    tasks                                    workflow_type, status, priority, budget_limit,     Unit pekerjaan yang dapat resume.
+                                             created_by
+
+                                             task_id, depends_on_task_id,
+    task_dependencies                                                                           DAG untuk execution ordering.
+                                             dependency_type
+
+                                             id, task_id, agent_id, model_provider,
+    agent_runs                               model_name, prompt_version, status,                Audit eksekusi specialist.
+                                             token_usage, cost, duration
+
+                                             id, agent_run_id, tool_name, input_hash,
+    tool_calls                               sanitized_input, output_ref, status,               Record semua side effects dan evidence.
+                                             approval_id
+
+                                             id, task_id, type, storage_ref, checksum,
+    artifacts                                                                                   Patch, screenshot, logs, test reports.
+                                             metadata, created_at
+
+                                             id, task_id, suite, command_profile, exit_code,
+    test_runs                                                                                   Hasil tes aktual.
+                                             status, coverage, log_ref
+
+                                             id, task_id, reviewer_type, severity, file_path,
+    reviews / findings                                                                          Code review/security/User Proxy gaps.
+                                             line_start, line_end, evidence, status
+
+                                             id, task_id, action_type, requested_by,
+                                                                                                Approval yang terikat ke aksi/payload
+    approvals                                requested_at, status, decided_by, decided_at,
+                                                                                                spesifik.
+                                             payload_hash
+
+                                             id, provider, base_url, model_policy,              Konfigurasi LLM tanpa menyimpan secret
+    provider_configs
+                                             secret_ref, enabled, created_by                    plaintext.
+
+                                             id, task_id, provider, input_tokens,
+    usage_records                            output_tokens, estimated_cost, actual_cost,        Pengukuran usage dan biaya.
+                                             currency
+
+                                             id, actor_type, actor_id, action, resource_type,
+    audit_events                                                                                Jejak audit keamanan dan operasi.
+                                             resource_id, result, timestamp, correlation_id
+
+                                             agent_id, version, enabled, capabilities,
+    agent_profiles                                                                              Registry specialist dan versinya.
+                                             permission_profile, model_policy_ref
+
+                                             id, project_id, type, content_ref,                 Keputusan dan konteks project; tidak
+    project_memory / ADRs
+                                             source_commit, freshness, created_at               menyimpan secrets.
+
+
+
+
+8.1 Aturan data dan retention
+       Gunakan UUID/ID stabil, foreign keys, created_at/updated_at, dan status enum yang dikontrol.
+       Workspace file tidak harus disimpan sebagai row per karakter di PostgreSQL; gunakan storage/file system
+        dan simpan referensi/version metadata.
+       Approval terikat pada payload hash/action context tertentu; jika payload berubah, approval lama tidak
+        berlaku.
+       Log dapat berisi potongan kode atau secret secara tidak sengaja; lakukan redaction sebelum persist/forward
+        ke model.
+       User dapat menghapus/archive project sesuai retention policy; audit security events dapat memiliki
+        retention lebih panjang dengan aturan jelas.
+       Backup database dan metadata workspace harus diuji pemulihannya secara berkala.
+
+
+
+                               Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 26
+                                                                                    KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+9. API Surface (Logical Contract)
+Endpoint berikut adalah rancangan baseline, bukan API yang telah dibuat. Semua request perlu auth, schema
+validation, authorization check, request ID/correlation ID, pagination untuk list, dan error response konsisten.
+
+ Domain                                           Endpoint proposal                                Purpose
+
+                                                  POST /api/v1/auth/login; POST /logout; GET
+ Auth                                                                                              Login/session/profile.
+                                                  /me
+
+                                                  GET/POST /api/v1/projects;
+ Projects                                                                                          CRUD project yang discope ke owner/role.
+                                                  GET/PATCH/DELETE /api/v1/projects/{id}
+
+                                                  POST /projects/{id}/imports; GET
+ Repository                                                                                        Import, file tree, indexing.
+                                                  /projects/{id}/tree; POST /projects/{id}/index
+
+                                                  GET /projects/{id}/files/{path}; POST            Read file dengan root validation, patch
+ Workspace
+                                                  /projects/{id}/patches; GET /tasks/{id}/diff     proposal, diff.
+
+                                                  POST /projects/{id}/conversations; POST
+ Chat & tasks                                     /projects/{id}/tasks; GET /tasks/{id}; POST      Create chat/task, status, cancel.
+                                                  /tasks/{id}/cancel
+
+                                                  GET /tasks/{id}/events (SSE) atau WS             Streaming task/agent/log events dengan
+ Events
+                                                  /api/v1/ws/tasks/{id}                            reconnect.
+
+                                                  GET /api/v1/agents; GET /agents/{agent_id};
+ Agents                                                                                            Catalog dan run history.
+                                                  GET /tasks/{id}/agent-runs
+
+                                                  POST /tasks/{id}/tests; GET /tasks/{id}/test-    Menjalankan test profile dan mengambil
+ Testing
+                                                  runs/{run_id}                                    hasil.
+
+                                                  GET /tasks/{id}/reviews; POST
+ Reviews                                                                                           Review findings dan feedback.
+                                                  /reviews/{id}/findings/{finding_id}/feedback
+
+                                                  GET /tasks/{id}/acceptance; POST
+ Acceptance                                                                                        Kriteria, evidence, report, revalidation.
+                                                  /tasks/{id}/acceptance/revalidate
+
+                                                  GET /api/v1/approvals; POST                      Approve/reject dengan server-side
+ Approvals
+                                                  /approvals/{id}/decision                         permission and payload binding.
+
+                                                  GET /projects/{id}/git/status; GET
+                                                                                                   Git status/branch. Commit/push/merge perlu
+ Git                                              /projects/{id}/git/diff; POST
+                                                                                                   policy.
+                                                  /projects/{id}/git/branch
+
+                                                  GET/PATCH /api/v1/settings/providers; GET
+ Providers & usage                                                                                 Provider metadata and cost/usage data.
+                                                  /api/v1/usage
+
+                                                  POST /projects/{id}/deployments/preflight;       Preflight and staging; production separate
+ Deployments
+                                                  POST /deployments/{id}/staging                   high-risk permission.
+
+                                                  GET /api/v1/admin/policies; GET /api/v1/audit-
+ Admin & audit                                                                                     Admin settings and audit trails.
+                                                  events
+
+
+
+
+9.1 Standard response and error rules
+   {
+       "request_id": "req_...",
+       "status": "accepted | running | completed | failed",
+       "data": {},
+       "error": {
+         "code": "VALIDATION_ERROR",
+         "message": "Input did not pass validation",
+         "details": []
+       }
+   }
+
+
+
+
+                                 Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 27
+                                                                              KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+      Gunakan 400/422 untuk input invalid; 401/403 untuk auth/authorization; 404 untuk resource tidak tersedia
+       pada scope user; 409 untuk state conflict; 429 untuk quota/rate limit; 500 hanya untuk error server tak
+       terduga.
+      Jangan expose stack trace, filesystem absolute paths, provider secrets, atau raw environment variables
+       kepada frontend.
+      Long-running operations mengembalikan task ID dan events; jangan menahan HTTP request selama
+       build/test panjang.
+      Setiap mutating endpoint mendukung idempotency bila retry dapat menggandakan operasi.
+
+
+10. Security, Isolation & Approval Policy
+     Security principle
+     Kode yang ditulis atau diimpor dari pengguna dapat bersifat tidak tepercaya. Docker container membantu
+     isolasi, tetapi bukan jaminan mutlak; konfigurasi daemon, bind mounts, capabilities, resource limits, dan
+     network exposure perlu dikendalikan.
+
+
+
+
+10.1 Threat model ringkas
+    Threat                                   Contoh                                           Control minimum
+
+                                             Instruksi berbahaya dalam README, issue,         Treat retrieved content as data; scoped tools;
+    Prompt injection
+                                             source comments, atau retrieved docs.            policy outside LLM; approval gates.
+
+                                             Path traversal atau symlink menulis ke luar      Canonical path resolution, symlink policy,
+    Workspace escape
+                                             project.                                         per-task mount, tests for escape attempts.
+
+                                                                                              No direct host shell; sandbox broker with
+                                             Agent dapat menjalankan shell host atau
+    Host compromise                                                                           validated operation schema; no raw socket
+                                             mengakses Docker socket.
+                                                                                              mounted into agent.
+
+                                             Infinite loop, dependency install besar, fork    CPU/RAM/PID/disk/time/output limits; kill
+    Resource exhaustion
+                                             bomb, build hangs.                               process group; concurrency quotas.
+
+                                             API key masuk ke prompt, logs, diff, artifact,   Secret refs, redaction, allowlisted env, secret
+    Secret leakage
+                                             or repository.                                   scanning, UI masking.
+
+                                                                                              Project-scoped authorization at API and
+    Cross-project access                     User/task dapat membaca file project lain.
+                                                                                              storage layers; isolation tests.
+
+                                             Force push, delete, migration, production        Risk classification + approval object bound to
+    Dangerous action
+                                             deployment.                                      exact action payload.
+
+                                             Malicious package install or dependency          Dependency scan, egress allowlist, isolated
+    Supply-chain risk
+                                             compromise.                                      sandbox, lockfile review.
+
+                                             Patch overwrites user changes or bad             Version checks, patch preview, Git
+    Data loss
+                                             migration.                                       checkpoint/backup, rollback strategy.
+
+                                             Tidak bisa mengetahui agent atau tool yang       Append-only audit events, correlation IDs,
+    Audit gaps
+                                             melakukan perubahan.                             structured run/tool records.
+
+
+
+
+10.2 Risk levels
+    Risk                                     Examples                                         Execution policy
+
+                                             Read file, search symbol, inspect diff,          Allowed within project and user
+    R0 — Read
+                                             review logs.                                     permission.
+
+                                             Create branch, write patch in task               Allowed in isolated workspace; preserve
+    R1 — Reversible scoped write
+                                             workspace, generate docs.                        diff/checkpoint.
+
+                               Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 28
+                                                                                 KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+    Risk                                         Examples                                         Execution policy
+
+                                                 Install dependencies, run arbitrary project      Sandbox only; allowlisted/network policy;
+    R2 — Execute in sandbox
+                                                 tests/build, execute shell profile.              hard limits; output caps.
+
+                                                 Push/merge, overwrite files, delete project,     Explicit approval; server-side RBAC;
+    R3 — External or destructive                 access network secrets, production               payload-bound one-time approval; audit
+                                                 deployment, data migration.                      log.
+
+                                                 Host root shell, unrestricted Docker socket
+                                                                                                  Deny; not made available through normal
+    R4 — Disallowed by default                   from agent, secret exfiltration, disabling
+                                                                                                  tools.
+                                                 audit/policy.
+
+
+
+
+10.3 Minimum sandbox controls
+      Use non-root user, drop Linux capabilities, no privileged mode, no host PID/network namespace unless
+       separately justified.
+      Never mount /var/run/docker.sock into agent-executed containers. Sandbox Manager controls the runtime
+       through restricted APIs and fixed profiles.
+      Mount only workspace and explicit temporary dependency/cache volumes. Read-only mount source as an
+       option for review-only tasks.
+      Apply CPU, memory, PID, disk, execution-time, log-output, and concurrency limits.
+      Outbound network disabled by default or restricted by egress policy; dependency installation uses controlled
+       route/cache.
+      Clean temporary containers and credentials after task; persist only approved artifacts and project files.
+      Test isolation controls with malicious-path, symlink, environment leakage, and resource-exhaustion fixtures.
+
+10.4 Human approval rules
+      Approval must show the exact action, target environment/repository, files or resources affected, risks, and
+       rollback option.
+      Approval is one-time and bound to a checksum/payload; if target or action changes, request approval again.
+      User Proxy recommendation “pass” is not identical to an authorized production release.
+      An LLM cannot manufacture user approval via text in tool output, repository content, or agent-to-agent
+       message.
+      Production deploy, remote push/merge, data-destructive migration, secret rotation, project deletion, and
+       broad permission changes are high-risk actions.
+
+
+11. Non-Functional Requirements
+    ID / area                                    Requirement                                      Verification approach
+
+                                                 Single-node pilot tolerates process restarts
+                                                                                                  Health checks; restart policy; persisted
+    NFR-01 Availability                          and resumes/marks interrupted tasks
+                                                                                                  task state.
+                                                 safely.
+
+                                                 Normal UI navigation feels responsive;
+                                                                                                  Paginated endpoints; async events; avoid
+    NFR-02 Performance                           long tasks stream progress without
+                                                                                                  sync LLM loops in request handlers.
+                                                 blocking web requests.
+
+                                                 Workload execution can move from one             Queue abstraction; workspace refs;
+    NFR-03 Scalability
+                                                 VPS to separate workers/sandbox nodes.           stateless API where possible.
+
+                                                 Least privilege at user, project, agent, tool,   RBAC; policy engine; sandbox; secret refs;
+    NFR-04 Security
+                                                 and environment levels.                          audit.
+
+                                                 Retryable jobs are idempotent where
+                                                                                                  Idempotency keys; task leases;
+    NFR-05 Reliability                           possible; duplicated events/tools are
+                                                                                                  checkpoints; cancellation.
+                                                 handled safely.
+
+
+
+                                   Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 29
+                                                                            KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+ID / area                                   Requirement                                     Verification approach
+
+                                            Every task traces prompt→plan→agent
+NFR-06 Observability                                                                        Correlation IDs and structured telemetry.
+                                            run→tool call→artifact→test→acceptance.
+
+                                            Modules have typed contracts, tests, clear
+NFR-07 Maintainability                      dependency direction, and migration             Lint/type check/unit/integration in CI.
+                                            discipline.
+
+                                            Changing model provider should not              Provider adapter and capability
+NFR-08 Provider portability
+                                            require changing product-domain logic.          normalization.
+
+                                            Core screens support keyboard
+                                                                                            Accessibility scan + manual keyboard
+NFR-09 Accessibility                        navigation, meaningful labels, sufficient
+                                                                                            checklist.
+                                            contrast, and error descriptions.
+
+                                            Database and project artifacts can be
+NFR-10 Data durability                                                                      Backup schedule, retention, restore test.
+                                            backed up/restored.
+
+                                            Task/model/tool usage has budgets and           Per-task token/cost limits and kill
+NFR-11 Cost control
+                                            observable usage.                               switches.
+
+                                            UI copy can be externalized; initial
+                                                                                            Translation keys; no hard-coded text
+NFR-12 Localization                         product language Bahasa Indonesia,
+                                                                                            scattered across components.
+                                            technical labels can be English.
+
+
+
+
+12. Acceptance Criteria & Test Plan
+12.1 Core MVP acceptance criteria
+ID                                          Criterion                                       Evidence / test
+
+                                            User dapat login/logout; user tanpa hak akses
+AC-01                                                                                       Auth tests + cross-project authorization tests.
+                                            tidak dapat membuka project milik user lain.
+
+                                            Pengguna membuat project dari
+AC-02                                       blank/template dan mengimpor project            Integration tests + malicious archive fixtures.
+                                            archive yang aman.
+
+                                            IDE membaca file, mencari source,
+AC-03                                       menampilkan tab, dan mengedit melalui           Frontend/API tests.
+                                            workspace API.
+
+                                            Prompt membuat task yang memiliki
+AC-04                                                                                       API + workflow integration test.
+                                            requirement, plan, status, dan task ID.
+
+                                            Task stream mengirim progress; reconnect
+AC-05                                       dapat mengambil event yang hilang/status        WebSocket/SSE reconnect test.
+                                            terkini.
+
+                                            Agent memanggil tools hanya yang diizinkan
+AC-06                                                                                       Policy unit tests + attempted-denied tool calls.
+                                            oleh profile/policy.
+
+                                            Kode dijalankan di sandbox, bukan host
+AC-07                                                                                       Sandbox integration + isolation tests.
+                                            shell, dengan timeout dan resource limit.
+
+                                            Test runner menyimpan exit code, logs,
+AC-08                                                                                       Fixture tests for pass/fail/timeout.
+                                            status, durasi, dan artifact.
+
+                                            Diff memperlihatkan file/hunk berubah dan
+AC-09                                                                                       UI flow + workspace integrity test.
+                                            pengguna dapat menolak patch.
+
+                                            Code review menghasilkan findings dengan
+AC-10                                                                                       Contract test + permission tests.
+                                            evidence; default reviewer read-only.
+
+
+
+                              Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 30
+                                                                                   KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+    ID                                            Criterion                                         Evidence / test
+
+                                                  User Proxy menghasilkan status setiap             Test pass/fail/unverified and no-evidence
+    AC-11
+                                                  acceptance criterion dan links ke evidence.       scenarios.
+
+                                                  Jika requirement wajib gagal, task tidak
+    AC-12                                         ditandai accepted tanpa waiver/decision           Workflow state tests.
+                                                  tercatat.
+
+                                                  Aksi R3 memerlukan approval valid;
+    AC-13                                         approval lama tidak berlaku jika payload          Approval service security tests.
+                                                  berubah.
+
+                                                  Task dapat dibatalkan dan worker/sandbox
+    AC-14                                         dihentikan atau ditandai tidak dapat              Cancellation integration test.
+                                                  dihentikan.
+
+                                                  Provider secrets tidak muncul pada frontend,
+    AC-15                                                                                           Secret redaction tests.
+                                                  prompt logs, atau artifacts.
+
+                                                  Task report menunjukkan token/cost aktual
+    AC-16                                         bila tersedia dan explicitly “unavailable” bila   Usage accounting tests.
+                                                  tidak.
+
+                                                  Restart backend tidak membuat task running
+    AC-17                                                                                           Restart/recovery test.
+                                                  yang hilang tanpa status recovery.
+
+                                                  User dapat meminta perbaikan atas gap dan
+    AC-18                                         sistem menjalankan siklus revalidation            End-to-end acceptance remediation test.
+                                                  terbatas.
+
+                                                  Semua perubahan memiliki workspace/task
+    AC-19                                                                                           Audit trace test.
+                                                  references dan audit event yang memadai.
+
+                                                  MVP dapat dijalankan melalui documented
+    AC-20                                         deployment procedure dan lulus health             Clean-install smoke test.
+                                                  checks.
+
+
+
+
+12.2 Test layers
+        Unit: schema validation, routing, permission policy, state transitions, path validation, budget logic, redaction.
+        Integration: PostgreSQL/Redis, provider adapter mocked, task queue, sandbox manager, storage, Git adapter.
+        E2E: login → create project → prompt → generate patch → run tests → view diff → User Proxy report →
+         approve/reject.
+        Security: cross-project access, path traversal/symlink, prompt injection, secret leakage, approval replay,
+         container limits.
+        Recovery: process restart, duplicate queue delivery, interrupted LLM stream, sandbox crash, partial task
+         artifacts.
+        UX: empty/loading/error states, keyboard navigation, responsive desktop widths, live logs and diff
+         readability.
+
+
+13. Roadmap Implementasi
+    Phase                             Scope                                Exit criteria                         Guardrail
+
+                                      Repository baseline, decisions,
+                                                                           CLAUDE.md aligned;
+                                      threat model, data schema, UI
+    Phase 0 — Discovery & contracts                                        implementation tracker; no            Do not build all agents yet.
+                                      routes, API contracts, agent/tool
+                                                                           undefined P0 blockers.
+                                      contract.
+
+                                      React shell, FastAPI, auth
+                                      skeleton, PostgreSQL migrations,     Clean install; service health;        No model-powered code
+    Phase 1 — Foundation
+                                      Redis, compose, health checks,       migrations run; smoke tests pass.     execution yet.
+                                      lint/test/CI.
+
+
+                                 Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 31
+                                                                                    KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+    Phase                               Scope                                Exit criteria                        Guardrail
+
+                                        Project CRUD, safe import, file      Users can open project and
+    Phase 2 — Projects & IDE            explorer, editor, local workspace,   view/edit files with authorization   Do not expose shell to browser.
+                                        basic Git status/diff.               tests.
+
+                                        Provider adapter, task records,
+                                        basic orchestrator, Planner,         Prompt creates scoped patch and      Tool gateway and budgets
+    Phase 3 — First agent loop
+                                        Explorer, Code Implementer,          full task trace.                     required.
+                                        streamed events.
+
+                                        Sandbox Manager, command
+                                                                             Code executes only in isolated       Security gate must pass before
+    Phase 4 — Sandbox & tests           profiles, test/build, timeout,
+                                                                             runtime; tests/logs persist.         open internet.
+                                        cancellation, Debugger loop.
+
+                                        Diff review, Code Review,
+                                                                             E2E case proves failed
+                                        requirement traceability, User                                            Do not treat model approval as
+    Phase 5 — Review & User Proxy                                            requirement routes to fix then
+                                        Proxy evidence/acceptance                                                 human approval.
+                                                                             revalidation.
+                                        report.
+
+                                        Agent catalog UI, settings, usage,
+                                                                             All P0 and agreed P1 criteria        Review cost and usability with
+    Phase 6 — Product completeness      knowledge, documentation,
+                                                                             pass.                                pilot users.
+                                        audit, responsive polish.
+
+                                        Build/CI, Docker templates,
+                                                                             Repeatable staging deployment;       Production deployment remains
+    Phase 7 — Staging delivery          staging deployment, smoke tests,
+                                                                             rollback rehearsed.                  gated.
+                                        rollback plan.
+
+                                        E2E browser,
+                                                                             Capability-by-capability
+    Phase 8 — Advanced specialist       security/dependency,                                                      Add specialist only when benefit
+                                                                             acceptance; each addition
+    rollout                             performance, migration, data,                                             outweighs complexity.
+                                                                             measured.
+                                        SRE, remote Git/PR specialists.
+
+
+
+
+13.1 MVP definition of done
+      End-to-end happy path works from login to project creation, prompt, patch, test, diff, acceptance report, and
+       user decision.
+      All P0 acceptance criteria pass in CI and staging.
+      No known critical security finding; isolation and approval tests pass.
+      Every task has inspectable status, events, artifacts, test evidence, and a cost/usage record or explicit
+       unavailable state.
+      Operator documentation covers install, update, backup, restore, provider configuration, and troubleshooting.
+      Known limitations are displayed honestly in UI and docs.
+
+
+14. Implementation Instructions for Claude Code
+Claude Code akan digunakan sebagai development tool untuk membangun produk; ia berbeda dari runtime
+agent platform. Runtime platform harus memanggil LLM provider melalui adapter, bukan bergantung pada
+Claude Code CLI sebagai satu-satunya backend kecuali itu sengaja diputuskan sebagai fitur opsional.
+
+14.1 Execution discipline
+1. Sebelum mengubah kode, baca `CLAUDE.md`, PRD, repository status, dan implementation tracker.
+2. Lakukan Phase 0: audit repository dan tuliskan rencana, asumsi, risks, serta dependency. Jangan langsung
+     menghasilkan semua modul.
+3. Implementasikan per vertical slice: UI → API → database → workflow/tools → test → dokumentasi.
+4. Untuk setiap batch, tampilkan file changed, test command, output aktual, known gaps, serta next step.
+5. Jangan mengklaim test lulus tanpa menjalankan test dan mengutip hasilnya. Jangan menandai phase selesai
+     jika acceptance criteria belum terpenuhi.
+6. Jaga perubahan scope; lakukan commit/branch sesuai strategi Git project dan jangan membuang perubahan
+     pengguna.
+
+                                    Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 32
+                                                                             KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+7. Jangan membuat agent specialist sebagai LLM process jika fungsi deterministik sudah cukup. Pisahkan agent
+     policy dan tools.
+8. Jalankan security checklist setiap kali sandbox, file paths, shell, credentials, Git remote, atau deployment
+     berubah.
+
+14.2 Prompt awal yang disarankan
+   Baca PRD_KodeKantor_Agentic_IDE_End_to_End.docx (atau versi Markdown yang disalin ke repo), CLAUDE.md, dan semua
+   dokumen project yang relevan.
+   Jangan langsung melakukan implementasi besar.
+   1. Audit struktur repository dan status Git.
+   2. Identifikasi apa yang sudah ada, apa yang belum ada, dan konflik terhadap PRD.
+   3. Buat docs/IMPLEMENTATION_TRACKER.md dengan P0/P1/P2, dependency, acceptance criteria, dan status.
+   4. Buat docs/DECISIONS.md untuk keputusan yang benar-benar perlu dikunci.
+   5. Laporkan risiko keamanan serta ketidakjelasan yang menghalangi Phase 1.
+   6. Jangan ubah kode aplikasi pada langkah ini, kecuali hanya membuat dokumen perencanaan.
+   Akhiri dengan daftar file yang dibaca/diubah dan bukti pemeriksaan yang dijalankan.
+
+
+
+14.3 Project documentation expected in repository
+   CLAUDE.md
+   README.md
+   docs/
+    PRD.md
+    ARCHITECTURE.md
+    DATA_MODEL.md
+    API_CONTRACTS.md
+    SECURITY_MODEL.md
+    AGENT_CATALOG.md
+    USER_PROXY_ACCEPTANCE.md
+    IMPLEMENTATION_ROADMAP.md
+    IMPLEMENTATION_TRACKER.md
+    TEST_STRATEGY.md
+    DECISIONS.md
+   backend/
+   frontend/
+   infra/
+   sandbox-images/
+   tests/
+
+
+
+
+15. Risks, Assumptions, and Open Decisions
+ ID                             Risk                              Severity                      Mitigation
+
+                                                                                                Sandbox manager, no direct host
+ R-01                           Arbitrary code execution di VPS   Critical                      shell, quota/resource/network
+                                                                                                controls, security tests.
+
+                                                                                                Tool policy di luar LLM;
+                                Prompt injection dari                                           retrieved content treated as
+ R-02                                                             High
+                                repository/logs                                                 untrusted data; scoped
+                                                                                                permissions.
+
+                                                                                                Task workspaces/branches; file
+                                Agent saling mengubah file
+ R-03                                                             High                          ownership; conflict detection;
+                                secara bersamaan
+                                                                                                apply through patch API.
+
+                                                                                                Tool-produced evidence only;
+                                LLM mengaku test berhasil
+ R-04                                                             High                          acceptance workflow requires
+                                tanpa bukti
+                                                                                                test run references.
+
+                                                                                                Retry cap, token/cost limits,
+                                Biaya model meningkat karena
+ R-05                                                             High                          timeouts, budget display,
+                                loop tak terbatas
+                                                                                                cancellation.
+
+
+
+
+                           Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 33
+                                                                         KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+    ID                           Risk                             Severity                          Mitigation
+
+                                                                                                    Wave-based rollout; capability
+                                 Scope meluas menjadi 41 agents
+    R-06                                                          High                              registry; measure value per
+                                 terlalu awal
+                                                                                                    specialist.
+
+                                                                                                    Patch preview, version checking,
+    R-07                         Kehilangan perubahan pengguna    High
+                                                                                                    task branch/checkpoint, backups.
+
+                                                                                                    Egress policy, cache/proxy,
+                                 Dependency install
+    R-08                                                          Medium/High                       allowlisted registries, isolated
+                                 membutuhkan network terbuka
+                                                                                                    execution.
+
+                                                                                                    Represent unavailable; provider
+                                 Provider tidak menyampaikan
+    R-09                                                          Medium                            adapter records raw metadata
+                                 token/cost data
+                                                                                                    when available.
+
+                                                                                                    Quotas, queue concurrency,
+                                 Single VPS memiliki batas
+    R-10                                                          Medium                            worker separation plan,
+                                 resource/availability
+                                                                                                    backup/recovery.
+
+
+
+
+15.1 Open decisions sebelum production
+        Identity: single-user private mode saja pada awalnya atau multi-user sejak MVP?
+        Git provider: local Git dahulu; GitHub/GitLab/Gitea mana yang menjadi integrasi pertama?
+        Model ID Claude Platform yang dipilih untuk pilot, budget token/biaya per task, serta apakah API key
+         dikelola administrator saja atau boleh disediakan per pengguna pada fase lanjutan. Provider MVP dikunci ke
+         Claude Platform API; model harus divalidasi terhadap katalog dan akses akun saat deployment.
+        Workspace storage, backup, retention, dan ukuran file/repository maksimum.
+        Sandbox network egress: default-off atau controlled allowlist untuk dependency install.
+        Apakah UI preview berjalan di subdomain terisolasi untuk mencegah akses ke cookie aplikasi utama?
+        Batas concurrency, ukuran VPS awal, dan kriteria pindah ke worker/sandbox host terpisah.
+        Policy untuk upload source code ke provider eksternal serta opsi redact/disable provider call.
+
+
+16. Glossary
+    Term                                                          Definisi
+
+                                                                  Peran runtime dengan instruksi, input/output contract,
+    Agent
+                                                                  capability, policy, dan batas eksekusi.
+
+                                                                  Komponen pengatur workflow, dependency, specialist
+    Orchestrator
+                                                                  dispatch, retry, state, dan finalization.
+
+                                                                  Fungsi deterministik/terstruktur yang melakukan operasi
+    Tool
+                                                                  seperti membaca file, menjalankan test, atau mengambil log.
+
+                                                                  Lapisan yang mengautentikasi, mengotorisasi, memvalidasi,
+    Tool Gateway
+                                                                  dan mengaudit tool calls.
+
+                                                                  Lingkungan execution terisolasi untuk menjalankan source
+    Sandbox
+                                                                  code, build, tests, atau preview.
+
+                                                                  Agent yang mengevaluasi hasil terhadap requirement dan
+    User Proxy Agent
+                                                                  user intent; bukan pemegang persetujuan manusia.
+
+                                                                  Kondisi terverifikasi yang menentukan kebutuhan dianggap
+    Acceptance criteria
+                                                                  terpenuhi.
+
+                                                                  Hasil test aktual, screenshot, diff, logs, response, atau artefak
+    Evidence
+                                                                  yang mendukung suatu status.
+
+
+                             Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 34
+                                                                            KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+ Term                                                                 Definisi
+
+                                                                      Directed acyclic graph: representasi task dan dependensi
+ DAG
+                                                                      untuk menentukan urutan/paralelisme.
+
+                                                                      Pengambilan potongan informasi relevan dari
+ RAG/Context retrieval
+                                                                      repository/knowledge store untuk menyusun konteks model.
+
+                                                                      Prioritas: P0 wajib untuk MVP; P1 perlu untuk produk yang
+ P0/P1/P2
+                                                                      lebih lengkap; P2 advanced/future capability.
+
+
+
+
+17. Referensi Teknis
+Referensi berikut menjadi titik awal untuk desain implementasi. Versi library dan opsi konfigurasi harus
+diverifikasi kembali ketika fase coding dimulai.
+
+ Sumber                                     URL                                           Relevansi
+
+                                            https://code.claude.com/docs/id/features-     Konsep CLAUDE.md, skills, subagents,
+ Claude Code — Extend Claude Code
+                                            overview                                      hooks, MCP, dan plugin.
+
+                                                                                          Referensi resmi pembuatan UI berbasis
+ React Documentation                        https://react.dev/
+                                                                                          komponen.
+
+                                            https://fastapi.tiangolo.com/advanced/        Referensi resmi untuk streaming/event
+ FastAPI WebSockets
+                                            websockets/                                   connection bila WebSocket dipilih.
+
+                                                                                          Pertimbangan namespace, daemon,
+ Docker Engine Security                     https://docs.docker.com/engine/security/
+                                                                                          capabilities, dan hardening container.
+
+                                            https://docs.docker.com/engine/security/      Panduan melindungi akses ke Docker
+ Docker: Protect the daemon socket
+                                            protect-access/                               daemon.
+
+ OWASP Application Security Verification                                                  Baseline untuk requirement dan verifikasi
+                                            https://asvs.owasp.org/
+ Standard                                                                                 kontrol keamanan web.
+
+                                                                                          Rilis stabil dan artefak ASVS; pilih versi
+ OWASP ASVS Downloads                       https://asvs.owasp.org/downloads/             yang berlaku saat security baseline
+                                                                                          dibuat.
+
+ Claude Platform — Messages API             https://platform.claude.com/docs/en/build-     Runtime LLM MVP: Messages API,
+                                            with-claude/working-with-messages              request/response dan streaming.
+
+ Claude Platform — Tool use                 https://platform.claude.com/docs/en/           Definisi tools dan tool-use round-trip yang
+                                            agents-and-tools/tool-use/overview             dieksekusi aplikasi.
+
+ Anthropic SDKs, CLI, and libraries         https://platform.claude.com/docs/en/cli-       Official Python/TypeScript SDKs dan
+                                            sdks-libraries/overview                        pembedaan SDK dengan Claude Code.
+
+ Claude Platform — Prompt caching           https://platform.claude.com/docs/en/build-     Optimasi konteks berulang bila sesuai
+                                            with-claude/prompt-caching                     dan didukung API.
+
+ Claude Platform — Models overview          https://platform.claude.com/docs/en/           Validasi model ID, kemampuan dan
+                                            models/overview                                ketersediaan saat deployment.
+
+
+
+
+                              Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 35
+                                                                      KODEKANTOR / PRODUCT REQUIREMENTS DOCUMENT
+
+
+
+Lampiran A — Feature Traceability Ringkas
+    Capability                 Modules                        Use case                      Acceptance criteria
+
+    Create                     M03/M04/M06/M08/M10/M14        UC-01                         AC-02, AC-04, AC-07, AC-11
+
+                               M04/M06/M08/M11/M12/                                         AC-05, AC-08, AC-09, AC-11,
+    Debug                                                     UC-04
+                               M13/M14                                                      AC-18
+
+                               M04/M05/M08/M09/M12/
+    Modify                                                    UC-03                         AC-03, AC-06, AC-09, AC-11
+                               M13/M14/M15
+
+    Test                       M10/M11/M12/M19                UC-05                         AC-07, AC-08, AC-14
+
+    User acceptance            M02/M06/M13/M14                UC-06                         AC-11, AC-12, AC-18
+
+    Deploy                     M18/M19/M09                    UC-08                         AC-13, AC-20
+
+    Budget/provider            M17/M19/M20                    UC-10                         AC-15, AC-16
+
+    Recovery                   M08/M10/M19                    UC-09                         AC-14, AC-17, AC-19
+
+
+
+
+Lampiran B — Checklist Review PRD sebelum
+Implementasi
+      Owner/identity model disepakati dan RBAC dasar didefinisikan.
+      Claude Platform API, model ID, budget per task, dan strategi secret storage telah diuji.
+      Execution sandbox model dan batasan network/resource disepakati.
+      Definisi task statuses, retries, cancellation, checkpoint, dan event stream disetujui.
+      User Proxy acceptance contract dan evidence schema dikunci.
+      P0 modules, acceptance criteria, test environments, dan release gates disetujui.
+      Ukuran VPS awal dan batas concurrency diputuskan berdasarkan target pilot.
+      PRD disalin ke repository sebagai docs/PRD.md atau format source-of-truth yang disepakati; docx menjadi
+       dokumen review.
+
+
+
+
+                           Internal Product Blueprint • Version 1.0 • 21 October 2026 | Page 36
+
