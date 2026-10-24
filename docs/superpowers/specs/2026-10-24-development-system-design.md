@@ -258,6 +258,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 24. **"AC" dipakai untuk dua hal**: kriteria per task `AC-n` vs kriteria produk AC-01..AC-20.
 25. **Header workbook usang**: sheet *Ringkasan* masih "PRD v1.0", *Status Modul* "20 modul".
 26. **Snapshot compose** `docker-socket-proxy INFO:1` vs ADR-026 `INFO=0` (sudah dicatat sebagai temuan tertunda).
+27. **Token reset password**: API_CONTRACTS §2 menulis token "dicatat di audit/log dev", sedangkan SECURITY_MODEL §6.2 melarang secret masuk DB/log, dan audit disimpan 365 hari. WP-1.1d menulis token hanya di log saat `APP_ENV=development` dan tidak pernah di audit. Menunggu keputusan PO.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
