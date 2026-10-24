@@ -44,7 +44,10 @@ def app(settings: Settings) -> FastAPI:
 
 @pytest.fixture
 def client(app: FastAPI) -> TestClient:
-    return TestClient(app, raise_server_exceptions=False)
+    # Mutating requests carry a valid CSRF pair; CSRF itself is covered in test_csrf.py.
+    client = TestClient(app, raise_server_exceptions=False, headers={"X-CSRF-Token": "t" * 43})
+    client.cookies.set("kk_csrf", "t" * 43)
+    return client
 
 
 def assert_failed_envelope(body: dict[str, object], code: str) -> None:

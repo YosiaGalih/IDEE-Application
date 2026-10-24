@@ -12,6 +12,7 @@ from app.api.router import api_router
 from app.core.audit import audit_guard_problems
 from app.core.config import Settings, load_settings
 from app.core.context import REQUEST_ID_HEADER, accept_request_id, request_id_var
+from app.core.csrf import CsrfMiddleware
 from app.core.errors import install_error_handlers
 from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
@@ -80,5 +81,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.dependencies = dependencies
     install_error_handlers(app)
     app.include_router(api_router, prefix="/api/v1")
+    # Order: the last added runs outermost, so CSRF rejections still carry X-Request-ID.
+    app.add_middleware(
+        CsrfMiddleware,
+        secure=settings.cookie_secure,
+        exempt=frozenset({("POST", "/api/v1/auth/login")}),
+    )
     app.add_middleware(RequestIdMiddleware)
     return app
