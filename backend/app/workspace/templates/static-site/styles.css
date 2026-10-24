@@ -1,0 +1,14 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 2rem;
+}
+
+main {
+  max-width: 40rem;
+}
+
+input {
+  display: block;
+  width: 100%;
+  margin: 0.5rem 0;
+}

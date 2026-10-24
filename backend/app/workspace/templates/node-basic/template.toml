@@ -1,0 +1,5 @@
+id = "node-basic"
+name = "Node.js dasar"
+description = "Modul JavaScript (ESM) dengan test bawaan node:test."
+stack = "node"
+icon = "nodejs"

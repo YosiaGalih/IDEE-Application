@@ -1,0 +1,5 @@
+id = "static-site"
+name = "Situs statis"
+description = "HTML, CSS, dan JavaScript tanpa build, dengan test logika."
+stack = "web"
+icon = "globe"
