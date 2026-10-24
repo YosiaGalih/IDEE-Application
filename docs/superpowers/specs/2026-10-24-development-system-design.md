@@ -278,6 +278,9 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - `tasks.parent_task_id` dan `tasks.conversation_id` memakai SET NULL.
     - `tasks.created_by` dan `conversations.user_id` memakai RESTRICT.
     - Spec WP-1.1e menandainya [Menebak]. Lead perlu mencatat keputusannya di DATA_MODEL.
+33. **Search/index:** WBS menaruhnya di WP-2.1, `IMPLEMENTATION_ROADMAP` R2.2 di Workspace & Git. WP-1.2 mengikuti WBS.
+34. **Lokasi fixture arsip:** `TEST_STRATEGY` §4 menyebut `tests/fixtures/archives/`, §2.1/§5 menaruh test di `backend/tests/security/`. WP-1.2b membangkitkan fixture di folder tmp dari `conftest.py`.
+35. **`.env*` vs `.env.example`:** ARCHITECTURE §7 menolak tulis `.env*`, sehingga `.env.example` tidak bisa diedit lewat IDE. WP-1.2a mengikuti kontrak; perlu keputusan PO bila mengganggu.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
