@@ -387,3 +387,12 @@ Risiko yang dicatat:
 - **Versi redis.** kombu 5.6.2 mendeklarasikan `redis<6.5` untuk extra `[redis]`, sedangkan repo memakai redis 8.1. Worker Celery sungguhan berjalan (broker round-trip lewat sweep startup), tetapi kombinasi ini di luar matriks yang didukung kombu.
 - **`visibility_timeout`.** Nilai bawaan 1 jam perlu diset di atas `TASK_MAX_DURATION_MINUTES` di WP-3.x.
 - **Task `queued` yatim** (pesan broker hilang) belum dipulihkan oleh sweep mana pun (WP-3.x).
+
+### Merge PR #1 ke `main` (24 Okt 2026)
+
+- **Keputusan PO:** "lanjutkan dan merge ke main". PR [YosiaGalih/IDEE-Application#1](https://github.com/YosiaGalih/IDEE-Application/pull/1) di-merge sebagai merge commit `ae11c5d` (bukan squash), sehingga SHA yang dirujuk tracker ini tetap ada di riwayat `main`.
+- **Kondisi saat merge:** head `beb9aad`, 4 check CI sukses (backend-lint, backend-types, backend-test, security-scan), `mergeable_state: clean`.
+- **Yang belum terpenuhi:**
+  - WP-1.1d (🔒) masuk `main` **tanpa sign-off formal AG-13 di sesi terpisah** (§6 #10 spec sistem pengembangan). Yang ada hanya pra-review `kk-security-reviewer` di sesi yang sama.
+  - Sign-off formal tetap wajib sebelum G1 diputuskan.
+- **Aturan CLAUDE.md** "manusia yang me-merge": merge dijalankan agent atas perintah eksplisit PO di sesi ini, bukan oleh manusia lewat UI GitHub. Ini dicatat sebagai pengecualian, bukan perubahan aturan.
