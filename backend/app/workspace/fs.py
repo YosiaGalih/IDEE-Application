@@ -544,9 +544,7 @@ class Workspace:
             while queue:
                 parts, into, level = queue.popleft()
                 try:
-                    listed = _list_dir(root_fd, real, parts, access, policy, budget)
-                except PolicyBudgetExceeded:
-                    return TreeResult(top, truncated=True)
+                    listed, exhausted = _list_dir(root_fd, real, parts, access, policy, budget)
                 except (WorkspaceNotFound, PathViolation):
                     if first:
                         raise
@@ -555,12 +553,14 @@ class Workspace:
                 for entry, child_parts in listed:
                     if count == max_entries:
                         return TreeResult(top, truncated=True)
-                    if entry.type == "dir" and child_parts is not None and level < depth:
+                    if entry.type == "dir" and child_parts is not None and level < depth and not exhausted:
                         children: list[TreeEntry] = []
                         entry = TreeEntry(entry.path, entry.name, "dir", None, children)
                         queue.append((child_parts, children, level + 1))
                     into.append(entry)
                     count += 1
+                if exhausted:
+                    return TreeResult(top, truncated=True)  # keep what was already checked
         return TreeResult(top, truncated=False)
 
     def _disk_usage(self) -> int:
@@ -788,16 +788,26 @@ def _open_dir_at(root_fd: int, parts: tuple[str, ...]) -> int:
 
 def _list_dir(
     root_fd: int, real: str, parts: tuple[str, ...], access: Access, policy: Policy, budget: Budget
-) -> list[tuple[TreeEntry, tuple[str, ...] | None]]:
-    """One directory's visible entries, folders first. A child to descend into carries its parts."""
+) -> tuple[list[tuple[TreeEntry, tuple[str, ...] | None]], bool]:
+    """One directory's visible entries, folders first, and whether the policy budget ran out on the way.
+
+    A child to descend into carries its parts. When the budget runs out, the entries checked so far are
+    still returned.
+    """
     fd = _open_dir_at(root_fd, parts)
+    exhausted = False
     try:
         with os.scandir(fd) as scan:
             names = sorted(entry.name for entry in scan)
         listed: list[tuple[TreeEntry, tuple[str, ...] | None]] = []
         for name in names:
             child = (*parts, name)
-            if name.startswith(TEMP_PREFIX) or policy.denied(child, access, budget):
+            try:
+                hidden = name.startswith(TEMP_PREFIX) or policy.denied(child, access, budget)
+            except PolicyBudgetExceeded:
+                exhausted = True
+                break
+            if hidden:
                 continue
             path = "/".join(child)
             try:
@@ -808,14 +818,18 @@ def _list_dir(
                 listed.append((TreeEntry(path, name, "dir", None, None), child))
             elif stat.S_ISREG(st.st_mode):
                 listed.append((TreeEntry(path, name, "file", st.st_size, None), None))
-            elif stat.S_ISLNK(st.st_mode) and (
-                target := _link_target(root_fd, real, child, access, policy, budget)
-            ):
-                kind, size = target
-                listed.append((TreeEntry(path, name, kind, size, None), None))  # never descended
+            elif stat.S_ISLNK(st.st_mode):
+                try:
+                    target = _link_target(root_fd, real, child, access, policy, budget)
+                except PolicyBudgetExceeded:
+                    exhausted = True
+                    break
+                if target:
+                    kind, size = target
+                    listed.append((TreeEntry(path, name, kind, size, None), None))  # never descended
     finally:
         os.close(fd)
-    return sorted(listed, key=lambda pair: pair[0].type != "dir")  # stable: names stay sorted
+    return sorted(listed, key=lambda pair: pair[0].type != "dir"), exhausted  # stable: names stay sorted
 
 
 def _link_target(

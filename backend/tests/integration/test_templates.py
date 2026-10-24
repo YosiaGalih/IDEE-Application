@@ -127,3 +127,20 @@ def test_failed_materialize_leaves_nothing(tmp_path: Path, monkeypatch: pytest.M
     with pytest.raises(OSError, match="disk full"):
         materialize("python-basic", tmp_path / "repo", project_name="x", project_slug="ok")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_failed_copy_leaves_no_staging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import shutil as shutil_module
+
+    real_copytree = shutil_module.copytree
+
+    def partial_copy(src: Path, dst: Path, *args: object, **kwargs: object) -> object:
+        copied = real_copytree(src, dst, *args, **kwargs)  # type: ignore[arg-type]
+        if Path(dst).name.startswith(".repo.creating-"):  # the top-level call, not copytree's recursion
+            raise OSError("disk full")  # the copy ran out of space after writing the tree
+        return copied
+
+    monkeypatch.setattr(shutil_module, "copytree", partial_copy)
+    with pytest.raises(OSError, match="disk full"):
+        materialize("python-basic", tmp_path / "repo", project_name="x", project_slug="ok")
+    assert list(tmp_path.iterdir()) == []

@@ -70,8 +70,10 @@ def materialize(template_id: str, dest: Path, *, project_name: str, project_slug
 
     source = TEMPLATES_DIR / template_id
     staging = dest.parent / f".{dest.name}.creating-{secrets.token_hex(6)}"
-    shutil.copytree(source, staging, ignore=shutil.ignore_patterns(METADATA, "__pycache__"), symlinks=False)
     try:
+        shutil.copytree(
+            source, staging, ignore=shutil.ignore_patterns(METADATA, "__pycache__"), symlinks=False
+        )
         written: list[str] = []
         for path in sorted(p for p in staging.rglob("*") if p.is_file()):
             text = path.read_text()

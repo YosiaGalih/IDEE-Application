@@ -94,10 +94,13 @@ def parse(
     """Pair raw entries with patch blocks. A type change (``T``, e.g. file → symlink) has two blocks.
 
     ``output_truncated``: git's output was cut at the adapter's cap. Files whose blocks were cut off are
-    listed without hunks and the diff is marked truncated, instead of failing.
+    listed without hunks and the diff is marked truncated, instead of failing. Their ``additions`` and
+    ``deletions`` then count only what was read; with ``max_bytes`` truncation alone they stay exact.
     """
     tokens = output.split(b"\0")
     entries, i = _entries(tokens)
+    if output_truncated and i >= len(tokens) - 1 and entries:
+        entries.pop()  # the cap fell inside the raw section: the last path may be cut off mid-name
     patch = b"\0".join(tokens[i + 1 :]) if i < len(tokens) else b""
     blocks = _blocks(patch)
     needed = sum(2 if letter == "T" else 1 for letter, _ in entries)

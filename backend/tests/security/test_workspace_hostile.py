@@ -294,3 +294,11 @@ def test_offset_search_is_bounded() -> None:
     with pytest.raises(HunkConflict):
         apply_hunks(old, parse_unified_diff(diff)[0].hunks)
     assert time.monotonic() - started < 2.0
+
+
+async def test_tree_budget_keeps_entries_already_checked(root: Path) -> None:
+    (root / ".agentignore").write_text("*.tmp\n" * 50 + UNIFORM * 150)
+    _chain(root, "a", 0, files=3000)
+    result = await Workspace(root).tree(".", Access.AGENT_READ, depth=1, max_entries=5000)
+    assert result.truncated is True
+    assert result.entries  # the entries checked before the budget ran out are returned
