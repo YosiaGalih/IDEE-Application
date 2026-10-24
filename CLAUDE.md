@@ -65,7 +65,21 @@ Tiga set skill terpasang. Setiap tahap punya **satu** pemilik supaya skill yang 
 
 ## Perintah
 
-Belum ada: kode belum di-scaffold. Perintah yang direncanakan (`docs/TEST_STRATEGY.md` §6) diisi di sini saat WP Phase 1 selesai.
+Backend (`cd backend`, Python 3.12 lewat uv):
+
+```bash
+uv sync --locked                       # pasang dependensi persis dari uv.lock
+uv run ruff check . && uv run ruff format --check .
+uv run pyright                         # 0 error wajib
+uv run lint-imports                    # kontrak layer (ARCHITECTURE §3.2)
+uv run pytest -q                       # unit + integrasi; butuh PostgreSQL 16 + Redis 7 (env TEST_DATABASE_URL / TEST_REDIS_URL)
+uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml
+```
+
+- PostgreSQL dan Redis lokal di container cloud: `pg_ctlcluster 16 main start` dan `redis-server --daemonize yes`.
+- DB uji default: `kodekantor:kodekantor@localhost:5432/kodekantor_test`.
+- Library baru hanya yang dirilis sebelum tanggal `exclude-newer` di `backend/pyproject.toml`. Majukan tanggal itu lewat PR.
+- Frontend, sandbox-manager, dan e2e belum di-scaffold; perintahnya menyusul di WP-nya.
 
 ## Agent skills
 

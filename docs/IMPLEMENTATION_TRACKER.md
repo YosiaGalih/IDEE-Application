@@ -146,3 +146,32 @@ Reviewer independen menemukan 11 isu (4 High, 6 Medium, 1 Low). Semua ditindakla
 - **Dokumen tersinkron:** FR_CATALOG §9, SYSTEM_SPEC §13 (OI-37..51 → K21), IMPLEMENTATION_DESIGN_V2 §14, API_CONTRACTS §14, DATA_MODEL V2.11–V2.12, SECURITY_MODEL T24–T28, CONFIGURATION v2.2 (satu sumber tarif `PRICING_PATH`; filter rekonsiliasi `USAGE_RECONCILE_API_KEY_IDS`/`_WORKSPACE_ID`), AGENT_CATALOG §13–§14, TOOL_CATALOG v2.2 (`deps.audit`), ARCHITECTURE §14, DECISIONS ADR-063..068, WBS (137 WP, G0–G16, W0–W14), PRD v2.2.
 - **Demo (WP-DEMO-04):** halaman *Monitoring biaya & token* me-replay 61 event usage dari rekaman nyata (scripted provider → biaya `tidak tersedia`, bukan 0), simulasi tarif dari input user berlabel estimasi, alert budget 50/80/100%, rekonsiliasi "tidak tersedia di demo". Halaman *Language packs & integrasi* berlabel rancangan. Uji Playwright 1662/1662 lulus.
 - **Belum diuji / terbuka:** filter `api_key_ids[]`/`workspace_ids[]` belum dicoba terhadap Admin API nyata (butuh akun organisasi); ukuran image toolchain & waktu build per pack [Menebak]; OI-39, OI-45, OI-48 (default usulan, keputusan PO); OI-49 (produk proxy, CI eksternal); OI-50 (LSP/DAP pack baru → backlog WP-14.6).
+
+## 12. Pembaruan 24 Okt 2026 — repo `YosiaGalih/IDEE-Application`, implementasi dibuka PO
+
+- **Keputusan PO (24 Okt 2026, di sesi Claude Code):** "jalankan implementasi sekarang". Instruksi lama "jalankan rancangannya saja" belum dicabut secara formal, tetapi perintah terbaru PO membuka implementasi.
+  - Q3: branch `main` boleh dibuat.
+  - Q4: ECC dipakai selektif.
+  - Q5: batas kredit cloud **$207**.
+- **Basis kode:** snapshot Wave 1–2 **tidak tersedia**. ZIP v2 (21 Okt) dan v2.1 (22 Okt) hanya berisi dokumen + `scripts/validate_registry*.py`.
+  - Jalur yang dipakai: B (greenfield), lihat `docs/superpowers/specs/2026-10-24-development-system-design.md` §4.1.
+  - Status "Snapshot/Selesai" WP kode P1–P5 di WBS tidak berlaku untuk repo ini.
+- **Gate G0 tetap belum diputuskan**: 9 ADR v1 *Proposed*, ADR-036..068, dan FR turunan. WP-1.1a hanya memakai keputusan yang sudah *Accepted* (ADR-001, ADR-015, ADR-017, ADR-018, ADR-030 desain).
+
+### WP-1.1a — kerangka backend core (FR-144, FR-149; sebagian AC-15, AC-20)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.1a-backend-core-skeleton-design.md`. Plan: `docs/superpowers/plans/2026-10-24-wp-1.1a-backend-core-skeleton.md`.
+
+| Pemeriksaan | Perintah | Hasil aktual (24 Okt 2026, container cloud, PostgreSQL 16 + Redis lokal) |
+|---|---|---|
+| Test backend | `cd backend && uv run pytest -q` | **77 passed** (unit 70 + integrasi 7, termasuk readiness terhadap DB/Redis nyata); stabil 4× run |
+| Lint & format | `uv run ruff check .` · `uv run ruff format --check .` | All checks passed · 24 files already formatted |
+| Tipe | `uv run pyright` | 0 errors, 0 warnings |
+| Layer | `uv run lint-imports` | Contracts: 2 kept, 0 broken |
+| Migrasi | `alembic upgrade head` → `downgrade base` → `upgrade head` | exit 0 ×3 (belum ada revisi; `0001_initial` = WP-1.1b) |
+| Registry | `python scripts/validate_registry.py agents/registry.v2.yaml` | `OK: 53 agents (41 specialists + ORCH + 11 K2) — schema_version 2` |
+| CI | `.github/workflows/backend.yml` | ⬜ belum berjalan — push ke GitHub ditolak 403 (akses Claude GitHub App belum ada) |
+
+Gap yang diketahui:
+- `/health/ready` akan `503` (`sandbox_manager: unavailable`) sampai WP-1.3 membangun sandbox-manager.
+- Test kontrak "setiap variabel terdokumentasi ada di `Settings`" baru mencakup tabel variabel aplikasi v1. Variabel infra dan v2+ masuk bersama WP-nya.
