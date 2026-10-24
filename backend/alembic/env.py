@@ -10,12 +10,14 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.core.config import load_settings
+from app.models.registry import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", load_settings().database_url.replace("%", "%%"))
+# Tests pass the URL explicitly; deployments use the same validated settings as the app.
+_url = config.attributes.get("database_url") or load_settings().database_url
+config.set_main_option("sqlalchemy.url", _url.replace("%", "%%"))
 
-# ORM metadata arrives with the first tables (WP-1.1b, migration 0001_initial).
-target_metadata = None
+target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:

@@ -16,9 +16,10 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from redis.asyncio import Redis
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings
+from app.core.db import make_engine
 from app.core.logging import get_logger
 
 ReadinessCheck = Callable[[], Awaitable[bool]]
@@ -48,7 +49,7 @@ class Dependencies:
     @classmethod
     def from_settings(cls, settings: Settings) -> Dependencies:
         return cls(
-            engine=create_async_engine(settings.database_url, pool_pre_ping=True),
+            engine=make_engine(settings.database_url),
             redis=Redis.from_url(settings.redis_url),
             http=httpx.AsyncClient(timeout=CHECK_TIMEOUT_SECONDS),
             sandbox_manager_url=settings.sandbox_manager_url.rstrip("/"),
