@@ -1,0 +1,255 @@
+"""tasks: projects, conversations, tasks, task_dependencies, task_events
+
+Revision ID: 0003_tasks
+Revises: 0002_identity
+Create Date: 2026-10-24 09:50:40.929018
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+revision: str = "0003_tasks"
+down_revision: str | Sequence[str] | None = "0002_identity"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "projects",
+        sa.Column("owner_id", sa.UUID(), nullable=False),
+        sa.Column("name", sa.String(length=120), nullable=False),
+        sa.Column("slug", sa.String(length=140), nullable=False),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column(
+            "stack",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column("workspace_ref", sa.String(length=255), nullable=False),
+        sa.Column("default_branch", sa.String(length=100), server_default=sa.text("'main'"), nullable=False),
+        sa.Column("status", sa.String(length=32), server_default=sa.text("'active'"), nullable=False),
+        sa.Column(
+            "settings",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.CheckConstraint(
+            "status IN ('active', 'archived', 'deleting_pending_approval', 'deleted')",
+            name=op.f("ck_projects_status"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["owner_id"], ["users.id"], name=op.f("fk_projects_owner_id_users"), ondelete="RESTRICT"
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_projects")),
+        sa.UniqueConstraint("owner_id", "slug", name="uq_projects_owner_id_slug"),
+    )
+    op.create_table(
+        "conversations",
+        sa.Column("project_id", sa.UUID(), nullable=False),
+        sa.Column("user_id", sa.UUID(), nullable=False),
+        sa.Column("title", sa.String(length=200), nullable=False),
+        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["project_id"],
+            ["projects.id"],
+            name=op.f("fk_conversations_project_id_projects"),
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["user_id"], ["users.id"], name=op.f("fk_conversations_user_id_users"), ondelete="RESTRICT"
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_conversations")),
+    )
+    op.create_index(op.f("ix_conversations_project_id"), "conversations", ["project_id"], unique=False)
+    op.create_index(op.f("ix_conversations_user_id"), "conversations", ["user_id"], unique=False)
+    op.create_table(
+        "tasks",
+        sa.Column("project_id", sa.UUID(), nullable=False),
+        sa.Column("parent_task_id", sa.UUID(), nullable=True),
+        sa.Column("conversation_id", sa.UUID(), nullable=True),
+        sa.Column("title", sa.String(length=200), nullable=False),
+        sa.Column("prompt", sa.Text(), nullable=False),
+        sa.Column("workflow_type", sa.String(length=16), nullable=False),
+        sa.Column("status", sa.String(length=32), server_default=sa.text("'draft'"), nullable=False),
+        sa.Column("status_reason", sa.String(length=200), nullable=True),
+        sa.Column("current_step", sa.String(length=40), nullable=True),
+        sa.Column("priority", sa.String(length=8), server_default=sa.text("'normal'"), nullable=False),
+        sa.Column(
+            "budget_limit",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column(
+            "checkpoint",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column("branch_name", sa.String(length=120), nullable=True),
+        sa.Column("base_commit", sa.String(length=64), nullable=True),
+        sa.Column("iteration", sa.Integer(), server_default=sa.text("1"), nullable=False),
+        sa.Column("debug_attempts", sa.Integer(), server_default=sa.text("0"), nullable=False),
+        sa.Column("cancel_requested", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+        sa.Column("pause_requested", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+        sa.Column("lease_owner", sa.String(length=120), nullable=True),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("event_seq", sa.BigInteger(), server_default=sa.text("0"), nullable=False),
+        sa.Column("version", sa.Integer(), server_default=sa.text("1"), nullable=False),
+        sa.Column("error_code", sa.String(length=64), nullable=True),
+        sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column("created_by", sa.UUID(), nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("id", sa.UUID(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.CheckConstraint(
+            (
+                "current_step IS NULL OR current_step IN ('intake', 'context', 'plan', "
+                "'implement', 'test', 'debug', 'review', 'user_proxy', 'gate', 'apply')"
+            ),
+            name=op.f("ck_tasks_current_step"),
+        ),
+        sa.CheckConstraint("priority IN ('low', 'normal', 'high')", name=op.f("ck_tasks_priority")),
+        sa.CheckConstraint(
+            (
+                "status IN ('draft', 'needs_clarification', 'planned', 'queued', 'running', "
+                "'validating', 'needs_changes', 'waiting_approval', 'interrupted', 'completed', "
+                "'failed', 'cancelled', 'rejected')"
+            ),
+            name=op.f("ck_tasks_status"),
+        ),
+        sa.CheckConstraint(
+            "workflow_type IN ('create', 'modify', 'debug', 'test', 'review', 'docs')",
+            name=op.f("ck_tasks_workflow_type"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["conversation_id"],
+            ["conversations.id"],
+            name=op.f("fk_tasks_conversation_id_conversations"),
+            ondelete="SET NULL",
+        ),
+        sa.ForeignKeyConstraint(
+            ["created_by"], ["users.id"], name=op.f("fk_tasks_created_by_users"), ondelete="RESTRICT"
+        ),
+        sa.ForeignKeyConstraint(
+            ["parent_task_id"], ["tasks.id"], name=op.f("fk_tasks_parent_task_id_tasks"), ondelete="SET NULL"
+        ),
+        sa.ForeignKeyConstraint(
+            ["project_id"], ["projects.id"], name=op.f("fk_tasks_project_id_projects"), ondelete="CASCADE"
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_tasks")),
+    )
+    op.create_index("ix_tasks_project_id_status", "tasks", ["project_id", "status"], unique=False)
+    op.create_index(op.f("ix_tasks_parent_task_id"), "tasks", ["parent_task_id"], unique=False)
+    op.create_index(op.f("ix_tasks_conversation_id"), "tasks", ["conversation_id"], unique=False)
+    op.create_index(op.f("ix_tasks_created_by"), "tasks", ["created_by"], unique=False)
+    op.create_index("ix_tasks_status_lease_expires_at", "tasks", ["status", "lease_expires_at"], unique=False)
+    op.create_table(
+        "task_dependencies",
+        sa.Column("task_id", sa.UUID(), nullable=False),
+        sa.Column("depends_on_task_id", sa.UUID(), nullable=False),
+        sa.Column("dependency_type", sa.String(length=16), nullable=False),
+        sa.Column("id", sa.UUID(), nullable=False),
+        sa.CheckConstraint(
+            "dependency_type IN ('blocks', 'relates')", name=op.f("ck_task_dependencies_dependency_type")
+        ),
+        sa.CheckConstraint("task_id <> depends_on_task_id", name=op.f("ck_task_dependencies_not_self")),
+        sa.ForeignKeyConstraint(
+            ["depends_on_task_id"],
+            ["tasks.id"],
+            name=op.f("fk_task_dependencies_depends_on_task_id_tasks"),
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["task_id"], ["tasks.id"], name=op.f("fk_task_dependencies_task_id_tasks"), ondelete="CASCADE"
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_task_dependencies")),
+        sa.UniqueConstraint(
+            "task_id", "depends_on_task_id", name="uq_task_dependencies_task_id_depends_on_task_id"
+        ),
+    )
+    op.create_index(
+        op.f("ix_task_dependencies_depends_on_task_id"),
+        "task_dependencies",
+        ["depends_on_task_id"],
+        unique=False,
+    )
+    op.create_table(
+        "task_events",
+        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
+        sa.Column("task_id", sa.UUID(), nullable=False),
+        sa.Column("seq", sa.BigInteger(), nullable=False),
+        sa.Column("type", sa.String(length=60), nullable=False),
+        sa.Column(
+            "payload",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["task_id"], ["tasks.id"], name=op.f("fk_task_events_task_id_tasks"), ondelete="CASCADE"
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_task_events")),
+        sa.UniqueConstraint("task_id", "seq", name="uq_task_events_task_id_seq"),
+    )
+
+    # Backstop for CLAUDE.md #4: tasks start as draft, and status changes only through
+    # workflow.states.transition, which sets the transaction-local kk.status_writer marker.
+    op.execute(
+        """
+        CREATE FUNCTION tasks_status_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF TG_OP = 'INSERT' THEN
+                IF NEW.status <> 'draft' THEN
+                    RAISE EXCEPTION 'tasks start as draft (ARCHITECTURE 5.1)'
+                        USING ERRCODE = 'check_violation';
+                END IF;
+            ELSIF NEW.status IS DISTINCT FROM OLD.status
+                  AND coalesce(current_setting('kk.status_writer', true), '') <> 'transition' THEN
+                RAISE EXCEPTION 'tasks.status may only change through workflow.states.transition'
+                    USING ERRCODE = 'insufficient_privilege';
+            END IF;
+            RETURN NEW;
+        END
+        $$
+        """
+    )
+    op.execute(
+        "CREATE TRIGGER tasks_status_guard BEFORE INSERT OR UPDATE OF status ON tasks "
+        "FOR EACH ROW EXECUTE FUNCTION tasks_status_guard()"
+    )
+    op.execute("ALTER TABLE tasks ENABLE ALWAYS TRIGGER tasks_status_guard")
+
+
+def downgrade() -> None:
+    op.execute("DROP TRIGGER IF EXISTS tasks_status_guard ON tasks")
+    op.execute("DROP FUNCTION IF EXISTS tasks_status_guard()")
+    op.drop_table("task_events")
+    op.drop_index(op.f("ix_task_dependencies_depends_on_task_id"), table_name="task_dependencies")
+    op.drop_table("task_dependencies")
+    op.drop_index("ix_tasks_status_lease_expires_at", table_name="tasks")
+    op.drop_index("ix_tasks_project_id_status", table_name="tasks")
+    op.drop_index(op.f("ix_tasks_created_by"), table_name="tasks")
+    op.drop_index(op.f("ix_tasks_conversation_id"), table_name="tasks")
+    op.drop_index(op.f("ix_tasks_parent_task_id"), table_name="tasks")
+    op.drop_table("tasks")
+    op.drop_index(op.f("ix_conversations_project_id"), table_name="conversations")
+    op.drop_index(op.f("ix_conversations_user_id"), table_name="conversations")
+    op.drop_table("conversations")
+    op.drop_table("projects")

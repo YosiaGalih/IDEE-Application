@@ -1,0 +1,112 @@
+name: backend
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-${{ github.ref }}
+  # Never cancel runs on main (security-scan evidence must complete).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_PYTHON: "3.12"
+
+jobs:
+  backend-lint:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.11.32"
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run lint-imports
+      - name: Agent registry (AGENT_CATALOG §12.2)
+        run: uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml
+
+  backend-types:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.11.32"
+      - run: uv sync --locked
+      - run: uv run pyright
+
+  backend-test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16.15-alpine
+        env:
+          POSTGRES_USER: kodekantor
+          POSTGRES_PASSWORD: kodekantor
+          POSTGRES_DB: kodekantor_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U kodekantor" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7.4.11-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # Test-only values; never real secrets (TEST_STRATEGY §1).
+      APP_ENV: test
+      SECRET_KEY: ci-only-secret-key-not-used-anywhere-else
+      DATABASE_URL: postgresql+asyncpg://kodekantor:kodekantor@localhost:5432/kodekantor_test
+      REDIS_URL: redis://localhost:6379/15
+      CLAUDE_MODEL_DEFAULT: ci-test-model
+      SANDBOX_MANAGER_TOKEN: ci-only-sandbox-token-not-used-elsewhere
+      LLM_PROVIDER: scripted
+      SANDBOX_DRIVER: fake
+      TEST_DATABASE_URL: postgresql+asyncpg://kodekantor:kodekantor@localhost:5432/kodekantor_test
+      TEST_REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.11.32"
+      - run: uv sync --locked
+      - name: Migrations (upgrade head → downgrade base → upgrade head, no model drift)
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic check
+      - run: uv run pytest -q
+
+  security-scan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.11.32"
+      - name: Dependency audit (pip-audit on uv.lock)
+        working-directory: backend
+        run: |
+          uv export --locked --no-hashes --no-emit-project --format requirements-txt > "$RUNNER_TEMP/requirements.txt"
+          uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict -r "$RUNNER_TEMP/requirements.txt"

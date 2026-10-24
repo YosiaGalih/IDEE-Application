@@ -1,0 +1,38 @@
+# Secrets — never commit (CONFIGURATION.md, SECURITY_MODEL §6)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+infra/secrets/
+
+# Python (backend/, sandbox_manager/)
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+
+# Node (frontend/, tests/e2e/)
+node_modules/
+dist/
+.vite/
+playwright-report/
+test-results/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code local-only files
+.claude/settings.local.json
+.scratch/
+
+# Redis snapshots from a local redis-server started inside the repo
+dump.rdb

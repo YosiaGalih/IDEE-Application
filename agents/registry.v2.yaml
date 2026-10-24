@@ -1,0 +1,2044 @@
+# KodeKantor — Agent registry v2 (sumber kebenaran katalog agent)
+#
+# Sumber: PRD v1.0 §6 (41 specialist + Orchestrator §6.1), kontrak §6.2, ADR-012 (pemetaan runtime MVP),
+#         docs/TOOL_CATALOG.md (nama tool & semantik permission), backend/app/agents/contracts.py (kontrak I/O),
+#         docs/PLATFORM_EXPANSION.md §9b KONTRAK v2 (K2 agent baru, K3 tool baru), ADR-046/047/048.
+# Skema & aturan: agents/README.md dan docs/AGENT_CATALOG.md (§12 = v2). Validasi: `python3 scripts/validate_registry.py`.
+# Disinkronkan ke tabel agent_profiles oleh `python -m app.cli seed-agents` — CATATAN: loader backend
+# (backend/app/agents/registry.py) masih hanya menerima schema_version 1; harus diperbarui Lead Architect
+# sebelum file v2 ini dapat di-seed (lihat docs/AGENT_CATALOG.md §12.9).
+#
+# Teks `name`, `description`, `capabilities`, `inputs_tools_note`, `output_note`, `access_note` disalin verbatim
+# dari PRD §6 (kecuali entri ORCH yang ditandai "(turunan)"). `purpose` dan `triggers` adalah turunan, kecuali A07
+# yang memakai contoh PRD §6.2. `approval_grant` SELALU `deny` (PRD §10.4) — validator menolak nilai lain.
+#
+# v2 (ADR-048, RANCANGAN — belum diimplementasikan): 41 + ORCH + 11 agent K2 (I42–I47, J48, K49–K51, S52) = 53 entri.
+# Entri v2 bertanda `target_mode` + `phase`; semuanya `mvp_mode: planned`, `enabled: false`. 41 entri lama tidak
+# berubah kecuali E29 (dipromosikan: target_mode llm, fase P9). Entri lama boleh tanpa field permission v2
+# (`portfolio`, `data_sensitivity_max`) — default validator: `portfolio: none`, `data_sensitivity_max: confidential`.
+# Teks entri K2 (`name`, slug, grup, target_mode, fase) disalin dari K2; `description`/`purpose`/`*_note` = turunan.
+
+schema_version: 2
+agents:
+  # ================================================================================================
+  # Planning & User Intent
+  # ================================================================================================
+  - agent_id: A01
+    slug: intent_classifier
+    name: "Request & Intent Classifier"
+    group: planning_intent
+    version: 1
+    priority: P0
+    mvp_mode: profile
+    runtime_agent: A02
+    enabled: true
+    model_tier: fast
+    description: "Mengklasifikasikan tujuan permintaan dan memilih workflow awal."
+    purpose: "classify request intent, stack, complexity and constraints and select the initial workflow (absorbed into the A02 intake run in MVP)"
+    triggers: [task_created, clarification_answered]
+    capabilities:
+      - intent.classify
+      - intent.detect_stack
+      - intent.estimate_complexity
+      - intent.identify_constraints
+      - intent.select_workflow
+    tools:
+      - repo.get_tree
+      - repo.detect_stack
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: IntakeInput
+    output_contract: IntakeOutput
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Requirement text, project metadata."
+    output_note: "Intent + workflow proposal."
+    access_note: "P0 • read-only."
+  - agent_id: A02
+    slug: requirement_analyst
+    name: "Requirement Analyst"
+    group: planning_intent
+    version: 1
+    priority: P0
+    mvp_mode: llm
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Mengubah prompt menjadi requirement eksplisit dan dapat diuji."
+    purpose: "turn the user prompt into explicit, testable requirements and acceptance criteria (also performs A01 intent classification)"
+    triggers: [task_created, clarification_answered, requirement_change_requested]
+    capabilities:
+      - requirements.extract
+      - requirements.generate_acceptance_criteria
+      - requirements.identify_edge_cases
+      - requirements.check_completeness
+      - requirements.generate_test_scenarios
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.detect_stack
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: IntakeInput
+    output_contract: IntakeOutput
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Requirement store, repository context."
+    output_note: "Requirement specification + acceptance criteria."
+    access_note: "P0 • read-only."
+  - agent_id: A03
+    slug: planner
+    name: "Planner & Task Decomposer"
+    group: planning_intent
+    version: 1
+    priority: P0
+    mvp_mode: llm
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Memecah pekerjaan menjadi task, dependensi, dan jadwal eksekusi."
+    purpose: "decompose approved requirements into an ordered plan DAG with specialist assignment and a requirement-to-test plan (also performs C16 test strategy)"
+    triggers: [requirements_ready, context_ready, remediation_requested]
+    capabilities:
+      - plan.decompose
+      - plan.define_dependencies
+      - plan.identify_parallel_tasks
+      - plan.assign_specialists
+      - plan.generate_execution_graph
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - tests.list_profiles
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: PlanInput
+    output_contract: PlanOutput
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Task API, agent registry."
+    output_note: "Task DAG + completion criteria."
+    access_note: "P0 • orchestration only."
+  - agent_id: A04
+    slug: codebase_explorer
+    name: "Codebase Explorer & Context Engineer"
+    group: planning_intent
+    version: 1
+    priority: P0
+    mvp_mode: tool
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Mencari konteks relevan tanpa memuat seluruh repository ke model."
+    purpose: "build a bounded context package (file/line references + summaries) without loading the whole repository into the model"
+    triggers: [requirements_ready, remediation_requested, reindex_requested]
+    capabilities:
+      - repo.get_tree
+      - repo.search_text
+      - repo.search_symbol
+      - repo.read_file
+      - repo.detect_entrypoints
+      - repo.build_dependency_map
+      - repo.find_related_tests
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - repo.detect_stack
+      - memory.retrieve_context
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 1, timeout_seconds: 120}
+    inputs_tools_note: "Read-only repository tools, code index."
+    output_note: "Context package + source references."
+    access_note: "P0 • read-only."
+  - agent_id: A05
+    slug: software_architect
+    name: "Software Architect"
+    group: planning_intent
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: complex
+    description: "Menentukan modul, antarmuka, kontrak, dan trade-off arsitektur."
+    purpose: "propose modules, interfaces, API contracts and trade-offs and record them as ADRs when task complexity requires design"
+    triggers: [high_complexity_detected, architecture_review_requested]
+    capabilities:
+      - architecture.propose
+      - architecture.define_modules
+      - architecture.define_interfaces
+      - architecture.define_api_contracts
+      - architecture.evaluate_tradeoffs
+      - architecture.create_adr
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - memory.retrieve_context
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 8, timeout_seconds: 600}
+    inputs_tools_note: "Diagrams, repo metadata, requirements."
+    output_note: "Architecture proposal + ADR."
+    access_note: "P1 • read-only/proposal."
+  - agent_id: A06
+    slug: change_impact_analyst
+    name: "Change Impact & Risk Analyst"
+    group: planning_intent
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Memetakan file terdampak, risiko regresi, dan rollback."
+    purpose: "map affected files, regression risk, required tests and a rollback plan for risky changes"
+    triggers: [risky_change_detected, plan_ready]
+    capabilities:
+      - impact.map_affected_files
+      - impact.trace_dependencies
+      - impact.detect_breaking_changes
+      - impact.estimate_regression_risk
+      - impact.identify_required_tests
+      - impact.create_rollback_plan
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - git.diff
+      - git.log
+      - review.get_task_diff
+    permissions: {filesystem: read_only, sandbox: deny, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Git diff, dependency map, tests."
+    output_note: "Impact assessment."
+    access_note: "P1 • read-only."
+  - agent_id: A07
+    slug: user_proxy
+    name: "User Proxy / User Intent & Acceptance"
+    group: planning_intent
+    version: 1
+    priority: P0
+    mvp_mode: llm
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Merepresentasikan kepentingan pengguna dan memeriksa produk aktual terhadap kebutuhan serta preferensinya."
+    purpose: "validate delivered changes against approved user intent"
+    triggers: [task_implementation_finished, acceptance_review_requested, user_feedback_received]
+    capabilities:
+      - user_proxy.capture_intent
+      - user_proxy.manage_requirements
+      - user_proxy.generate_acceptance_criteria
+      - user_proxy.validate_implementation
+      - user_proxy.validate_user_journey
+      - user_proxy.review_visual_output
+      - user_proxy.detect_requirement_gap
+      - user_proxy.issue_acceptance_report
+    tools:
+      - acceptance.list_criteria
+      - acceptance.list_evidence
+      - tests.get_run
+      - review.get_task_diff
+      - git.diff
+      - repo.read_file
+      - repo.search_text
+      - submit_result
+    permissions: {filesystem: read_only, sandbox: deny, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: UserProxyInput
+    output_contract: UserProxyOutput
+    limits: {max_iterations: 12, timeout_seconds: 300}
+    inputs_tools_note: "Requirement baseline, preview/browser, test evidence, feedback."
+    output_note: "Acceptance report: pass/fail/unverified + evidence."
+    access_note: "P0 • mostly read-only; cannot give human approval."
+  # ================================================================================================
+  # Software Development
+  # ================================================================================================
+  - agent_id: B08
+    slug: ui_ux_designer
+    name: "UI/UX Designer"
+    group: software_development
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menerjemahkan kebutuhan menjadi user flow, wireframe, dan design system."
+    purpose: "translate requirements into user flows, wireframe specifications, components and design tokens as reviewable design artifacts"
+    triggers: [ui_change_requested, plan_step_ready]
+    capabilities:
+      - design.analyze_brief
+      - design.create_user_flow
+      - design.define_wireframe
+      - design.define_components
+      - design.define_design_tokens
+      - design.check_responsive_layout
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - memory.retrieve_context
+    permissions: {filesystem: docs_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 20, timeout_seconds: 600}
+    inputs_tools_note: "Design tokens, screenshots, component library."
+    output_note: "UI specification + component map."
+    access_note: "P1 • design artifacts."
+  - agent_id: B09
+    slug: frontend_developer
+    name: "Frontend Developer"
+    group: software_development
+    version: 1
+    priority: P0
+    mvp_mode: profile
+    runtime_agent: B14
+    enabled: true
+    model_tier: default
+    description: "Membangun UI, routing, state, dan integrasi API."
+    purpose: "implement UI components, pages, routing, state and API integration inside the task worktree"
+    triggers: [plan_step_ready, remediation_requested]
+    capabilities:
+      - frontend.create_component
+      - frontend.create_page
+      - frontend.configure_routing
+      - frontend.manage_state
+      - frontend.integrate_api
+      - frontend.handle_loading_error
+      - frontend.optimize_rendering
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - code.write_file
+      - code.apply_patch
+      - code.delete_file
+      - git.status
+      - git.diff
+      - git.commit_task
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: ImplementInput
+    output_contract: ImplementOutput
+    limits: {max_iterations: 40, timeout_seconds: 900}
+    inputs_tools_note: "Workspace patch, package scripts, browser preview."
+    output_note: "Frontend patch + build evidence."
+    access_note: "P0/P1 • write scoped workspace."
+  - agent_id: B10
+    slug: backend_developer
+    name: "Backend Developer"
+    group: software_development
+    version: 1
+    priority: P0
+    mvp_mode: profile
+    runtime_agent: B14
+    enabled: true
+    model_tier: default
+    description: "Membangun business logic, service layer, middleware, dan API handlers."
+    purpose: "implement business logic, services, middleware and API handlers inside the task worktree"
+    triggers: [plan_step_ready, remediation_requested]
+    capabilities:
+      - backend.create_endpoint
+      - backend.implement_service
+      - backend.validate_input
+      - backend.handle_errors
+      - backend.implement_background_job
+      - backend.configure_middleware
+      - backend.optimize_endpoint
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - code.write_file
+      - code.apply_patch
+      - code.delete_file
+      - git.status
+      - git.diff
+      - git.commit_task
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: ImplementInput
+    output_contract: ImplementOutput
+    limits: {max_iterations: 40, timeout_seconds: 900}
+    inputs_tools_note: "Workspace patch, test runner, API schema."
+    output_note: "Backend patch + test evidence."
+    access_note: "P0/P1 • write scoped workspace."
+  - agent_id: B11
+    slug: api_integration_specialist
+    name: "API & Integration Specialist"
+    group: software_development
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Merancang kontrak API dan integrasi eksternal yang tahan terhadap kegagalan."
+    purpose: "define API contracts and implement resilient external integrations with retries, timeouts and webhook verification"
+    triggers: [plan_step_ready, api_contract_change_requested]
+    capabilities:
+      - api.define_contract
+      - api.generate_openapi
+      - api.implement_client
+      - api.integrate_external_service
+      - api.validate_compatibility
+      - api.configure_retry_timeout
+      - api.verify_webhooks
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 30, timeout_seconds: 900}
+    inputs_tools_note: "OpenAPI tools, mock servers, secret references."
+    output_note: "Contract + integration patch."
+    access_note: "P1 • sandboxed write."
+  - agent_id: B12
+    slug: database_specialist
+    name: "Database & Data Modeling Specialist"
+    group: software_development
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Merancang skema, query, indeks, transaksi, dan integritas data."
+    purpose: "design schemas, queries, indexes and migrations validated against a local test database, never production"
+    triggers: [plan_step_ready, schema_change_requested]
+    capabilities:
+      - db.design_schema
+      - db.define_relationships
+      - db.create_query
+      - db.optimize_query
+      - db.analyze_query_plan
+      - db.recommend_indexes
+      - db.validate_integrity
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 30, timeout_seconds: 900}
+    inputs_tools_note: "Migration files, local test DB, explain plans."
+    output_note: "Schema proposal/query/migration + validation."
+    access_note: "P1 • no production writes."
+  - agent_id: B13
+    slug: auth_identity_specialist
+    name: "Authentication & Identity Specialist"
+    group: software_development
+    version: 1
+    priority: P1
+    mvp_mode: profile
+    runtime_agent: B14
+    enabled: true
+    model_tier: default
+    description: "Membangun login, session, OAuth/SSO, RBAC, dan account recovery."
+    purpose: "implement login, sessions, RBAC, OAuth/SSO and account recovery with accompanying security tests"
+    triggers: [plan_step_ready, remediation_requested]
+    capabilities:
+      - auth.implement_login
+      - auth.configure_session
+      - auth.implement_rbac
+      - auth.configure_oauth
+      - auth.review_authorization
+      - auth.implement_account_recovery
+      - auth.audit_identity_flows
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - git.commit_task
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: ImplementInput
+    output_contract: ImplementOutput
+    limits: {max_iterations: 40, timeout_seconds: 900}
+    inputs_tools_note: "Auth test fixtures, identity provider sandbox."
+    output_note: "Identity patch + security tests."
+    access_note: "P1 • sandboxed write."
+  - agent_id: B14
+    slug: code_implementer
+    name: "General Code Implementation Agent"
+    group: software_development
+    version: 1
+    priority: P0
+    mvp_mode: llm
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Worker utama untuk membuat dan mengubah kode dalam scope task."
+    purpose: "create and modify code within the task scope and produce a patch with a changed-file manifest"
+    triggers: [plan_step_ready, remediation_requested]
+    capabilities:
+      - code.create_file
+      - code.apply_patch
+      - code.modify_function
+      - code.implement_feature
+      - code.refactor_scope
+      - code.resolve_type_errors
+      - code.validate_patch
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - code.write_file
+      - code.apply_patch
+      - code.delete_file
+      - git.status
+      - git.diff
+      - git.commit_task
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: ImplementInput
+    output_contract: ImplementOutput
+    limits: {max_iterations: 40, timeout_seconds: 900}
+    inputs_tools_note: "Scoped filesystem, patch API, compiler/linter."
+    output_note: "Patch + changed-file manifest."
+    access_note: "P0 • scoped write; no direct deploy."
+  - agent_id: B15
+    slug: ai_llm_app_specialist
+    name: "AI/LLM Application Specialist"
+    group: software_development
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Membangun fitur aplikasi pengguna yang menggunakan model AI."
+    purpose: "build user-facing AI features (provider config, prompts, tool calling, structured output, RAG) with an evaluation report"
+    triggers: [plan_step_ready, ai_feature_requested]
+    capabilities:
+      - ai.configure_provider
+      - ai.create_prompt_template
+      - ai.implement_tool_calling
+      - ai.define_structured_output
+      - ai.implement_rag
+      - ai.evaluate_model_output
+      - ai.track_token_cost
+      - ai.configure_fallback
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 30, timeout_seconds: 900}
+    inputs_tools_note: "Provider adapters, eval harness, vector store."
+    output_note: "AI integration + evaluation report."
+    access_note: "P2 • sandboxed write."
+  # ================================================================================================
+  # Testing & Debugging
+  # ================================================================================================
+  - agent_id: C16
+    slug: test_strategy
+    name: "Test Strategy Agent"
+    group: testing_debugging
+    version: 1
+    priority: P0
+    mvp_mode: profile
+    runtime_agent: A03
+    enabled: true
+    model_tier: default
+    description: "Menetapkan strategi tes dan cakupan yang proporsional terhadap risiko."
+    purpose: "define a risk-proportional test plan and requirement-to-test coverage matrix (absorbed into the A03 planning run in MVP)"
+    triggers: [requirements_ready, context_ready]
+    capabilities:
+      - test.plan
+      - test.define_test_matrix
+      - test.map_requirements_to_tests
+      - test.identify_coverage_gaps
+      - test.prioritize_regression_tests
+    tools:
+      - repo.get_tree
+      - repo.search_text
+      - repo.find_related_tests
+      - tests.list_profiles
+      - tests.get_run
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: PlanInput
+    output_contract: PlanOutput
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Requirements, repository map, test reports."
+    output_note: "Test plan + coverage matrix."
+    access_note: "P0 • read-only/planning."
+  - agent_id: C17
+    slug: unit_testing
+    name: "Unit Testing Agent"
+    group: testing_debugging
+    version: 1
+    priority: P0
+    mvp_mode: tool
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Membuat dan menjalankan unit test."
+    purpose: "run the approved lint/unit/build profiles in the sandbox and persist real test evidence (test generation by LLM is a later wave)"
+    triggers: [implementation_finished, debug_patch_applied, user_test_run_requested]
+    capabilities:
+      - tests.generate_unit_tests
+      - tests.run_unit_tests
+      - tests.analyze_unit_failures
+      - tests.identify_boundary_cases
+      - tests.check_assertion_quality
+      - tests.report_coverage
+    tools:
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: test_only, sandbox: allow, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 1, timeout_seconds: 900}
+    inputs_tools_note: "Approved test runner, test files."
+    output_note: "Test patch + test report."
+    access_note: "P0 • test-only writes by default."
+  - agent_id: C18
+    slug: integration_api_testing
+    name: "Integration & API Testing Agent"
+    group: testing_debugging
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Memvalidasi kontrak serta interaksi antarmodul dan service."
+    purpose: "generate and run integration/API/contract tests against sandboxed services and fixtures"
+    triggers: [implementation_finished, api_contract_change_requested]
+    capabilities:
+      - tests.generate_integration_tests
+      - tests.run_api_tests
+      - tests.verify_contracts
+      - tests.test_database_integration
+      - tests.simulate_dependency_failure
+      - tests.validate_authentication_flows
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: test_only, sandbox: allow, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 20, timeout_seconds: 900}
+    inputs_tools_note: "Sandbox services, fixtures, API test runner."
+    output_note: "Integration report + evidence."
+    access_note: "P1 • sandbox."
+  - agent_id: C19
+    slug: e2e_browser_qa
+    name: "E2E & Browser QA Agent"
+    group: testing_debugging
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menjalankan user journey melalui browser dan menangkap bukti UI."
+    purpose: "run user journeys in an isolated browser against the preview and capture screenshots and console/network logs as evidence"
+    triggers: [preview_ready, acceptance_review_requested]
+    capabilities:
+      - browser.open_page
+      - browser.click_element
+      - browser.fill_form
+      - browser.capture_screenshot
+      - browser.collect_console_errors
+      - browser.inspect_network_failures
+      - browser.run_user_journey
+      - browser.compare_visual_state
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: test_only, sandbox: allow, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 20, timeout_seconds: 900}
+    inputs_tools_note: "Playwright/browser sandbox, preview URL."
+    output_note: "E2E report + screenshots + console/network logs."
+    access_note: "P1 • isolated browser."
+  - agent_id: C20
+    slug: debugger
+    name: "Debugger & Root Cause Analyst"
+    group: testing_debugging
+    version: 1
+    priority: P0
+    mvp_mode: llm
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Menemukan akar masalah dan mengarahkan perbaikan berdasarkan bukti."
+    purpose: "find the root cause of a failing run from real evidence, apply a scoped fix and hand back for re-test"
+    triggers: [test_run_failed]
+    capabilities:
+      - debug.parse_stack_trace
+      - debug.analyze_logs
+      - debug.reproduce_issue
+      - debug.identify_root_cause
+      - debug.propose_patch
+      - debug.compare_before_after
+      - debug.validate_fix
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+      - env.inspect_runtime
+      - submit_result
+    permissions: {filesystem: scoped_write, sandbox: allow, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: DebugInput
+    output_contract: DebugOutput
+    limits: {max_iterations: 20, timeout_seconds: 600}
+    inputs_tools_note: "Logs, sandbox, tests, scoped patch tool."
+    output_note: "Diagnosis + patch proposal + validation."
+    access_note: "P0 • scoped write after diagnosis."
+  - agent_id: C21
+    slug: env_build_troubleshooter
+    name: "Environment & Build Troubleshooter"
+    group: testing_debugging
+    version: 1
+    priority: P1
+    mvp_mode: profile
+    runtime_agent: C20
+    enabled: true
+    model_tier: default
+    description: "Mendiagnosis kegagalan toolchain, dependency, config, dan build."
+    purpose: "diagnose toolchain, dependency, configuration and build failures and produce a validated config patch"
+    triggers: [test_run_failed]
+    capabilities:
+      - env.inspect_runtime
+      - env.detect_missing_dependency
+      - build.run
+      - build.diagnose_failure
+      - build.resolve_configuration
+      - build.check_version_compatibility
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+      - env.inspect_runtime
+      - submit_result
+    permissions: {filesystem: scoped_write, sandbox: allow, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: DebugInput
+    output_contract: DebugOutput
+    limits: {max_iterations: 20, timeout_seconds: 600}
+    inputs_tools_note: "Sandbox terminal, manifests, build logs."
+    output_note: "Environment diagnosis + validated config patch."
+    access_note: "P1 • sandbox."
+  # ================================================================================================
+  # Quality & Security
+  # ================================================================================================
+  - agent_id: D22
+    slug: code_reviewer
+    name: "Code Review Agent"
+    group: quality_security
+    version: 1
+    priority: P0
+    mvp_mode: llm
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Melakukan review independen terhadap diff dan kualitas implementasi."
+    purpose: "independently review the task diff and produce evidence-backed findings with severity and location"
+    triggers: [validation_started, review_requested]
+    capabilities:
+      - review.inspect_diff
+      - review.detect_logic_bug
+      - review.check_conventions
+      - review.detect_duplication
+      - review.analyze_regression_risk
+      - review.verify_acceptance_criteria
+      - review.generate_findings
+    tools:
+      - review.get_task_diff
+      - git.diff
+      - git.log
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - tests.get_run
+      - acceptance.list_criteria
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: read_only, sandbox: deny, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: ReviewInput
+    output_contract: ReviewOutput
+    limits: {max_iterations: 12, timeout_seconds: 600}
+    inputs_tools_note: "Git diff, coding standards, test evidence."
+    output_note: "Finding list with severity/location/evidence."
+    access_note: "P0 • read-only."
+  - agent_id: D23
+    slug: app_security
+    name: "Application Security Agent"
+    group: quality_security
+    version: 1
+    priority: P0
+    mvp_mode: tool
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Menilai risiko aplikasi, akses, input validation, secrets, dan konfigurasi."
+    purpose: "run deterministic security baseline scans (secret patterns in MVP) over the task worktree and report findings"
+    triggers: [validation_started]
+    capabilities:
+      - security.scan_secrets
+      - security.review_authorization
+      - security.review_input_validation
+      - security.detect_injection_risks
+      - security.review_file_access
+      - security.analyze_threat_model
+      - security.review_security_headers
+    tools:
+      - security.scan_secrets
+      - review.get_task_diff
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 1, timeout_seconds: 120}
+    inputs_tools_note: "SAST/secret scanner, source, security test tools."
+    output_note: "Security findings + remediation guidance."
+    access_note: "P0 baseline • read-only, scanner execution."
+  - agent_id: D24
+    slug: dependency_supply_chain
+    name: "Dependency & Supply Chain Agent"
+    group: quality_security
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menilai package, kerentanan, lisensi, dan upgrade dependency."
+    purpose: "inventory dependencies, audit vulnerabilities and licenses and propose reviewed upgrades"
+    triggers: [dependency_manifest_changed, release_preflight_started]
+    capabilities:
+      - deps.inventory
+      - deps.audit_vulnerabilities
+      - deps.check_licenses
+      - deps.detect_unused_packages
+      - deps.propose_upgrade
+      - deps.validate_lockfile
+      - deps.check_transitive_dependencies
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - review.get_task_diff
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Lockfiles, advisory feeds, license scanner."
+    output_note: "Dependency inventory + upgrade proposal."
+    access_note: "P1 • upgrade requires review."
+  - agent_id: D25
+    slug: performance_scalability
+    name: "Performance & Scalability Agent"
+    group: quality_security
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Mengukur bottleneck CPU, memori, query, jaringan, atau rendering."
+    purpose: "profile bottlenecks and compare before/after metrics using non-production load tests"
+    triggers: [performance_review_requested]
+    capabilities:
+      - performance.profile_application
+      - performance.analyze_query
+      - performance.detect_bottleneck
+      - performance.review_memory_usage
+      - performance.design_load_test
+      - performance.compare_benchmark
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: read_only, sandbox: allow, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 12, timeout_seconds: 900}
+    inputs_tools_note: "Profiler, benchmark runner, test environment."
+    output_note: "Baseline, bottleneck findings, before/after metrics."
+    access_note: "P2 • non-production load tests."
+  - agent_id: D26
+    slug: accessibility_compatibility
+    name: "Accessibility & Compatibility Agent"
+    group: quality_security
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Memeriksa aksesibilitas dan konsistensi lintas browser/resolusi."
+    purpose: "scan accessibility and cross-browser/responsive compatibility and report issues"
+    triggers: [ui_change_detected, accessibility_review_requested]
+    capabilities:
+      - a11y.scan
+      - a11y.check_keyboard_navigation
+      - a11y.review_semantics
+      - a11y.check_contrast
+      - compatibility.test_browser_matrix
+      - compatibility.validate_responsive
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: read_only, sandbox: allow, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 12, timeout_seconds: 900}
+    inputs_tools_note: "Browser runner, accessibility scanner."
+    output_note: "Accessibility/compatibility report."
+    access_note: "P2 • read-only + test execution."
+  # ================================================================================================
+  # Git & Collaboration
+  # ================================================================================================
+  - agent_id: E27
+    slug: git_workflow
+    name: "Git Workflow Agent"
+    group: git_collaboration
+    version: 1
+    priority: P0
+    mvp_mode: tool
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Mengelola branch, status, diff, dan kandidat commit."
+    purpose: "manage the task branch/worktree, inspect status/diff/history and create commits on the task branch only (no force-push)"
+    triggers: [task_worktree_requested, implementation_finished, apply_approved]
+    capabilities:
+      - git.inspect_status
+      - git.inspect_diff
+      - git.create_task_branch
+      - git.inspect_history
+      - git.prepare_commit
+      - git.generate_commit_message
+      - git.inspect_untracked_files
+    tools:
+      - git.status
+      - git.diff
+      - git.log
+      - git.commit_task
+    permissions: {filesystem: read_only, sandbox: deny, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 1, timeout_seconds: 60}
+    inputs_tools_note: "Git adapter, scoped repository."
+    output_note: "Branch/status/diff/commit proposal."
+    access_note: "P0 basic / P1 advanced; no force-push."
+  - agent_id: E28
+    slug: merge_conflict_resolution
+    name: "Merge Conflict Resolution Agent"
+    group: git_collaboration
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menganalisis dan menyelesaikan konflik secara transparan."
+    purpose: "explain and resolve merge conflicts transparently while preserving user data and re-running tests"
+    triggers: [merge_conflict_detected]
+    capabilities:
+      - git.detect_conflicts
+      - git.explain_conflict
+      - git.propose_resolution
+      - git.apply_resolution
+      - git.validate_merge_result
+      - git.run_post_merge_tests
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - git.log
+      - git.commit_task
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 20, timeout_seconds: 900}
+    inputs_tools_note: "Git adapter, diff, tests."
+    output_note: "Resolution patch + tests."
+    access_note: "P2 • user data preserved; no destructive overwrite."
+  - agent_id: E29
+    slug: pull_request_collaboration
+    name: "Pull Request & Collaboration Agent"
+    group: git_collaboration
+    version: 2                     # v2: tools + kontrak konseptual + permission v2 (ADR-048)
+    priority: P1                   # v2: P2 → P1 (dibutuhkan alur push & PR fase P9); access_note PRD tetap verbatim
+    mvp_mode: planned
+    target_mode: llm               # K2 "Promosi" / ADR-048
+    phase: P9
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menyiapkan PR, ringkasan perubahan, checklist, dan feedback."
+    purpose: "prepare PR descriptions, change summaries and review checklists; remote writes require authorization"
+    triggers: [pr_requested, review_feedback_received]
+    capabilities:
+      - collaboration.link_issue_to_task
+      - collaboration.prepare_pr_description
+      - collaboration.summarize_changes
+      - collaboration.generate_review_checklist
+      - collaboration.collect_review_feedback
+      - collaboration.map_feedback_to_tasks
+    tools:
+      - review.get_task_diff
+      - git.diff
+      - git.log
+      - acceptance.list_criteria
+      - acceptance.list_evidence      # v2: bukti test/temuan untuk bagian "Evidence" deskripsi PR
+      - tests.get_run                 # v2
+      - github.get_pr_status          # v2 (K3, R0): status CI + komentar review → collect_review_feedback
+      - submit_result                 # v2: keluaran PRDraft terstruktur (bukan teks bersitasi)
+    permissions: {filesystem: read_only, sandbox: deny, git: read, network: deny, deployment: deny, portfolio: none, data_sensitivity_max: confidential, approval_grant: deny}
+    input_contract: PRDraftRequest
+    output_contract: PRDraft
+    contract_status: planned
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Git provider adapter, issue tracker."
+    output_note: "PR draft + review checklist."
+    access_note: "P2 • remote write requires authorization."
+    notes:
+      - "E29 hanya MENULIS judul/deskripsi/checklist PR (draft, dipratinjau user). Push branch & buka PR dieksekusi J48 (tool-mode) setelah approval R3 terikat repo+branch+head_commit+hash judul/deskripsi (PLATFORM_EXPANSION §5.3, §5.5)."
+      - "Tidak pernah memegang token GitHub; tidak boleh memiliki tool R3 (validator v2)."
+      - "Komentar review/CI dari github.get_pr_status = data tidak tepercaya (T11); tidak dapat mengubah policy atau memicu aksi."
+  # ================================================================================================
+  # DevOps & Operations
+  # ================================================================================================
+  - agent_id: F30
+    slug: build_ci
+    name: "Build & CI Agent"
+    group: devops_operations
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menyusun pipeline build dan menjalankan quality gates."
+    purpose: "generate and validate CI pipeline configuration and run local quality-gate checks"
+    triggers: [ci_config_requested, release_preflight_started]
+    capabilities:
+      - ci.generate_pipeline
+      - ci.validate_config
+      - ci.run_local_checks
+      - ci.analyze_pipeline_failure
+      - ci.configure_test_stages
+      - ci.verify_artifacts
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 20, timeout_seconds: 900}
+    inputs_tools_note: "CI config files, local runners."
+    output_note: "Pipeline config + validation report."
+    access_note: "P1 • config patch."
+  - agent_id: F31
+    slug: infrastructure_as_code
+    name: "Infrastructure as Code Agent"
+    group: devops_operations
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menulis konfigurasi Docker dan infrastruktur sebagai kode."
+    purpose: "write Dockerfile/Compose/IaC files with static validation and resource-limit/network-policy review"
+    triggers: [infra_config_requested, release_preflight_started]
+    capabilities:
+      - infra.generate_dockerfile
+      - infra.generate_compose
+      - infra.generate_iac
+      - infra.validate_configuration
+      - infra.review_resource_limits
+      - infra.check_network_policy
+      - infra.plan_environment_changes
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 20, timeout_seconds: 900}
+    inputs_tools_note: "Docker/Compose validators, IaC tooling."
+    output_note: "Infra files + static validation."
+    access_note: "P1 • no unrestricted host control."
+  - agent_id: F32
+    slug: deployment_release
+    name: "Deployment & Release Agent"
+    group: devops_operations
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menyiapkan rilis, preflight, staging, smoke tests, dan rollback."
+    purpose: "prepare releases, run preflight and smoke tests, deploy to staging behind approval and prepare rollback"
+    triggers: [deployment_requested, apply_approved]
+    capabilities:
+      - release.prepare
+      - release.validate_artifact
+      - release.run_preflight
+      - release.deploy_staging
+      - release.run_smoke_tests
+      - release.prepare_rollback
+      - release.deploy_production
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+      - deploy.staging
+    permissions: {filesystem: read_only, sandbox: allow, git: read, network: deny, deployment: staging_with_approval, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 12, timeout_seconds: 900}
+    inputs_tools_note: "Deployment adapter with environment policy."
+    output_note: "Release plan + deployment report."
+    access_note: "P2; production needs explicit approval."
+  - agent_id: F33
+    slug: observability_sre
+    name: "Observability & SRE Agent"
+    group: devops_operations
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menganalisis telemetry, SLO, logs, metrics, dan traces."
+    purpose: "analyse logs, metrics, traces and SLOs read-only and recommend alert rules"
+    triggers: [incident_detected, release_deployed]
+    capabilities:
+      - observability.query_logs
+      - observability.inspect_metrics
+      - observability.inspect_traces
+      - observability.detect_anomaly
+      - observability.evaluate_slo
+      - observability.propose_alert_rule
+      - observability.correlate_release_with_errors
+    tools:
+      - repo.read_file
+      - repo.search_text
+      - memory.retrieve_context
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Monitoring adapters, read-only telemetry."
+    output_note: "SRE report + recommended alerts."
+    access_note: "P2 • read-only by default."
+  - agent_id: F34
+    slug: incident_response
+    name: "Incident Response & Recovery Agent"
+    group: devops_operations
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Membantu klasifikasi insiden, mitigasi, rollback, dan postmortem."
+    purpose: "classify incidents, correlate events with recent changes and propose mitigation/rollback (actions require approval)"
+    triggers: [incident_detected]
+    capabilities:
+      - incident.classify_severity
+      - incident.correlate_events
+      - incident.identify_recent_changes
+      - incident.propose_mitigation
+      - incident.prepare_rollback
+      - incident.verify_recovery
+      - incident.generate_postmortem
+    tools:
+      - repo.read_file
+      - repo.search_text
+      - git.log
+      - memory.retrieve_context
+    permissions: {filesystem: read_only, sandbox: deny, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 8, timeout_seconds: 300}
+    inputs_tools_note: "Logs/metrics/deploy history, approved action tools."
+    output_note: "Incident timeline + recovery proposal."
+    access_note: "P2 • action requires approval."
+  # ================================================================================================
+  # Documentation & Knowledge
+  # ================================================================================================
+  - agent_id: G35
+    slug: technical_documentation
+    name: "Technical Documentation Agent"
+    group: documentation_knowledge
+    version: 1
+    priority: P1
+    mvp_mode: profile
+    runtime_agent: B14
+    enabled: true
+    model_tier: default
+    description: "Membuat README, setup guide, arsitektur, dan changelog."
+    purpose: "write README, setup guide, architecture docs and changelog as a reviewable documentation patch"
+    triggers: [docs_generation_requested, plan_step_ready]
+    capabilities:
+      - docs.generate_readme
+      - docs.generate_setup_guide
+      - docs.document_architecture
+      - docs.document_environment
+      - docs.update_changelog
+      - docs.verify_instructions
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - memory.retrieve_context
+      - submit_result
+    permissions: {filesystem: docs_only, sandbox: deny, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: ImplementInput
+    output_contract: ImplementOutput
+    limits: {max_iterations: 30, timeout_seconds: 600}
+    inputs_tools_note: "Repository, architecture records, test results."
+    output_note: "Documentation patch."
+    access_note: "P1 • scoped docs writes."
+  - agent_id: G36
+    slug: api_developer_docs
+    name: "API & Developer Documentation Agent"
+    group: documentation_knowledge
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Memastikan dokumentasi API dan contoh developer selaras dengan implementasi."
+    purpose: "keep API reference, request examples and error-code docs consistent with the implementation"
+    triggers: [api_contract_change_requested, docs_generation_requested]
+    capabilities:
+      - docs.generate_api_reference
+      - docs.generate_request_examples
+      - docs.document_error_codes
+      - docs.generate_sdk_guide
+      - docs.check_contract_consistency
+      - docs.update_api_examples
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+    permissions: {filesystem: docs_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 20, timeout_seconds: 600}
+    inputs_tools_note: "OpenAPI schema, test environment."
+    output_note: "API documentation + examples."
+    access_note: "P2 • docs writes."
+  - agent_id: G37
+    slug: project_knowledge_memory
+    name: "Project Knowledge & Memory Agent"
+    group: documentation_knowledge
+    version: 1
+    priority: P1
+    mvp_mode: tool
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Menyimpan keputusan dan mengambil konteks lintas task dengan kontrol stale data."
+    purpose: "store project decisions and retrieve cross-task context with freshness (stale) control, never storing secrets"
+    triggers: [context_requested, decision_recorded, reindex_requested]
+    capabilities:
+      - memory.index_repository
+      - memory.retrieve_context
+      - memory.summarize_decisions
+      - memory.store_architecture_decision
+      - memory.retrieve_task_history
+      - memory.refresh_index
+      - memory.detect_stale_context
+    tools:
+      - memory.retrieve_context
+      - memory.store_decision
+    permissions: {filesystem: read_only, sandbox: deny, git: read, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 1, timeout_seconds: 60}
+    inputs_tools_note: "Code index, task DB, ADR store."
+    output_note: "Context package + memory references."
+    access_note: "P1 • never store secrets."
+  # ================================================================================================
+  # Specialized Engineering
+  # ================================================================================================
+  - agent_id: H38
+    slug: data_engineering
+    name: "Data Engineering Agent"
+    group: specialized_engineering
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Membangun pipeline data dan transformasi yang dapat diuji."
+    purpose: "build testable data pipelines and transformations with data-quality tests on isolated data"
+    triggers: [plan_step_ready, data_pipeline_requested]
+    capabilities:
+      - data.design_pipeline
+      - data.implement_transform
+      - data.validate_quality
+      - data.configure_scheduling
+      - data.check_idempotency
+      - data.profile_dataset
+      - data.generate_data_tests
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 30, timeout_seconds: 900}
+    inputs_tools_note: "Sandbox, fixtures, schema tools."
+    output_note: "Pipeline patch + data-quality tests."
+    access_note: "P2 • isolated data."
+  - agent_id: H39
+    slug: migration_specialist
+    name: "Migration Specialist"
+    group: specialized_engineering
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: complex
+    description: "Merencanakan migrasi schema, data, framework, dan kompatibilitas."
+    purpose: "plan schema/data/framework migrations with dry-run on a temporary database and a rollback plan"
+    triggers: [migration_requested]
+    capabilities:
+      - migration.analyze_source_target
+      - migration.map_schema
+      - migration.generate_migration_script
+      - migration.plan_backfill
+      - migration.run_dry_run
+      - migration.validate_data_integrity
+      - migration.prepare_rollback
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - code.write_file
+      - code.apply_patch
+      - git.status
+      - git.diff
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 30, timeout_seconds: 900}
+    inputs_tools_note: "Temporary DB, migration runner, backups check."
+    output_note: "Migration plan + dry-run report."
+    access_note: "P2 • no production mutation without approval."
+  - agent_id: H40
+    slug: legacy_modernization
+    name: "Legacy Modernization & Refactoring Agent"
+    group: specialized_engineering
+    version: 1
+    priority: P2
+    mvp_mode: planned
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Memodernisasi kode bertahap dengan menjaga perilaku yang disepakati."
+    purpose: "modernize legacy code in bounded, behavior-preserving steps with a regression report"
+    triggers: [refactor_requested]
+    capabilities:
+      - refactor.assess_legacy_code
+      - refactor.identify_code_smells
+      - refactor.propose_safe_steps
+      - refactor.extract_module
+      - refactor.remove_dead_code
+      - refactor.update_patterns
+      - refactor.verify_behavior
+    tools:
+      - repo.get_tree
+      - repo.read_file
+      - repo.search_text
+      - repo.search_symbol
+      - repo.find_related_tests
+      - code.write_file
+      - code.apply_patch
+      - code.delete_file
+      - git.status
+      - git.diff
+      - git.commit_task
+      - tests.list_profiles
+      - tests.run
+      - tests.get_run
+    permissions: {filesystem: scoped_write, sandbox: allow, git: branch_commit, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 30, timeout_seconds: 900}
+    inputs_tools_note: "Coverage, code index, scoped patch tools."
+    output_note: "Refactor patch + behavior regression report."
+    access_note: "P2 • bounded changes."
+  - agent_id: H41
+    slug: language_framework_specialist
+    name: "Language & Framework Specialist"
+    group: specialized_engineering
+    version: 1
+    priority: P1
+    mvp_mode: tool
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Memilih instruksi dan toolchain khusus berdasarkan bahasa/framework project."
+    purpose: "detect the project stack and resolve language-specific build/test/lint profiles (profile-driven, not one LLM per stack)"
+    triggers: [project_imported, project_created, reindex_requested]
+    capabilities:
+      - framework.detect_stack
+      - framework.load_language_profile
+      - framework.resolve_build_commands
+      - framework.check_idioms
+      - framework.check_version_compatibility
+      - framework.resolve_framework_errors
+      - framework.recommend_project_structure
+    tools:
+      - repo.detect_stack
+      - tests.list_profiles
+    permissions: {filesystem: read_only, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 1, timeout_seconds: 60}
+    inputs_tools_note: "Language profile registry, linter/test/build tools."
+    output_note: "Stack profile + framework-specific guidance."
+    access_note: "P1 foundation; profile-driven rather than 1 LLM per stack."
+  # ================================================================================================
+  # v2 — AI Assistant (Portal AI) · K2 · ADR-038/039/040/046/047/048 · RANCANGAN, belum diimplementasikan
+  # ================================================================================================
+  - agent_id: I42
+    slug: assistant_concierge
+    name: "Assistant Router & Concierge"
+    group: ai_assistant
+    version: 1
+    priority: P0
+    mvp_mode: planned
+    target_mode: llm
+    phase: P10
+    runtime_agent: null
+    enabled: false
+    model_tier: default            # K2: fast/default — jawaban umum = default; pre-pass routing boleh fast via model_policy
+    description: "Menjawab pertanyaan umum di Portal AI dan merutekan permintaan ke capability yang aktif (riset web, dokumen, gambar, analisis data, tanya jawab dokumen, asisten lamaran)."
+    purpose: "pintu masuk percakapan Portal AI: menjawab langsung bila cukup, atau menghasilkan keputusan routing ke capability/agent yang aktif dan masih dalam kuota (AX-11)"
+    triggers: [assistant_message_received, assistant_message_regenerate_requested]
+    capabilities:
+      - assistant.classify_request
+      - assistant.check_capability_quota
+      - assistant.route_to_capability
+      - assistant.answer_general
+      - assistant.ground_answer_in_kb
+      - assistant.ask_clarification
+      - assistant.summarize_thread
+    tools:
+      - capabilities.list
+      - kb.search
+      - submit_result
+    permissions: {filesystem: none, sandbox: deny, git: none, network: deny, deployment: deny, portfolio: none, data_sensitivity_max: confidential, approval_grant: deny}
+    input_contract: RouteRequest
+    output_contract: RouteDecision
+    contract_status: planned
+    limits: {max_iterations: 6, timeout_seconds: 300, tool_quota: {kb.search: 3}}
+    inputs_tools_note: "(K2) Pesan + riwayat thread, label sensitivitas Ruang, daftar capability aktif & kuota (capabilities.list), potongan koleksi pengetahuan user (kb.search)."
+    output_note: "(K2) Jawaban teks (bersitasi bila memakai kb.search) ATAU RouteDecision via submit_result."
+    access_note: "P0 perluasan (P10) • tanpa akses file/sandbox/Git; tidak dapat memanggil agent lain atau tool R1–R4 secara langsung."
+    notes:
+      - "ADR-047: jawaban akhir = teks (bersitasi bila ada search_result); submit_result HANYA untuk RouteDecision (metadata non-teks)."
+      - "RouteDecision adalah usulan: service assistant (deterministik) memvalidasinya terhadap capabilities.list (aktif + kuota, AX-11) dan izin RBAC sebelum men-dispatch I43–I47/K50."
+      - "Pesan user melewati S52 (moderation.check_text) sebagai pre-hook sebelum I42 dipanggil."
+  - agent_id: I43
+    slug: web_research
+    name: "Web Research & Citation Agent"
+    group: ai_assistant
+    version: 1
+    priority: P0
+    mvp_mode: planned
+    target_mode: llm
+    phase: P10
+    runtime_agent: null
+    enabled: false
+    model_tier: default            # K2: default/complex — mode Mendalam memakai complex via model_policy
+    description: "Melakukan riset web bersitasi (mode Cepat dan Mendalam) memakai server tool Claude web_search/web_fetch; setiap klaim faktual dari web disertai sumber dan tanggal pencarian."
+    purpose: "menjawab pertanyaan yang membutuhkan informasi terkini dengan rencana kueri, pencarian, pembacaan sumber, dan sintesis bersitasi; jawaban tanpa sumber diberi label (ADR-038)"
+    triggers: [web_research_requested]
+    capabilities:
+      - research.plan_queries
+      - research.search
+      - research.fetch_source
+      - research.evaluate_sources
+      - research.synthesize_with_citations
+      - research.flag_unsourced_claims
+      - research.report_search_date
+    tools:
+      - web.search
+      - web.fetch
+    permissions: {filesystem: none, sandbox: deny, git: none, network: provider_web, deployment: deny, portfolio: none, data_sensitivity_max: internal, approval_grant: deny}
+    input_contract: ResearchRequest
+    output_contract: CitedAnswer
+    contract_status: planned
+    limits: {max_iterations: 12, timeout_seconds: 900, tool_quota: {web.search: 20, web.fetch: 10}}
+    inputs_tools_note: "(K2) Pertanyaan, mode (Cepat max_uses 3 / Mendalam max_uses 20), allow/block domain dari policy; server tool web_search + web_fetch (executor: provider)."
+    output_note: "(K2) Teks bersitasi (web_search_result_location) + tanggal pencarian; diekstrak backend ke message_citations."
+    access_note: "P0 perluasan (P10) • tanpa tool R1–R4; konten web = data tidak tepercaya (T11)."
+    notes:
+      - "ADR-047: TIDAK memakai submit_result; run berakhir dengan teks bersitasi (validator v2 menolak submit_result untuk output CitedAnswer)."
+      - "data_sensitivity_max internal: kueri pencarian dibentuk dari isi percakapan dan keluar ke mesin pencari via provider — Ruang confidential tidak dirutekan ke I43 (T15)."
+      - "Klaim angka/tanggal terkini tanpa sitasi wajib diberi label 'Tanpa sumber web' (PLATFORM_EXPANSION §4.3)."
+  - agent_id: I44
+    slug: document_builder
+    name: "Document Builder Agent"
+    group: ai_assistant
+    version: 1
+    priority: P0
+    mvp_mode: planned
+    target_mode: llm
+    phase: P10
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menyusun dan membuat dokumen PPT/Word/Excel/PDF dari prompt atau outline dengan template brand (sans-serif default), memakai Agent Skills Claude atau DocEngine lokal sesuai label sensitivitas."
+    purpose: "mengubah permintaan dokumen menjadi outline dan konten terstruktur, lalu merender file valid lewat engine yang diizinkan policy (ADR-039) dan menyimpannya sebagai aset dengan provenance"
+    triggers: [document_generation_requested]
+    capabilities:
+      - docs.outline
+      - docs.select_template
+      - docs.compose_content
+      - docs.select_engine
+      - docs.render
+      - docs.validate_output
+      - docs.store_asset
+    tools:
+      - docs.render_skills
+      - docs.render_local
+      - assets.store
+      - submit_result
+    permissions: {filesystem: none, sandbox: allow, git: none, network: provider_web, deployment: deny, portfolio: none, data_sensitivity_max: internal, approval_grant: deny}
+    input_contract: DocumentRequest
+    output_contract: DocumentResult
+    contract_status: planned
+    limits: {max_iterations: 12, timeout_seconds: 900, tool_quota: {docs.render_skills: 3, docs.render_local: 3}}
+    inputs_tools_note: "(K2) Jenis dokumen, prompt/outline, template_id, tema, aset sumber; Agent Skills pptx/docx/xlsx/pdf (provider) atau sandbox kodekantor/sandbox-docs."
+    output_note: "(K2) DocumentResult (asset_id, engine yang dipakai, hasil validasi buka-file) via submit_result."
+    access_note: "P0 perluasan (P10) • R1 (Skills) / R2 (render lokal di sandbox tanpa network); unduhan via URL bertanda tangan."
+    notes:
+      - "Validator v2: karena memegang docs.render_skills (provider, tidak ZDR), data_sensitivity_max = internal. Dokumen untuk Ruang confidential TIDAK lewat I44 — lihat AGENT_CATALOG §12.9 (jalur outline → render lokal deterministik; profil lokal-only butuh ADR)."
+      - "Pemilihan engine diputuskan policy (config/providers.yaml); docs.select_engine hanya usulan, ToolGateway yang berwenang (AX-06)."
+  - agent_id: I45
+    slug: visual_prompt
+    name: "Visual Prompt Agent"
+    group: ai_assistant
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    target_mode: llm
+    phase: P11
+    runtime_agent: null
+    enabled: false
+    model_tier: fast
+    description: "Menyusun prompt gambar yang aman dan efektif, memeriksa kebijakan konten, lalu membuat atau mengedit gambar lewat ImageProvider dengan provenance dan kuota."
+    purpose: "mengubah permintaan visual user menjadi prompt gambar yang lolos moderasi, memanggil ImageProvider (vendor ADR-040a), dan mencatat provenance serta estimasi biaya"
+    triggers: [image_generation_requested, image_edit_requested]
+    capabilities:
+      - image.compose_prompt
+      - image.check_prompt_policy
+      - image.estimate_cost
+      - image.generate
+      - image.edit
+      - image.record_provenance
+    tools:
+      - moderation.check_image_prompt
+      - image.generate
+      - image.edit
+      - submit_result
+    permissions: {filesystem: none, sandbox: deny, git: none, network: deny, deployment: deny, portfolio: none, data_sensitivity_max: internal, approval_grant: deny}
+    input_contract: VisualRequest
+    output_contract: VisualResult
+    contract_status: planned
+    limits: {max_iterations: 6, timeout_seconds: 300, tool_quota: {image.generate: 4, image.edit: 4}}
+    inputs_tools_note: "(K2) Prompt, ukuran, gaya, referensi; moderasi prompt (S52) + ImageProvider (executor: provider vendor)."
+    output_note: "(K2) VisualResult (asset_id gambar, prompt final, verdict moderasi, provider/model, estimasi biaya) via submit_result."
+    access_note: "P1 perluasan (P11) • R1 + moderasi wajib lulus + kuota gambar per user/hari (AX-07, T16)."
+    notes:
+      - "Nama kontrak VisualRequest/VisualResult (bukan ImageRequest/ImageResult) agar tidak bentrok dengan DTO protokol ImageProvider (PLATFORM_EXPANSION §3) yang membawa bytes."
+      - "Hasil flagged vendor tidak ditampilkan; tolak tokoh nyata, merek, karakter berhak cipta, konten seksual/minor, kekerasan."
+  - agent_id: I46
+    slug: data_analyst
+    name: "Data Analysis Agent"
+    group: ai_assistant
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    target_mode: llm
+    phase: P11
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menganalisis file CSV/XLSX yang diunggah user dengan menulis dan menjalankan kode pandas/matplotlib di sandbox, menghasilkan tabel, grafik, dan kode yang dapat diperiksa."
+    purpose: "menjawab pertanyaan data berbasis bukti eksekusi kode nyata di sandbox tanpa network; angka hanya dilaporkan dari output run, bukan tebakan model"
+    triggers: [data_analysis_requested]
+    capabilities:
+      - analysis.profile_dataset
+      - analysis.plan_analysis
+      - analysis.run_code
+      - analysis.create_chart
+      - analysis.explain_results
+      - analysis.export_artifacts
+    tools:
+      - analysis.run
+      - assets.store
+      - submit_result
+    permissions: {filesystem: none, sandbox: allow, git: none, network: deny, deployment: deny, portfolio: none, data_sensitivity_max: confidential, approval_grant: deny}
+    input_contract: AnalysisRequest
+    output_contract: AnalysisResult
+    contract_status: planned
+    limits: {max_iterations: 16, timeout_seconds: 900, tool_quota: {analysis.run: 8}}
+    inputs_tools_note: "(K2) Pertanyaan + aset dataset (read-only); sandbox kodekantor/sandbox-docs (pandas/matplotlib, tanpa network)."
+    output_note: "(K2) AnalysisResult (ringkasan, tabel, grafik, kode yang dijalankan, analysis_run_id sebagai bukti) via submit_result."
+    access_note: "P1 perluasan (P11) • R2 sandbox tanpa network; dataset tidak keluar dari VPS."
+    notes:
+      - "K2 memberi pilihan analysis.run ATAU code.execute_remote. Registry memilih analysis.run (lokal) agar data confidential dapat dianalisis tanpa egress; beralih ke code.execute_remote menuntut version+1, network provider_web, dan data_sensitivity_max ≤ internal (ditegakkan validator)."
+  - agent_id: I47
+    slug: knowledge_base
+    name: "Knowledge Base Agent"
+    group: ai_assistant
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    target_mode: llm
+    phase: P11
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menjawab pertanyaan atas dokumen milik user (koleksi pengetahuan) dengan retrieval leksikal PostgreSQL dan sitasi Claude ke potongan dokumen sumber."
+    purpose: "tanya jawab dokumen sendiri tanpa embedding (ADR-046): mencari potongan relevan, mengirimnya sebagai blok search_result, dan menjawab dengan sitasi ke potongan (AX-10)"
+    triggers: [kb_query_requested]
+    capabilities:
+      - kb.retrieve
+      - kb.expand_query
+      - kb.read_chunk
+      - kb.answer_with_citations
+      - kb.report_coverage_gap
+    tools:
+      - kb.search
+      - kb.get_chunk
+    permissions: {filesystem: none, sandbox: deny, git: none, network: deny, deployment: deny, portfolio: none, data_sensitivity_max: confidential, approval_grant: deny}
+    input_contract: KBQuery
+    output_contract: CitedAnswer
+    contract_status: planned
+    limits: {max_iterations: 8, timeout_seconds: 300, tool_quota: {kb.search: 4, kb.get_chunk: 12}}
+    inputs_tools_note: "(K2) Pertanyaan + collection_ids milik user; kb.search/kb.get_chunk (PostgreSQL FTS + pg_trgm) mengembalikan blok search_result."
+    output_note: "(K2) Teks bersitasi (search_result_location) ke potongan dokumen sumber."
+    access_note: "P1 perluasan (P11) • scope koleksi milik user; isi dokumen = data tidak tepercaya."
+    notes:
+      - "ADR-047: TIDAK memakai submit_result; jawaban = teks bersitasi."
+      - "ADR-046: untuk data confidential potongan dikirim inline sebagai search_result, tidak lewat Files API (tidak ZDR)."
+      - "Bila potongan tidak memuat jawaban, katakan tidak ditemukan di dokumen — jangan mengisi dari pengetahuan umum tanpa label."
+  # ================================================================================================
+  # v2 — Integrations (Portal IDE) · K2 · ADR-041 · RANCANGAN
+  # ================================================================================================
+  - agent_id: J48
+    slug: github_integration
+    name: "GitHub Integration Agent"
+    group: integrations
+    version: 1
+    priority: P0
+    mvp_mode: planned
+    target_mode: tool
+    phase: P9
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menjalankan operasi GitHub App secara deterministik: daftar repo, impor/pull repo privat, push branch task dan membuka PR setelah approval R3, serta membaca status PR."
+    purpose: "satu-satunya identitas yang mengeksekusi operasi GitHub; token instalasi per operasi (1 repo, ≤1 jam, tidak disimpan), push/PR hanya dengan approval R3 terikat payload"
+    triggers: [github_import_requested, github_pull_requested, github_push_pr_approved, github_webhook_received]
+    capabilities:
+      - github.list_installations
+      - github.list_repositories
+      - github.import_repository
+      - github.pull_default_branch
+      - github.push_task_branch
+      - github.open_pull_request
+      - github.track_pr_status
+    tools:
+      - github.list_repos
+      - github.import_repo
+      - github.pull
+      - github.push_branch
+      - github.open_pr
+      - github.get_pr_status
+    permissions: {filesystem: none, sandbox: deny, git: branch_commit, network: deny, deployment: deny, portfolio: none, data_sensitivity_max: confidential, approval_grant: deny}
+    input_contract: GitHubOperationRequest
+    output_contract: GitHubOperationResult
+    contract_status: planned
+    limits: {max_iterations: 1, timeout_seconds: 600}
+    inputs_tools_note: "(K2) installation_id, repo_id, branch/head_commit, approval_id (R3), judul/deskripsi PR dari E29; GitHub App via worker antrean integrations."
+    output_note: "(K2) Hasil operasi (project_id, commit, nomor/URL PR, status checks) + audit_ref."
+    access_note: "P0 perluasan (P9) • tool-mode deterministik; push/PR = R3; force-push, hapus branch remote, merge PR, ubah .github/workflows = R4 (tidak tersedia)."
+    notes:
+      - "Private key GitHub App (.pem) TIDAK PERNAH masuk konteks agent mana pun (J48 bukan LLM); hanya container worker-integrations yang me-mount secret file read-only (ADR-053; PLATFORM_EXPANSION §5.4)."
+      - "network: deny = sandbox egress tetap mati; panggilan GitHub dilakukan worker integrations, dikendalikan field git + token instalasi per operasi."
+      - "Pre-push: secret scan (gitleaks) pada diff; path .github/workflows/** diblokir (T13)."
+  # ================================================================================================
+  # v2 — Portfolio (Portal Portfolio) · K2 · ADR-042 · RANCANGAN
+  # ================================================================================================
+  - agent_id: K49
+    slug: portfolio_curator
+    name: "Portfolio Curator Agent"
+    group: portfolio
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    target_mode: llm
+    phase: P12
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menyusun draft entri portfolio (proyek, pengalaman, skill) dari repo GitHub dan project KodeKantor milik user, hanya berdasarkan bukti yang ada."
+    purpose: "mengkurasi bahan portfolio menjadi draft bertanda AI dengan rujukan bukti (README, metadata repo, hasil test); tidak pernah mengarang pencapaian, angka, sertifikat, atau testimoni (AX-09)"
+    triggers: [portfolio_import_requested, portfolio_draft_requested]
+    capabilities:
+      - portfolio.import_github_project
+      - portfolio.import_kodekantor_project
+      - portfolio.draft_project_entry
+      - portfolio.draft_experience_entry
+      - portfolio.suggest_skills_with_evidence
+      - portfolio.mark_ai_draft
+    tools:
+      - portfolio.get_profile
+      - github.get_repo_summary
+      - repo.read_file
+      - portfolio.draft_item
+      - submit_result
+    permissions: {filesystem: read_only, sandbox: deny, git: read, network: deny, deployment: deny, portfolio: draft, data_sensitivity_max: confidential, approval_grant: deny}
+    input_contract: PortfolioDraftRequest
+    output_contract: PortfolioDraft
+    contract_status: planned
+    limits: {max_iterations: 12, timeout_seconds: 600, tool_quota: {portfolio.draft_item: 10}}
+    inputs_tools_note: "(K2) Profil user, ringkasan repo GitHub (metadata/README), file project KodeKantor (read-only)."
+    output_note: "(K2) PortfolioDraft (item draft + evidence_refs + pertanyaan untuk user) via submit_result."
+    access_note: "P1 perluasan (P12) • hanya draft (visibility draft, source ai_draft); publikasi hanya lewat K51 + R3."
+    notes:
+      - "Setiap kalimat hasil AI ditandai sampai user menyetujui; klaim tanpa bukti dicantumkan di omitted_claims, bukan ditulis."
+      - "Repo privat: hanya metadata yang dipilih user boleh masuk draft yang kelak dipublikasikan (AX-08); isi file privat hanya untuk konteks."
+  - agent_id: K50
+    slug: cv_job_fit
+    name: "CV & Job-fit Agent"
+    group: portfolio
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    target_mode: llm
+    phase: P12
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Menganalisis kecocokan profil user dengan lowongan (URL atau teks), menyarankan penyesuaian CV dan draft cover letter, serta merender CV ramah ATS (DOCX/PDF)."
+    purpose: "membandingkan persyaratan lowongan (dikutip dengan sitasi) dengan bukti di portfolio user, lalu menghasilkan laporan kecocokan dan draft — tanpa mengarang pengalaman atau skill"
+    triggers: [job_fit_analysis_requested, cv_generation_requested]
+    capabilities:
+      - cv.fetch_job_posting
+      - cv.analyze_job_fit
+      - cv.suggest_cv_adjustments
+      - cv.draft_cover_letter
+      - cv.render_cv
+      - cv.flag_unsupported_claims
+    tools:
+      - web.fetch
+      - portfolio.get_profile
+      - docs.render_local
+      - portfolio.draft_item
+      - submit_result
+    permissions: {filesystem: none, sandbox: allow, git: none, network: provider_web, deployment: deny, portfolio: draft, data_sensitivity_max: internal, approval_grant: deny}
+    input_contract: JobFitRequest
+    output_contract: JobFitReport
+    contract_status: planned
+    limits: {max_iterations: 12, timeout_seconds: 600, tool_quota: {web.fetch: 2, docs.render_local: 2}}
+    inputs_tools_note: "(K2) URL/teks lowongan (web_fetch, executor provider), profil & item portfolio, template CV ATS sans-serif (DocEngine lokal)."
+    output_note: "(K2) Kutipan persyaratan lowongan sebagai teks bersitasi + JobFitReport via submit_result; CV/cover letter sebagai draft."
+    access_note: "P1 perluasan (P12) • hanya draft; CV dirender lokal (data pribadi tidak ke Skills)."
+    notes:
+      - "ADR-047 (hibrida): kutipan lowongan ditulis sebagai teks bersitasi di giliran akhir (diekstrak ke message_citations); JobFitReport via submit_result hanya membawa metadata non-teks yang merujuk citation_ref."
+      - "Tidak boleh menambah pengalaman, angka, sertifikat, atau skill yang tidak ada di profil; kekurangan dilaporkan sebagai gap (AX-09, T17)."
+      - "Isi halaman lowongan = data tidak tepercaya (T11)."
+  - agent_id: K51
+    slug: portfolio_publisher
+    name: "Portfolio Publisher"
+    group: portfolio
+    version: 1
+    priority: P1
+    mvp_mode: planned
+    target_mode: tool
+    phase: P12
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Memeriksa privasi snapshot portfolio, membangun situs statis di sandbox, dan mempublikasikannya hanya setelah approval R3 terikat hash snapshot."
+    purpose: "publikasi portfolio deterministik: snapshot → cek privasi + secret scan → build Jinja2 di sandbox → approval R3 → publish ke portfolio.<domain> atau GitHub Pages"
+    triggers: [portfolio_publish_requested, portfolio_publish_approved]
+    capabilities:
+      - portfolio.snapshot_content
+      - portfolio.check_privacy
+      - portfolio.build_site
+      - portfolio.request_publish_approval
+      - portfolio.publish_site
+      - portfolio.record_publication
+    tools:
+      - portfolio.privacy_check
+      - portfolio.build_site
+      - portfolio.publish
+    permissions: {filesystem: none, sandbox: allow, git: none, network: deny, deployment: deny, portfolio: none, data_sensitivity_max: internal, approval_grant: deny}
+    input_contract: PublishRequest
+    output_contract: PublishResult
+    contract_status: planned
+    limits: {max_iterations: 1, timeout_seconds: 600}
+    inputs_tools_note: "(K2) version_id snapshot, target (static | github_pages), approval_id."
+    output_note: "(K2) Laporan privasi, artefak build, status publikasi + URL."
+    access_note: "P1 perluasan (P12) • tool-mode; build = R2 (sandbox tanpa network); publish = R3 (approval terikat hash snapshot)."
+    notes:
+      - "Temuan privasi (email/telepon yang tidak ditandai publik, isi repo privat, secret) memblokir permintaan approval (AX-08, T18)."
+      - "Untuk target github_pages, eksekusi push memakai adapter GitHub App di worker integrations dalam approval portfolio_publish yang sama; tidak ada token di sandbox."
+  # ================================================================================================
+  # v2 — Quality & Security · K2 · ADR-040/045 · RANCANGAN
+  # ================================================================================================
+  - agent_id: S52
+    slug: content_safety
+    name: "Content Safety & Moderation"
+    group: quality_security
+    version: 1
+    priority: P0
+    mvp_mode: planned
+    target_mode: tool
+    phase: P10
+    runtime_agent: null
+    enabled: false
+    model_tier: default
+    description: "Memoderasi teks dan prompt gambar dengan aturan deterministik berversi ditambah moderasi vendor, dan mencatat verdict terikat hash konten."
+    purpose: "gerbang keselamatan konten sebelum capability berisiko dijalankan: aturan kebijakan deterministik dulu, moderasi vendor sebagai lapisan kedua, verdict dapat diaudit"
+    triggers: [assistant_message_received, image_generation_requested, image_edit_requested]
+    capabilities:
+      - safety.apply_policy_rules
+      - safety.moderate_text
+      - safety.moderate_prompt
+      - safety.call_vendor_moderation
+      - safety.record_verdict
+    tools:
+      - moderation.check_text
+      - moderation.check_image_prompt
+    permissions: {filesystem: none, sandbox: deny, git: none, network: deny, deployment: deny, portfolio: none, data_sensitivity_max: confidential, approval_grant: deny}
+    input_contract: ModerationRequest
+    output_contract: ModerationVerdict
+    contract_status: planned
+    limits: {max_iterations: 1, timeout_seconds: 30}
+    inputs_tools_note: "(K2) Konten teks/prompt gambar, konteks (chat | research | image), label sensitivitas."
+    output_note: "(K2) ModerationVerdict (allow | block | review, rule_hits, kategori vendor, verdict_id terikat hash konten)."
+    access_note: "P0 perluasan (P10) • tool-mode deterministik + moderasi vendor; bukan LLM."
+    notes:
+      - "Aturan deterministik selalu dijalankan; moderasi vendor hanya untuk konten berlabel ≤ internal (data confidential tidak dikirim ke vendor moderasi)."
+      - "Verdict block tidak dapat dioverride oleh agent; override hanya oleh admin lewat policy berversi + audit."
+  # ================================================================================================
+  # Orchestration (PRD §6.1)
+  # ================================================================================================
+  - agent_id: ORCH
+    slug: orchestrator
+    name: "Orchestrator Agent"
+    group: orchestration
+    version: 1
+    priority: P0
+    mvp_mode: tool
+    runtime_agent: null
+    enabled: true
+    model_tier: default
+    description: "Orchestrator bertanggung jawab untuk memutuskan workflow, memilih specialist, mengatur dependensi, menjalankan policy checks, menyimpan checkpoint, mengonsolidasikan hasil, dan menghentikan task secara benar. Ia tidak boleh melewati Tool Gateway atau mengganti status dengan asumsi."
+    purpose: "decide the workflow, dispatch specialists, enforce budget/policy, checkpoint, consolidate evidence and finalize tasks without bypassing the Tool Gateway"
+    triggers: [task_created, task_resumed, approval_decided, task_cancel_requested]
+    capabilities:
+      - orchestrator.route_intent
+      - orchestrator.create_workflow
+      - orchestrator.schedule_task
+      - orchestrator.resolve_dependencies
+      - orchestrator.invoke_agent
+      - orchestrator.enforce_budget
+      - orchestrator.handle_retry
+      - orchestrator.pause_resume
+      - orchestrator.collect_evidence
+      - orchestrator.request_approval
+      - orchestrator.finalize_task
+    tools: []
+    permissions: {filesystem: none, sandbox: deny, git: none, network: deny, deployment: deny, approval_grant: deny}
+    input_contract: null
+    output_contract: null
+    limits: {max_iterations: 12, timeout_seconds: 900}
+    inputs_tools_note: "(turunan) Task record, agent registry, policy, budget, checkpoint; dispatches tool-mode agents and LLM agents through AgentRuntime/ToolGateway."
+    output_note: "(turunan) Task status transitions (via workflow/states.py), events, consolidated evidence, approval requests."
+    access_note: "P0 • (turunan) central role, not the 42nd specialist; cannot bypass Tool Gateway or set status by assumption; approval_grant deny."
