@@ -33,3 +33,6 @@ test-results/
 # Claude Code local-only files
 .claude/settings.local.json
 .scratch/
+
+# Redis snapshots from a local redis-server started inside the repo
+dump.rdb
