@@ -13,10 +13,11 @@ from app.core.audit import audit_guard_problems
 from app.core.config import Settings, load_settings
 from app.core.context import REQUEST_ID_HEADER, accept_request_id, request_id_var
 from app.core.csrf import CsrfMiddleware
-from app.core.errors import install_error_handlers
-from app.core.idempotency import IdempotencyMiddleware
+from app.core.errors import AppError, install_error_handlers
+from app.core.idempotency import IdempotencyMiddleware, SessionIdentity
 from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
+from app.services.auth import resolve_session
 from app.services.health import Dependencies
 
 
@@ -82,9 +83,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.dependencies = dependencies
     install_error_handlers(app)
     app.include_router(api_router, prefix="/api/v1")
+
     # Order: the last added runs outermost. RequestId > CSRF > Idempotency: CSRF rejections carry
     # X-Request-ID, and a request that fails CSRF never touches the idempotency store.
-    app.add_middleware(IdempotencyMiddleware, redis=dependencies.redis, exempt_prefix="/api/v1/auth/")
+    async def session_identity(token: str) -> SessionIdentity | None:
+        try:
+            user, session, _ = await resolve_session(dependencies.sessions, settings, token)
+        except AppError:
+            return None
+        return SessionIdentity(str(session.id), str(user.id))
+
+    app.add_middleware(
+        IdempotencyMiddleware,
+        redis=dependencies.redis,
+        session_validator=session_identity,
+        exempt_prefix="/api/v1/auth/",
+    )
     app.add_middleware(
         CsrfMiddleware,
         secure=settings.cookie_secure,

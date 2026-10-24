@@ -77,12 +77,12 @@ async def status_of(engine: AsyncEngine, task_id: uuid.UUID) -> tuple[str, str |
     return row.status, row.status_reason, row.lease_owner
 
 
-async def test_expired_running_becomes_interrupted(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+async def test_expired_lease_marks_interrupted(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
     running = await make_task("running", "-5 seconds")
     validating = await make_task("validating", "-5 seconds")
     bus = Recorder()
     result = await recover_expired(make_sessionmaker(engine), bus, AUDIT)
-    assert (result.recovered, result.failed) == (2, 0)
+    assert (result.candidates, result.recovered, result.failed, result.skipped) == (2, 2, 0, 0)
     for task_id in (running, validating):
         assert await status_of(engine, task_id) == ("interrupted", "lease_expired", None)
     assert {m["payload"]["to"] for m in bus.sent} == {"interrupted"}
@@ -106,12 +106,27 @@ async def test_cancel_requested_becomes_cancelled(engine: AsyncEngine, make_task
 async def test_live_leases_and_other_statuses_are_untouched(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
     live = await make_task("running", "30 seconds")
     queued = await make_task("queued", "-5 seconds")
-    no_lease = await make_task("running", None)
+    fresh_no_lease = await make_task("running", None)  # just moved to running; its worker is claiming
     result = await recover_expired(make_sessionmaker(engine), Recorder(), AUDIT)
     assert result.recovered == 0
     assert (await status_of(engine, live))[0] == "running"
     assert (await status_of(engine, queued))[0] == "queued"
-    assert (await status_of(engine, no_lease))[0] == "running"
+    assert (await status_of(engine, fresh_no_lease))[0] == "running"
+
+
+async def test_active_task_without_a_lease_is_recovered_after_a_grace_period(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """Review WP-1.1f H2: running with lease NULL (released early / crash) was never recovered."""
+    task_id = await make_task("running", None)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE tasks SET updated_at = now() - interval '2 minutes' WHERE id = :id"), {"id": task_id}
+        )
+    result = await recover_expired(make_sessionmaker(engine), Recorder(), AUDIT)
+    assert result.recovered == 1
+    assert (await status_of(engine, task_id))[:2] == ("interrupted", "lease_expired")
 
 
 async def test_parallel_sweeps_transition_once(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
@@ -131,10 +146,11 @@ async def test_parallel_sweeps_transition_once(engine: AsyncEngine, make_task) -
     assert sorted(count for _, count in per_task) == [1] * 5
 
 
-async def test_one_failing_task_does_not_stop_the_sweep(
+async def test_one_failing_task_does_not_stop_the_sweep(  # type: ignore[no-untyped-def]
     engine: AsyncEngine,
     make_task,
-    monkeypatch: pytest.MonkeyPatch,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     from app.workflow import recovery
 
@@ -150,6 +166,7 @@ async def test_one_failing_task_does_not_stop_the_sweep(
     monkeypatch.setattr(recovery, "transition", flaky)
     result = await recover_expired(make_sessionmaker(engine), Recorder(), AUDIT)
     assert (result.recovered, result.failed) == (1, 1)
+    assert "task_recovery_failed" in capsys.readouterr().out
     assert (await status_of(engine, good))[0] == "interrupted"
     assert (await status_of(engine, bad))[0] == "running"
 
@@ -210,7 +227,7 @@ def test_cli_recover_reports_counts(
     for key, value in make_test_env().items():
         monkeypatch.setenv(key, value)
     assert main(["recover"]) == 0
-    assert "recovered: 1, failed: 0" in capsys.readouterr().out
+    assert "candidates: 1, recovered: 1, failed: 0, skipped: 0" in capsys.readouterr().out
     assert asyncio.run(read_status(migrated_database, task_id)) == "interrupted"
 
 
@@ -221,5 +238,37 @@ def test_celery_job_runs_the_sweep(monkeypatch: pytest.MonkeyPatch, migrated_dat
     task_id = asyncio.run(seed_orphan(migrated_database))
     for key, value in make_test_env().items():
         monkeypatch.setenv(key, value)
-    assert recovery_sweep.apply().get() == {"recovered": 1, "failed": 0}
+    assert recovery_sweep.apply().get() == {"candidates": 1, "recovered": 1, "failed": 0, "skipped": 0}
     assert asyncio.run(read_status(migrated_database, task_id)) == "interrupted"
+
+
+async def test_duplicate_delivery_single_execution(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """TEST_STRATEGY AC-17: a redelivered job for an already-claimed or finished task does not run it."""
+    from app.workflow.lease import ClaimResult, claim_lease
+
+    queued = await make_task("queued", None)
+    finished = await make_task("completed", None)
+    sessions = make_sessionmaker(engine)
+
+    async def claim(task_id: uuid.UUID, worker: str) -> ClaimResult:
+        async with sessions() as session:
+            result = await claim_lease(session, task_id, worker, max_active=5)
+            await session.commit()
+            return result
+
+    first, second = await asyncio.gather(claim(queued, "w1"), claim(queued, "w2"))
+    assert sorted([first.value, second.value]) == ["acquired", "held"]
+    assert await claim(finished, "w3") is ClaimResult.NOT_CLAIMABLE
+
+
+def test_failed_recoveries_fail_the_celery_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.worker import jobs
+    from app.workflow.recovery import RecoveryIncomplete, RecoveryResult
+
+    async def partial() -> dict[str, int]:
+        raise RecoveryIncomplete(RecoveryResult(candidates=2, recovered=1, failed=1, skipped=0))
+
+    monkeypatch.setattr(jobs, "run_recovery_sweep", partial)
+    result = jobs.recovery_sweep.apply()
+    assert result.failed()
+    assert isinstance(result.result, RecoveryIncomplete)

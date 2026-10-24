@@ -35,10 +35,16 @@ async def _create_owner(args: argparse.Namespace, password: str) -> int:
 
 
 def _recover() -> int:
+    from app.worker.celery_app import configure_worker_logging
     from app.worker.jobs import run_recovery_sweep
+    from app.workflow.recovery import RecoveryIncomplete
 
-    counts = asyncio.run(run_recovery_sweep())
-    print(f"recovered: {counts['recovered']}, failed: {counts['failed']}")
+    configure_worker_logging(load_settings())
+    try:
+        counts = asyncio.run(run_recovery_sweep())
+    except RecoveryIncomplete as exc:
+        counts = dict(exc.result.__dict__)
+    print(", ".join(f"{name}: {counts[name]}" for name in ("candidates", "recovered", "failed", "skipped")))
     return 0 if counts["failed"] == 0 else 1
 
 

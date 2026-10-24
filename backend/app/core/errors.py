@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import Scope, Send
 
 from app.core.context import REQUEST_ID_HEADER, new_request_id
 from app.core.logging import get_logger
@@ -162,8 +163,8 @@ def install_error_handlers(app: FastAPI) -> None:
 
 
 async def send_error(
-    scope: Any,
-    send: Any,
+    scope: Scope,
+    send: Send,
     *,
     http_status: int,
     code: str,
