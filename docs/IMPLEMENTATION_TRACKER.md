@@ -531,3 +531,23 @@ Hasil: `uv run pytest -q` → **1140 passed**; ruff, format, pyright, dan lint-i
 | Sisa folder | Folder `.*.importing-*`, `.*.creating-*`, dan file `.kk-locks/*.lock` yang tertinggal saat crash belum di-sweep. |
 | `*.env` | Nama dengan akhiran `.env` (mis. `config/prod.env`) tidak tercakup kontrak `.env*`; perlu keputusan Lead. |
 
+
+**Status review akhir WP-1.2 (atas 0ffc109, dengan LOW ditutup di commit berikutnya):**
+
+| Sub-WP | `kk-security-reviewer` (pra-review) | `kk-backend-reviewer` |
+|---|---|---|
+| 1.2a 🔒 | **SIGNED OFF** (pra-review): T2 `test_paths.py` + `test_workspace_hostile.py`; T5 `test_policy_matrix`; T9 test konkurensi/konflik; T3 `test_no_host_exec.py` | **APPROVE** |
+| 1.2b 🔒 | **SIGNED OFF** (pra-review): T2/T4 `test_archive_import.py` | **APPROVE** |
+| 1.2c 🔒 | **SIGNED OFF** (pra-review): T3 + temuan snapshot ".git/config → eksekusi host" ditutup oleh `test_git_hardening.py` | **APPROVE** |
+| 1.2d | — | **APPROVE** |
+
+- **LOW yang ditutup setelah verdict:**
+  - `tree()` mempertahankan entri yang sudah dicek saat budget habis;
+  - path raw yang terpotong di diff yang di-cap dibuang;
+  - kegagalan `copytree` tidak meninggalkan folder staging.
+- **LOW dan INFO yang tetap terbuka (dicatat, bukan blocker):**
+  - **Policy berat.** `.agentignore` besar tanpa jangkar (±200 pola) bisa menolak path agen di kedalaman ≥ 100. Ini gagal tertutup.
+  - **Zip.** Central directory zip di-parse penuh sebelum cek jumlah entri; dibatasi oleh cap arsip 200 MiB.
+  - **Spec #7.** Keputusan `strip_single_root=False` perlu direkonsiliasi oleh Lead. Spec sudah diperbarui, tetapi rancangan awal berbeda.
+  - **Log git.** `_log_failure` meredaksi `tree.parent` saja. Path git dir worktree bisa muncul di log server, tidak pernah di respons klien.
+- **Sign-off formal AG-13** untuk WP-1.2 🔒 tetap wajib dari **sesi terpisah** sebelum G1. Pra-review di atas dilakukan di sesi yang sama yang membangun WP ini (§6 #10 spec sistem pengembangan).
