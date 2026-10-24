@@ -9,11 +9,16 @@ user, mounts, network, limits, env and runtime come from the profile and the set
   - a folder is covered by an empty read-only tmpfs;
   - a worktree ``.git`` file is covered by an empty read-only file;
   - anything else (a symlink, a device) is refused.
-- ``/workspace/.kk`` is a fresh per-run artefact folder owned by the manager.
+- ``/workspace/.kk`` is a fresh per-run artefact folder owned by the manager (conflict #36).
   - ADR-033 asked for a tmpfs read through the archive API, but Docker cannot copy out of a tmpfs mount
     (measured, docker 29/runc).
-  - Instead it is a bind of ``<private>/runs/<run_id>``, read by the manager after the run, with
-    ``O_NOFOLLOW``.
+  - Instead it is a bind of ``<WORKSPACE_ROOT>/<project>/.kk-runs/<run_id>``: inside the project folder, so
+    the per-project disk quota covers it (ARCHITECTURE §8), outside every workspace a run can mount.
+  - The manager reads it after the run with ``O_NOFOLLOW``, counts it toward the growth limit (read-only
+    runs too), then removes it.
+
+**Container log.** Docker keeps a container's stdout in its own log file, whatever the manager stores. The
+json-file log is capped so a run cannot fill the host disk through stdout.
 """
 
 from __future__ import annotations
@@ -40,8 +45,17 @@ def empty_file(settings: Settings) -> Path:
     return settings.private_dir / "empty"
 
 
-def run_artifacts_dir(settings: Settings, run_id: str) -> Path:
-    return settings.private_dir / "runs" / run_id
+RUNS_DIR = ".kk-runs"
+
+
+def run_artifacts_dir(settings: Settings, project_id: object, run_id: str) -> Path:
+    return settings.workspace_root / str(project_id) / RUNS_DIR / run_id
+
+
+def log_config(settings: Settings) -> dict[str, Any]:
+    """Docker's own log of the container: a few times the stored output, at least 16 MiB, two files."""
+    size = max(4 * settings.max_output_bytes, 16 * 1024 * 1024)
+    return {"Type": "json-file", "Config": {"max-size": str(size), "max-file": "2"}}
 
 
 def git_mount(workspace: Path, settings: Settings) -> dict[str, Any] | None:
@@ -80,7 +94,7 @@ def build_container_spec(run: ValidatedRun, run_id: str, settings: Settings) -> 
         },
         {
             "Type": "bind",
-            "Source": str(run_artifacts_dir(settings, run_id)),
+            "Source": str(run_artifacts_dir(settings, run.project_id, run_id)),
             "Target": ARTIFACTS,
             "ReadOnly": False,
         },
@@ -102,6 +116,7 @@ def build_container_spec(run: ValidatedRun, run_id: str, settings: Settings) -> 
         "Tmpfs": dict(_TMPFS),
         "Mounts": mounts,
         "IpcMode": "private",
+        "LogConfig": log_config(settings),
         "AutoRemove": False,  # removed by the manager after the log and artefacts are read
     }
     if settings.runtime:

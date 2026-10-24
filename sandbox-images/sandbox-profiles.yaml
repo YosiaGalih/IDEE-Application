@@ -2,6 +2,7 @@
 # A caller names only a profile_id; image, argv, timeouts and network come from here.
 # `image` is an alias resolved through SANDBOX_IMAGE_<ALIAS> (sandbox_manager/config.py).
 # Extra arguments from a caller must fullmatch args_pattern and must not start with "-".
+# timeout_s may be left out: SANDBOX_TIMEOUT_SECONDS applies, capped at max_timeout_s.
 version: 1
 profiles:
   - profile_id: python.pytest
@@ -13,6 +14,7 @@ profiles:
     timeout_s: 300
     max_timeout_s: 900
     network: none
+    artifacts: [junit]  # exit 0 without a junit report ends the run as an error, not as "no tests"
 
   - profile_id: python.ruff
     image: python

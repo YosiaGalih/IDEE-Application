@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 MIN_TOKEN_LENGTH = 32
@@ -26,11 +27,12 @@ def _memory_bytes(value: str) -> int:
 
 @dataclass(frozen=True)
 class Settings:
-    token: str
+    token: str = field(repr=False)
     workspace_root: Path
     profiles_path: Path
     driver: str  # "docker" | "fake"
-    docker_host: str  # unix:///var/run/docker.sock or tcp://docker-socket-proxy:2375
+    app_env: str
+    docker_host: str  # tcp://docker-socket-proxy:2375; unix:// only outside production (ADR-009 (1))
     images: Mapping[str, str]  # profile image alias → image reference
     cpu_limit: float
     memory_bytes: int
@@ -68,17 +70,22 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     workspace_root = Path(env.get("WORKSPACE_ROOT", "/srv/kodekantor/workspaces"))
     if not workspace_root.is_absolute():
         raise ConfigError("WORKSPACE_ROOT must be absolute")
+    docker_host = env.get("DOCKER_HOST", "tcp://docker-socket-proxy:2375")
+    if not docker_host.startswith(("tcp://", "unix://")):
+        raise ConfigError("DOCKER_HOST must be tcp:// or unix://")
+    if docker_host.startswith("unix://") and env.get("APP_ENV", "production") == "production":
+        raise ConfigError("DOCKER_HOST must be the socket proxy in production, never the socket (ADR-009)")
     try:
-        return Settings(
+        settings = Settings(
             token=token,
             workspace_root=workspace_root,
             profiles_path=Path(env.get("SANDBOX_PROFILES_PATH", "/etc/kodekantor/sandbox-profiles.yaml")),
             driver=driver,
-            docker_host=env.get("DOCKER_HOST", "unix:///var/run/docker.sock"),
+            app_env=env.get("APP_ENV", "production"),
+            docker_host=docker_host,
             images={
                 "python": env.get("SANDBOX_IMAGE_PYTHON", "kodekantor/sandbox-python:1"),
                 "node": env.get("SANDBOX_IMAGE_NODE", "kodekantor/sandbox-node:1"),
-                **({"test": env["SANDBOX_IMAGE_TEST"]} if env.get("SANDBOX_IMAGE_TEST") else {}),
             },
             cpu_limit=float(env.get("SANDBOX_CPU_LIMIT", "1.0")),
             memory_bytes=_memory_bytes(env.get("SANDBOX_MEMORY_LIMIT", "1g")),
@@ -93,3 +100,32 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         )
     except ValueError as exc:
         raise ConfigError("a numeric SANDBOX_* setting is not a number") from exc
+    _check_limits(settings)
+    return settings
+
+
+def _check_limits(settings: Settings) -> None:
+    """Docker reads 0 or -1 as "no limit": every limit must be a real, positive bound (fail closed)."""
+    if not (math.isfinite(settings.cpu_limit) and 0 < settings.cpu_limit <= 64):
+        raise ConfigError("SANDBOX_CPU_LIMIT must be a number in (0, 64]")
+    if settings.memory_bytes < 64 * 1024**2:
+        raise ConfigError("SANDBOX_MEMORY_LIMIT must be at least 64m")
+    checks = {
+        "SANDBOX_PIDS_LIMIT": settings.pids_limit,
+        "SANDBOX_TIMEOUT_SECONDS": settings.default_timeout_s,
+        "SANDBOX_MAX_OUTPUT_BYTES": settings.max_output_bytes,
+        "SANDBOX_MAX_WORKSPACE_GROWTH_MB": settings.max_workspace_growth_mb,
+        "SANDBOX_MAX_CONCURRENT_RUNS": settings.max_concurrent_runs,
+    }
+    for name, value in checks.items():
+        if value < 1:
+            raise ConfigError(f"{name} must be at least 1")
+
+
+def check_process_user(settings: Settings) -> None:
+    """In production the manager runs as root or as the sandbox user (10001), never as a third uid.
+
+    With a third uid the run folders would have to be world-writable (``docker_driver.prepare_artifacts``).
+    """
+    if settings.app_env == "production" and os.geteuid() not in (0, 10001):
+        raise ConfigError("in production the sandbox manager must run as uid 10001 (or root)")

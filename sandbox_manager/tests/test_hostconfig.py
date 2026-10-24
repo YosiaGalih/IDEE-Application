@@ -69,7 +69,16 @@ def test_hardened_hostconfig(settings: Settings, profiles: dict[str, Profile]) -
         "ReadOnly": False,
         "BindOptions": {"Propagation": "rprivate"},
     }
-    assert mounts["/workspace/.kk"]["Source"] == str(run_artifacts_dir(settings, RUN_ID))
+    assert mounts["/workspace/.kk"]["Source"] == str(run_artifacts_dir(settings, PROJECT, RUN_ID))
+    assert mounts["/workspace/.kk"]["Source"] == str(
+        settings.workspace_root / str(PROJECT) / ".kk-runs" / RUN_ID
+    )
+    assert host["Ulimits"] == [{"Name": "nofile", "Soft": 1024, "Hard": 1024}]
+    assert "size=268435456" in host["Tmpfs"]["/tmp"] and "size=67108864" in host["Tmpfs"]["/home/sandbox"]
+    assert host["LogConfig"] == {
+        "Type": "json-file",
+        "Config": {"max-size": str(16 * 1024 * 1024), "max-file": "2"},
+    }
     assert spec["Labels"] == {
         "kk.managed": "1",
         "kk.run_id": RUN_ID,
@@ -127,6 +136,7 @@ def test_caller_cannot_override(settings: Settings, profiles: dict[str, Profile]
         "network",
         "read_only",
         "wait",
+        "client_request_id",
     }
 
 
@@ -200,3 +210,10 @@ def test_git_other_kinds_are_refused(
     with pytest.raises(RequestRejected) as info:
         build_container_spec(validated(settings, profiles), RUN_ID, settings)
     assert info.value.code == "GIT_METADATA_UNSAFE"
+
+
+def test_container_log_is_capped(settings: Settings, profiles: dict[str, Profile]) -> None:
+    task_workspace(settings)
+    big = replace(settings, max_output_bytes=10 * 1024 * 1024)
+    spec = build_container_spec(validated(big, profiles), RUN_ID, big)
+    assert spec["HostConfig"]["LogConfig"]["Config"] == {"max-size": str(40 * 1024 * 1024), "max-file": "2"}

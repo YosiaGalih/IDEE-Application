@@ -30,7 +30,7 @@ ALLOWED = [
     ("POST", r"/containers/create"),
     ("POST", r"/containers/[0-9a-f]+/(start|wait|kill)"),
     ("GET", r"/containers/[0-9a-f]+/(logs|json)"),
-    ("DELETE", r"/containers/[0-9a-f]+"),
+    ("DELETE", r"/containers/([0-9a-f]+|kk-run-[0-9a-f]+)"),
     ("GET", r"/containers/json"),
 ]
 CID = "c0ffee"
@@ -50,8 +50,14 @@ class FakeEngine:
     log_chunk: int = 3  # deliver logs in awkward pieces to exercise the demultiplexer
     run_forever: bool = False
     fail: dict[str, int] = field(default_factory=dict)  # path regex → status
+    oom: bool = False
+    break_logs: bool = False
+    listed: list[dict[str, Any]] = field(
+        default_factory=lambda: [{"Id": "0dd1", "Labels": {}}, {"Id": "0dd2", "Labels": {}}]
+    )
     on_start: Callable[[dict[str, Any]], None] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
+    requests: list[httpx.Request] = field(default_factory=list)
     spec: dict[str, Any] | None = None
     removed: list[str] = field(default_factory=list)
     killed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -59,6 +65,7 @@ class FakeEngine:
     async def handle(self, request: httpx.Request) -> httpx.Response:
         method, path = request.method, request.url.path
         self.calls.append((method, path))
+        self.requests.append(request)
         for pattern, status in self.fail.items():
             if re.fullmatch(pattern, path):
                 return httpx.Response(status, json={"message": "boom"})
@@ -81,7 +88,7 @@ class FakeEngine:
         if path.endswith("/logs"):
             return httpx.Response(200, content=self._log_stream())
         if path.endswith("/json") and path.startswith("/containers/") and path != "/containers/json":
-            return httpx.Response(200, json={"Image": "sha256:abc"})
+            return httpx.Response(200, json={"Image": "sha256:abc", "State": {"OOMKilled": self.oom}})
         if path.endswith("/kill"):
             self.killed.set()
             return httpx.Response(204)
@@ -89,12 +96,14 @@ class FakeEngine:
             self.removed.append(path.rsplit("/", 1)[1])
             return httpx.Response(204)
         if path == "/containers/json":
-            return httpx.Response(200, json=[{"Id": "0dd1"}, {"Id": "0dd2"}])
+            return httpx.Response(200, json=self.listed)
         return httpx.Response(500)
 
     async def _log_stream(self) -> AsyncIterator[bytes]:
         for start in range(0, len(self.log), self.log_chunk):
             yield self.log[start : start + self.log_chunk]
+        if self.break_logs:
+            raise httpx.ReadError("connection reset")
         if self.run_forever:
             await self.killed.wait()
 
@@ -146,7 +155,9 @@ async def test_successful_run(settings: Settings, profiles: dict[str, Profile]) 
     assert public["stderr_tail"] == "warning\n"
     assert record.artifacts == {"junit": '<testsuite tests="3"/>', "coverage": "<coverage/>"}
     assert fake.removed == [CID]
-    assert not run_artifacts_dir(settings, record.run_id).exists()
+    assert record.artifact_status == {"junit": "ok", "coverage": "ok"}
+    assert not run_artifacts_dir(settings, PROJECT, record.run_id).exists()
+    assert record.started_at is not None and record.log_incomplete is False
 
 
 async def test_failed_run(settings: Settings, profiles: dict[str, Profile]) -> None:
@@ -195,14 +206,15 @@ async def test_output_limit(settings: Settings, profiles: dict[str, Profile]) ->
     record = await execute(replace(settings, max_output_bytes=1000), fake, a_run(settings, profiles))
     assert record.truncated is True
     assert record.size == 1000
-    assert record.public()["stderr_tail"] == "b" * 400
+    assert record.chunks[-1] == ("stderr", "b" * 400)
+    assert record.public()["stderr_tail"] == "b" * 600  # the tail keeps the end past the stored log
 
 
 async def test_timeout_kills_and_removes(settings: Settings, profiles: dict[str, Profile]) -> None:
     task_workspace(settings)
     fake = FakeEngine(run_forever=True, log=frame(1, b"started\n"))
     record = await execute(settings, fake, a_run(settings, profiles, timeout_s=1))
-    assert (record.status, record.exit_code) == ("timeout", None)
+    assert (record.status, record.exit_code) == ("timeout", 137)
     assert ("POST", f"/containers/{CID}/kill") in fake.calls
     assert fake.removed == [CID]
     assert record.public()["stdout_tail"] == "started\n"
@@ -233,8 +245,9 @@ async def test_engine_errors_end_as_error_and_remove(
     fake = FakeEngine(fail={failing: 500})
     record = await execute(settings, fake, a_run(settings, profiles))
     assert (record.status, record.error_code) == ("error", "DOCKER_ERROR")
-    assert fake.removed == ([] if "create" in failing else [CID])
-    assert list((settings.private_dir / "runs").iterdir()) == []
+    # a failed create may still have made the container: it is removed by name
+    assert fake.removed == ([f"kk-run-{record.run_id}"] if "create" in failing else [CID])
+    assert list((settings.workspace_root / str(PROJECT) / ".kk-runs").iterdir()) == []
 
 
 async def test_docker_unreachable(settings: Settings, profiles: dict[str, Profile]) -> None:
@@ -349,4 +362,145 @@ async def test_kill_before_create(settings: Settings, profiles: dict[str, Profil
     record = await registry.submit(a_run(settings, profiles), wait=False)
     await asyncio.wait_for(record.done.wait(), 5)
     assert record.status == "killed"
+    assert ("POST", "/containers/create") not in fake.calls
+
+
+def with_artifacts(profiles: dict[str, Profile], *names: str) -> dict[str, Profile]:
+    updated = profiles["python.pytest"].model_copy(update={"artifacts": names})
+    return {**profiles, "python.pytest": updated}
+
+
+async def test_required_junit_missing_is_an_error(settings: Settings, profiles: dict[str, Profile]) -> None:
+    task_workspace(settings)
+    record = await execute(settings, FakeEngine(), a_run(settings, with_artifacts(profiles, "junit")))
+    assert (record.status, record.exit_code, record.error_code) == ("error", 0, "ARTIFACT_MISSING")
+    assert record.artifact_status["junit"] == "missing"
+
+
+async def test_required_junit_too_large_is_rejected(settings: Settings, profiles: dict[str, Profile]) -> None:
+    task_workspace(settings)
+
+    def container(spec: dict[str, Any]) -> None:
+        (mount_source(spec, "/workspace/.kk") / "junit.xml").write_bytes(b"x" * (1024 * 1024 + 1))
+
+    run = a_run(settings, with_artifacts(profiles, "junit"))
+    record = await execute(settings, FakeEngine(on_start=container), run)
+    assert (record.status, record.error_code) == ("error", "ARTIFACT_REJECTED")
+    assert record.artifact_status["junit"] == "too_large"
+
+
+async def test_missing_junit_on_a_failed_run_stays_failed(
+    settings: Settings, profiles: dict[str, Profile]
+) -> None:
+    task_workspace(settings)
+    run = a_run(settings, with_artifacts(profiles, "junit"))
+    record = await execute(settings, FakeEngine(exit_code=2), run)
+    assert (record.status, record.error_code) == ("failed", None)  # never upgraded, never hidden
+    assert record.artifact_status["junit"] == "missing"
+
+
+async def test_oom_is_not_a_test_failure(settings: Settings, profiles: dict[str, Profile]) -> None:
+    task_workspace(settings)
+    record = await execute(settings, FakeEngine(exit_code=137, oom=True), a_run(settings, profiles))
+    assert (record.status, record.exit_code, record.error_code) == ("error", 137, "OOM_KILLED")
+
+
+async def test_broken_log_stream_is_flagged(settings: Settings, profiles: dict[str, Profile]) -> None:
+    task_workspace(settings)
+    fake = FakeEngine(log=frame(1, b"partial"), break_logs=True)
+    record = await execute(settings, fake, a_run(settings, profiles))
+    assert record.status == "succeeded"
+    assert record.log_incomplete is True and record.public()["log_incomplete"] is True
+
+
+async def test_container_not_removed_is_an_error(settings: Settings, profiles: dict[str, Profile]) -> None:
+    import sandbox_manager.docker_driver as driver_module
+
+    task_workspace(settings)
+    fake = FakeEngine(fail={rf"/containers/{CID}": 500})
+    original = driver_module.asyncio.sleep
+
+    async def no_wait(_: float) -> None:
+        await original(0)
+
+    driver_module.asyncio.sleep = no_wait  # type: ignore[assignment]
+    try:
+        record = await execute(settings, fake, a_run(settings, profiles))
+    finally:
+        driver_module.asyncio.sleep = original
+    assert (record.status, record.exit_code, record.error_code) == ("error", 0, "CONTAINER_NOT_REMOVED")
+    assert [call for call in fake.calls if call[0] == "DELETE"] == [("DELETE", f"/containers/{CID}")] * 3
+    # the container may still write: its artefact folder is left for the start-up sweep, not raced
+    assert (settings.workspace_root / str(PROJECT) / ".kk-runs" / record.run_id).exists()
+
+
+async def test_kill_after_success_keeps_the_result(settings: Settings, profiles: dict[str, Profile]) -> None:
+    task_workspace(settings)
+    fake = FakeEngine()
+    driver = make_driver(settings, fake)
+    registry = RunRegistry(driver, settings)
+    real_wait = driver.engine.wait
+
+    async def wait_then_kill(container_id: str, timeout_s: float) -> int:
+        code = await real_wait(container_id, timeout_s)
+        for pending in registry.runs.values():  # the kill arrives after the process already exited 0
+            pending.kill_requested = True
+        return code
+
+    driver.engine.wait = wait_then_kill  # type: ignore[method-assign]
+    record = await registry.submit(a_run(settings, profiles), wait=True)
+    assert (record.status, record.exit_code) == ("succeeded", 0)
+
+
+async def test_watchdog_kills_on_artifact_folder_growth(
+    settings: Settings, profiles: dict[str, Profile], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sandbox_manager.docker_driver as driver_module
+
+    monkeypatch.setattr(driver_module, "WATCH_INTERVAL_S", 0.02)
+    monkeypatch.setattr(driver_module, "MAX_ARTIFACT_DIR_BYTES", 64 * 1024)
+    repo_workspace(settings)
+
+    def container(spec: dict[str, Any]) -> None:
+        with open(mount_source(spec, "/workspace/.kk") / "fill.bin", "wb") as handle:
+            handle.write(b"x" * 128 * 1024)
+
+    fake = FakeEngine(run_forever=True, on_start=container)
+    run = a_run(settings, profiles, task_id=None, workspace_subpath=f"{PROJECT}/repo", timeout_s=60)
+    record = await asyncio.wait_for(execute(settings, fake, run), 5)
+    assert (record.status, record.error_code) == ("error", "DISK_LIMIT")  # read-only runs are bounded too
+    assert ("POST", f"/containers/{CID}/kill") in fake.calls
+    assert not run_artifacts_dir(settings, PROJECT, record.run_id).exists()
+
+
+async def test_reaper_removes_only_inactive_own_containers(settings: Settings) -> None:
+    fake = FakeEngine()
+    driver = make_driver(settings, fake)
+    fake.listed = [
+        {"Id": "aaa1", "Labels": {"kk.run_id": "active-run"}},
+        {"Id": "bbb2", "Labels": {"kk.run_id": "finished-run"}},
+    ]
+    assert await driver.reap({"active-run"}) == 1
+    assert fake.removed == ["bbb2"]
+    listing = next(request for request in fake.requests if request.url.path == "/containers/json")
+    filters = json.loads(listing.url.params["filters"])
+    assert filters == {"label": ["kk.managed=1", f"kk.manager={driver.instance}"]}
+
+
+async def test_start_up_sweeps_leftover_run_folders(settings: Settings) -> None:
+    leftover = settings.workspace_root / str(PROJECT) / ".kk-runs" / "old-run"
+    (leftover / "locked").mkdir(parents=True)
+    (leftover / "locked" / "f").write_text("x")
+    await make_driver(settings, FakeEngine()).cleanup_orphans()
+    assert not leftover.exists()
+
+
+async def test_run_folder_link_is_refused(
+    settings: Settings, profiles: dict[str, Profile], tmp_path: Path
+) -> None:
+    task_workspace(settings)
+    os.symlink(tmp_path, settings.workspace_root / str(PROJECT) / ".kk-runs")
+    fake = FakeEngine()
+    record = await execute(settings, fake, a_run(settings, profiles))
+    assert (record.status, record.error_code) == ("error", "WORKSPACE_UNSAFE")
     assert ("POST", "/containers/create") not in fake.calls

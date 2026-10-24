@@ -50,10 +50,11 @@ jobs:
         run: |
           docker build -t kodekantor/sandbox-python:1 sandbox-images/python
           docker build -t kodekantor/sandbox-node:1 sandbox-images/node
+      # As root: in production the manager runs as uid 10001 or root, never as a third uid
+      # (config.check_process_user). Behaviour as uid 10001 is covered inside a container
+      # (test_disk_helpers_as_sandbox_uid).
       - name: Isolation tests (missing daemon or image fails, never skips)
         working-directory: sandbox_manager
-        env:
-          KK_REQUIRE_DOCKER: "1"
         run: |
           uv sync --locked
-          uv run pytest -q -m docker
+          sudo env KK_REQUIRE_DOCKER=1 .venv/bin/python -m pytest -q -m docker -p no:cacheprovider

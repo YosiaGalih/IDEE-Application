@@ -1,9 +1,9 @@
 # kodekantor/sandbox-python: the image for python.* profiles (ARCHITECTURE §8, ADR-026 (2)).
 #
 # Runs as uid 10001 with a read-only rootfs and no network; the manager adds every runtime limit.
-# The base is pinned by digest. BASE_IMAGE may point at a mirror, but only with this same digest.
-ARG BASE_IMAGE=docker.io/library/python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
-FROM ${BASE_IMAGE}
+# The base is pinned by digest (3.12-slim). BASE_REPO may name a mirror; the digest stays the same.
+ARG BASE_REPO=docker.io/library/python
+FROM ${BASE_REPO}@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

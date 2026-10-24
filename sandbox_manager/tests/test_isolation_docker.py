@@ -250,7 +250,7 @@ async def test_kill_task(client: httpx.AsyncClient, settings: Settings) -> None:
         if (await client.get(f"/v1/runs/{run_id}", headers=AUTH)).json()["status"] == "running":
             break
         await asyncio.sleep(0.05)
-    assert (await client.post(f"/v1/tasks/{TASK}/kill", headers=AUTH)).json() == {"killed": 1}
+    assert (await client.post(f"/v1/tasks/{TASK}/kill", headers=AUTH)).json() == {"killed": 1, "failed": 0}
     for _ in range(200):
         status = (await client.get(f"/v1/runs/{run_id}", headers=AUTH)).json()["status"]
         if status not in ("queued", "running"):
@@ -328,8 +328,8 @@ async def test_memory_limit(docker_settings: Settings, settings: Settings) -> No
     probe(task_workspace(settings), "blocks = [bytearray(16 * 1024 * 1024) for _ in range(64)]\n")
     async for client in start_client(replace(docker_settings, memory_bytes=128 * 1024 * 1024)):
         result = await run(client)
-        assert result["status"] == "failed"
-        assert result["exit_code"] == 137  # killed by the OOM killer
+        # killed by the OOM killer: reported as such, never as a failing test
+        assert (result["status"], result["exit_code"], result["error_code"]) == ("error", 137, "OOM_KILLED")
 
 
 async def test_python_pytest_profile(client: httpx.AsyncClient, settings: Settings) -> None:
@@ -383,7 +383,7 @@ async def test_no_container_left(client: httpx.AsyncClient, settings: Settings) 
     for _ in range(3):
         assert (await run(client))["status"] == "succeeded"
     assert await managed_containers() == []
-    assert list((settings.private_dir / "runs").iterdir()) == []
+    assert list((settings.workspace_root / str(PROJECT) / ".kk-runs").iterdir()) == []
 
 
 async def test_orphans_removed_at_start(docker_settings: Settings, settings: Settings) -> None:
@@ -400,3 +400,121 @@ async def test_orphans_removed_at_start(docker_settings: Settings, settings: Set
         assert orphan not in await engine.managed_containers()
     finally:
         await engine.aclose()
+
+
+async def test_read_only_run_cannot_flood_the_artifact_folder(
+    client: httpx.AsyncClient, settings: Settings
+) -> None:
+    """Security review F1: /workspace/.kk is the one writable path of a read-only run, and it is bounded."""
+    repo = repo_workspace(settings)
+    probe(
+        repo,
+        "import time\n"
+        "with open('/workspace/.kk/flood.bin', 'wb') as out:\n"
+        "    for _ in range(400):\n"
+        "        out.write(b'x' * 1024 * 1024)\n"
+        "        out.flush()\n"
+        "        time.sleep(0.05)\n",
+    )
+    started = time.monotonic()
+    result = await run(client, repo=True, timeout_s=60)
+    assert (result["status"], result["error_code"]) == ("error", "DISK_LIMIT"), result
+    assert time.monotonic() - started < 20  # stopped by the watchdog, not by the run's timeout
+    assert list((settings.workspace_root / str(PROJECT) / ".kk-runs").iterdir()) == []
+    assert await managed_containers() == []
+
+
+async def test_hostile_artifact_tree_is_removed(client: httpx.AsyncClient, settings: Settings) -> None:
+    """A locked folder and a 1500-deep tree in /workspace/.kk do not survive the run (security review F1)."""
+    probe(
+        task_workspace(settings),
+        "import os\n"
+        "os.makedirs('/workspace/.kk/locked/inner')\n"
+        "open('/workspace/.kk/locked/inner/f', 'w').write('x')\n"
+        "os.chmod('/workspace/.kk/locked/inner', 0)\n"
+        "os.chmod('/workspace/.kk/locked', 0o500)\n"
+        "os.mkdir('/workspace/.kk/deep'); os.chdir('/workspace/.kk/deep')\n"
+        "for _ in range(1500):  # os.makedirs recurses\n"
+        "    os.mkdir('d'); os.chdir('d')\n"
+        "print('{}')\n",
+    )
+    result = await run(client)
+    assert result["status"] == "succeeded", result
+    assert list((settings.workspace_root / str(PROJECT) / ".kk-runs").iterdir()) == []
+
+
+async def test_disk_helpers_as_sandbox_uid(settings: Settings) -> None:
+    """The measurement and removal code itself, run as uid 10001 like the manager in compose."""
+    await require_docker([settings.images["python"]])
+    disk_py = REPO_ROOT / "sandbox_manager" / "sandbox_manager" / "disk.py"
+    script = (
+        "import importlib.util, json, os\n"
+        "spec = importlib.util.spec_from_file_location('disk', '/kk/disk.py')\n"
+        "disk = importlib.util.module_from_spec(spec); spec.loader.exec_module(disk)\n"
+        "os.makedirs('/tmp/t/locked'); open('/tmp/t/locked/big', 'wb').write(b'x' * 5_000_000)\n"
+        "os.chmod('/tmp/t/locked', 0)\n"
+        "try:\n"
+        "    disk.tree_bytes('/tmp/t'); measured = 'counted'\n"
+        "except disk.Unmeasurable:\n"
+        "    measured = 'unmeasurable'\n"
+        "removed = disk.remove_tree('/tmp/t')\n"
+        "print(json.dumps({'uid': os.getuid(), 'measured': measured, 'removed': removed,"
+        " 'gone': not os.path.exists('/tmp/t')}))\n"
+    )
+    engine = DockerEngine(docker_host())
+    spec = {
+        "Image": settings.images["python"],
+        "Cmd": ["python", "-c", script],
+        "User": "10001:10001",
+        "Labels": {"kk.managed": "1"},
+        "HostConfig": {
+            "NetworkMode": "none",
+            "Mounts": [{"Type": "bind", "Source": str(disk_py), "Target": "/kk/disk.py", "ReadOnly": True}],
+            "Tmpfs": {"/tmp": "rw,size=67108864,mode=1777"},
+        },
+    }
+    try:
+        container = await engine.create(spec, "kk-disk-uid-test")
+        try:
+            await engine.start(container)
+            assert await engine.wait(container, 60) == 0
+            output = b"".join([data async for _, data in engine.logs(container)])
+        finally:
+            await engine.remove(container)
+    finally:
+        await engine.aclose()
+    assert json.loads(output) == {"uid": 10001, "measured": "unmeasurable", "removed": True, "gone": True}
+
+
+async def test_container_log_cap_is_accepted_by_docker(settings: Settings, docker_settings: Settings) -> None:
+    """Docker keeps stdout in its own log file; the spec's cap must be one the daemon applies."""
+    await require_docker([settings.images["python"]])
+    from sandbox_manager.hostconfig import build_container_spec
+    from sandbox_manager.validation import RunRequest, validate
+
+    task_workspace(settings)
+    profiles = load_profiles(PROFILES_FILE, set(settings.images))
+    body = {
+        "project_id": str(PROJECT),
+        "task_id": str(TASK),
+        "workspace_subpath": f"{PROJECT}/tasks/{TASK}",
+        "profile_id": "python.pytest",
+    }
+    spec = build_container_spec(
+        validate(RunRequest.model_validate(body), profiles, docker_settings), "logcap", docker_settings
+    )
+    spec["HostConfig"]["Mounts"] = []  # only the log settings matter here
+    engine = DockerEngine(docker_host())
+    try:
+        container = await engine.create(spec, "kk-logcap-test")
+        try:
+            state = await engine.inspect(container)
+        finally:
+            await engine.remove(container)
+    finally:
+        await engine.aclose()
+    assert state is not None
+    assert state["HostConfig"]["LogConfig"] == {
+        "Type": "json-file",
+        "Config": {"max-file": "2", "max-size": str(16 * 1024 * 1024)},
+    }

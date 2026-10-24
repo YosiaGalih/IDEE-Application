@@ -92,7 +92,7 @@ docker build -t kodekantor/sandbox-python:1 ../sandbox-images/python
 docker build -t kodekantor/sandbox-node:1 ../sandbox-images/node
 ```
 
-- dockerd di container cloud: `nohup dockerd >/tmp/dockerd.log 2>&1 &`. Docker Hub bisa 429: build dengan `--build-arg BASE_IMAGE=mirror.gcr.io/library/<image>@<digest yang sama>`; di balik proxy TLS tambahkan `--network host --build-arg HTTPS_PROXY --secret id=extra_ca,src=/root/.ccr/ca-bundle.crt`.
+- dockerd di container cloud: `nohup dockerd >/tmp/dockerd.log 2>&1 &`. Docker Hub bisa 429: build dengan `--build-arg BASE_REPO=mirror.gcr.io/library/<image>`; di balik proxy TLS tambahkan `--network host --build-arg HTTPS_PROXY --secret id=extra_ca,src=/root/.ccr/ca-bundle.crt`.
 - Dependensi image Python: ubah `sandbox-images/python/requirements.in`, lalu `sandbox-images/lock.sh`.
 
 ## Agent skills

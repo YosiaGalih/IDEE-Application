@@ -37,6 +37,7 @@ class RunRequest(BaseModel):
     network: Literal["none", "egress"] = "none"
     read_only: bool = False
     wait: bool = False
+    client_request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.:-]{1,64}$")  # retry key
 
 
 class RequestRejected(Exception):
@@ -85,9 +86,9 @@ def validate(request: RunRequest, profiles: dict[str, Profile], settings: Settin
         if arg.startswith("-") or not re.fullmatch(profile.args_pattern, arg):
             raise RequestRejected("INVALID_ARGS", "An argument is not allowed by the profile")
 
-    timeout = request.timeout_s or profile.timeout_s
-    if timeout > profile.max_timeout_s:
+    if request.timeout_s is not None and request.timeout_s > profile.max_timeout_s:
         raise RequestRejected("INVALID_TIMEOUT", "timeout_s exceeds the profile maximum")
+    timeout = request.timeout_s or profile.timeout_s or min(settings.default_timeout_s, profile.max_timeout_s)
 
     if request.network == "egress" and (
         profile.network != "egress-allowed" or settings.egress != "allowlist"

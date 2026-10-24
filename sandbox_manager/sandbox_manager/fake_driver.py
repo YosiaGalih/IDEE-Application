@@ -20,7 +20,13 @@ class FakeDriver:
     async def health(self) -> str:
         return "ok"
 
+    async def images(self) -> dict[str, bool]:
+        return {"python": True, "node": True}
+
     async def cleanup_orphans(self) -> int:
+        return 0
+
+    async def reap(self, active_run_ids: set[str]) -> int:
         return 0
 
     async def kill(self, record: RunRecord) -> None:
@@ -28,7 +34,8 @@ class FakeDriver:
 
     async def execute(self, run: ValidatedRun, record: RunRecord) -> None:
         self.executed.append(run)
-        record.mark_running("fake/image:1")
+        record.image = "fake/image:1"
+        record.mark_started()
         mode = run.args[0] if run.args else "ok"
         if mode == "sleep":
             for _ in range(run.timeout_s * 10):
@@ -46,5 +53,6 @@ class FakeDriver:
             record.append("stderr", b"assertion failed\n")
             record.finish("failed", exit_code=1)
             return
-        record.artifacts["junit"] = '<testsuite tests="1" failures="0"/>'
+        record.artifacts["junit"] = '<testsuite tests="1" failures="0"><testcase name="t"/></testsuite>'
+        record.artifact_status["junit"] = "ok"
         record.finish("succeeded", exit_code=0)

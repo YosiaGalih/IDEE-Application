@@ -24,9 +24,12 @@ class Profile(BaseModel):
     argv: tuple[str, ...] = Field(min_length=1)
     args_pattern: str  # every extra argument must fullmatch this
     max_args: int = Field(default=20, ge=0, le=100)
-    timeout_s: int = Field(gt=0)
+    timeout_s: int | None = Field(default=None, gt=0)  # None → SANDBOX_TIMEOUT_SECONDS, capped at the max
     max_timeout_s: int = Field(gt=0)
     network: Literal["none", "egress-allowed"] = "none"
+    # Files the profile writes to /workspace/.kk. Exit 0 without one of them ends the run as an error
+    # (ARTIFACT_MISSING/ARTIFACT_REJECTED): "no report" is never mistaken for "no tests".
+    artifacts: tuple[Literal["junit", "coverage"], ...] = ()
 
     @field_validator("profile_id")
     @classmethod
@@ -43,7 +46,7 @@ class Profile(BaseModel):
 
     @model_validator(mode="after")
     def _timeouts(self) -> Profile:
-        if self.timeout_s > self.max_timeout_s:
+        if self.timeout_s is not None and self.timeout_s > self.max_timeout_s:
             raise ValueError("timeout_s exceeds max_timeout_s")
         return self
 
