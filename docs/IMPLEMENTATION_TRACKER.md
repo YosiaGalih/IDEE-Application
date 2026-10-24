@@ -238,3 +238,23 @@ Spec: `docs/superpowers/specs/2026-10-24-wp-1.1c-identity-rbac-design.md`. Diban
 Catatan:
 - Panjang password minimum 12 adalah pilihan saya (dokumen tidak menetapkan) [Kemungkinan Besar, NIST SP 800-63B].
 - Endpoint `/auth/*`, CSRF, rate limit, dan lockout = WP-1.1d (🔒).
+
+**Pre-review keamanan (kk-security-reviewer, bukan sign-off gate) @ d837fff:** tidak ada CRITICAL atau HIGH. Ada 2 MEDIUM dan 2 LOW:
+
+| Temuan | Status | Bukti |
+|---|---|---|
+| MEDIUM T5: `IntegrityError` dari `create-owner` membawa hash argon2id di teks exception/traceback | **ditutup**:<br>• `make_engine(..., hide_parameters=True)`<br>• pola `$argon2…` di `Redactor`<br>• duplikat email → `EmailTakenError` tanpa exception asal<br>• CLI exit 1 dengan pesan polos | `tests/security/test_owner_bootstrap.py`:<br>• `::test_duplicate_email_error_carries_no_password_hash`<br>• `::test_engine_hides_bind_parameters_in_db_errors`<br>• `::test_cli_duplicate_email_prints_no_hash`<br>• `test_redaction.py::test_argon2_hash_is_redacted` |
+| MEDIUM ADR-002: `create_owner` check-then-insert, sehingga dua owner global bisa lahir saat bersamaan | **ditutup di service**: `pg_advisory_xact_lock` sebelum cek | `::test_concurrent_bootstrap_creates_exactly_one_owner` (6 panggilan paralel → 1 owner, 5 `OwnerExistsError`). Sebelum fix: 3 test merah. |
+| LOW T6: `RoleGrant` menerima scope dengan newline di akhir | **ditutup**: `fullmatch` | `test_rbac.py::test_unknown_role_or_scope_is_rejected` |
+| LOW T6: (a) tanpa `project_id`, role global memberi izin project; (b) admin global + grant `readonly` project tetap admin di project itu | **dibawa ke WP-1.2/1.1d**: `require_permission` wajib menerima `project_id` untuk resource project, dengan test. (b) sesuai API_CONTRACTS §2 apa adanya. | — |
+
+Diusulkan ke AG-00 (perubahan kontrak, belum dibuat): partial unique index `user_roles(role_name) WHERE role_name='owner' AND scope='global'`. Tujuannya agar invarian single-owner juga dijaga DB, tidak hanya service. Usulan ini menunggu keputusan desain `owner:transfer`.
+
+Hasil setelah perbaikan: `uv run pytest -q` → **164 passed**; ruff, format, pyright, dan lint-imports bersih.
+
+Scanner belum dijalankan oleh reviewer:
+- gitleaks dijalankan di CI;
+- pip-audit dijalankan di CI;
+- semgrep dan trivy belum ada.
+
+Sign-off formal AG-13 tetap diperlukan sebelum G1.

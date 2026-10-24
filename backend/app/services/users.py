@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
@@ -15,8 +16,15 @@ from app.models.identity import User, UserRole
 # passwords [Kemungkinan Besar].
 MIN_PASSWORD_LENGTH = 12
 
+# Serialises owner bootstrap so the "no owner yet" check and the insert cannot interleave (ADR-002).
+_OWNER_BOOTSTRAP_LOCK = "kodekantor.create_owner"
+
 
 class OwnerExistsError(Exception):
+    pass
+
+
+class EmailTakenError(Exception):
     pass
 
 
@@ -37,6 +45,7 @@ async def create_owner(
     if len(password) < MIN_PASSWORD_LENGTH:
         raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
     async with sessions() as session:
+        await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(_OWNER_BOOTSTRAP_LOCK))))
         owner_exists = await session.scalar(
             select(exists().where(UserRole.role_name == "owner", UserRole.scope == "global"))
         )
@@ -44,7 +53,13 @@ async def create_owner(
             raise OwnerExistsError("an owner already exists")
         user = User(email=email, display_name=display_name.strip(), password_hash=hash_password(password))
         session.add(user)
-        await session.flush()
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            if "uq_users_email" not in str(exc.orig):
+                raise
+            # Raised without the DB error attached: its text can carry the INSERT values.
+            raise EmailTakenError("a user with this email already exists") from None
         session.add(UserRole(user_id=user.id, role_name="owner", scope="global"))
         await audit.write(
             session,

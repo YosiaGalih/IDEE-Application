@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from app.models.enums import ROLES
 
-_PROJECT_SCOPE = re.compile(r"^project:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_PROJECT_SCOPE = re.compile(r"project:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 
 GLOBAL_ONLY_PERMISSIONS = frozenset(
     {"admin:users", "admin:policies", "settings:providers", "audit:read", "usage:read_all"}
@@ -52,12 +52,12 @@ class RoleGrant:
     def __post_init__(self) -> None:
         if self.role not in ROLES:
             raise ValueError(f"unknown role {self.role!r}")
-        if self.scope != "global" and not _PROJECT_SCOPE.match(self.scope):
+        if self.scope != "global" and not _PROJECT_SCOPE.fullmatch(self.scope):
             raise ValueError("scope must be 'global' or 'project:<uuid>'")
 
     @property
     def project_id(self) -> uuid.UUID | None:
-        match = _PROJECT_SCOPE.match(self.scope)
+        match = _PROJECT_SCOPE.fullmatch(self.scope)
         return uuid.UUID(match.group(1)) if match else None
 
 

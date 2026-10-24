@@ -14,7 +14,7 @@ from app.core.audit import AuditWriter
 from app.core.config import ConfigError, load_settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.redaction import Redactor
-from app.services.users import OwnerExistsError, create_owner
+from app.services.users import EmailTakenError, OwnerExistsError, create_owner
 
 
 async def _create_owner(args: argparse.Namespace, password: str) -> int:
@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"invalid input: {exc}", file=sys.stderr)
         return 2
-    except OwnerExistsError as exc:
+    except (OwnerExistsError, EmailTakenError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

@@ -32,6 +32,7 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"),  # JWT
+    re.compile(r"\$argon2(?:id|i|d)\$[A-Za-z0-9+/=,$]+"),  # password hash (PHC string)
     # PEM blocks, including a truncated block with no END marker.
     re.compile(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\Z)",

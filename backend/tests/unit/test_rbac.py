@@ -106,6 +106,8 @@ def test_unknown_role_or_scope_is_rejected() -> None:
         RoleGrant("superuser", "global")
     with pytest.raises(ValueError):
         RoleGrant("admin", "project:not-a-uuid")
+    with pytest.raises(ValueError):
+        RoleGrant("admin", f"project:{uuid.uuid4()}\n")
 
 
 def test_unknown_permission_is_rejected() -> None:

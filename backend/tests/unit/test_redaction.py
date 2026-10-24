@@ -237,3 +237,11 @@ def test_bare_jwt_is_redacted(redactor: Redactor) -> None:
 def test_secret_in_dict_key_is_redacted(redactor: Redactor) -> None:
     out = redactor.redact_obj({FAKE_ANTHROPIC: 1})
     assert FAKE_ANTHROPIC not in repr(out)
+
+
+def test_argon2_hash_is_redacted(redactor: Redactor) -> None:
+    # A password hash is a credential verifier: it never leaves the users table (SECURITY_MODEL §8).
+    digest = "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG"
+    out = redactor.redact(f"params ('a@b.test', '{digest}', 'x')")
+    assert "RdescudvJCsgt3ub" not in out
+    assert "c29tZXNhbHQ" not in out
