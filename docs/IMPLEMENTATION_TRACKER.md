@@ -271,6 +271,21 @@ Eksekusi inline (native), bukan subagent per task, demi batas kredit. Rulings di
 | ruff · format · pyright · lint-imports | bersih · 0 error · 2 kontrak dipatuhi |
 | alembic upgrade + check | exit 0, "No new upgrade operations detected" (tanpa migrasi baru) |
 
+**Review WP-1.1d** (`kk-backend-reviewer` + `kk-security-reviewer`, pra-review, bukan sign-off gate):
+
+| Temuan | Status | Bukti |
+|---|---|---|
+| HIGH (kedua reviewer): login gagal memegang 2 koneksi. Sekitar 16 login gagal paralel membuat pool habis selama 30 detik, dan bisa dipicu tanpa autentikasi. | **ditutup**: setiap jalur auth memegang paling banyak 1 koneksi | `test_failed_logins_never_hold_two_connections` (pool 2 koneksi, 9 login paralel) merah → hijau |
+| HIGH: argon2 memblokir event loop | **ditutup**: thread pool 4 worker (`averify_password` / `ahash_password`), di luar row lock | `test_argon2_runs_off_the_event_loop` merah → hijau |
+| MEDIUM (keamanan): burst paralel mengevaluasi 15 tebakan | **ditutup**: reservasi percobaan atomik sebelum verifikasi | `test_lockout_cannot_be_bypassed_by_a_burst` (20 IP, ≤ 5 dievaluasi) merah → hijau |
+| MEDIUM: test race token reset tidak membuktikan `FOR UPDATE` | **ditutup**: test deterministik | `test_reset_waits_for_the_token_row_lock`; mutan tanpa `FOR UPDATE` terbunuh |
+| MEDIUM/LOW lain:<br>• lockout lewat change tidak diaudit<br>• counter lockout membengkak<br>• token reset hidup setelah change<br>• 429 tidak di-log<br>• timeout Redis<br>• `no-store`<br>• reset untuk user disabled<br>• forgot bersamaan<br>• timing forgot<br>• `Depends`<br>• kontrak services ↛ fastapi | **ditutup** | test merah → hijau per butir. Timing forgot: perbaikan struktural (token diterbitkan di background setelah respons). |
+| MEDIUM: `response_model` / `Envelope[T]` | **ditunda ke WP-1.2** | — |
+| MEDIUM (keamanan): kunci IP di belakang proxy (XFF, IPv6 /64, `ip=None`) | **syarat sign-off 🔒 WP-1.5** | — |
+| LOW/NIT: prefix `__Host-` (#29), `csrf_token` mentah (#28), parse header ganda, Origin WebSocket (ADR-059) | dicatat | konflik dokumen dilaporkan |
+
+Hasil setelah perbaikan: `uv run pytest -q` → **432 passed** (commit 7713d59). Sign-off formal AG-13 tetap diperlukan sebelum G1.
+
 Keputusan yang perlu dicek PO ada di spec bagian "Keputusan saya (cek)":
 - TTL token reset 30 menit [Menebak].
 - `remember_me` hanya mengatur `Max-Age`.
@@ -290,3 +305,16 @@ Spec: `docs/superpowers/specs/2026-10-24-wp-1.1e-task-state-machine-design.md`. 
 Catatan:
 - Reviewer paralel yang memakai DB uji yang sama membuat test saling mengganggu. Mulai sekarang setiap proses memakai DB sendiri: `kodekantor_main`, `kodekantor_review`.
 - `dump.rdb` Redis sempat ter-commit, lalu dihapus dari tracking dan diabaikan.
+
+**Review WP-1.1e** (`kk-silent-failure-hunter`; hasil `kk-backend-reviewer` menyusul):
+
+| Temuan | Status | Bukti |
+|---|---|---|
+| HIGH F1: event dari transaksi atau savepoint yang di-rollback ikut terpublish, dengan seq yang dipakai ulang | **ditutup**: hook session (commit → daftar committed; rollback → buang); `publish_pending` hanya mengirim event yang sudah commit | 4 test merah → hijau |
+| MEDIUM F2: audit gagal setelah UPDATE meninggalkan perubahan status tanpa audit | **ditutup**: UPDATE + audit + event dalam satu savepoint; aktor divalidasi dulu | `test_failed_audit_leaves_no_status_change` |
+| MEDIUM F3/F4: `reason` tidak diredaksi; reason > 200 karakter menggagalkan transisi | **ditutup**: `audit` wajib, redaktor-nya dipakai di kolom/event/audit; kolom memotong 200 karakter, event menyimpan utuh | 2 test |
+| MEDIUM F5/F6: kegagalan publish tanpa konteks; publish terlupa | **ditutup sebagian**: log memuat `type`/`seq`/`error_type`, ditambah `commit_and_publish`. Guard statis untuk pemanggil ditunda ke WP-3.x. | 2 test |
+| LOW F8–F11 | **ditutup**:<br>• masuk `queued` menghapus `completed_at`<br>• task yang dihapus → NOT_FOUND; detail versi saat konflik<br>• task dari sesi lain atau status lokal yang diubah ditolak<br>• guard statis diperluas<br>• **trigger DB `tasks_status_guard`** sebagai backstop CLAUDE.md #4 | test per butir |
+| LOW F7 (lock/publish timeout); audit transisi yang ditolak | **ditunda ke WP-3.x**: `write_detached` butuh koneksi kedua, bahaya pool yang sama seperti WP-1.1d | — |
+
+Hasil setelah perbaikan: `uv run pytest -q` → **450 passed**; migrasi naik-turun dan `check` exit 0. `0003_tasks` diedit di tempat untuk trigger karena belum pernah diterapkan di luar DB uji.

@@ -259,6 +259,15 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 25. **Header workbook usang**: sheet *Ringkasan* masih "PRD v1.0", *Status Modul* "20 modul".
 26. **Snapshot compose** `docker-socket-proxy INFO:1` vs ADR-026 `INFO=0` (sudah dicatat sebagai temuan tertunda).
 27. **Token reset password**: API_CONTRACTS §2 menulis token "dicatat di audit/log dev", sedangkan SECURITY_MODEL §6.2 melarang secret masuk DB/log, dan audit disimpan 365 hari. WP-1.1d menulis token hanya di log saat `APP_ENV=development` dan tidak pernah di audit. Menunggu keputusan PO.
+28. **`sessions.csrf_token` disimpan mentah**:
+    - DATA_MODEL mendefinisikan kolom `csrf_token varchar(64)`.
+    - SECURITY_MODEL §6.1 meminta token CSRF disimpan sebagai sha256.
+    - `.claude/rules/backend.md` melarang kolom yang berisi token.
+    - WP-1.1d mengikuti DATA_MODEL. Risikonya rendah, karena token CSRF tidak berguna tanpa cookie sesi.
+    - Menunggu keputusan Lead.
+29. **Nama cookie `kk_session` / `kk_csrf`** (API_CONTRACTS §2) vs usul prefix `__Host-`:
+    - Prefix `__Host-` melindungi dari cookie yang ditanam subdomain saudara, misalnya preview P1.
+    - Pre-review keamanan WP-1.1d mengusulkan agar ini diputuskan sebelum fitur preview.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
