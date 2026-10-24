@@ -81,3 +81,13 @@ def test_live_is_always_ok(settings: Settings) -> None:
     response = TestClient(create_app(settings)).get("/api/v1/health/live")
     assert response.status_code == 200
     assert response.json()["data"] == {"status": "ok"}
+
+
+def test_redis_client_has_explicit_timeouts(settings: Settings) -> None:
+    """A Redis that accepts but never answers must fail the rate limiter fast (fail closed)."""
+    from app.services.health import Dependencies
+
+    deps = Dependencies.from_settings(settings)
+    kwargs = deps.redis.connection_pool.connection_kwargs
+    assert kwargs.get("socket_timeout") == 2.0
+    assert kwargs.get("socket_connect_timeout") == 2.0

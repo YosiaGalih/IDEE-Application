@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
-from app.core.security import hash_password
+from app.core.security import ahash_password
 from app.models.identity import User, UserRole
 
 # Not fixed by the docs; 12 follows NIST SP 800-63B guidance for user-chosen
@@ -50,6 +50,7 @@ async def create_owner(
     if not display_name.strip() or len(display_name) > 120:
         raise ValueError("display_name must be 1-120 characters")
     validate_new_password(password)
+    password_hash = await ahash_password(password)
     async with sessions() as session:
         await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(_OWNER_BOOTSTRAP_LOCK))))
         owner_exists = await session.scalar(
@@ -57,7 +58,7 @@ async def create_owner(
         )
         if owner_exists:
             raise OwnerExistsError("an owner already exists")
-        user = User(email=email, display_name=display_name.strip(), password_hash=hash_password(password))
+        user = User(email=email, display_name=display_name.strip(), password_hash=password_hash)
         session.add(user)
         try:
             await session.flush()

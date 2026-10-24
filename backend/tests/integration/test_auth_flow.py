@@ -440,3 +440,148 @@ async def test_new_password_length_rules(client: httpx.AsyncClient, owner_id: uu
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+async def test_change_password_lockout_is_audited(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    await login(client)
+    for _ in range(5):
+        response = await client.post(
+            CHANGE,
+            json={"current_password": "not-the-password", "new_password": NEW_PASSWORD},
+            headers=csrf(client),
+        )
+        assert response.status_code == 403
+    assert await count_audit(engine, "auth.lockout", owner_id) == 1
+
+
+async def test_two_failures_at_the_limit_leave_a_clean_counter(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE users SET failed_login_count = 4"))
+    await asyncio.gather(*(login(client, password="wrong-password-123") for _ in range(2)))
+    async with make_sessionmaker(engine)() as session:
+        user = await session.get(User, owner_id)
+    assert user is not None and user.locked_until is not None
+    assert user.failed_login_count == 0
+
+
+async def test_change_password_revokes_unused_reset_tokens(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    await issue_reset_token(engine)
+    await login(client)
+    response = await client.post(
+        CHANGE, json={"current_password": PASSWORD, "new_password": NEW_PASSWORD}, headers=csrf(client)
+    )
+    assert response.status_code == 200
+    async with engine.connect() as conn:
+        live = (
+            await conn.execute(text("SELECT count(*) FROM password_reset_tokens WHERE used_at IS NULL"))
+        ).scalar()
+    assert live == 0
+
+
+async def test_rate_limited_attempts_are_logged(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for _ in range(11):
+        await login(client, email="nobody@example.test")
+    out = capsys.readouterr().out
+    assert '"rate_limited"' in out and '"scope": "login"' in out
+    assert "203.0.113.10" not in out
+
+
+@pytest.mark.parametrize("path", [FORGOT, RESET])
+async def test_forgot_and_reset_are_rate_limited(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, path: str
+) -> None:
+    headers = await presession_csrf(client)
+    body = (
+        {"email": "nobody@example.test"} if path == FORGOT else {"token": "x", "new_password": NEW_PASSWORD}
+    )
+    statuses = [(await client.post(path, json=body, headers=headers)).status_code for _ in range(11)]
+    assert statuses[-1] == 429
+    assert 429 not in statuses[:10]
+
+
+@pytest.mark.parametrize("remember", [True, False])
+async def test_remember_me_controls_cookie_max_age(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, remember: bool
+) -> None:
+    response = await client.post(LOGIN, json={"email": EMAIL, "password": PASSWORD, "remember_me": remember})
+    cookie = set_cookie(response, "kk_session").lower()
+    if remember:
+        max_age = int(cookie.split("max-age=")[1].split(";")[0])
+        assert 7 * 86400 - 60 <= max_age <= 7 * 86400
+    else:
+        assert "max-age" not in cookie and "expires" not in cookie
+
+
+async def test_last_seen_written_at_most_once_per_minute(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    await login(client)
+    token_hash = hash_token(client.cookies["kk_session"])
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE sessions SET last_seen_at = now() - interval '30 seconds' WHERE token_hash = :h"),
+            {"h": token_hash},
+        )
+        before = (
+            await conn.execute(
+                text("SELECT last_seen_at FROM sessions WHERE token_hash = :h"), {"h": token_hash}
+            )
+        ).scalar()
+    await client.get(ME)
+    async with engine.connect() as conn:
+        after = (
+            await conn.execute(
+                text("SELECT last_seen_at FROM sessions WHERE token_hash = :h"), {"h": token_hash}
+            )
+        ).scalar()
+    assert after == before
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE sessions SET last_seen_at = now() - interval '2 minutes' WHERE token_hash = :h"),
+            {"h": token_hash},
+        )
+    await client.get(ME)
+    async with engine.connect() as conn:
+        moved = (
+            await conn.execute(
+                text(
+                    "SELECT now() - last_seen_at < interval '10 seconds' FROM sessions WHERE token_hash = :h"
+                ),
+                {"h": token_hash},
+            )
+        ).scalar()
+    assert moved is True
+
+
+async def test_auth_responses_are_not_cached(client: httpx.AsyncClient, owner_id: uuid.UUID) -> None:
+    assert (await login(client)).headers.get("cache-control") == "no-store"
+    assert (await client.get(ME)).headers.get("cache-control") == "no-store"
+
+
+@pytest.mark.parametrize("path", [LOGOUT, CHANGE])
+async def test_session_routes_require_a_session(client: httpx.AsyncClient, path: str) -> None:
+    headers = await presession_csrf(client)
+    body = {"current_password": PASSWORD, "new_password": NEW_PASSWORD} if path == CHANGE else None
+    response = await client.post(path, json=body, headers=headers)
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHENTICATED"
+
+
+async def test_reset_refuses_a_disabled_user(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    token = await issue_reset_token(engine)
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE users SET status = 'disabled'"))
+    response = await client.post(
+        RESET, json={"token": token, "new_password": NEW_PASSWORD}, headers=await presession_csrf(client)
+    )
+    assert response.status_code == 400

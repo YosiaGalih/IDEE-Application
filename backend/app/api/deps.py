@@ -46,11 +46,17 @@ def client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-async def current_user(request: Request) -> AuthContext:
+SessionsDep = Annotated[Sessions, Depends(db_sessions)]
+AuditDep = Annotated[AuditWriter, Depends(audit_writer)]
+LimiterDep = Annotated[FixedWindowLimiter, Depends(rate_limiter)]
+ClientIp = Annotated[str | None, Depends(client_ip)]
+
+
+async def current_user(request: Request, sessions: SessionsDep) -> AuthContext:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         raise AppError("UNAUTHENTICATED", "Authentication required", http_status=401)
-    user, session, grants = await resolve_session(db_sessions(request), request.app.state.settings, token)
+    user, session, grants = await resolve_session(sessions, request.app.state.settings, token)
     # The middleware already checked header == cookie; a pre-session cookie must not authorise a session.
     if request.method in MUTATING_METHODS and not tokens_match(
         session.csrf_token, request.headers.get(CSRF_HEADER)

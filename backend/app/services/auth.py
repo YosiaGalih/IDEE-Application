@@ -1,8 +1,14 @@
-"""Login, sessions and logout (API_CONTRACTS §2, SECURITY_MODEL §8, ADR-002).
+"""Login, sessions, logout and passwords (API_CONTRACTS §2, SECURITY_MODEL §8, ADR-002).
 
-Every login failure (unknown email, locked, disabled, wrong password) returns the same 401. The real
-reason goes only to the audit trail (API_CONTRACTS §11 #17). Sessions are opaque 256-bit tokens; only
-their sha256 is stored.
+- **One response for every login failure.** Unknown email, locked, disabled and wrong password all return
+  the same 401. The real reason goes only to the audit trail (API_CONTRACTS §11 #17).
+- **Equal cost per path.** Each path runs exactly one argon2 verification.
+- **At most one connection per request.** No transaction stays open across argon2, and a request never
+  holds a connection while asking the pool for another one. A request that did both could exhaust the
+  pool under concurrent failures.
+- **Lockout counts attempts, not results.** An attempt reserves a slot before its password is verified,
+  so a concurrent burst still gets at most ``MAX_FAILED_LOGINS`` guesses evaluated per lockout window.
+- **Opaque sessions.** Sessions are 256-bit tokens; only their sha256 is stored.
 """
 
 from __future__ import annotations
@@ -12,15 +18,23 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import case, delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
 from app.core.config import Settings
 from app.core.errors import AppError
+from app.core.logging import get_logger
 from app.core.ratelimit import FixedWindowLimiter, RateLimiterUnavailable
 from app.core.rbac import RoleGrant
-from app.core.security import hash_password, hash_token, needs_rehash, new_token, verify_password
+from app.core.security import (
+    ahash_password,
+    averify_password,
+    hash_password,
+    hash_token,
+    needs_rehash,
+    new_token,
+)
 from app.models.identity import PasswordResetToken, Session, User, UserRole
 from app.services.users import validate_new_password
 
@@ -37,6 +51,7 @@ RESET_TOKEN_TTL = timedelta(minutes=30)
 _DUMMY_HASH = hash_password(secrets.token_urlsafe(16))
 
 Sessions = async_sessionmaker[AsyncSession]
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -60,6 +75,8 @@ async def enforce_rate_limit(limiter: FixedWindowLimiter, key: str) -> None:
             "DEPENDENCY_UNAVAILABLE", "A required dependency is unavailable", http_status=503
         ) from None
     if not decision.allowed:
+        # Logged, not audited: an attacker must not be able to flood the audit trail (spec, Login step 1).
+        logger.warning("rate_limited", scope=key.split(":")[2], retry_after=decision.retry_after)
         raise AppError(
             "RATE_LIMITED",
             "Too many attempts, try again later",
@@ -82,41 +99,40 @@ async def login(
 ) -> LoginResult:
     await enforce_rate_limit(limiter, f"kk:rl:login:{ip}")
     email = email.strip().lower()
+    async with sessions() as db:
+        row = (
+            await db.execute(select(User.id, User.password_hash, User.status).where(User.email == email))
+        ).one_or_none()
+
+    if row is None:
+        await averify_password(_DUMMY_HASH, password)
+        await _deny(sessions, audit, actor_id="anonymous", reason="unknown_email", ip=ip)
+        raise unauthenticated(INVALID_CREDENTIALS)
+    user_id, password_hash, status = row
+    if status != "active":
+        await averify_password(password_hash, password)
+        await _deny(sessions, audit, actor_id=str(user_id), reason="disabled", ip=ip)
+        raise unauthenticated(INVALID_CREDENTIALS)
+    if not await reserve_attempt(sessions, user_id):
+        await averify_password(password_hash, password)
+        await _deny(sessions, audit, actor_id=str(user_id), reason="locked", ip=ip)
+        raise unauthenticated(INVALID_CREDENTIALS)
+    if not await averify_password(password_hash, password):
+        await settle_failure(sessions, audit, user_id, ip=ip)
+        await _deny(sessions, audit, actor_id=str(user_id), reason="bad_password", ip=ip)
+        raise unauthenticated(INVALID_CREDENTIALS)
+
+    rehashed = await ahash_password(password) if needs_rehash(password_hash) else None
     now = datetime.now(UTC)
     async with sessions() as db:
-        user = await db.scalar(select(User).where(User.email == email))
-        if user is None:
-            verify_password(_DUMMY_HASH, password)
-            await _deny(sessions, audit, actor_id="anonymous", reason="unknown_email", ip=ip)
+        user = await db.get(User, user_id)
+        if user is None:  # deleted between the read and now
             raise unauthenticated(INVALID_CREDENTIALS)
-        password_ok = verify_password(user.password_hash, password)
-        if user.locked_until is not None and user.locked_until > now:
-            await _deny(sessions, audit, actor_id=str(user.id), reason="locked", ip=ip)
-            raise unauthenticated(INVALID_CREDENTIALS)
-        if user.status != "active":
-            await _deny(sessions, audit, actor_id=str(user.id), reason="disabled", ip=ip)
-            raise unauthenticated(INVALID_CREDENTIALS)
-        if not password_ok:
-            locked = await record_failure(db, user.id, now)
-            await _deny(sessions, audit, actor_id=str(user.id), reason="bad_password", ip=ip)
-            if locked:
-                await audit.write_detached(
-                    sessions,
-                    actor_type="system",
-                    actor_id="auth",
-                    action="auth.lockout",
-                    result="success",
-                    resource_type="user",
-                    resource_id=str(user.id),
-                    ip=ip,
-                )
-            raise unauthenticated(INVALID_CREDENTIALS)
-
         user.failed_login_count = 0
         user.locked_until = None
         user.last_login_at = now
-        if needs_rehash(user.password_hash):
-            user.password_hash = hash_password(password)
+        if rehashed is not None:
+            user.password_hash = rehashed
         if previous_token:
             # Rotation: the session this browser held before is never reused (SECURITY_MODEL §8).
             await db.execute(
@@ -150,22 +166,61 @@ async def login(
         return LoginResult(user, session_token, csrf_token, expires_at)
 
 
-async def record_failure(db: AsyncSession, user_id: uuid.UUID, now: datetime) -> bool:
-    """Count one failed attempt atomically; return True when this attempt locked the account."""
-    reaches_limit = User.failed_login_count + 1 >= MAX_FAILED_LOGINS
-    count = (
-        await db.execute(
-            update(User)
-            .where(User.id == user_id)
-            .values(
-                failed_login_count=case((reaches_limit, 0), else_=User.failed_login_count + 1),
-                locked_until=case((reaches_limit, now + LOCKOUT), else_=User.locked_until),
+async def reserve_attempt(sessions: Sessions, user_id: uuid.UUID) -> bool:
+    """Take one of the account's ``MAX_FAILED_LOGINS`` attempts before verifying a password.
+
+    Returns False when the account is locked or the attempts are used up by requests still in flight. A
+    successful login gives the slots back (counter reset); a failed one keeps its slot.
+    """
+    now = datetime.now(UTC)
+    async with sessions() as db:
+        granted = (
+            await db.execute(
+                update(User)
+                .where(
+                    User.id == user_id,
+                    User.failed_login_count < MAX_FAILED_LOGINS,
+                    or_(User.locked_until.is_(None), User.locked_until <= now),
+                )
+                .values(failed_login_count=User.failed_login_count + 1)
+                .returning(User.id)
             )
-            .returning(User.failed_login_count)
-        )
-    ).scalar_one()
-    await db.commit()
-    return count == 0
+        ).scalar_one_or_none()
+        await db.commit()
+    return granted is not None
+
+
+async def settle_failure(
+    sessions: Sessions, audit: AuditWriter, user_id: uuid.UUID, *, ip: str | None
+) -> bool:
+    """After a failed verification, lock the account once its attempts are spent (True: this call locked)."""
+    now = datetime.now(UTC)
+    async with sessions() as db:
+        locked = (
+            await db.execute(
+                update(User)
+                .where(
+                    User.id == user_id,
+                    User.failed_login_count >= MAX_FAILED_LOGINS,
+                    or_(User.locked_until.is_(None), User.locked_until <= now),
+                )
+                .values(failed_login_count=0, locked_until=now + LOCKOUT)
+                .returning(User.id)
+            )
+        ).scalar_one_or_none()
+        if locked is not None:
+            await audit.write(
+                db,
+                actor_type="system",
+                actor_id="auth",
+                action="auth.lockout",
+                result="success",
+                resource_type="user",
+                resource_id=str(user_id),
+                ip=ip,
+            )
+        await db.commit()
+    return locked is not None
 
 
 async def _deny(
@@ -238,20 +293,24 @@ async def logout(
 async def request_password_reset(
     sessions: Sessions, audit: AuditWriter, limiter: FixedWindowLimiter, *, email: str, ip: str | None
 ) -> str | None:
+    """Rate-limit, then issue a reset token (see ``issue_password_reset``)."""
+    await enforce_rate_limit(limiter, f"kk:rl:forgot:{ip}")
+    return await issue_password_reset(sessions, audit, email=email, ip=ip)
+
+
+async def issue_password_reset(
+    sessions: Sessions, audit: AuditWriter, *, email: str, ip: str | None
+) -> str | None:
     """Create a single-use reset token for an active user; return it raw, or None if there is no such user.
 
-    The caller never reveals which case happened. Older unused tokens of that user stop working.
+    The caller never reveals which case happened. Older unused tokens of that user stop working; the user row
+    is locked so two concurrent requests cannot both leave a live token.
     """
-    await enforce_rate_limit(limiter, f"kk:rl:forgot:{ip}")
     async with sessions() as db:
-        user = await db.scalar(select(User).where(User.email == email.strip().lower()))
+        user = await db.scalar(select(User).where(User.email == email.strip().lower()).with_for_update())
         if user is None or user.status != "active":
             return None
-        await db.execute(
-            delete(PasswordResetToken).where(
-                PasswordResetToken.user_id == user.id, PasswordResetToken.used_at.is_(None)
-            )
-        )
+        await _delete_unused_reset_tokens(db, user.id)
         token = new_token()
         db.add(
             PasswordResetToken(
@@ -285,17 +344,20 @@ async def reset_password(
 ) -> None:
     await enforce_rate_limit(limiter, f"kk:rl:reset:{ip}")
     validate_new_password(new_password)
+    new_hash = await ahash_password(new_password)  # before any row lock is taken
     now = datetime.now(UTC)
     async with sessions() as db:
         # FOR UPDATE: a concurrent use of the same token waits, then no longer matches ``used_at IS NULL``.
         reset = await db.scalar(
             select(PasswordResetToken)
+            .join(User, User.id == PasswordResetToken.user_id)
             .where(
                 PasswordResetToken.token_hash == hash_token(token),
                 PasswordResetToken.used_at.is_(None),
                 PasswordResetToken.expires_at > now,
+                User.status == "active",
             )
-            .with_for_update()
+            .with_for_update(of=PasswordResetToken)
         )
         if reset is None:
             raise AppError("BAD_REQUEST", "Reset token is invalid or expired", http_status=400)
@@ -303,8 +365,9 @@ async def reset_password(
         await db.execute(
             update(User)
             .where(User.id == reset.user_id)
-            .values(password_hash=hash_password(new_password), failed_login_count=0, locked_until=None)
+            .values(password_hash=new_hash, failed_login_count=0, locked_until=None)
         )
+        await _delete_unused_reset_tokens(db, reset.user_id)
         await _revoke_sessions(db, reset.user_id, now)
         await audit.write(
             db,
@@ -330,29 +393,43 @@ async def change_password(
     ip: str | None,
 ) -> None:
     validate_new_password(new_password)
+    async with sessions() as db:
+        password_hash = await db.scalar(select(User.password_hash).where(User.id == user_id))
+    if password_hash is None:
+        raise unauthenticated()
+    # Wrong current passwords use the login attempts, so a stolen session cannot brute-force the password.
+    reserved = await reserve_attempt(sessions, user_id)
+    if not reserved or not await averify_password(password_hash, current_password):
+        if reserved:
+            await settle_failure(sessions, audit, user_id, ip=ip)
+        await audit.write_detached(
+            sessions,
+            actor_type="user",
+            actor_id=str(user_id),
+            action="auth.password_change",
+            result="denied",
+            resource_type="user",
+            resource_id=str(user_id),
+            metadata={"reason": "bad_password" if reserved else "locked"},
+            ip=ip,
+        )
+        raise AppError("FORBIDDEN", "Current password is incorrect", http_status=403)
+
+    new_hash = await ahash_password(new_password)
     now = datetime.now(UTC)
     async with sessions() as db:
-        user = await db.get(User, user_id, with_for_update=True)
-        if user is None:
-            raise unauthenticated()
-        locked = user.locked_until is not None and user.locked_until > now
-        if locked or not verify_password(user.password_hash, current_password):
-            if not locked:
-                # Counts toward the login lockout, so a stolen session cannot brute-force the password.
-                await record_failure(db, user.id, now)
-            await audit.write_detached(
-                sessions,
-                actor_type="user",
-                actor_id=str(user_id),
-                action="auth.password_change",
-                result="denied",
-                resource_type="user",
-                resource_id=str(user_id),
-                metadata={"reason": "locked" if locked else "bad_password"},
-                ip=ip,
+        # Only if the hash is still the one verified above: a concurrent change or reset wins otherwise.
+        changed = (
+            await db.execute(
+                update(User)
+                .where(User.id == user_id, User.password_hash == password_hash)
+                .values(password_hash=new_hash, failed_login_count=0, locked_until=None)
+                .returning(User.id)
             )
-            raise AppError("FORBIDDEN", "Current password is incorrect", http_status=403)
-        user.password_hash = hash_password(new_password)
+        ).scalar_one_or_none()
+        if changed is None:
+            raise AppError("CONFLICT", "The password changed meanwhile; sign in again", http_status=409)
+        await _delete_unused_reset_tokens(db, user_id)
         await _revoke_sessions(db, user_id, now, keep=session_id)
         await audit.write(
             db,
@@ -365,6 +442,14 @@ async def change_password(
             ip=ip,
         )
         await db.commit()
+
+
+async def _delete_unused_reset_tokens(db: AsyncSession, user_id: uuid.UUID) -> None:
+    await db.execute(
+        delete(PasswordResetToken).where(
+            PasswordResetToken.user_id == user_id, PasswordResetToken.used_at.is_(None)
+        )
+    )
 
 
 async def _revoke_sessions(

@@ -9,8 +9,9 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
 
-from app.api.deps import CurrentUser, audit_writer, client_ip, db_sessions, rate_limiter
+from app.api.deps import AuditDep, ClientIp, CurrentUser, LimiterDep, SessionsDep
 from app.core.context import REQUEST_ID_HEADER
 from app.core.csrf import CSRF_COOKIE, SESSION_COOKIE
 from app.core.errors import envelope, request_id_of
@@ -75,24 +76,29 @@ class UserOut(BaseModel):
         )
 
 
-def ok(request: Request, data: dict[str, Any]) -> JSONResponse:
+def ok(request: Request, data: dict[str, Any], *, background: BackgroundTask | None = None) -> JSONResponse:
     request_id = request_id_of(request)
+    # Auth responses carry identity data and set credentials; no cache may keep them.
     return JSONResponse(
-        envelope(request_id, status="completed", data=data), headers={REQUEST_ID_HEADER: request_id}
+        envelope(request_id, status="completed", data=data),
+        headers={REQUEST_ID_HEADER: request_id, "Cache-Control": "no-store"},
+        background=background,
     )
 
 
 @router.post("/login")
-async def login(body: LoginIn, request: Request) -> JSONResponse:
+async def login(
+    body: LoginIn, request: Request, sessions: SessionsDep, audit: AuditDep, limiter: LimiterDep, ip: ClientIp
+) -> JSONResponse:
     settings = request.app.state.settings
     result = await auth.login(
-        db_sessions(request),
-        audit_writer(request),
-        rate_limiter(request),
+        sessions,
+        audit,
+        limiter,
         settings,
         email=body.email,
         password=body.password,
-        ip=client_ip(request),
+        ip=ip,
         user_agent=request.headers.get("user-agent"),
         previous_token=request.cookies.get(SESSION_COOKIE),
     )
@@ -116,14 +122,10 @@ async def login(body: LoginIn, request: Request) -> JSONResponse:
 
 
 @router.post("/logout")
-async def logout(request: Request, ctx: CurrentUser) -> JSONResponse:
-    await auth.logout(
-        db_sessions(request),
-        audit_writer(request),
-        session_id=ctx.session.id,
-        user_id=ctx.user.id,
-        ip=client_ip(request),
-    )
+async def logout(
+    request: Request, ctx: CurrentUser, sessions: SessionsDep, audit: AuditDep, ip: ClientIp
+) -> JSONResponse:
+    await auth.logout(sessions, audit, session_id=ctx.session.id, user_id=ctx.user.id, ip=ip)
     response = ok(request, {})
     secure = request.app.state.settings.cookie_secure
     response.delete_cookie(SESSION_COOKIE, path="/", secure=secure, httponly=True, samesite="lax")
@@ -145,42 +147,52 @@ async def me(request: Request, ctx: CurrentUser) -> JSONResponse:
 
 
 @router.post("/password/forgot")
-async def forgot_password(body: ForgotIn, request: Request) -> JSONResponse:
-    token = await auth.request_password_reset(
-        db_sessions(request),
-        audit_writer(request),
-        rate_limiter(request),
-        email=body.email,
-        ip=client_ip(request),
-    )
-    # Email delivery is P1. Only a development install prints the link; production never writes the token.
-    if token is not None and request.app.state.settings.app_env == "development":
-        logger.info("password_reset_link", reset_path=f"/reset-password/{token}")
-    return ok(request, {})
+async def forgot_password(
+    body: ForgotIn,
+    request: Request,
+    sessions: SessionsDep,
+    audit: AuditDep,
+    limiter: LimiterDep,
+    ip: ClientIp,
+) -> JSONResponse:
+    await auth.enforce_rate_limit(limiter, f"kk:rl:forgot:{ip}")
+    development = request.app.state.settings.app_env == "development"
+
+    async def issue() -> None:
+        # Runs after the response is sent, so known and unknown emails take the same time to answer.
+        try:
+            token = await auth.issue_password_reset(sessions, audit, email=body.email, ip=ip)
+        except Exception:
+            logger.exception("password_reset_issue_failed")
+            return
+        # Email delivery is P1. Only a development install prints the link; production never writes it.
+        if token is not None and development:
+            logger.info("password_reset_link", reset_path=f"/reset-password/{token}")
+
+    return ok(request, {}, background=BackgroundTask(issue))
 
 
 @router.post("/password/reset")
-async def reset_password(body: ResetIn, request: Request) -> JSONResponse:
+async def reset_password(
+    body: ResetIn, request: Request, sessions: SessionsDep, audit: AuditDep, limiter: LimiterDep, ip: ClientIp
+) -> JSONResponse:
     await auth.reset_password(
-        db_sessions(request),
-        audit_writer(request),
-        rate_limiter(request),
-        token=body.token,
-        new_password=body.new_password,
-        ip=client_ip(request),
+        sessions, audit, limiter, token=body.token, new_password=body.new_password, ip=ip
     )
     return ok(request, {})
 
 
 @router.post("/password/change")
-async def change_password(body: ChangeIn, request: Request, ctx: CurrentUser) -> JSONResponse:
+async def change_password(
+    body: ChangeIn, request: Request, ctx: CurrentUser, sessions: SessionsDep, audit: AuditDep, ip: ClientIp
+) -> JSONResponse:
     await auth.change_password(
-        db_sessions(request),
-        audit_writer(request),
+        sessions,
+        audit,
         user_id=ctx.user.id,
         session_id=ctx.session.id,
         current_password=body.current_password,
         new_password=body.new_password,
-        ip=client_ip(request),
+        ip=ip,
     )
     return ok(request, {})

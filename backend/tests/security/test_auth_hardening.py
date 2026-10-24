@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -216,3 +217,146 @@ async def test_revoked_session_is_rejected(
     async with engine.begin() as conn:
         await conn.execute(text("UPDATE sessions SET revoked_at = now()"))
     assert (await client.get("/api/v1/auth/me")).status_code == 401
+
+
+async def test_failed_logins_never_hold_two_connections(owner_id: uuid.UUID, engine: AsyncEngine) -> None:
+    """Review WP-1.1d HIGH: a denied login held its read session while writing the audit row in a second one,
+    so concurrent failures exhausted the pool (self-deadlock until pool_timeout)."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.db import make_sessionmaker as sessionmaker_for
+
+    await add_user(engine, "locked@example.test", locked_until=datetime.now(UTC) + timedelta(minutes=10))
+    await add_user(engine, "disabled@example.test", status="disabled")
+    small = create_async_engine(make_test_env()["DATABASE_URL"], pool_size=2, max_overflow=0, pool_timeout=3)
+    app, client = await make_client()
+    app.state.dependencies.sessions = sessionmaker_for(small)
+    emails = ["nobody@example.test", "locked@example.test", "disabled@example.test"] * 3
+    try:
+        async with client:
+            responses = await asyncio.gather(*(login(client, email=e) for e in emails[:9]))
+    finally:
+        await app.state.dependencies.aclose()
+        await small.dispose()
+    assert [r.status_code for r in responses] == [401] * 9
+
+
+async def test_argon2_runs_off_the_event_loop(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review WP-1.1d HIGH: argon2 is CPU-bound (~70 ms); on the event loop it froze every request."""
+    import threading
+
+    from app.core import security
+
+    threads: list[str] = []
+    real_verify, real_hash = security.verify_password, security.hash_password
+
+    def spy_verify(password_hash: str, password: str) -> bool:
+        threads.append(threading.current_thread().name)
+        return real_verify(password_hash, password)
+
+    def spy_hash(password: str) -> str:
+        threads.append(threading.current_thread().name)
+        return real_hash(password)
+
+    monkeypatch.setattr(security, "verify_password", spy_verify)
+    monkeypatch.setattr(security, "hash_password", spy_hash)
+    await login(client, email="nobody@example.test")
+    await login(client, password="wrong-password-123")
+    await login(client)
+    change = {"current_password": PASSWORD, "new_password": NEW_PASSWORD}
+    response = await client.post(
+        "/api/v1/auth/password/change", json=change, headers={"X-CSRF-Token": client.cookies["kk_csrf"]}
+    )
+    assert response.status_code == 200
+    assert len(threads) >= 5
+    assert all(name.startswith("argon2") for name in threads), threads
+
+
+async def test_lockout_cannot_be_bypassed_by_a_burst(owner_id: uuid.UUID, engine: AsyncEngine) -> None:
+    """Security pre-review WP-1.1d: a concurrent burst got 15 guesses evaluated, not 5 per lockout window."""
+    app, _ = await make_client()
+    clients = [
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=(f"198.51.100.{i}", 1)), base_url="http://t"
+        )
+        for i in range(20)
+    ]
+    try:
+        responses = await asyncio.gather(
+            *(login(c, password=f"wrong-guess-{i:04d}") for i, c in enumerate(clients))
+        )
+        late = await login(clients[0])
+    finally:
+        for c in clients:
+            await c.aclose()
+        await app.state.dependencies.aclose()
+    assert [r.status_code for r in responses] == [401] * 20
+    assert late.status_code == 401  # the right password no longer helps once the account is locked
+    async with make_sessionmaker(engine)() as session:
+        reasons = (
+            await session.scalars(
+                select(AuditEvent.metadata_).where(
+                    AuditEvent.action == "auth.login", AuditEvent.actor_id == str(owner_id)
+                )
+            )
+        ).all()
+        lockouts = (
+            await session.scalars(
+                select(AuditEvent.id).where(
+                    AuditEvent.action == "auth.lockout", AuditEvent.resource_id == str(owner_id)
+                )
+            )
+        ).all()
+    evaluated = [r for r in reasons if r.get("reason") == "bad_password"]
+    assert len(evaluated) <= 5, reasons
+    assert len(lockouts) == 1
+
+
+async def test_reset_waits_for_the_token_row_lock(owner_id: uuid.UUID, engine: AsyncEngine) -> None:
+    """Deterministic proof of FOR UPDATE: a reset blocked on the token row fails once the holder uses it."""
+    from app.core.errors import AppError
+
+    redis = Redis.from_url(make_test_env()["REDIS_URL"])
+    sessions = make_sessionmaker(engine)
+    try:
+        token = await auth.request_password_reset(
+            sessions, AuditWriter(Redactor()), FixedWindowLimiter(redis), email=EMAIL, ip=None
+        )
+        async with sessions() as holder:
+            await holder.execute(text("SELECT id FROM password_reset_tokens FOR UPDATE"))
+            racer = asyncio.create_task(
+                auth.reset_password(
+                    sessions,
+                    AuditWriter(Redactor()),
+                    FixedWindowLimiter(redis),
+                    token=token or "",
+                    new_password=NEW_PASSWORD,
+                    ip=None,
+                )
+            )
+            await asyncio.sleep(0.5)
+            assert not racer.done()  # blocked on the row lock
+            await holder.execute(text("UPDATE password_reset_tokens SET used_at = now()"))
+            await holder.commit()
+        with pytest.raises(AppError) as caught:
+            await racer
+        assert caught.value.code == "BAD_REQUEST"
+    finally:
+        await redis.aclose()
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type"),
+    [
+        ('{"email": "a@b.c", "password": "x"}', "text/plain"),
+        ("email=a%40b.c&password=x", "application/x-www-form-urlencoded"),
+    ],
+)
+async def test_login_rejects_non_json_bodies(
+    client: httpx.AsyncClient, content: str, content_type: str
+) -> None:
+    """The login CSRF exemption is safe only because a cross-site form cannot send JSON."""
+    response = await client.post(LOGIN, content=content, headers={"Content-Type": content_type})
+    assert response.status_code == 422

@@ -25,6 +25,7 @@ from app.core.logging import get_logger
 ReadinessCheck = Callable[[], Awaitable[bool]]
 
 CHECK_TIMEOUT_SECONDS = 2.0
+REDIS_TIMEOUT_SECONDS = 2.0
 ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
 
 logger = get_logger(__name__)
@@ -52,7 +53,13 @@ class Dependencies:
         engine = make_engine(settings.database_url)
         return cls(
             engine=engine,
-            redis=Redis.from_url(settings.redis_url),
+            # Explicit timeouts: a Redis that accepts but never answers must fail fast (rate limiting fails
+            # closed on it), whatever the redis-py default is.
+            redis=Redis.from_url(
+                settings.redis_url,
+                socket_timeout=REDIS_TIMEOUT_SECONDS,
+                socket_connect_timeout=REDIS_TIMEOUT_SECONDS,
+            ),
             http=httpx.AsyncClient(timeout=CHECK_TIMEOUT_SECONDS),
             sandbox_manager_url=settings.sandbox_manager_url.rstrip("/"),
             # Read once at startup: building ScriptDirectory imports every revision module (blocking I/O).

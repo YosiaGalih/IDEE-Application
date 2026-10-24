@@ -85,5 +85,12 @@ forbidden_modules = ["anthropic", "requests", "subprocess"]
 # WP-2.x adds app.gitops -> subprocess; WP-3.1 adds: ignore_imports = ["app.llm.anthropic_provider -> anthropic"]
 allow_indirect_imports = true
 
+[[tool.importlinter.contracts]]
+name = "Services stay framework-free (thin routes, ARCHITECTURE §4.1)"
+type = "forbidden"
+source_modules = ["app.services", "app.workflow"]
+forbidden_modules = ["fastapi", "starlette"]
+allow_indirect_imports = true
+
 [tool.ruff.lint.isort]
 known-third-party = ["alembic"]
