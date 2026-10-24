@@ -103,7 +103,7 @@ async def test_writer_normalises_metadata_to_json_and_redacts_free_text(session:
         actor_id="worker",
         action="tool.denied",
         result="denied",
-        resource_id="token=abcdef123456",
+        resource_id="token=abcdef123456",  # gitleaks:allow (synthetic fixture)
         metadata={"tags": {"b", "a"}, "ratio": float("nan"), "accessToken": "zzz12345"},
     )
     await session.commit()

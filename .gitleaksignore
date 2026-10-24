@@ -1,0 +1,5 @@
+# Synthetic secrets in redaction/audit tests (SECURITY_MODEL §6.2 fixtures); none is a real credential.
+# New fixtures carry an inline "gitleaks:allow" comment instead of an entry here.
+4faf0ffa12c03fe1b2b5d4b241a9bfad81e1d91c:backend/tests/unit/test_redaction.py:curl-auth-header:168
+6b7b588e842654f07f483d299ec6c07e8f0555cc:backend/tests/unit/test_redaction.py:jwt:227
+6b7b588e842654f07f483d299ec6c07e8f0555cc:backend/tests/integration/test_core_audit.py:generic-api-key:108
