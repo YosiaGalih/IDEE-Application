@@ -89,7 +89,33 @@ def _requirement_names(lines: list[str]) -> set[str]:
     return names
 
 
+_PARSE_ERRORS = (ValueError, TypeError, AttributeError, RecursionError)  # hostile or odd markers
+
+
+def _toml(text: str) -> dict[str, Any]:
+    try:
+        return tomllib.loads(text)
+    except _PARSE_ERRORS:
+        return {}
+
+
+def _json_object(text: str) -> dict[str, Any]:
+    try:
+        loaded = json.loads(text)
+    except _PARSE_ERRORS:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def _pyproject_deps(data: dict[str, Any]) -> set[str]:
+    """Dependency names; a marker with unexpected types contributes nothing instead of failing."""
+    try:
+        return _pyproject_deps_unchecked(data)
+    except _PARSE_ERRORS:
+        return set()
+
+
+def _pyproject_deps_unchecked(data: dict[str, Any]) -> set[str]:
     project = data.get("project", {})
     lines: list[str] = list(project.get("dependencies", []))
     for group in project.get("optional-dependencies", {}).values():
@@ -131,10 +157,7 @@ class _Detector:
         deps: set[str] = set()
         pyproject: dict[str, Any] = {}
         if self.has(folder, "pyproject.toml") and (text := await self.read(f"{folder}pyproject.toml")):
-            try:
-                pyproject = tomllib.loads(text)
-            except tomllib.TOMLDecodeError:
-                pyproject = {}
+            pyproject = _toml(text)
             deps |= _pyproject_deps(pyproject)
         for path in requirements:
             if text := await self.read(path):
@@ -150,7 +173,8 @@ class _Detector:
         if self.has(folder, "manage.py"):
             found.frameworks.add("django")
 
-        pytest_config = "pytest" in pyproject.get("tool", {})
+        tool = pyproject.get("tool")
+        pytest_config = isinstance(tool, dict) and "pytest" in tool
         test_layout = any(
             p.startswith(f"{folder}tests/")
             or p.rsplit("/", 1)[-1].startswith("test_")
@@ -173,11 +197,7 @@ class _Detector:
             found.languages.add("html")
         package: dict[str, Any] = {}
         if text := await self.read(f"{folder}package.json"):
-            try:
-                loaded = json.loads(text)
-            except ValueError:
-                loaded = {}
-            package = loaded if isinstance(loaded, dict) else {}
+            package = _json_object(text)
         deps: set[str] = set()
         for key in ("dependencies", "devDependencies"):
             section = package.get(key)

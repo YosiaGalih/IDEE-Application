@@ -57,7 +57,7 @@ from app.workspace.errors import (
 )
 from app.workspace.patches import FilePatch, HunkConflict, apply_hunks, parse_unified_diff
 from app.workspace.paths import open_parent, open_root, resolve
-from app.workspace.policy import AGENTIGNORE, Access, AgentignoreInvalid, Policy
+from app.workspace.policy import AGENTIGNORE, Access, AgentignoreInvalid, Budget, Policy, PolicyBudgetExceeded
 
 logger = get_logger(__name__)
 
@@ -69,6 +69,8 @@ AGENTIGNORE_LIMIT = 64 * 1024
 LOCK_WAIT_S = 10.0  # [Menebak]
 LOCKS_DIRNAME = ".kk-locks"
 MAX_TREE_DEPTH = 10
+TREE_POLICY_BUDGET = 2_000_000  # [Menebak] .agentignore matching cells per tree() call; then truncated
+MAX_WALK_DEPTH = 256  # folders open at once in disk_usage; API paths stop at 128 segments
 MAX_TREE_ENTRIES = 5000
 TEMP_PREFIX = ".kk-tmp-"
 _SNIFF_BYTES = 8192
@@ -526,9 +528,14 @@ class Workspace:
         return [plan.change for plan in plans]
 
     def _tree(self, rel: str, access: Access, depth: int, max_entries: int) -> TreeResult:
-        """Breadth-first, so a truncated listing still shows every entry of the upper levels."""
+        """Breadth-first, so a truncated listing still shows every entry of the upper levels.
+
+        Policy matching for the whole listing shares one budget; when it runs out the listing stops and is
+        reported truncated (a hostile ``.agentignore`` cannot turn one call into minutes of work).
+        """
         with self._opened() as (root_fd, real):
             policy = self._policy(root_fd, access)
+            budget = Budget(TREE_POLICY_BUDGET)
             start = resolve(real, rel, access, policy)
             top: list[TreeEntry] = []
             queue: deque[tuple[tuple[str, ...], list[TreeEntry], int]] = deque([(start, top, 1)])
@@ -537,7 +544,9 @@ class Workspace:
             while queue:
                 parts, into, level = queue.popleft()
                 try:
-                    listed = _list_dir(root_fd, real, parts, access, policy)
+                    listed = _list_dir(root_fd, real, parts, access, policy, budget)
+                except PolicyBudgetExceeded:
+                    return TreeResult(top, truncated=True)
                 except (WorkspaceNotFound, PathViolation):
                     if first:
                         raise
@@ -555,17 +564,37 @@ class Workspace:
         return TreeResult(top, truncated=False)
 
     def _disk_usage(self) -> int:
+        """Iterative, fd-based walk; at most ``MAX_WALK_DEPTH`` folders open at once."""
         total = 0
         with self._opened() as (root_fd, _):
-            walk = os.fwalk(".", dir_fd=root_fd, follow_symlinks=False, onerror=_log_walk_error)
-            for _folder, _dirs, files, dir_fd in walk:
-                for name in files:
+            stack: list[tuple[int, Iterator[str]]] = []
+            try:
+                fd = os.dup(root_fd)
+                stack.append((fd, iter(_names(fd))))
+                while stack:
+                    fd, names = stack[-1]
+                    name = next(names, None)
+                    if name is None:
+                        os.close(fd)
+                        stack.pop()
+                        continue
                     try:
-                        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                        st = os.stat(name, dir_fd=fd, follow_symlinks=False)
                     except FileNotFoundError:
                         continue
                     if stat.S_ISREG(st.st_mode):
                         total += st.st_size
+                    elif stat.S_ISDIR(st.st_mode):
+                        if len(stack) >= MAX_WALK_DEPTH:
+                            raise PathViolation("too_deep")  # deeper than any path the API can address
+                        try:
+                            child = os.open(name, _DIR_FLAGS, dir_fd=fd)
+                        except OSError:
+                            continue  # swapped for a link or removed mid-walk: never followed
+                        stack.append((child, iter(_names(child))))
+            finally:
+                for fd, _ in stack:
+                    os.close(fd)
         return total
 
 
@@ -575,8 +604,13 @@ def _invalid_policy(access: Access) -> Policy:
     return Policy()  # the user can still read, and repair the file
 
 
-def _log_walk_error(exc: OSError) -> None:
-    logger.warning("workspace_walk_error", error_type=type(exc).__name__)
+def _names(dir_fd: int) -> list[str]:
+    try:
+        with os.scandir(dir_fd) as scan:
+            return [entry.name for entry in scan]
+    except OSError as exc:
+        logger.warning("workspace_walk_error", error_type=type(exc).__name__)
+        return []
 
 
 class TaskWorkspace:
@@ -753,7 +787,7 @@ def _open_dir_at(root_fd: int, parts: tuple[str, ...]) -> int:
 
 
 def _list_dir(
-    root_fd: int, real: str, parts: tuple[str, ...], access: Access, policy: Policy
+    root_fd: int, real: str, parts: tuple[str, ...], access: Access, policy: Policy, budget: Budget
 ) -> list[tuple[TreeEntry, tuple[str, ...] | None]]:
     """One directory's visible entries, folders first. A child to descend into carries its parts."""
     fd = _open_dir_at(root_fd, parts)
@@ -763,7 +797,7 @@ def _list_dir(
         listed: list[tuple[TreeEntry, tuple[str, ...] | None]] = []
         for name in names:
             child = (*parts, name)
-            if name.startswith(TEMP_PREFIX) or policy.denied(child, access):
+            if name.startswith(TEMP_PREFIX) or policy.denied(child, access, budget):
                 continue
             path = "/".join(child)
             try:
@@ -774,7 +808,9 @@ def _list_dir(
                 listed.append((TreeEntry(path, name, "dir", None, None), child))
             elif stat.S_ISREG(st.st_mode):
                 listed.append((TreeEntry(path, name, "file", st.st_size, None), None))
-            elif stat.S_ISLNK(st.st_mode) and (target := _link_target(root_fd, real, child, access, policy)):
+            elif stat.S_ISLNK(st.st_mode) and (
+                target := _link_target(root_fd, real, child, access, policy, budget)
+            ):
                 kind, size = target
                 listed.append((TreeEntry(path, name, kind, size, None), None))  # never descended
     finally:
@@ -783,11 +819,11 @@ def _list_dir(
 
 
 def _link_target(
-    root_fd: int, real: str, child: tuple[str, ...], access: Access, policy: Policy
+    root_fd: int, real: str, child: tuple[str, ...], access: Access, policy: Policy, budget: Budget
 ) -> tuple[Literal["file", "dir"], int | None] | None:
     """What an in-root symlink points at; ``None`` hides escaping, dangling, or denied links."""
     try:
-        resolved = resolve(real, "/".join(child), access, policy)
+        resolved = resolve(real, "/".join(child), access, policy, budget)
     except PathViolation:
         return None
     if not resolved:

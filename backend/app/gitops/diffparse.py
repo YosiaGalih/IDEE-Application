@@ -88,25 +88,42 @@ def _blocks(patch: bytes) -> list[list[bytes]]:
     return blocks
 
 
-def parse(output: bytes, *, base: str, head: str | None, max_bytes: int) -> Diff:
+def parse(
+    output: bytes, *, base: str, head: str | None, max_bytes: int, output_truncated: bool = False
+) -> Diff:
+    """Pair raw entries with patch blocks. A type change (``T``, e.g. file → symlink) has two blocks.
+
+    ``output_truncated``: git's output was cut at the adapter's cap. Files whose blocks were cut off are
+    listed without hunks and the diff is marked truncated, instead of failing.
+    """
     tokens = output.split(b"\0")
     entries, i = _entries(tokens)
     patch = b"\0".join(tokens[i + 1 :]) if i < len(tokens) else b""
     blocks = _blocks(patch)
-    if len(blocks) != len(entries):
+    needed = sum(2 if letter == "T" else 1 for letter, _ in entries)
+    if len(blocks) != needed and not (output_truncated and len(blocks) < needed):
         raise GitError("diff_parse")
 
     budget = max_bytes
-    truncated = False
+    truncated = output_truncated
     files: list[DiffFile] = []
-    for (letter, path), block in zip(entries, blocks, strict=True):
+    cursor = 0
+    for letter, path in entries:
         status = _STATUS[letter]
         item = DiffFile(path, None if status == "added" else path, status)
+        take = 2 if letter == "T" else 1
+        # A block boundary resets the hunk: the second block's "---"/"+++" headers are not diff lines.
+        lines = [line for block in blocks[cursor : cursor + take] for line in (b"diff --git ", *block)]
+        cursor += take
         hunk: DiffHunk | None = None
         old_no = new_no = 0
-        for line in block:
-            if line.startswith((b"Binary files ", b"GIT binary patch")) and hunk is None:
+        for line in lines:
+            if line == b"diff --git ":
+                hunk = None
+                continue
+            if line.startswith((b"Binary files ", b"GIT binary patch")):
                 item.is_binary = True
+                hunk = None
                 continue
             if (match := _HUNK.match(line)) is not None:
                 old_no, new_no = int(match[1]), int(match[3])

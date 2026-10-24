@@ -26,6 +26,7 @@ from app.workspace.errors import PatchRejected
 
 MAX_DIFF_BYTES = 1024 * 1024  # [Menebak]
 MAX_FILES = 200  # [Menebak]
+OFFSET_SEARCH_BUDGET = 5_000_000  # [Menebak] line comparisons per file when a hunk has moved
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _HEADER_REJECTS = (
     (("rename from", "rename to", "similarity index", "dissimilarity index"), "rename"),
@@ -195,6 +196,8 @@ def parse_unified_diff(text: str) -> list[FilePatch]:
             mode = None
         elif line.startswith(("Binary files ", "GIT binary patch")):
             raise PatchRejected("binary")
+        elif line.startswith("@@"):
+            raise PatchRejected("malformed")  # a hunk cut off from its file header: never skip it
         else:
             i += 1
         if len(patches) > MAX_FILES:
@@ -234,6 +237,7 @@ def apply_hunks(old: str | None, hunks: list[Hunk]) -> str:
     cursor = 0  # index in old_lines up to which the output is final
     delta = 0  # offset found for the previous hunk, carried to the next (as ``patch`` does)
     eof_hunk: Hunk | None = None
+    work = 0
     for index, hunk in enumerate(hunks):
         expected = [text for tag, text in hunk.lines if tag in " -"]
         size = len(expected)
@@ -248,11 +252,15 @@ def apply_hunks(old: str | None, hunks: list[Hunk]) -> str:
         elif not expected:
             raise HunkConflict(index, "context_mismatch")  # a pure insertion has no context to search for
         else:
-            found = [at for at in at_line.get(expected[0], ()) if at >= cursor and matches(at)]
+            candidates = at_line.get(expected[0], [])
+            work += len(candidates) * size  # line comparisons this search may cost
+            if work > OFFSET_SEARCH_BUDGET:
+                raise HunkConflict(index, "too_complex")  # e.g. a long hunk over a file of identical lines
+            found = [at for at in candidates if at >= cursor and matches(at)]
             if len(found) > 1:
                 raise HunkConflict(index, "ambiguous")
             if not found:
-                earlier = any(at < cursor and matches(at) for at in at_line.get(expected[0], ()))
+                earlier = any(at < cursor and matches(at) for at in candidates)
                 raise HunkConflict(index, "overlap" if earlier else "context_mismatch")
             pos = found[0]
         if old_lines and pos + size == len(old_lines) and hunk.old_no_eol != (old_lines[-1][1] == ""):

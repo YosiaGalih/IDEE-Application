@@ -203,11 +203,11 @@ async def test_merge_clean(git: GitAdapter, repo: GitTarget) -> None:
     task = await git.create_worktree(repo.repo, repo.repo.parent / "tasks" / "t1", "kk/task-00000001", base)
     write(task.worktree / "new.py", "x = 1\n")  # type: ignore[operator]
     await git.commit_all(task, "task", ME)
-    result = await git.merge_branch(repo.repo, "kk/task-00000001", "apply task", ME)
+    result = await git.merge_branch(repo.repo, "kk/task-00000001", "apply task", ME, into="main")
     assert (result.merged, result.reason, result.conflicts) == (True, "merged", [])
     assert result.commit == await git.current_commit(repo)
     assert (repo.repo / "new.py").read_text() == "x = 1\n"
-    again = await git.merge_branch(repo.repo, "kk/task-00000001", "apply task", ME)
+    again = await git.merge_branch(repo.repo, "kk/task-00000001", "apply task", ME, into="main")
     assert (again.merged, again.reason) == (False, "up_to_date")
 
 
@@ -219,7 +219,7 @@ async def test_merge_conflict_aborts(git: GitAdapter, repo: GitTarget) -> None:
     await git.commit_all(task, "task edit", ME)
     write(repo.repo / "f.txt", "a\nUSER\nc\n")
     head = await git.commit_all(repo, "user edit", ME)
-    result = await git.merge_branch(repo.repo, "kk/task-00000002", "apply task", ME)
+    result = await git.merge_branch(repo.repo, "kk/task-00000002", "apply task", ME, into="main")
     assert (result.merged, result.reason, result.conflicts, result.commit) == (
         False,
         "conflict",
@@ -238,7 +238,7 @@ async def test_merge_refuses_dirty_tree(git: GitAdapter, repo: GitTarget) -> Non
     write(task.worktree / "f.txt", "task\n")  # type: ignore[operator]
     await git.commit_all(task, "task", ME)
     write(repo.repo / "f.txt", "uncommitted user edit\n")
-    result = await git.merge_branch(repo.repo, "kk/task-00000003", "apply", ME)
+    result = await git.merge_branch(repo.repo, "kk/task-00000003", "apply", ME, into="main")
     assert (result.merged, result.reason) == (False, "dirty")
     assert (repo.repo / "f.txt").read_text() == "uncommitted user edit\n"
 
@@ -250,7 +250,7 @@ async def test_merge_refuses_untracked_overwrite(git: GitAdapter, repo: GitTarge
     write(task.worktree / "notes.txt", "from task\n")  # type: ignore[operator]
     await git.commit_all(task, "task", ME)
     write(repo.repo / "notes.txt", "user's own untracked notes\n")
-    result = await git.merge_branch(repo.repo, "kk/task-00000004", "apply", ME)
+    result = await git.merge_branch(repo.repo, "kk/task-00000004", "apply", ME, into="main")
     assert (result.merged, result.reason) == (False, "dirty")
     assert (repo.repo / "notes.txt").read_text() == "user's own untracked notes\n"
 
@@ -279,3 +279,55 @@ async def test_workspace_temp_files_are_never_committed(git: GitAdapter, repo: G
     parent = (await git.log(repo, 2))[1].commit
     diff = await git.diff(repo, base=parent, head="main")
     assert [f.path for f in diff.files] == ["real.txt"]
+
+
+# --- review regressions (WP-1.2c) ---------------------------------------------------------------------------
+
+
+async def test_type_change_is_one_modified_file(git: GitAdapter, repo: GitTarget) -> None:
+    """A file replaced by a symlink is one raw entry but two patch blocks (backend re-review)."""
+    (repo.repo / "keep.md").unlink()
+    os.symlink("f.txt", repo.repo / "keep.md")
+    diff = await git.diff(repo)
+    assert [(f.path, f.status) for f in diff.files] == [("keep.md", "modified")]
+    assert diff.files[0].deletions == 1 and diff.files[0].additions == 1
+
+
+async def test_large_diff_truncates_instead_of_failing(git: GitAdapter, repo: GitTarget) -> None:
+    small_cap = GitAdapter(max_output=4096)
+    write(repo.repo / "big.txt", "".join(f"line {i}\n" for i in range(5000)))
+    write(repo.repo / "z_after.txt", "z\n")
+    diff = await small_cap.diff(repo)
+    assert diff.truncated is True
+    assert {f.path for f in diff.files} >= {"big.txt", "z_after.txt"}  # every changed file is still listed
+
+
+async def test_working_tree_diff_writes_nothing_to_the_repo(git: GitAdapter, repo: GitTarget) -> None:
+    store = repo.repo / ".git" / "objects"
+
+    def objects() -> set[str]:
+        return {str(p.relative_to(store)) for p in store.rglob("*") if p.is_file()}
+
+    before = objects()
+    write(repo.repo / "untracked.txt", "fresh content never committed\n")
+    diff = await git.diff(repo)
+    assert "untracked.txt" in {f.path for f in diff.files}
+    assert objects() == before
+
+
+async def test_merge_refuses_the_wrong_branch(git: GitAdapter, repo: GitTarget) -> None:
+    base = await git.current_commit(repo)
+    assert base is not None
+    task = await git.create_worktree(repo.repo, repo.repo.parent / "tasks" / "t1", "kk/task-00000006", base)
+    write(task.worktree / "x.py", "x\n")  # type: ignore[operator]
+    await git.commit_all(task, "task", ME)
+    with pytest.raises(GitError) as caught:
+        await git.merge_branch(repo.repo, "kk/task-00000006", "apply", ME, into="develop")
+    assert caught.value.reason == "wrong_branch"
+    assert not (repo.repo / "x.py").exists()
+
+
+async def test_init_missing_folder(tmp_path: Path, git: GitAdapter) -> None:
+    with pytest.raises(GitError) as caught:
+        await git.init(tmp_path / "nope", "main")
+    assert caught.value.reason == "not_found"

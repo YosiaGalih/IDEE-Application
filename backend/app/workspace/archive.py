@@ -24,11 +24,13 @@ top-level entry is ``src/`` into a different layout.
 from __future__ import annotations
 
 import contextlib
+import errno
 import gzip
 import os
 import secrets
 import shutil
 import stat
+import struct
 import tarfile
 import zipfile
 import zlib
@@ -45,6 +47,7 @@ _CHUNK = 64 * 1024
 _PROGRESS_EVERY = 100
 _FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_ZIP_METHODS = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)  # streamed with bounded reads by zipfile
 # Errors raised by the decoders for a damaged or unsupported archive. Plain OSError is not here: a write
 # failure (disk full) is a real error, not a bad archive.
 _FORMAT_ERRORS = (
@@ -55,6 +58,8 @@ _FORMAT_ERRORS = (
     gzip.BadGzipFile,
     NotImplementedError,
     RuntimeError,
+    ValueError,  # includes UnicodeDecodeError for a name flagged UTF-8 that is not
+    struct.error,
 )
 
 
@@ -131,7 +136,7 @@ class _Extractor:
             raise ArchiveRejected(
                 exc.reason if exc.reason in ("absolute", "traversal") else "invalid_name"
             ) from None
-        if ".git" in parts:
+        if any(segment.lower() == ".git" for segment in parts):
             raise ArchiveRejected("git_dir")
         return parts
 
@@ -193,6 +198,10 @@ class _Extractor:
                     raise ArchiveRejected("device")
                 if info.flag_bits & 0x1:
                     raise ArchiveRejected("format")  # encrypted
+                if info.compress_type not in _ZIP_METHODS:
+                    # zipfile inflates BZIP2/LZMA members in one unbounded call: the byte counter would
+                    # only see the output after it had already been allocated.
+                    raise ArchiveRejected("format")
                 if info.is_dir() or kind == stat.S_IFDIR:
                     self.add_dir(parts)
                     continue
@@ -273,6 +282,10 @@ def import_archive(
                     extractor.extract_tar(archive, compressed=kind == "tar.gz")
             except _FORMAT_ERRORS:
                 raise ArchiveRejected("format") from None
+            except OSError as exc:
+                if exc.errno == errno.EINVAL:  # zipfile seeking to a corrupt offset; disk errors stay real
+                    raise ArchiveRejected("format") from None
+                raise
             stripped = _single_root(staging_fd) if strip_single_root else None
         finally:
             os.close(staging_fd)

@@ -20,7 +20,7 @@ import stat
 from pathlib import Path
 
 from app.workspace.errors import PathViolation, WorkspaceNotFound
-from app.workspace.policy import Access, Policy
+from app.workspace.policy import Access, Budget, Policy
 
 MAX_SEGMENT_BYTES = 255
 MAX_PATH_BYTES = 4096
@@ -58,10 +58,12 @@ def split_rel(rel: str) -> tuple[str, ...]:
     return tuple(parts)
 
 
-def resolve(root_real: str, rel: str, access: Access, policy: Policy) -> tuple[str, ...]:
+def resolve(
+    root_real: str, rel: str, access: Access, policy: Policy, budget: Budget | None = None
+) -> tuple[str, ...]:
     """The segments to open for ``rel`` under the (already real) root, or ``PathViolation``."""
     requested = split_rel(rel)
-    if policy.denied(requested, access):
+    if policy.denied(requested, access, budget):
         raise PathViolation("denied")
     try:
         real = _realpath(os.path.join(root_real, *requested))
@@ -70,10 +72,12 @@ def resolve(root_real: str, rel: str, access: Access, policy: Policy) -> tuple[s
     if os.path.commonpath([root_real, real]) != root_real:
         raise PathViolation("outside_root")
     resolved = Path(real).relative_to(root_real).parts
+    if len(resolved) > MAX_DEPTH:  # an in-root link into a deeper tree than any requested path may name
+        raise PathViolation("too_long")
     if resolved != requested:
         if access in _WRITES:
             raise PathViolation("symlink")
-        if policy.denied(resolved, access):
+        if policy.denied(resolved, access, budget):
             raise PathViolation("denied")
     return resolved
 

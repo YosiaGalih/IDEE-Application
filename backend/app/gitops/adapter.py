@@ -130,6 +130,7 @@ class _Result:
     returncode: int
     stdout: bytes
     stderr: bytes
+    truncated: bool = False  # stdout was cut at ``max_output`` (only when the caller allowed it)
 
 
 class _TooLarge(Exception):
@@ -160,8 +161,11 @@ def _ref(ref: str) -> str:
         raise GitInputError("ref") from None
 
 
+_MESSAGE_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # log() separates fields with \x1e/\x1f
+
+
 def _message(message: str) -> str:
-    if not 1 <= len(message) <= 5000 or "\x00" in message:
+    if not 1 <= len(message) <= 5000 or _MESSAGE_FORBIDDEN.search(message):
         raise GitInputError("message")
     return message
 
@@ -216,7 +220,9 @@ class GitAdapter:
         cwd: Path,
         env: dict[str, str] | None = None,
         check: bool = True,
+        truncate: bool = False,
     ) -> _Result:
+        """Run git. ``truncate``: past ``max_output`` stop reading and return what was read (no error)."""
         argv = [self.git]
         for setting in _CONFIG:
             argv += ["-c", setting]
@@ -235,7 +241,7 @@ class GitAdapter:
             start_new_session=True,  # its own process group, so a timeout kills every child too
         )
         try:
-            stdout, stderr = await asyncio.wait_for(self._collect(proc), self.timeout_s)
+            stdout, stderr, cut = await asyncio.wait_for(self._collect(proc, truncate), self.timeout_s)
         except TimeoutError:
             await _kill(proc)
             raise GitError("timeout") from None
@@ -245,40 +251,55 @@ class GitAdapter:
         except BaseException:
             await _kill(proc)
             raise
-        result = _Result(proc.returncode if proc.returncode is not None else -1, stdout, stderr)
-        if check and result.returncode != 0:
+        result = _Result(proc.returncode if proc.returncode is not None else -1, stdout, stderr, cut)
+        if check and result.returncode != 0 and not cut:
             self._log_failure(args[0], result, work_tree or cwd)
             raise GitError(f"{args[0]}_failed")
         return result
 
-    async def _collect(self, proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    async def _collect(self, proc: asyncio.subprocess.Process, truncate: bool) -> tuple[bytes, bytes, bool]:
         assert proc.stdout is not None and proc.stderr is not None
+        stdout_stream, stderr_stream = proc.stdout, proc.stderr
 
-        async def out() -> bytes:
+        async def out() -> tuple[bytes, bool]:
             chunks: list[bytes] = []
             size = 0
-            while chunk := await proc.stdout.read(_CHUNK):  # type: ignore[union-attr]
+            while chunk := await stdout_stream.read(_CHUNK):
+                if size + len(chunk) > self.max_output:
+                    if not truncate:
+                        raise _TooLarge()
+                    chunks.append(chunk[: self.max_output - size])
+                    return b"".join(chunks), True
                 size += len(chunk)
-                if size > self.max_output:
-                    raise _TooLarge()
                 chunks.append(chunk)
-            return b"".join(chunks)
+            return b"".join(chunks), False
 
         async def err() -> bytes:
             kept = bytearray()
-            while chunk := await proc.stderr.read(_CHUNK):  # type: ignore[union-attr]
+            while chunk := await stderr_stream.read(_CHUNK):
                 kept += chunk[: max(0, STDERR_KEEP - len(kept))]
             return bytes(kept)
 
-        stdout, stderr = await asyncio.gather(out(), err())
+        err_task = asyncio.ensure_future(err())
+        try:
+            stdout, cut = await out()
+            if cut:
+                await _kill(proc)  # stop git; the rest of its output is not wanted
+            stderr = await err_task
+        finally:
+            err_task.cancel()
         await proc.wait()
-        return stdout, stderr
+        return stdout, stderr, cut
 
     def _log_failure(self, command: str, result: _Result, tree: Path) -> None:
         text = result.stderr.decode("utf-8", "replace").replace(str(tree.parent), "<workspace>")
         logger.warning("git_failed", command=command, returncode=result.returncode, stderr=text)
 
     # --- targets -----------------------------------------------------------------------------------------
+
+    async def _adirs(self, target: GitTarget) -> tuple[Path, Path]:
+        """``_dirs`` off the event loop: it reads the worktree registry from disk."""
+        return await asyncio.to_thread(self._dirs, target)
 
     def _dirs(self, target: GitTarget) -> tuple[Path, Path]:
         git_dir = target.repo / ".git"
@@ -308,6 +329,8 @@ class GitAdapter:
 
     async def init(self, repo: Path, default_branch: str) -> None:
         _branch(default_branch)
+        if not await asyncio.to_thread(repo.is_dir):
+            raise GitError("not_found")
         if await asyncio.to_thread(os.path.lexists, repo / ".git"):
             raise GitError("already_a_repo")
         await self._run(
@@ -316,7 +339,7 @@ class GitAdapter:
         await asyncio.to_thread(_ensure_excludes, repo / ".git")
 
     async def current_commit(self, target: GitTarget) -> str | None:
-        git_dir, tree = self._dirs(target)
+        git_dir, tree = await self._adirs(target)
         result = await self._run(
             ["rev-parse", "--verify", "-q", "HEAD^{commit}"],
             git_dir=git_dir,
@@ -327,7 +350,7 @@ class GitAdapter:
         return result.stdout.decode().strip() if result.returncode == 0 else None
 
     async def status(self, target: GitTarget) -> GitStatus:
-        git_dir, tree = self._dirs(target)
+        git_dir, tree = await self._adirs(target)
         result = await self._run(
             ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all", "--no-renames"],
             git_dir=git_dir,
@@ -361,7 +384,7 @@ class GitAdapter:
     async def log(self, target: GitTarget, limit: int = 10) -> list[LogEntry]:
         if await self.current_commit(target) is None:
             return []
-        git_dir, tree = self._dirs(target)
+        git_dir, tree = await self._adirs(target)
         result = await self._run(
             [
                 "log",
@@ -381,7 +404,7 @@ class GitAdapter:
         return entries
 
     async def branches(self, target: GitTarget) -> list[Branch]:
-        git_dir, tree = self._dirs(target)
+        git_dir, tree = await self._adirs(target)
         result = await self._run(
             ["for-each-ref", "--format=%(refname:short)%00%(objectname)", "refs/heads"],
             git_dir=git_dir,
@@ -389,7 +412,9 @@ class GitAdapter:
             cwd=tree,
         )
         found: list[Branch] = []
-        for line in result.stdout.decode("utf-8", "surrogateescape").splitlines():
+        for line in result.stdout.decode("utf-8", "surrogateescape").split("\n"):
+            if not line:
+                continue
             name, _, head = line.partition("\0")
             found.append(Branch(name, head, name.startswith(TASK_BRANCH_PREFIX)))
         return found
@@ -416,7 +441,7 @@ class GitAdapter:
         max_bytes: int = 1024 * 1024,
     ) -> Diff:
         """``base``..``head``; ``head=None`` is the working tree including untracked files."""
-        git_dir, tree = self._dirs(target)
+        git_dir, tree = await self._adirs(target)
         if base is not None:
             base_sha = await self._resolve(git_dir, tree, base)
         else:
@@ -425,15 +450,32 @@ class GitAdapter:
         if head is not None:
             head_sha = await self._resolve(git_dir, tree, head)
             result = await self._run(
-                [*_DIFF_FLAGS, base_sha, head_sha, *pathspec], git_dir=git_dir, work_tree=tree, cwd=tree
+                [*_DIFF_FLAGS, base_sha, head_sha, *pathspec],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                truncate=True,
             )
-            return diffparse.parse(result.stdout, base=base_sha, head=head_sha, max_bytes=max_bytes)
-        with tempfile.TemporaryDirectory(prefix="kk-git-index-") as scratch:
-            # A copy of the index, so untracked files can be staged for the diff without touching the user's.
+            return diffparse.parse(
+                result.stdout,
+                base=base_sha,
+                head=head_sha,
+                max_bytes=max_bytes,
+                output_truncated=result.truncated,
+            )
+        with tempfile.TemporaryDirectory(prefix="kk-git-diff-") as scratch:
+            # A copy of the index and a scratch object store: untracked files are staged for the diff, and the
+            # blobs that creates land in the scratch store, so reading a diff never writes to the repository.
             index = Path(scratch) / "index"
+            objects = Path(scratch) / "objects"
+            await asyncio.to_thread(objects.mkdir)
             with contextlib.suppress(FileNotFoundError):
                 await asyncio.to_thread(shutil.copyfile, git_dir / "index", index)
-            env = {"GIT_INDEX_FILE": str(index)}
+            env = {
+                "GIT_INDEX_FILE": str(index),
+                "GIT_OBJECT_DIRECTORY": str(objects),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(target.repo / ".git" / "objects"),
+            }
             await self._run(["add", "-A"], git_dir=git_dir, work_tree=tree, cwd=tree, env=env)
             result = await self._run(
                 [*_DIFF_FLAGS, "--cached", base_sha, *pathspec],
@@ -441,14 +483,21 @@ class GitAdapter:
                 work_tree=tree,
                 cwd=tree,
                 env=env,
+                truncate=True,
             )
-        return diffparse.parse(result.stdout, base=base_sha, head=None, max_bytes=max_bytes)
+        return diffparse.parse(
+            result.stdout,
+            base=base_sha,
+            head=None,
+            max_bytes=max_bytes,
+            output_truncated=result.truncated,
+        )
 
     # --- write ---------------------------------------------------------------------------------------------
 
     async def create_branch(self, target: GitTarget, name: str, from_ref: str) -> str:
         _branch(name)
-        git_dir, tree = self._dirs(target)
+        git_dir, tree = await self._adirs(target)
         sha = await self._resolve(git_dir, tree, from_ref)
         await self._run(["branch", "--no-track", name, sha], git_dir=git_dir, work_tree=tree, cwd=tree)
         return sha
@@ -457,7 +506,7 @@ class GitAdapter:
         """Stage everything and commit; ``None`` when there is nothing to commit."""
         _message(message)
         _author(author)
-        git_dir, tree = self._dirs(target)
+        git_dir, tree = await self._adirs(target)
         await self._run(["add", "-A"], git_dir=git_dir, work_tree=tree, cwd=tree)
         staged = await self._run(
             ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
@@ -482,7 +531,7 @@ class GitAdapter:
         _branch(branch)
         if not path.is_absolute():
             raise GitInputError("path")
-        git_dir, tree = self._dirs(GitTarget(repo))
+        git_dir, tree = await self._adirs(GitTarget(repo))
         sha = await self._resolve(git_dir, tree, base)
         if await asyncio.to_thread(os.path.lexists, path):
             raise GitError("worktree_exists")
@@ -495,14 +544,14 @@ class GitAdapter:
         )
         await asyncio.to_thread(_ensure_excludes, git_dir)
         target = GitTarget(repo, path)
-        self._dirs(target)  # registered, or not_a_worktree
+        await self._adirs(target)  # registered, or not_a_worktree
         return target
 
     async def remove_worktree(self, repo: Path, path: Path) -> None:
         """Remove a task worktree (dirty or not); its branch stays for the audit trail."""
         if not path.is_absolute():
             raise GitInputError("path")
-        git_dir, _ = self._dirs(GitTarget(repo, path))  # refuses a path that is not a registered worktree
+        git_dir, _ = await self._adirs(GitTarget(repo, path))  # refuses an unregistered worktree
         common = repo / ".git"
         try:
             await self._run(
@@ -518,14 +567,22 @@ class GitAdapter:
         if await asyncio.to_thread(git_dir.exists):
             raise GitError("worktree_not_removed")
 
-    async def merge_branch(self, repo: Path, branch: str, message: str, author: Author) -> MergeResult:
-        """Merge ``branch`` into the main working tree with ``--no-ff``. A conflict is aborted, never left."""
+    async def merge_branch(
+        self, repo: Path, branch: str, message: str, author: Author, *, into: str
+    ) -> MergeResult:
+        """Merge ``branch`` into ``into`` (the checked-out branch of the main working tree), ``--no-ff``.
+
+        A conflict is aborted, never left in the tree. The tree must be on ``into`` and clean.
+        """
         _branch(branch)
+        _branch(into)
         _message(message)
         _author(author)
         target = GitTarget(repo)
-        git_dir, tree = self._dirs(target)
+        git_dir, tree = await self._adirs(target)
         status = await self.status(target)
+        if status.branch != into:
+            raise GitError("wrong_branch")  # never merge into whatever happens to be checked out
         if any(change.status != "untracked" for change in status.changes):
             return MergeResult(False, None, [], "dirty")
         before = status.head
@@ -549,7 +606,7 @@ class GitAdapter:
             cwd=tree,
         )
         conflicts = [p.decode("utf-8", "surrogateescape") for p in unmerged.stdout.split(b"\0") if p]
-        if (git_dir / "MERGE_HEAD").exists():
+        if await asyncio.to_thread((git_dir / "MERGE_HEAD").exists):
             await self._run(["merge", "--abort"], git_dir=git_dir, work_tree=tree, cwd=tree)
         if conflicts:
             return MergeResult(False, None, sorted(conflicts), "conflict")

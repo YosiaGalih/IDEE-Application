@@ -149,3 +149,24 @@ async def test_denied_and_dependency_folders_are_not_read(tmp_path: Path) -> Non
 async def test_deterministic(tmp_path: Path) -> None:
     ws = tree(tmp_path, {"pyproject.toml": PYPROJECT_UV, "package.json": "{}", "go.mod": ""})
     assert await detect_stack(ws) == await detect_stack(ws)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"pyproject.toml": "project = 5\n"},
+        {"pyproject.toml": "tool = 1\n"},
+        {"pyproject.toml": "[tool]\npoetry = 1\n"},
+        {"pyproject.toml": "[project]\noptional-dependencies = [1]\n"},
+        {"pyproject.toml": "dependency-groups = [1]\n"},
+        {"pyproject.toml": "[tool.poetry]\ngroup = [1]\n"},
+        {"pyproject.toml": "[project]\ndependencies = 5\n"},
+        {"pyproject.toml": "x = " + "[" * 20000 + "]" * 20000 + "\n"},
+        {"package.json": "[" * 20000 + "]" * 20000},
+        {"package.json": json.dumps({"scripts": 5, "dependencies": [1], "main": 7, "packageManager": 3})},
+    ],
+)
+async def test_hostile_markers_never_crash(tmp_path: Path, files: dict[str, str]) -> None:
+    """Markers come from imported or sandbox-written projects: wrong types and deep nesting are ignored."""
+    stack = await detect_stack(tree(tmp_path, files))
+    assert stack.frameworks == []

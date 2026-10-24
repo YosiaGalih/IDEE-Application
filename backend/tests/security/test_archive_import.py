@@ -5,6 +5,7 @@ Fixtures are built in ``tmp_path`` by the builders below (TEST_STRATEGY §4: gen
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
 import os
@@ -179,6 +180,26 @@ def size_lie(tmp: Path) -> tuple[Path, ArchiveLimits]:
     return path, DEFAULT
 
 
+def git_dir_upper(tmp: Path) -> tuple[Path, ArchiveLimits]:
+    entries = [(".GIT/config", b"[core]\n"), ("x/.Git/hooks/post-checkout", b"#!/bin/sh\n")]
+    return _zip(tmp / "git_upper.zip", entries), DEFAULT
+
+
+def _zip_method(tmp: Path, method: int) -> tuple[Path, ArchiveLimits]:
+    path = tmp / f"method{method}.zip"
+    with zipfile.ZipFile(path, "w", compression=method) as zf:
+        zf.writestr("a.txt", b"a" * 1000)
+    return path, DEFAULT
+
+
+def lzma_zip(tmp: Path) -> tuple[Path, ArchiveLimits]:
+    return _zip_method(tmp, zipfile.ZIP_LZMA)
+
+
+def bzip2_zip(tmp: Path) -> tuple[Path, ArchiveLimits]:
+    return _zip_method(tmp, zipfile.ZIP_BZIP2)
+
+
 REJECT_CASES: dict[str, tuple[Builder, set[str]]] = {
     "traversal": (traversal, {"traversal"}),
     "absolute": (absolute, {"absolute"}),
@@ -196,10 +217,13 @@ REJECT_CASES: dict[str, tuple[Builder, set[str]]] = {
     "overwrite": (overwrite, {"duplicate"}),
     "file_then_dir": (file_then_dir, {"duplicate"}),
     "git_dir": (git_dir, {"git_dir"}),
+    "git_dir_upper": (git_dir_upper, {"git_dir"}),
     "backslash": (backslash, {"invalid_name"}),
     "not_an_archive": (not_an_archive, {"format"}),
     "corrupt_gzip": (corrupt_gzip, {"format"}),
     "encrypted_zip": (encrypted_zip, {"format"}),
+    "lzma_zip": (lzma_zip, {"format"}),  # unbounded in-memory inflate in zipfile (security re-review)
+    "bzip2_zip": (bzip2_zip, {"format"}),
     "size_lie": (size_lie, {"format", "oversize"}),
 }
 
@@ -309,3 +333,31 @@ def test_gzip_member_is_read_as_tar_only(tmp_path: Path) -> None:
     with pytest.raises(ArchiveRejected) as caught:
         import_archive(path, tmp_path / "p1")
     assert caught.value.reason == "format"
+
+
+def _corrupt_variants(tmp: Path) -> list[bytes]:
+    good = _zip(tmp / "good.zip", [("a.txt", b"a" * 200), ("dir/b.txt", b"b" * 300)]).read_bytes()
+    central = good.index(b"PK\x01\x02")
+    end = good.index(b"PK\x05\x06")
+    variants = [good[:n] for n in (10, 40, central, central + 10, end + 4)]
+    for offset in (central + 42, central + 46, end + 16):  # local header offset, name, central dir offset
+        flipped = bytearray(good)
+        flipped[offset : offset + 4] = b"\xff\xff\xff\x7f"
+        variants.append(bytes(flipped))
+    bad_name = bytearray(good)
+    name_at = central + 46
+    bad_name[central + 8 : central + 10] = struct.pack("<H", 0x800)  # UTF-8 flag
+    bad_name[name_at : name_at + 1] = b"\xff"
+    variants.append(bytes(bad_name))
+    return variants
+
+
+def test_corrupt_zips_are_format_rejections(tmp_path: Path) -> None:
+    """Damaged archives are a 400 ARCHIVE_REJECTED, never a raw exception (backend re-review)."""
+    for index, data in enumerate(_corrupt_variants(tmp_path)):
+        archive = tmp_path / f"corrupt{index}.zip"
+        archive.write_bytes(data)
+        dest = tmp_path / f"p{index}"
+        with contextlib.suppress(ArchiveRejected):  # any other exception fails the test
+            import_archive(archive, dest)
+        assert leftovers(tmp_path) == []

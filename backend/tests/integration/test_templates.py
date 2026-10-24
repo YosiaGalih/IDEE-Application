@@ -102,3 +102,28 @@ def test_name_is_not_interpreted(tmp_path: Path) -> None:
     materialize("static-site", tmp_path / "repo", project_name=name, project_slug="safe")
     readme = (tmp_path / "repo" / "README.md").read_text()
     assert readme.startswith("# {{project_slug}} <b>&</b>")
+
+
+def test_project_name_is_escaped_in_html(tmp_path: Path) -> None:
+    name = "</title><script>alert(document.domain)</script>"
+    materialize("static-site", tmp_path / "repo", project_name=name, project_slug="safe")
+    page = (tmp_path / "repo" / "index.html").read_text()
+    assert "<script>alert" not in page
+    assert "&lt;/title&gt;&lt;script&gt;" in page
+    assert (tmp_path / "repo" / "README.md").read_text().startswith(f"# {name}")  # Markdown keeps it literal
+
+
+def test_failed_materialize_leaves_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_write = Path.write_text
+    calls = {"n": 0}
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> int:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        return real_write(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", flaky)
+    with pytest.raises(OSError, match="disk full"):
+        materialize("python-basic", tmp_path / "repo", project_name="x", project_slug="ok")
+    assert list(tmp_path.iterdir()) == []

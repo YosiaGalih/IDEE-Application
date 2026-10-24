@@ -16,8 +16,10 @@ Every template's tests pass without network access (``tests/integration/test_tem
 
 from __future__ import annotations
 
+import html
 import os
 import re
+import secrets
 import shutil
 import tomllib
 from dataclasses import dataclass
@@ -67,14 +69,24 @@ def materialize(template_id: str, dest: Path, *, project_name: str, project_slug
         raise AlreadyExists()
 
     source = TEMPLATES_DIR / template_id
-    shutil.copytree(source, dest, ignore=shutil.ignore_patterns(METADATA, "__pycache__"), symlinks=False)
-    written: list[str] = []
-    for path in sorted(p for p in dest.rglob("*") if p.is_file()):
-        text = path.read_text()
-        replaced = text.replace("{{project_slug}}", project_slug)
-        if path.suffix in _NAME_FILES:
-            replaced = replaced.replace("{{project_name}}", project_name)
-        if replaced != text:
-            path.write_text(replaced)
-        written.append(path.relative_to(dest).as_posix())
+    staging = dest.parent / f".{dest.name}.creating-{secrets.token_hex(6)}"
+    shutil.copytree(source, staging, ignore=shutil.ignore_patterns(METADATA, "__pycache__"), symlinks=False)
+    try:
+        written: list[str] = []
+        for path in sorted(p for p in staging.rglob("*") if p.is_file()):
+            text = path.read_text()
+            replaced = text.replace("{{project_slug}}", project_slug)
+            if path.suffix == ".html":  # the name is user text: escaped where a browser renders it
+                replaced = replaced.replace("{{project_name}}", html.escape(project_name))
+            elif path.suffix in _NAME_FILES:
+                replaced = replaced.replace("{{project_name}}", project_name)
+            if replaced != text:
+                path.write_text(replaced)
+            written.append(path.relative_to(staging).as_posix())
+        if os.path.lexists(dest):
+            raise AlreadyExists()
+        os.rename(staging, dest)  # all or nothing: a failed copy never leaves a half project at dest
+    finally:
+        if os.path.lexists(staging):
+            shutil.rmtree(staging)
     return written

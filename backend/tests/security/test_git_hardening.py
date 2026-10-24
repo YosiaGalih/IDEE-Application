@@ -66,7 +66,7 @@ async def test_hooks_never_run(tmp_path: Path, repo: GitTarget) -> None:
     task = await git.create_worktree(repo.repo, repo.repo.parent / "tasks" / "t1", "kk/task-0000000a", base)
     (task.worktree / "g.txt").write_text("g\n")  # type: ignore[operator]
     await git.commit_all(task, "task", ME)
-    await git.merge_branch(repo.repo, "kk/task-0000000a", "apply", ME)
+    await git.merge_branch(repo.repo, "kk/task-0000000a", "apply", ME, into="main")
     assert not marker.exists()
 
 
@@ -184,6 +184,8 @@ async def test_rejects_bad_refs(repo: GitTarget, ref: str) -> None:
         ("", ME),
         ("a\x00b", ME),
         ("x" * 5001, ME),
+        ("subject\x1ewith a record separator", ME),
+        ("bell\x07", ME),
         ("ok", Author("Ev<il", "e@x.test")),
         ("ok", Author("Evil", "e@x.test>\nInjected: yes")),
         ("ok", Author("", "e@x.test")),

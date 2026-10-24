@@ -409,3 +409,12 @@ async def test_failed_rollback_is_reported(
         await ws.apply_patch(diff, Access.AGENT_WRITE)
     assert caught.value.details == [{"path": "a.py"}]
     assert leftovers(root) == []
+
+
+@pytest.mark.parametrize("separator", ["", "some prose between hunks"])
+def test_hunk_after_blank_or_prose_line_is_rejected(separator: str) -> None:
+    """A hunk separated from its file header must fail, not be skipped (backend re-review H1)."""
+    diff = f"--- a/f\n+++ b/f\n@@ -1 +1 @@\n-1\n+ONE\n{separator}\n@@ -8 +8 @@\n-8\n+EIGHT\n"
+    with pytest.raises(PatchRejected) as caught:
+        parse_unified_diff(diff)
+    assert caught.value.reason == "malformed"
