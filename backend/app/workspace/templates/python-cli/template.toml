@@ -1,0 +1,5 @@
+id = "python-cli"
+name = "Python CLI"
+description = "Aplikasi baris perintah dengan argparse dan test pytest."
+stack = "python"
+icon = "terminal"

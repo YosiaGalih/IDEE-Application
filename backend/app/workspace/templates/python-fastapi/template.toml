@@ -1,0 +1,5 @@
+id = "python-fastapi"
+name = "Python FastAPI"
+description = "Layanan HTTP FastAPI dengan endpoint health dan test."
+stack = "python"
+icon = "server"

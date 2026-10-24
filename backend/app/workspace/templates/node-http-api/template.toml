@@ -1,0 +1,5 @@
+id = "node-http-api"
+name = "Node.js HTTP API"
+description = "API HTTP dengan modul bawaan node:http, tanpa dependensi."
+stack = "node"
+icon = "server"

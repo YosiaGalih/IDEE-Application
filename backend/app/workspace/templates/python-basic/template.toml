@@ -1,0 +1,5 @@
+id = "python-basic"
+name = "Python dasar"
+description = "Paket Python kecil dengan test pytest."
+stack = "python"
+icon = "python"
