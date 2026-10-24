@@ -281,6 +281,8 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 33. **Search/index:** WBS menaruhnya di WP-2.1, `IMPLEMENTATION_ROADMAP` R2.2 di Workspace & Git. WP-1.2 mengikuti WBS.
 34. **Lokasi fixture arsip:** `TEST_STRATEGY` §4 menyebut `tests/fixtures/archives/`, §2.1/§5 menaruh test di `backend/tests/security/`. WP-1.2b membangkitkan fixture di folder tmp dari `conftest.py`.
 35. **`.env*` vs `.env.example`:** ARCHITECTURE §7 menolak tulis `.env*`, sehingga `.env.example` tidak bisa diedit lewat IDE. WP-1.2a mengikuti kontrak; perlu keputusan PO bila mengganggu.
+36. **Artefak run read-only (ADR-033, ARCHITECTURE §8):** dokumen meminta `/workspace/.kk` berupa tmpfs yang dibaca lewat Docker archive API, dan "mount hanya" workspace. Diukur di Docker 29/runc (WP-1.3): tmpfs di dalam bind read-only gagal tanpa mountpoint, dan archive API tidak membaca isi tmpfs. WP-1.3 memakai bind kedua: folder baru per run `<WORKSPACE_ROOT>/.kk-sandbox/runs/<run_id>` → `/workspace/.kk`, dibaca manager dengan `O_NOFOLLOW` lalu dihapus. Akibatnya ARCHITECTURE §8 ("mount hanya workspace") dan ADR-033 ("archive API") perlu diamandemen; perlu keputusan PO (AG-00 pemilik dokumen).
+37. **Klien sandbox `wait=true` vs `on_log`:** spec WP-1.3 awal menulis `run()` memakai `wait=true`, tetapi kontrak `SandboxClient.run(..., on_log=...)` di ARCHITECTURE §4.2 butuh log berjalan. WP-1.3 mengikuti kontrak: submit lalu polling `/logs`.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

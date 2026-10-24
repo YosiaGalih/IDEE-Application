@@ -1,0 +1,35 @@
+# Fixed run profiles (ADR-009 (2)). The sandbox manager and the backend read this file read-only.
+# A caller names only a profile_id; image, argv, timeouts and network come from here.
+# `image` is an alias resolved through SANDBOX_IMAGE_<ALIAS> (sandbox_manager/config.py).
+# Extra arguments from a caller must fullmatch args_pattern and must not start with "-".
+version: 1
+profiles:
+  - profile_id: python.pytest
+    image: python
+    suite: test
+    argv: [python, -m, pytest, -q, -p, no:cacheprovider, --junitxml=/workspace/.kk/junit.xml]
+    args_pattern: '[A-Za-z0-9_./:\[\]-]{1,200}'  # a test path or node id
+    max_args: 20
+    timeout_s: 300
+    max_timeout_s: 900
+    network: none
+
+  - profile_id: python.ruff
+    image: python
+    suite: lint
+    argv: [ruff, check, --no-cache, --output-format=concise]
+    args_pattern: '[A-Za-z0-9_./-]{1,200}'  # a path
+    max_args: 20
+    timeout_s: 120
+    max_timeout_s: 300
+    network: none
+
+  - profile_id: node.npm_test
+    image: node
+    suite: test
+    argv: [npm, test, --silent]
+    args_pattern: '[A-Za-z0-9_./-]{1,200}'
+    max_args: 0
+    timeout_s: 300
+    max_timeout_s: 900
+    network: none

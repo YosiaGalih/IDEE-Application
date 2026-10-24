@@ -77,7 +77,7 @@ layers = [
     "app.api",
     "app.services",
     "app.workflow",
-    "app.workspace | app.gitops",
+    "app.workspace | app.gitops | app.sandbox",
     "app.core",
     "app.models",
 ]
