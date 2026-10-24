@@ -16,17 +16,51 @@ RAW_SQL = re.compile(r"update\s+tasks\s+set\b[^;]*\bstatus\b", re.IGNORECASE | r
 
 
 def _imports_task(tree: ast.Module) -> bool:
+    """Any way of reaching the Task model: from-import, module import, or package attribute."""
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "app.models.tasks":
-            if any(alias.name in {"Task", "*"} for alias in node.names):
+        if isinstance(node, ast.ImportFrom):
+            if node.module == "app.models.tasks":
                 return True
+            if node.module == "app.models" and any(alias.name == "tasks" for alias in node.names):
+                return True
+        if isinstance(node, ast.Import) and any(alias.name == "app.models.tasks" for alias in node.names):
+            return True
     return False
 
 
-def _has_status_key(node: ast.expr | None) -> bool:
-    return isinstance(node, ast.Dict) and any(
-        isinstance(key, ast.Constant) and key.value == "status" for key in node.keys
+def _string_value(node: ast.expr) -> str | None:
+    """Text of a string constant, f-string (placeholders as {}), or a + concatenation of those."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            v.value if isinstance(v, ast.Constant) and isinstance(v.value, str) else "{}" for v in node.values
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _string_value(node.left), _string_value(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _is_raw_status_update(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp):
+        return False
+    value = _string_value(node)
+    if value is None:
+        return False
+    # A dynamic column ("{}") after UPDATE tasks SET could be status too.
+    return bool(RAW_SQL.search(value) or re.search(r"update\s+tasks\s+set\s+\{\}", value, re.IGNORECASE))
+
+
+def _is_status_key(key: ast.expr | None) -> bool:
+    return (isinstance(key, ast.Constant) and key.value == "status") or (
+        isinstance(key, ast.Attribute) and key.attr == "status"
     )
+
+
+def _has_status_key(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Dict) and any(_is_status_key(key) for key in node.keys)
 
 
 def _dicts_with_status(tree: ast.Module) -> set[str]:
@@ -51,13 +85,26 @@ def _values_sets_status(call: ast.Call, status_dicts: set[str]) -> bool:
     return any(_has_status_key(v) or (isinstance(v, ast.Name) and v.id in status_dicts) for v in splats)
 
 
+def _inside_string_expression(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    """Report a concatenation or f-string once, at its outermost node, not again for each part."""
+    parent = parents.get(node)
+    return isinstance(parent, ast.JoinedStr) or (
+        isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Add) and _string_value(parent) is not None
+    )
+
+
 def status_writes(source: str) -> list[str]:
     tree = ast.parse(source)
     found: list[str] = []
     uses_task = _imports_task(tree)
     status_dicts = _dicts_with_status(tree)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and RAW_SQL.search(node.value):
+        if (
+            isinstance(node, ast.expr)
+            and _is_raw_status_update(node)
+            and not _inside_string_expression(node, parents)
+        ):
             found.append(f"line {node.lineno}: raw SQL updates tasks.status")
         if not uses_task:
             continue
@@ -134,3 +181,32 @@ def test_user_status_writes_elsewhere_are_not_flagged() -> None:
         "from app.models.identity import User\n\ndef f(user: User) -> None:\n    user.status = 'disabled'\n"
     )
     assert status_writes(source) == []
+
+
+def test_guard_detects_other_import_forms() -> None:
+    sources = [
+        "from app.models import tasks\n\ndef f(t: tasks.Task) -> None:\n    t.status = 'x'\n",
+        (
+            "import app.models.tasks as m\nfrom sqlalchemy import update\n\n"
+            "stmt = update(m.Task).values(status='x')\n"
+        ),
+    ]
+    for source in sources:
+        assert status_writes(source), source
+
+
+def test_guard_detects_column_keyed_values() -> None:
+    source = (
+        "from sqlalchemy import update\nfrom app.models.tasks import Task\n\n"
+        "stmt = update(Task).values({Task.status: 'x'})\n"
+    )
+    assert status_writes(source) == ["line 4: .values(status=...)"]
+
+
+def test_guard_detects_split_raw_sql() -> None:
+    source = (
+        "COL = 'status'\n"
+        "QUERY = f'UPDATE tasks SET {COL} = :s'\n"
+        "OTHER = 'UPDATE tasks SET ' + 'status = :s'\n"
+    )
+    assert len(status_writes(source)) == 2

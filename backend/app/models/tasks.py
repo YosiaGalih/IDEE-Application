@@ -27,6 +27,10 @@ from app.models.base import Base, Timestamps, UUIDPrimaryKey, in_values
 from app.models.enums import DEPENDENCY_TYPES, TASK_PRIORITIES, TASK_STATUSES, TASK_STEPS, WORKFLOW_TYPES
 
 _EMPTY_JSON = text("'{}'::jsonb")
+# The tasks_status_guard trigger (migration 0003) rejects a status change unless this transaction-local
+# setting names the state machine: a database backstop for CLAUDE.md #4.
+STATUS_WRITER_SETTING = "kk.status_writer"
+STATUS_WRITER = "transition"
 
 
 class Task(UUIDPrimaryKey, Timestamps, Base):

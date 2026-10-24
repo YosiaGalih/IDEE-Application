@@ -65,6 +65,8 @@ async def test_status_check_rejects_unknown_value(session: AsyncSession) -> None
     project = await make_project(session)
     task = await make_task(session, project)
     await session.commit()
+    # Pass the writer backstop so the CHECK itself is what rejects the value.
+    await session.execute(text("SELECT set_config('kk.status_writer', 'transition', true)"))
     with pytest.raises(IntegrityError, match="ck_tasks_status"):
         await session.execute(text("UPDATE tasks SET status = 'bogus' WHERE id = :id"), {"id": task.id})
 

@@ -46,6 +46,11 @@ class AuditWriter:
     def __init__(self, redactor: Redactor) -> None:
         self._redactor = redactor
 
+    @property
+    def redactor(self) -> Redactor:
+        """The redactor that also knows the configured secret literals; reuse it for related writes."""
+        return self._redactor
+
     def _event(self, **fields: Any) -> AuditEvent:
         if fields["actor_type"] not in ACTOR_TYPES:
             raise ValueError(f"actor_type must be one of {ACTOR_TYPES}")

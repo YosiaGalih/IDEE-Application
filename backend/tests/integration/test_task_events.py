@@ -15,12 +15,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.db import make_sessionmaker
-from app.core.events import RedisEventBus, discard_pending, emit_task_event, publish_pending, task_channel
+from app.core.events import RedisEventBus, emit_task_event, publish_pending, task_channel
+from app.core.redaction import Redactor
 from app.core.security import hash_password
 from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task, TaskEvent
 from tests.conftest import make_test_env, reset_data
+
+REDACTOR = Redactor()
 
 
 @pytest.fixture
@@ -63,7 +66,9 @@ async def next_message(pubsub: PubSub, wait: float = 0.5) -> dict[str, Any] | No
 async def test_emit_assigns_monotonic_seq(session: AsyncSession, redis: Redis, task_id: uuid.UUID) -> None:
     bus = RedisEventBus(redis)
     seqs = [
-        await emit_task_event(session, bus, task_id, "task.log", {"level": "info", "message": str(i)})
+        await emit_task_event(
+            session, bus, task_id, "task.log", {"level": "info", "message": str(i)}, redactor=REDACTOR
+        )
         for i in range(3)
     ]
     await session.commit()
@@ -79,7 +84,7 @@ async def test_parallel_emits_have_gapless_seq(engine: AsyncEngine, task_id: uui
     async def one(i: int) -> int | None:
         async with sessions() as session:
             seq = await emit_task_event(
-                session, None, task_id, "task.log", {"level": "info", "message": str(i)}
+                session, None, task_id, "task.log", {"level": "info", "message": str(i)}, redactor=REDACTOR
             )
             await session.commit()
             return seq
@@ -92,10 +97,12 @@ async def test_publish_after_commit_only(
     session: AsyncSession, redis: Redis, subscription: PubSub, task_id: uuid.UUID
 ) -> None:
     bus = RedisEventBus(redis)
-    seq = await emit_task_event(session, bus, task_id, "task.log", {"level": "info", "message": "hi"})
+    seq = await emit_task_event(
+        session, bus, task_id, "task.log", {"level": "info", "message": "hi"}, redactor=REDACTOR
+    )
     assert await next_message(subscription) is None
-    with pytest.raises(RuntimeError, match="after commit"):
-        await publish_pending(session, bus)
+    await publish_pending(session, bus)  # before commit: nothing is publishable yet
+    assert await next_message(subscription) is None
     await session.commit()
     await publish_pending(session, bus)
     message = await next_message(subscription, wait=2)
@@ -113,9 +120,10 @@ async def test_rollback_discards_pending_events(
     session: AsyncSession, redis: Redis, subscription: PubSub, task_id: uuid.UUID
 ) -> None:
     bus = RedisEventBus(redis)
-    await emit_task_event(session, bus, task_id, "task.log", {"level": "info", "message": "lost"})
-    await session.rollback()
-    discard_pending(session)
+    await emit_task_event(
+        session, bus, task_id, "task.log", {"level": "info", "message": "lost"}, redactor=REDACTOR
+    )
+    await session.rollback()  # no manual discard: the session hooks drop uncommitted events
     await publish_pending(session, bus)
     assert await next_message(subscription) is None
     assert await session.scalar(select(TaskEvent.id).where(TaskEvent.task_id == task_id)) is None
@@ -129,7 +137,7 @@ async def test_event_payload_is_redacted(
         "message": "export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123456",
         "api_key": "plain-value-1",
     }
-    await emit_task_event(session, bus, task_id, "task.log", payload)
+    await emit_task_event(session, bus, task_id, "task.log", payload, redactor=REDACTOR)
     await session.commit()
     await publish_pending(session, bus)
     stored = await session.scalar(select(TaskEvent.payload).where(TaskEvent.task_id == task_id))
@@ -144,7 +152,13 @@ async def test_ephemeral_is_published_not_stored(
 ) -> None:
     bus = RedisEventBus(redis)
     seq = await emit_task_event(
-        session, bus, task_id, "agent.delta", {"agent_run_id": "r1", "text": "partial"}, ephemeral=True
+        session,
+        bus,
+        task_id,
+        "agent.delta",
+        {"agent_run_id": "r1", "text": "partial"},
+        ephemeral=True,
+        redactor=REDACTOR,
     )
     assert seq is None
     message = await next_message(subscription, wait=2)
@@ -156,8 +170,94 @@ async def test_ephemeral_is_published_not_stored(
 
 async def test_rejects_overlong_type_and_unknown_task(session: AsyncSession, task_id: uuid.UUID) -> None:
     with pytest.raises(ValueError, match="type"):
-        await emit_task_event(session, None, task_id, "x" * 61, {})
+        await emit_task_event(session, None, task_id, "x" * 61, {}, redactor=REDACTOR)
     with pytest.raises(ValueError, match="task"):
-        await emit_task_event(session, None, uuid.uuid4(), "task.log", {})
+        await emit_task_event(session, None, uuid.uuid4(), "task.log", {}, redactor=REDACTOR)
     with pytest.raises(ValueError, match="bus"):
-        await emit_task_event(session, None, task_id, "agent.delta", {}, ephemeral=True)
+        await emit_task_event(session, None, task_id, "agent.delta", {}, ephemeral=True, redactor=REDACTOR)
+
+
+async def test_rolled_back_savepoint_events_are_not_published(
+    session: AsyncSession, redis: Redis, subscription: PubSub, task_id: uuid.UUID
+) -> None:
+    bus = RedisEventBus(redis)
+    await emit_task_event(session, bus, task_id, "task.log", {"message": "kept"}, redactor=REDACTOR)
+    try:
+        async with session.begin_nested():
+            await emit_task_event(
+                session, bus, task_id, "task.log", {"message": "dropped"}, redactor=REDACTOR
+            )
+            raise RuntimeError("step failed")
+    except RuntimeError:
+        pass
+    await session.commit()
+    await publish_pending(session, bus)
+    first = await next_message(subscription, wait=2)
+    assert first is not None and first["payload"] == {"message": "kept"}
+    assert await next_message(subscription) is None
+
+
+async def test_committed_events_survive_a_later_rollback(
+    session: AsyncSession, redis: Redis, subscription: PubSub, task_id: uuid.UUID
+) -> None:
+    bus = RedisEventBus(redis)
+    seq = await emit_task_event(session, bus, task_id, "task.log", {"message": "durable"}, redactor=REDACTOR)
+    await session.commit()
+    await session.execute(select(Task.id))  # a second unit of work that rolls back
+    await session.rollback()
+    await publish_pending(session, bus)
+    message = await next_message(subscription, wait=2)
+    assert message is not None and message["seq"] == seq
+
+
+async def test_publish_after_commit_even_when_a_new_transaction_began(
+    session: AsyncSession, redis: Redis, subscription: PubSub, task_id: uuid.UUID
+) -> None:
+    bus = RedisEventBus(redis)
+    await emit_task_event(session, bus, task_id, "task.log", {"message": "x"}, redactor=REDACTOR)
+    await session.commit()
+    await session.execute(select(Task.id))  # autobegins
+    await publish_pending(session, bus)
+    assert await next_message(subscription, wait=2) is not None
+
+
+class FailingBus:
+    def __init__(self, fail_seq: int) -> None:
+        self.fail_seq = fail_seq
+        self.sent: list[int | None] = []
+
+    async def publish(self, channel: str, message: dict[str, Any]) -> None:
+        if message["seq"] == self.fail_seq:
+            raise ConnectionError("redis went away")
+        self.sent.append(message["seq"])
+
+
+async def test_publish_failure_is_logged_with_context(
+    session: AsyncSession, task_id: uuid.UUID, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from app.core.logging import configure_logging
+
+    configure_logging("INFO", REDACTOR)
+    bus = FailingBus(fail_seq=2)
+    for i in range(3):
+        await emit_task_event(session, bus, task_id, "task.log", {"message": str(i)}, redactor=REDACTOR)
+    await session.commit()
+    await publish_pending(session, bus)
+    assert bus.sent == [1, 3]
+    line = next(
+        json.loads(row) for row in capsys.readouterr().out.splitlines() if "task_event_publish_failed" in row
+    )
+    assert line["seq"] == 2 and line["type"] == "task.log" and line["error_type"] == "ConnectionError"
+    assert line["task_id"] == str(task_id)
+
+
+async def test_commit_and_publish_is_one_step(
+    session: AsyncSession, redis: Redis, subscription: PubSub, task_id: uuid.UUID
+) -> None:
+    from app.core.events import commit_and_publish
+
+    bus = RedisEventBus(redis)
+    seq = await emit_task_event(session, bus, task_id, "task.log", {"message": "x"}, redactor=REDACTOR)
+    await commit_and_publish(session, bus)
+    message = await next_message(subscription, wait=2)
+    assert message is not None and message["seq"] == seq
