@@ -152,3 +152,74 @@ async def test_one_failing_task_does_not_stop_the_sweep(
     assert (result.recovered, result.failed) == (1, 1)
     assert (await status_of(engine, good))[0] == "interrupted"
     assert (await status_of(engine, bad))[0] == "running"
+
+
+async def seed_orphan(database_url: str) -> uuid.UUID:
+    """Own engine: callers are synchronous tests that drive asyncio.run themselves."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(database_url)
+    try:
+        await reset_data(engine)
+        async with make_sessionmaker(engine)() as session:
+            owner = User(email="owner@example.test", display_name="O", password_hash=hash_password("x" * 12))
+            session.add(owner)
+            await session.flush()
+            project = Project(owner_id=owner.id, name="P", slug="p", workspace_ref="p")
+            session.add(project)
+            await session.flush()
+            task = Task(
+                project_id=project.id, title="t", prompt="p", workflow_type="create", created_by=owner.id
+            )
+            session.add(task)
+            await session.flush()
+            await session.execute(text("SELECT set_config('kk.status_writer', 'transition', true)"))
+            await session.execute(
+                text(
+                    "UPDATE tasks SET status = 'running', lease_owner = 'w', "
+                    "lease_expires_at = now() - interval '5 seconds' WHERE id = :id"
+                ),
+                {"id": task.id},
+            )
+            await session.commit()
+            return task.id
+    finally:
+        await engine.dispose()
+
+
+async def read_status(database_url: str, task_id: uuid.UUID) -> str:
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as conn:
+            return (
+                await conn.execute(text("SELECT status FROM tasks WHERE id = :id"), {"id": task_id})
+            ).scalar_one()
+    finally:
+        await engine.dispose()
+
+
+def test_cli_recover_reports_counts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], migrated_database: str
+) -> None:
+    from app.cli import main
+    from tests.conftest import make_test_env
+
+    task_id = asyncio.run(seed_orphan(migrated_database))
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    assert main(["recover"]) == 0
+    assert "recovered: 1, failed: 0" in capsys.readouterr().out
+    assert asyncio.run(read_status(migrated_database, task_id)) == "interrupted"
+
+
+def test_celery_job_runs_the_sweep(monkeypatch: pytest.MonkeyPatch, migrated_database: str) -> None:
+    from app.worker.jobs import recovery_sweep
+    from tests.conftest import make_test_env
+
+    task_id = asyncio.run(seed_orphan(migrated_database))
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    assert recovery_sweep.apply().get() == {"recovered": 1, "failed": 0}
+    assert asyncio.run(read_status(migrated_database, task_id)) == "interrupted"

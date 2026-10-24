@@ -34,6 +34,14 @@ async def _create_owner(args: argparse.Namespace, password: str) -> int:
     return 0
 
 
+def _recover() -> int:
+    from app.worker.jobs import run_recovery_sweep
+
+    counts = asyncio.run(run_recovery_sweep())
+    print(f"recovered: {counts['recovered']}, failed: {counts['failed']}")
+    return 0 if counts["failed"] == 0 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -41,7 +49,14 @@ def main(argv: list[str] | None = None) -> int:
     owner.add_argument("--email", required=True)
     owner.add_argument("--display-name", required=True)
     owner.add_argument("--password-stdin", action="store_true", help="read the password from stdin")
+    commands.add_parser("recover", help="run the task recovery sweep once (RUNBOOK)")
     args = parser.parse_args(argv)
+    if args.command == "recover":
+        try:
+            return _recover()
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     password = sys.stdin.readline().rstrip("\n") if args.password_stdin else getpass.getpass("Password: ")
     try:

@@ -70,7 +70,7 @@ include_external_packages = true
 name = "Layers (ARCHITECTURE §3.2)"
 type = "layers"
 layers = [
-    "app.main",
+    "app.main | app.worker",
     "app.api",
     "app.services",
     "app.workflow",
