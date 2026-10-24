@@ -12,7 +12,13 @@ from app.main import create_app
 from tests.conftest import make_test_env
 
 SANDBOX_HEALTHZ = "http://sandbox-manager.test:8100/healthz"
-HEALTHY = {"status": "ok", "driver": "docker", "docker": "ok", "runtime": "runc"}
+HEALTHY = {
+    "status": "ok",
+    "driver": "docker",
+    "docker": "ok",
+    "images": {"python": True, "node": True},
+    "runtime": "runc",
+}
 
 
 @pytest.fixture

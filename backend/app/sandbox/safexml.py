@@ -31,7 +31,11 @@ def parse(data: bytes) -> ET.Element:
     try:
         parser.Parse(data, True)
         return builder.close()
+    except UnsafeXML:
+        raise
     except expat.ExpatError as exc:
         raise UnsafeXML("malformed XML") from exc
+    except (ValueError, LookupError) as exc:  # e.g. encoding="shift_jis" (multi-byte) or an unknown encoding
+        raise UnsafeXML("unsupported XML encoding") from exc
     except AssertionError as exc:  # TreeBuilder.close() on an empty or unbalanced document
         raise UnsafeXML("malformed XML") from exc

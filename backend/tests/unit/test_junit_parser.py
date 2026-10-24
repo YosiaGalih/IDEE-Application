@@ -114,3 +114,59 @@ def test_message_is_bounded() -> None:
 )
 def test_parse_coverage(data: bytes, rate: float | None) -> None:
     assert parse_coverage(data) == rate
+
+
+def test_worst_outcome_of_a_case_counts() -> None:
+    """pytest writes <skipped/> then <error/> when a skipped test's teardown fails (silent-failure F10)."""
+    data = (
+        b'<testsuite tests="1" errors="1">'
+        b'<testcase name="t"><skipped/><error message="teardown"/></testcase></testsuite>'
+    )
+    summary = parse_junit(data)
+    assert (summary.tests, summary.errors, summary.skipped) == (1, 1, 0)
+    assert summary.cases[0].message == "teardown" and summary.inconsistent is False
+
+
+def test_suite_level_errors_count() -> None:
+    data = (
+        b'<testsuites><testsuite name="collect" errors="1">'
+        b'<error message="ImportError"/></testsuite></testsuites>'
+    )
+    summary = parse_junit(data)
+    assert (summary.tests, summary.errors) == (1, 1)
+    assert summary.cases[0].status == "error"
+
+
+def test_claims_beyond_the_cases_are_flagged() -> None:
+    lying = b'<testsuite tests="500" failures="0"><testcase name="a"/><testcase name="b"/></testsuite>'
+    assert parse_junit(lying).inconsistent is True
+    honest = (
+        b'<testsuite tests="2" failures="1">'
+        b'<testcase name="a"/><testcase name="b"><failure/></testcase></testsuite>'
+    )
+    assert parse_junit(honest).inconsistent is False
+    bare = b'<testsuite><testcase name="a"/></testsuite>'
+    assert parse_junit(bare).inconsistent is False  # no summary attributes, nothing claimed
+
+
+def test_failing_cases_survive_truncation() -> None:
+    cases = [b'<testcase name="p%d"/>' % i for i in range(2000)]
+    cases[1500] = b'<testcase name="the-failure"><failure message="boom"/></testcase>'
+    summary = parse_junit(b"<testsuite>" + b"".join(cases) + b"</testsuite>")
+    assert summary.cases_truncated is True and len(summary.cases) == MAX_CASES
+    assert summary.cases[0].name == "the-failure"
+
+
+@pytest.mark.parametrize("encoding", [b"shift_jis", b"euc-jp", b"x-bogus"])
+def test_hostile_encoding_declarations(encoding: bytes) -> None:
+    data = b'<?xml version="1.0" encoding="' + encoding + b'"?><testsuite/>'
+    with pytest.raises(JUnitError):
+        parse_junit(data)
+    assert (
+        parse_coverage(b'<?xml version="1.0" encoding="' + encoding + b'"?><coverage line-rate="1"/>') is None
+    )
+
+
+def test_coverage_of_nothing_is_not_full_coverage() -> None:
+    assert parse_coverage(b'<coverage line-rate="1" lines-valid="0" lines-covered="0"/>') is None
+    assert parse_coverage(b'<coverage line-rate="0.5" lines-valid="10" lines-covered="5"/>') == 0.5

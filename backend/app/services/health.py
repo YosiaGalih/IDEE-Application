@@ -59,7 +59,11 @@ class Dependencies:
                 socket_timeout=REDIS_TIMEOUT_SECONDS,
                 socket_connect_timeout=REDIS_TIMEOUT_SECONDS,
             ),
-            sandbox=HttpSandboxClient(settings.sandbox_manager_url, settings.sandbox_manager_token),
+            sandbox=HttpSandboxClient(
+                settings.sandbox_manager_url,
+                settings.sandbox_manager_token,
+                allow_fake_driver=not settings.is_production,
+            ),
             # Read once at startup: building ScriptDirectory imports every revision module (blocking I/O).
             migration_heads=frozenset(alembic_heads()),
             sessions=make_sessionmaker(engine),

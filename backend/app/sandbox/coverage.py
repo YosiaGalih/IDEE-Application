@@ -21,4 +21,6 @@ def parse_coverage(data: bytes) -> float | None:
         return None
     if math.isnan(rate) or not 0.0 <= rate <= 1.0:
         return None
+    if root.get("lines-valid") == "0":  # 0 of 0 lines: coverage.py writes line-rate="1" for nothing measured
+        return None
     return rate
