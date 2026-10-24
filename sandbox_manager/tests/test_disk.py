@@ -79,3 +79,23 @@ def test_locked_folders_are_removed(tmp_path: Path) -> None:
 
 def test_missing_path_is_fine(tmp_path: Path) -> None:
     assert remove_tree(tmp_path / "nothing")
+
+
+def test_tree_deeper_than_path_max_is_removed(tmp_path: Path) -> None:
+    """Security review N1: a sandbox can nest folders past PATH_MAX by chdir."""
+    root = tmp_path / "run"
+    make_deep(root, 2100)  # 2100 x "/d" is past 4096 bytes
+    with pytest.raises(Unmeasurable):  # measurement fails closed
+        tree_bytes(root)
+    assert remove_tree(root)
+    assert not root.exists()
+
+
+def test_name_clashes_do_not_stop_removal(tmp_path: Path) -> None:
+    root = tmp_path / "run"
+    (root / "a" / ".kk-rm-1").mkdir(parents=True)  # names a naive lifting scheme would reuse
+    (root / ".kk-rm-1").mkdir()
+    (root / ".kk-rm-1" / "f").write_text("x")
+    (root / "a" / "f").write_text("x")
+    assert remove_tree(root)
+    assert not root.exists()

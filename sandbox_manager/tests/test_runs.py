@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import replace
 
 import pytest
@@ -148,9 +149,16 @@ async def test_client_request_id_returns_the_same_run(
     again = await registry.submit(run, wait=False, client_request_id="step-1")
     other = await registry.submit(run, wait=False, client_request_id="step-2")
     assert again is first and other is not first
-    node = replace(run, profile=profiles["node.npm_test"])
-    with pytest.raises(IdempotencyConflict):
-        await registry.submit(node, wait=False, client_request_id="step-1")
+    variants = [
+        replace(run, profile=profiles["node.npm_test"]),
+        replace(run, task_id=uuid.UUID("eeeeeeee-3333-4333-8333-ffffffffffff")),
+        replace(run, args=("tests/other.py",)),
+        replace(run, read_only=True),
+        replace(run, timeout_s=90),
+    ]
+    for variant in variants:  # security review N2: never another task's or mode's evidence
+        with pytest.raises(IdempotencyConflict):
+            await registry.submit(variant, wait=False, client_request_id="step-1")
     driver.release.set()
     await registry.shutdown()
 

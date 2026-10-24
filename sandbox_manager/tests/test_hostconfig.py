@@ -77,7 +77,7 @@ def test_hardened_hostconfig(settings: Settings, profiles: dict[str, Profile]) -
     assert "size=268435456" in host["Tmpfs"]["/tmp"] and "size=67108864" in host["Tmpfs"]["/home/sandbox"]
     assert host["LogConfig"] == {
         "Type": "json-file",
-        "Config": {"max-size": str(16 * 1024 * 1024), "max-file": "2"},
+        "Config": {"max-size": str(64 * 1024 * 1024), "max-file": "2"},
     }
     assert spec["Labels"] == {
         "kk.managed": "1",
@@ -216,4 +216,4 @@ def test_container_log_is_capped(settings: Settings, profiles: dict[str, Profile
     task_workspace(settings)
     big = replace(settings, max_output_bytes=10 * 1024 * 1024)
     spec = build_container_spec(validated(big, profiles), RUN_ID, big)
-    assert spec["HostConfig"]["LogConfig"]["Config"] == {"max-size": str(40 * 1024 * 1024), "max-file": "2"}
+    assert spec["HostConfig"]["LogConfig"]["Config"] == {"max-size": str(80 * 1024 * 1024), "max-file": "2"}

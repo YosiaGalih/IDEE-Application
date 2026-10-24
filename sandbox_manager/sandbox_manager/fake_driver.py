@@ -6,6 +6,7 @@ Behaviour is chosen by the first extra argument: ``ok`` (default), ``fail``, ``s
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
 from sandbox_manager.runs import RunRecord
 from sandbox_manager.validation import ValidatedRun
@@ -26,7 +27,7 @@ class FakeDriver:
     async def cleanup_orphans(self) -> int:
         return 0
 
-    async def reap(self, active_run_ids: set[str]) -> int:
+    async def reap(self, active_run_ids: Callable[[], set[str]]) -> int:
         return 0
 
     async def kill(self, record: RunRecord) -> None:

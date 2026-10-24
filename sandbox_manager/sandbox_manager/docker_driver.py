@@ -37,7 +37,7 @@ import os
 import re
 import secrets
 import stat
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -318,11 +318,16 @@ class DockerDriver:
             log.warning("start: removed %d leftover containers and %d run folders", removed, swept)
         return removed
 
-    async def reap(self, active_run_ids: set[str]) -> int:
-        """Remove this instance's containers that belong to no active run."""
+    async def reap(self, active_run_ids: Callable[[], set[str]]) -> int:
+        """Remove this instance's containers that belong to no active run.
+
+        The active runs are read after the listing, so a run created meanwhile is never taken for an orphan.
+        """
         reaped = 0
-        for item in await self.engine.list_containers(["kk.managed=1", f"kk.manager={self.instance}"]):
-            if (item.get("Labels") or {}).get("kk.run_id") not in active_run_ids:
+        listed = await self.engine.list_containers(["kk.managed=1", f"kk.manager={self.instance}"])
+        active = active_run_ids()
+        for item in listed:
+            if (item.get("Labels") or {}).get("kk.run_id") not in active:
                 await self.engine.remove(str(item["Id"]))
                 reaped += 1
         if reaped:
@@ -358,7 +363,8 @@ class DockerDriver:
             outcome = ("error", None, "DOCKER_ERROR")
         finally:
             if await self._remove_container(record):
-                await asyncio.to_thread(remove_tree, artifacts)
+                if not await asyncio.to_thread(remove_tree, artifacts) and outcome[0] != "error":
+                    outcome = ("error", outcome[1], "ARTIFACTS_NOT_REMOVED")  # disk would leak: say so
             else:  # it may still write there: leave the folder to the start-up sweep, never race it
                 outcome = ("error", outcome[1], "CONTAINER_NOT_REMOVED")
         status, exit_code, error_code = outcome
@@ -419,6 +425,8 @@ class DockerDriver:
             return ("error", exit_code, "DISK_UNMEASURABLE")
         if grown > self.settings.max_workspace_growth_mb * 1024 * 1024:
             return ("error", exit_code, "DISK_LIMIT")
+        if await asyncio.to_thread(tree_bytes, artifacts) > MAX_ARTIFACT_DIR_BYTES:
+            return ("error", exit_code, "DISK_LIMIT")  # written faster than the watchdog looked
         if oom_killed and status not in ("timeout", "killed"):
             return ("error", exit_code, "OOM_KILLED")
         if status == "succeeded":

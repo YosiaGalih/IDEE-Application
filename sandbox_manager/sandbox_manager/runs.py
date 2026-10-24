@@ -12,6 +12,7 @@ import contextlib
 import logging
 import secrets
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -78,6 +79,7 @@ class RunRecord:
     log_incomplete: bool = False  # the log stream broke or was not drained: stored output may be partial
     artifact_status: dict[str, str] = field(default_factory=dict)  # name → ok|missing|too_large|not_regular
     client_request_id: str | None = None
+    fingerprint: tuple[object, ...] = ()  # the validated request: a retry must match it exactly
     _started: float = 0.0
     _delivered: int = 0  # chunks before this index were sent to a reader and never change again
     _tails: dict[str, bytearray] = field(
@@ -193,11 +195,24 @@ class Driver(Protocol):
 
     async def images(self) -> dict[str, bool]: ...
 
-    async def reap(self, active_run_ids: set[str]) -> int:
-        """Remove the driver's containers that belong to no active run."""
+    async def reap(self, active_run_ids: Callable[[], set[str]]) -> int:
+        """Remove the driver's containers that belong to no active run (read after listing)."""
         ...
 
     async def cleanup_orphans(self) -> int: ...
+
+
+def _fingerprint(run: ValidatedRun) -> tuple[object, ...]:
+    return (
+        run.project_id,
+        run.task_id,
+        str(run.workspace),
+        run.profile.profile_id,
+        run.args,
+        run.timeout_s,
+        run.network,
+        run.read_only,
+    )
 
 
 class RunRegistry:
@@ -216,10 +231,7 @@ class RunRegistry:
         if client_request_id is not None:
             existing = next((r for r in self.runs.values() if r.client_request_id == client_request_id), None)
             if existing is not None:
-                if (existing.project_id, existing.profile_id) != (
-                    str(run.project_id),
-                    run.profile.profile_id,
-                ):
+                if existing.fingerprint != _fingerprint(run):  # another task, workspace, args or mode
                     raise IdempotencyConflict()
                 return await self._wait(existing, run.timeout_s) if wait else existing
         record = RunRecord(
@@ -230,6 +242,7 @@ class RunRegistry:
             timeout_s=run.timeout_s,
             max_output_bytes=self.settings.max_output_bytes,
             client_request_id=client_request_id,
+            fingerprint=_fingerprint(run),
         )
         self.runs[record.run_id] = record
         task = asyncio.create_task(self._run(run, record))

@@ -57,7 +57,7 @@ def create_app(
         while True:
             await asyncio.sleep(REAP_INTERVAL_S)
             try:
-                await driver.reap(registry.active_run_ids())
+                await driver.reap(registry.active_run_ids)
             except Exception:
                 log.exception("reaper failed; retrying at the next interval")
 

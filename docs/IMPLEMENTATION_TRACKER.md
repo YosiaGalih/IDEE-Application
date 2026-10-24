@@ -633,3 +633,26 @@ Bukti setelah perbaikan:
 - pip-audit bersih; gitleaks bersih.
 
 Konflik dokumen baru: #38 (API_CONTRACTS §10 tertinggal: field tambahan dan semantik `wait=true`). Tidak dikerjakan: F4 AG-13 (sapuan global saat start) dipertahankan dengan asumsi satu manager per daemon, terdokumentasi di spec.
+
+#### WP-1.3 — review keamanan putaran 2 (24 Okt 2026)
+
+`kk-security-reviewer` pada diff perbaikan (9711b56..b676c04): **TIDAK DITANDATANGANI**.
+- F1–F9 putaran 1 tertutup, atau tertutup sebagian dengan sisa yang terdokumentasi.
+- Blocker baru: N1 HIGH.
+
+| Temuan | Perbaikan | Test |
+|---|---|---|
+| N1 HIGH: pohon artefak lebih dalam dari PATH_MAX (≈ 2000 level lewat `chdir`) tidak bisa dihapus, juga oleh sapuan start; disk bocor ≈ 316 MiB per run | `remove_tree` berbasis descriptor folder: isi sub-folder diangkat ke atas dengan `rename` antar-descriptor (nama acak), folder dibuka (`chmod`) sebelum diangkat; tanpa path panjang. Gagal hapus → `ARTIFACTS_NOT_REMOVED` | `test_tree_deeper_than_path_max_is_removed`, `test_name_clashes_do_not_stop_removal`, `test_artifact_folder_not_removed_is_reported`; Docker: `test_artifact_tree_deeper_than_path_max_is_removed`, `test_disk_helpers_as_sandbox_uid` (uid 10001: kedalaman 2100 + folder terdalam terkunci) |
+| N2 MEDIUM: `client_request_id` mengembalikan run milik task/args/mode lain | fingerprint lengkap request tervalidasi; beda → `IDEMPOTENCY_CONFLICT` | `test_client_request_id_returns_the_same_run` (5 varian) |
+| N3 LOW: batas 8 MiB tidak dicek setelah run | `tree_bytes(artifacts) > 8 MiB` setelah run → `DISK_LIMIT` | `test_artifact_folder_over_cap_after_run` |
+| N4 LOW: rotasi log Docker membuang entri tanpa flag | batas dinaikkan ke max(8 × output, 64 MiB); sisa risiko dicatat di spec keputusan #18 | `test_hardened_hostconfig`, `test_container_log_is_capped`; Docker: `test_container_log_cap_is_accepted_by_docker` |
+| N5 LOW: reaper memakai snapshot run aktif yang basi | run aktif dibaca setelah listing | `test_reaper_reads_active_runs_after_listing` |
+| F4 (sisa): sapuan start global | usulan ADR, konflik #39 | – |
+
+Bukti:
+- sandbox_manager `uv run pytest -q` → **151 passed, 1 skipped**;
+- test disk sebagai uid 65534 → **8 passed**;
+- `-m docker` lokal (root) → **23 passed**;
+- ruff dan pyright bersih.
+
+Verifikasi AG-13 atas N1–N5 dilakukan di sesi sign-off formal (rencana lanjutan U4). PR #3 tetap draft sampai sign-off itu ada.

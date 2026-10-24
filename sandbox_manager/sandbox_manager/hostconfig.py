@@ -53,8 +53,14 @@ def run_artifacts_dir(settings: Settings, project_id: object, run_id: str) -> Pa
 
 
 def log_config(settings: Settings) -> dict[str, Any]:
-    """Docker's own log of the container: a few times the stored output, at least 16 MiB, two files."""
-    size = max(4 * settings.max_output_bytes, 16 * 1024 * 1024)
+    """Docker's own log of the container: bounded, two files.
+
+    Each json-file entry costs about 60 bytes on top of its data, so a flood of tiny lines fills the files
+    much faster than its byte count. Once the reader falls more than the cap behind, rotated entries are
+    lost without a flag. The cap is generous (8 times the stored output, at least 64 MiB) to make that
+    rare; the run's status never depends on the log (residual risk, security review N4).
+    """
+    size = max(8 * settings.max_output_bytes, 64 * 1024 * 1024)
     return {"Type": "json-file", "Config": {"max-size": str(size), "max-file": "2"}}
 
 

@@ -19,8 +19,8 @@ Dokumen ini dipakai setiap kali sesi baru dimulai. Bagian §1 diperbarui di akhi
 | Commit hijau terakhir | b676c04 (CI hijau, `sandbox-isolation` 22 test Docker nyata sebagai root) |
 | Di `main` | WP-1.1 (PR #1), WP-1.2 (PR #2) |
 | Selesai di sesi ini | U1 dan U2 (perbaikan review putaran 1; tabel lengkap di tracker §12 "WP-1.3 — review putaran 1") |
-| Berikutnya | U3: hasil review keamanan putaran 2 (lihat tracker). Bila ditandatangani, PR #3 keluar dari draft. Lalu U4 (sign-off formal AG-13, sesi terpisah) dan U5 (keputusan PO) |
-| Menunggu PO | konflik #36, #37, #38 (spec sistem pengembangan §8); merge PR #3; G0/G1 |
+| Berikutnya | U4: sign-off formal AG-13 WP-1.2 + WP-1.3 di sesi terpisah. Putaran 2 menolak karena N1; N1–N5 sudah diperbaiki, tetapi belum diverifikasi reviewer. Bila ditandatangani, PR #3 keluar dari draft. Lalu U5 (keputusan PO) |
+| Menunggu PO | konflik #36–#39 (spec sistem pengembangan §8); merge PR #3; G0/G1 |
 
 ## 2. Aturan kerja di bawah limit
 

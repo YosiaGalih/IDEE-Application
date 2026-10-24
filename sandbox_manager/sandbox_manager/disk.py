@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import secrets
 import stat
 from pathlib import Path
 
@@ -49,34 +50,103 @@ def tree_bytes(root: Path) -> int:
 
 
 def remove_tree(path: Path) -> bool:
-    """Remove ``path`` without recursion, opening up folders the sandbox locked. False (logged) if any stays.
+    """Remove ``path`` however deep it is, opening up folders the sandbox locked. False (logged) if any stays.
 
-    Call it only once nothing else writes into ``path`` (the container is gone): it works on path names.
+    Works with folder descriptors and short names only, never with long paths: a sandbox can nest folders
+    past PATH_MAX (4096 bytes) by ``chdir``, which ``os.walk`` and ``shutil.rmtree`` cannot remove. Each
+    pass lifts the contents of a non-empty sub-folder into the top folder (``rename`` between two
+    descriptors), so at most two descriptors are open and no path ever grows.
+
+    Call it only once nothing else writes into ``path`` (the container is gone).
     """
-    if not os.path.lexists(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
         return True
-    if not os.path.isdir(path) or os.path.islink(path):
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
-        return not os.path.lexists(path)
+    if not stat.S_ISDIR(st.st_mode):
+        return _unlink(str(path))
     with contextlib.suppress(OSError):  # not ours: the removal below reports what stays
         os.chmod(path, 0o700)
-    for folder, dirs, _files in os.walk(path):  # top-down: each folder is opened before it is listed
-        for name in dirs:
-            child = os.path.join(folder, name)
-            if not os.path.islink(child):
-                with contextlib.suppress(OSError):
-                    os.chmod(child, 0o700)
-    failures = 0
-    for folder, dirs, files in os.walk(path, topdown=False):
-        for name in files:
-            failures += not _unlink(os.path.join(folder, name))
-        for name in dirs:
-            child = os.path.join(folder, name)
-            failures += not (_unlink(child) if os.path.islink(child) else _rmdir(child))
-    failures += not _rmdir(str(path))
-    if failures or os.path.lexists(path):
-        log.error("could not remove %s (%d entries left)", path, failures)
+    try:
+        top = os.open(path, _DIR_FLAGS)
+    except OSError as exc:
+        log.error("could not open %s for removal: %s", path, type(exc).__name__)
+        return False
+    try:
+        left = _empty(top)
+    finally:
+        os.close(top)
+    if left or not _rmdir(str(path)):
+        log.error("could not remove %s (%d entries left)", path, left)
+        return False
+    return True
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_MAX_PASSES = 1_000_000  # [Menebak] a bound on the lifting passes; far above any real tree
+
+
+def _empty(top: int) -> int:
+    """Empty the folder open as ``top``; returns how many entries could not be removed."""
+    prefix = f".kk-rm-{secrets.token_hex(6)}-"  # unguessable: the sandbox cannot pre-create a clash
+    lifted = 0
+    for _ in range(_MAX_PASSES):
+        stuck = 0
+        progress = False
+        for name in os.listdir(top):
+            try:
+                st = os.stat(name, dir_fd=top, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                if _unlink_at(name, top):
+                    progress = True
+                else:
+                    stuck += 1
+                continue
+            try:
+                os.rmdir(name, dir_fd=top)
+                progress = True
+                continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass  # not empty (or locked): lift its contents one level up
+            with contextlib.suppress(OSError):
+                os.chmod(name, 0o700, dir_fd=top)  # a folder (checked above), not a link
+            try:
+                child = os.open(name, _DIR_FLAGS, dir_fd=top)
+            except OSError:
+                stuck += 1
+                continue
+            try:
+                for inner in os.listdir(child):
+                    lifted += 1
+                    with contextlib.suppress(
+                        OSError
+                    ):  # moving a folder rewrites its "..": it must be writable
+                        if stat.S_ISDIR(os.stat(inner, dir_fd=child, follow_symlinks=False).st_mode):
+                            os.chmod(inner, 0o700, dir_fd=child)
+                    try:
+                        os.rename(inner, f"{prefix}{lifted}", src_dir_fd=child, dst_dir_fd=top)
+                        progress = True
+                    except OSError:
+                        stuck += 1
+            finally:
+                os.close(child)
+        if stuck == 0 and not os.listdir(top):
+            return 0
+        if not progress:
+            return max(stuck, len(os.listdir(top)))
+    return len(os.listdir(top))
+
+
+def _unlink_at(name: str, folder: int) -> bool:
+    try:
+        os.unlink(name, dir_fd=folder)
+    except FileNotFoundError:
+        pass
+    except OSError:
         return False
     return True
 

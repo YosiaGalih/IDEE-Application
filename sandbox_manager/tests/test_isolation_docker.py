@@ -458,8 +458,14 @@ async def test_disk_helpers_as_sandbox_uid(settings: Settings) -> None:
         "except disk.Unmeasurable:\n"
         "    measured = 'unmeasurable'\n"
         "removed = disk.remove_tree('/tmp/t')\n"
+        "os.makedirs('/tmp/deep'); os.chdir('/tmp/deep')\n"
+        "for _ in range(2100):\n"
+        "    os.mkdir('d'); os.chdir('d')\n"
+        "os.chmod('.', 0); os.chdir('/')\n"
+        "deep_removed = disk.remove_tree('/tmp/deep')\n"
         "print(json.dumps({'uid': os.getuid(), 'measured': measured, 'removed': removed,"
-        " 'gone': not os.path.exists('/tmp/t')}))\n"
+        " 'gone': not os.path.exists('/tmp/t'),"
+        " 'deep_gone': deep_removed and not os.path.exists('/tmp/deep')}))\n"
     )
     engine = DockerEngine(docker_host())
     spec = {
@@ -483,7 +489,13 @@ async def test_disk_helpers_as_sandbox_uid(settings: Settings) -> None:
             await engine.remove(container)
     finally:
         await engine.aclose()
-    assert json.loads(output) == {"uid": 10001, "measured": "unmeasurable", "removed": True, "gone": True}
+    assert json.loads(output) == {
+        "uid": 10001,
+        "measured": "unmeasurable",
+        "removed": True,
+        "gone": True,
+        "deep_gone": True,  # past PATH_MAX, innermost folder locked
+    }
 
 
 async def test_container_log_cap_is_accepted_by_docker(settings: Settings, docker_settings: Settings) -> None:
@@ -516,5 +528,23 @@ async def test_container_log_cap_is_accepted_by_docker(settings: Settings, docke
     assert state is not None
     assert state["HostConfig"]["LogConfig"] == {
         "Type": "json-file",
-        "Config": {"max-file": "2", "max-size": str(16 * 1024 * 1024)},
+        "Config": {"max-file": "2", "max-size": str(64 * 1024 * 1024)},
     }
+
+
+async def test_artifact_tree_deeper_than_path_max_is_removed(
+    client: httpx.AsyncClient, settings: Settings
+) -> None:
+    """Security review N1: nesting past PATH_MAX by chdir neither escapes measurement nor leaks disk."""
+    probe(
+        task_workspace(settings),
+        "import os\n"
+        "os.chdir('/workspace/.kk')\n"
+        "for _ in range(2100):  # past 4096 bytes of path on the host\n"
+        "    os.mkdir('d'); os.chdir('d')\n"
+        "open('blob', 'wb').write(b'x' * 4 * 1024 * 1024)\n"
+        "print('{}')\n",
+    )
+    result = await run(client)
+    assert (result["status"], result["error_code"]) == ("error", "DISK_UNMEASURABLE"), result
+    assert list((settings.workspace_root / str(PROJECT) / ".kk-runs").iterdir()) == []

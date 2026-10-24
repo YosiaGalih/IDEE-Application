@@ -480,7 +480,7 @@ async def test_reaper_removes_only_inactive_own_containers(settings: Settings) -
         {"Id": "aaa1", "Labels": {"kk.run_id": "active-run"}},
         {"Id": "bbb2", "Labels": {"kk.run_id": "finished-run"}},
     ]
-    assert await driver.reap({"active-run"}) == 1
+    assert await driver.reap(lambda: {"active-run"}) == 1
     assert fake.removed == ["bbb2"]
     listing = next(request for request in fake.requests if request.url.path == "/containers/json")
     filters = json.loads(listing.url.params["filters"])
@@ -504,3 +504,47 @@ async def test_run_folder_link_is_refused(
     record = await execute(settings, fake, a_run(settings, profiles))
     assert (record.status, record.error_code) == ("error", "WORKSPACE_UNSAFE")
     assert ("POST", "/containers/create") not in fake.calls
+
+
+async def test_reaper_reads_active_runs_after_listing(settings: Settings) -> None:
+    """Security review N5: a run created while the containers are listed is not an orphan."""
+    fake = FakeEngine()
+    driver = make_driver(settings, fake)
+    fake.listed = [{"Id": "ccc3", "Labels": {"kk.run_id": "new-run"}}]
+    order: list[str] = []
+    real_list = driver.engine.list_containers
+
+    async def listing(labels: list[str]) -> list[dict[str, Any]]:
+        order.append("list")
+        return await real_list(labels)
+
+    def active() -> set[str]:
+        order.append("active")
+        return {"new-run"}
+
+    driver.engine.list_containers = listing  # type: ignore[method-assign]
+    assert await driver.reap(active) == 0
+    assert order == ["list", "active"] and fake.removed == []
+
+
+async def test_artifact_folder_over_cap_after_run(settings: Settings, profiles: dict[str, Profile]) -> None:
+    """Security review N3: written and exited faster than the watchdog looked."""
+    task_workspace(settings)
+
+    def container(spec: dict[str, Any]) -> None:
+        with open(mount_source(spec, "/workspace/.kk") / "fill.bin", "wb") as handle:
+            handle.truncate(9 * 1024 * 1024)
+
+    record = await execute(settings, FakeEngine(on_start=container), a_run(settings, profiles))
+    assert (record.status, record.error_code) == ("error", "DISK_LIMIT")
+
+
+async def test_artifact_folder_not_removed_is_reported(
+    settings: Settings, profiles: dict[str, Profile], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sandbox_manager.docker_driver as driver_module
+
+    task_workspace(settings)
+    monkeypatch.setattr(driver_module, "remove_tree", lambda path: False)
+    record = await execute(settings, FakeEngine(), a_run(settings, profiles))
+    assert (record.status, record.exit_code, record.error_code) == ("error", 0, "ARTIFACTS_NOT_REMOVED")
