@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from tests.conftest import reset_data
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -14,5 +15,4 @@ def _database(migrated_database: str) -> str:
 
 @pytest.fixture(autouse=True)
 async def clean_identity(engine: AsyncEngine) -> None:
-    async with engine.begin() as conn:
-        await conn.execute(text("DELETE FROM users"))
+    await reset_data(engine)

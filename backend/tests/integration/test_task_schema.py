@@ -13,13 +13,12 @@ from app.core.security import hash_password
 from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task, TaskDependency, TaskEvent
+from tests.conftest import reset_data
 
 
 @pytest.fixture(autouse=True)
 async def clean(engine: AsyncEngine) -> None:
-    async with engine.begin() as conn:
-        await conn.execute(text("DELETE FROM projects"))
-        await conn.execute(text("DELETE FROM users"))
+    await reset_data(engine)
 
 
 async def make_project(session: AsyncSession, slug: str = "demo") -> Project:

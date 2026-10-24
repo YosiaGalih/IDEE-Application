@@ -16,12 +16,12 @@ from app.core.redaction import Redactor
 from app.core.security import hash_token, verify_password
 from app.models.identity import Session, User, UserRole
 from app.services.users import OwnerExistsError, create_owner
+from tests.conftest import reset_data
 
 
 @pytest.fixture(autouse=True)
 async def clean_identity(engine: AsyncEngine) -> None:
-    async with engine.begin() as conn:
-        await conn.execute(text("DELETE FROM users"))
+    await reset_data(engine)
 
 
 def new_user(email: str = "dev@example.test") -> User:

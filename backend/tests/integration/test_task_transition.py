@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.db import make_sessionmaker
@@ -17,15 +17,14 @@ from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task, TaskEvent
 from app.workflow.states import Actor, TaskStatus, transition
+from tests.conftest import reset_data
 
 ACTOR = Actor("system", "orchestrator")
 
 
 @pytest.fixture
 async def task_id(engine: AsyncEngine) -> uuid.UUID:
-    async with engine.begin() as conn:
-        await conn.execute(text("DELETE FROM projects"))
-        await conn.execute(text("DELETE FROM users"))
+    await reset_data(engine)
     async with make_sessionmaker(engine)() as session:
         owner = User(email="owner@example.test", display_name="O", password_hash=hash_password("x" * 12))
         session.add(owner)

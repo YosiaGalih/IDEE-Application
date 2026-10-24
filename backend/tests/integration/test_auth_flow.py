@@ -28,7 +28,7 @@ from app.models.audit import AuditEvent
 from app.models.identity import Session, User, UserRole
 from app.services import auth
 from app.services.users import create_owner
-from tests.conftest import make_test_env
+from tests.conftest import make_test_env, reset_data
 
 EMAIL = "owner@example.test"
 PASSWORD = "owner-long-passphrase"
@@ -39,8 +39,7 @@ LOGOUT = "/api/v1/auth/logout"
 
 @pytest.fixture(autouse=True)
 async def clean_state(engine: AsyncEngine) -> AsyncIterator[None]:
-    async with engine.begin() as conn:
-        await conn.execute(text("DELETE FROM users"))
+    await reset_data(engine)
     redis = Redis.from_url(make_test_env()["REDIS_URL"])
     await redis.flushdb()
     yield

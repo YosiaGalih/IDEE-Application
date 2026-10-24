@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import Settings, load_settings
@@ -67,3 +68,10 @@ async def engine(migrated_database: str) -> AsyncIterator[AsyncEngine]:
 async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     async with async_sessionmaker(engine, expire_on_commit=False)() as session:
         yield session
+
+
+async def reset_data(engine: AsyncEngine) -> None:
+    """Delete test-owned rows in FK order (projects restrict their owner). audit_events stays: append-only."""
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM projects"))
+        await conn.execute(text("DELETE FROM users"))

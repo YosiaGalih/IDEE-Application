@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.db import make_sessionmaker
@@ -20,7 +20,7 @@ from app.core.security import hash_password
 from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task, TaskEvent
-from tests.conftest import make_test_env
+from tests.conftest import make_test_env, reset_data
 
 
 @pytest.fixture
@@ -32,9 +32,7 @@ async def redis() -> AsyncIterator[Redis]:
 
 @pytest.fixture
 async def task_id(engine: AsyncEngine) -> uuid.UUID:
-    async with engine.begin() as conn:
-        await conn.execute(text("DELETE FROM projects"))
-        await conn.execute(text("DELETE FROM users"))
+    await reset_data(engine)
     async with make_sessionmaker(engine)() as session:
         owner = User(email="owner@example.test", display_name="O", password_hash=hash_password("x" * 12))
         session.add(owner)
