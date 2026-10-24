@@ -164,7 +164,7 @@ async def test_unreadable_agentignore_fails_closed(ws: Workspace, root: Path) ->
 
 async def test_write_create_requires_absent(ws: Workspace) -> None:
     change = await ws.write_file("src/new.py", "x = 1\n", Access.USER_WRITE, expected_sha256=None)
-    assert (change.change, change.old_sha256, change.new_sha256) == ("created", None, sha(b"x = 1\n"))
+    assert (change.change, change.old_sha256, change.sha256) == ("added", None, sha(b"x = 1\n"))
     with pytest.raises(VersionConflict) as caught:
         await ws.write_file("src/new.py", "x = 2\n", Access.USER_WRITE, expected_sha256=None)
     assert caught.value.current_sha256 == sha(b"x = 1\n")
@@ -276,11 +276,11 @@ async def test_concurrent_writers_one_conflict(
     """Version check and replace are one step: of N writers holding the same sha exactly one wins."""
     original = fs._check_version
 
-    def slow_check(current: fs.Current | None, expected: object) -> None:
+    def slow_check(path: str, current: fs.Current | None, expected: object) -> None:
         import time
 
         time.sleep(0.05)  # widens the window a missing lock would let the writers through
-        original(current, expected)  # type: ignore[arg-type]
+        original(path, current, expected)  # type: ignore[arg-type]
 
     monkeypatch.setattr(fs, "_check_version", slow_check)
     old = sha(b"one\ntwo\nthree\nfour\n")
@@ -303,7 +303,7 @@ async def test_delete_requires_sha(ws: Workspace, root: Path) -> None:
     change = await ws.delete_file(
         "src/a.py", Access.USER_WRITE, expected_sha256=sha(b"one\ntwo\nthree\nfour\n")
     )
-    assert (change.change, change.new_sha256) == ("deleted", None)
+    assert (change.change, change.sha256) == ("deleted", None)
     assert not (root / "src" / "a.py").exists()
     with pytest.raises(WorkspaceNotFound):
         await ws.delete_file("src/a.py", Access.USER_WRITE, expected_sha256=ANY_VERSION)
@@ -457,3 +457,46 @@ async def test_disk_usage_counts_regular_files_only(ws: Workspace, root: Path, t
     os.symlink(big, root / "big-link")
     (root / "linked-dir").symlink_to(tmp_path)
     assert await ws.disk_usage() == before
+
+
+async def test_line_range_counts_newlines_only(ws: Workspace, root: Path) -> None:
+    """Form feeds and other separators splitlines() knows must not shift line numbers (review M4)."""
+    (root / "ff.py").write_text("a\x0cb\nc\nd\n")
+    got = await ws.read_file("ff.py", Access.AGENT_READ, start_line=2, end_line=2)
+    assert got.content == "c\n"
+
+
+async def test_created_folders_are_0755_under_a_strict_umask(ws: Workspace, root: Path) -> None:
+    old = os.umask(0o077)
+    try:
+        await ws.write_file("deep/er/f.txt", "x\n", Access.USER_WRITE, expected_sha256=None)
+        await ws.make_dir("other", Access.USER_WRITE)
+    finally:
+        os.umask(old)
+    assert (root / "deep").stat().st_mode & 0o777 == 0o755
+    assert (root / "deep" / "er").stat().st_mode & 0o777 == 0o755
+    assert (root / "other").stat().st_mode & 0o777 == 0o755
+    assert (root / "deep" / "er" / "f.txt").stat().st_mode & 0o777 == 0o644
+
+
+async def test_version_conflict_names_the_path(ws: Workspace) -> None:
+    with pytest.raises(VersionConflict) as caught:
+        await ws.write_file("src/a.py", "x\n", Access.USER_WRITE, expected_sha256="0" * 64)
+    assert caught.value.details[0]["path"] == "src/a.py"
+
+
+async def test_tree_survives_entries_vanishing(
+    ws: Workspace, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (root / "gone.txt").write_text("x")
+    real_stat = os.stat
+
+    def vanishing(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if path == "gone.txt":
+            raise FileNotFoundError(path)
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", vanishing)
+    names = [e.name for e in (await ws.tree(".", Access.USER_READ)).entries]
+    assert "gone.txt" not in names
+    assert "src" in names

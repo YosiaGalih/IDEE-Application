@@ -32,7 +32,7 @@ def ws(root: Path) -> Workspace:
 
 
 def contents(root: Path) -> dict[str, bytes]:
-    return {p.name: p.read_bytes() for p in root.iterdir()}
+    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
 def leftovers(root: Path) -> list[Path]:
@@ -68,7 +68,7 @@ async def test_modify_add_delete(ws: Workspace, root: Path) -> None:
     changes = await ws.apply_patch(THREE_FILES, Access.AGENT_WRITE)
     assert [(c.path, c.change) for c in changes] == [
         ("a.py", "modified"),
-        ("new.py", "created"),
+        ("new.py", "added"),
         ("old.txt", "deleted"),
     ]
     assert (root / "a.py").read_text().endswith("    return a - b  # checked\n")
@@ -257,7 +257,7 @@ async def test_rollback_on_replace_failure(
 async def test_empty_file_add_and_delete_from_bare_git_header(ws: Workspace, root: Path) -> None:
     add = "diff --git a/pkg/__init__.py b/pkg/__init__.py\nnew file mode 100644\nindex 0000000..e69de29\n"
     changes = await ws.apply_patch(add, Access.AGENT_WRITE)
-    assert [(c.path, c.change, c.size) for c in changes] == [("pkg/__init__.py", "created", 0)]
+    assert [(c.path, c.change, c.size) for c in changes] == [("pkg/__init__.py", "added", 0)]
     assert (root / "pkg" / "__init__.py").read_bytes() == b""
     delete = (
         "diff --git a/pkg/__init__.py b/pkg/__init__.py\ndeleted file mode 100644\nindex e69de29..0000000\n"
@@ -276,3 +276,136 @@ async def test_add_into_new_folder(ws: Workspace, root: Path) -> None:
     diff = "--- /dev/null\n+++ b/deep/er/new.py\n@@ -0,0 +1 @@\n+x = 1\n"
     await ws.apply_patch(diff, Access.AGENT_WRITE)
     assert (root / "deep" / "er" / "new.py").read_text() == "x = 1\n"
+
+
+# --- review regressions (WP-1.2a) ---------------------------------------------------------------------------
+
+
+def test_body_longer_than_header_counts_is_rejected() -> None:
+    """A miscounted hunk header must not silently drop the extra lines (backend review H1)."""
+    diff = "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-a\n+A\n-b\n+B\n"
+    with pytest.raises(PatchRejected) as caught:
+        parse_unified_diff(diff)
+    assert caught.value.reason == "malformed"
+
+
+def test_next_file_header_after_hunk_is_fine() -> None:
+    diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+A\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-b\n+B\n"
+    assert [p.path for p in parse_unified_diff(diff)] == ["f", "g"]
+
+
+def first_line(path: str) -> str:
+    return "def add(a, b):" if "a.py" in path else "x = 1"
+
+
+@pytest.mark.parametrize(
+    ("first", "second"), [("a.py", "./a.py"), ("a.py", "a.py/"), ("src//b.py", "src/b.py")]
+)
+async def test_alias_paths_are_one_file(ws: Workspace, root: Path, first: str, second: str) -> None:
+    """Two spellings of one path would apply two patches to one snapshot (review H2)."""
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src" / "b.py").write_text("x = 1\ny = 2\n")
+    before = contents(root)
+    diff = "".join(
+        f"--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-{first_line(path)}\n+{new}\n"
+        for path, new in ((first, "one"), (second, "two"))
+    )
+    with pytest.raises(PatchRejected) as caught:
+        await ws.apply_patch(diff, Access.AGENT_WRITE)
+    assert caught.value.reason == "duplicate_path"
+    assert contents(root) == before
+
+
+def test_final_newline_must_agree_with_the_file() -> None:
+    """The diff's view of the final newline must match the file, as git apply requires (review M2)."""
+    marker_but_file_has_newline = (
+        "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n\\ No newline at end of file\n"
+    )
+    with pytest.raises(HunkConflict):
+        apply_hunks("a\nb\n", parse_unified_diff(marker_but_file_has_newline)[0].hunks)
+    no_marker_but_file_lacks_newline = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n"
+    with pytest.raises(HunkConflict):
+        apply_hunks("a\nb", parse_unified_diff(no_marker_but_file_lacks_newline)[0].hunks)
+    consistent = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n\\ No newline at end of file\n"
+    assert apply_hunks("a\nb", parse_unified_diff(consistent)[0].hunks) == "A\nb"
+
+
+def test_mixed_line_endings_untouched_lines_keep_theirs() -> None:
+    """Only added lines take the dominant EOL (review M3)."""
+    diff = "--- a/f\n+++ b/f\n@@ -4 +4 @@\n-d\n+D\n"
+    assert apply_hunks("a\r\nb\r\nc\nd\ne\n", parse_unified_diff(diff)[0].hunks) == "a\r\nb\r\nc\nD\ne\n"
+    context = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n"
+    assert apply_hunks("a\r\nb\r\nc\n", parse_unified_diff(context)[0].hunks) == "a\r\nB\r\nc\n"
+    # a context line whose ending differs from the dominant one keeps it
+    lf_context = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n"
+    assert apply_hunks("a\nb\r\nc\r\nd\r\n", parse_unified_diff(lf_context)[0].hunks) == "a\nB\r\nc\r\nd\r\n"
+
+
+@pytest.mark.parametrize("mode", ["120000", "160000", "100664"])
+def test_non_regular_modes_rejected(mode: str) -> None:
+    diff = f"diff --git a/l b/l\nnew file mode {mode}\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+target\n"
+    with pytest.raises(PatchRejected) as caught:
+        parse_unified_diff(diff)
+    assert caught.value.reason == "mode"
+
+
+async def test_executable_mode_is_applied(ws: Workspace, root: Path) -> None:
+    diff = (
+        "diff --git a/run.sh b/run.sh\nnew file mode 100755\n"
+        "--- /dev/null\n+++ b/run.sh\n@@ -0,0 +1 @@\n+echo hi\n"
+    )
+    await ws.apply_patch(diff, Access.AGENT_WRITE)
+    assert (root / "run.sh").stat().st_mode & 0o777 == 0o755
+
+
+def test_lone_surrogate_diff_is_rejected() -> None:
+    with pytest.raises(PatchRejected):
+        parse_unified_diff("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+\ud800\n")
+
+
+async def test_rollback_removes_added_files(
+    ws: Workspace, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    diff = (
+        "--- /dev/null\n+++ b/added.py\n@@ -0,0 +1 @@\n+c = 1\n"
+        "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 3\n"
+    )
+    real_replace = os.replace
+
+    def flaky_replace(src: str, dst: str, **kwargs: int) -> None:
+        if dst == "b.py" and src.startswith(fs.TEMP_PREFIX):
+            raise OSError("disk full")
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="disk full"):
+        await ws.apply_patch(diff, Access.AGENT_WRITE)
+    assert not (root / "added.py").exists()
+    assert (root / "b.py").read_text() == "x = 1\ny = 2\n"
+    assert leftovers(root) == []
+
+
+async def test_failed_rollback_is_reported(
+    ws: Workspace, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.workspace.errors import PatchRollbackFailed
+
+    diff = (
+        "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n-def add(a, b):\n+def add(a: int, b: int):\n"
+        "     return a + b\n"
+        "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 3\n"
+    )
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src: str, dst: str, **kwargs: int) -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:  # the swap of b.py fails, and so does restoring a.py
+            raise OSError("disk full")
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    with pytest.raises(PatchRollbackFailed) as caught:
+        await ws.apply_patch(diff, Access.AGENT_WRITE)
+    assert caught.value.details == [{"path": "a.py"}]
+    assert leftovers(root) == []

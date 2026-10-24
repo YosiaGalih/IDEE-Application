@@ -1,6 +1,7 @@
 """Workspace file operations (ARCHITECTURE §4.2 ``app/workspace/fs.py``, §7; FR-028, FR-029, FR-032; T2, T9).
 
 ``Workspace(root)`` serves both trees of ARCHITECTURE §7: the user's ``repo/`` and a task worktree.
+``TaskWorkspace`` is the agent-bound view of a task worktree that tools use (``ToolContext.workspace``).
 
 **Access**
 - Every path goes through ``paths.resolve`` (string checks, containment, denylist per ``Access``).
@@ -9,8 +10,15 @@
 **Writes**
 - Atomic: temp file in the same folder, ``fsync``, then ``os.replace``.
 - Version-checked with ``expected_sha256`` (FR-029).
-- The version check and the replace run under an ``flock`` on the root fd. That serialises writers across
-  threads and processes (several API workers, the Celery worker).
+- Serialised by an ``flock`` on a lock file **outside** the root, in ``<root>/../.kk-locks/``. Sandboxed code
+  can reach the root but cannot hold the lock.
+- The lock is waited for at most ``LOCK_WAIT_S``, then ``WorkspaceBusy``.
+
+**Hostile trees.** A worktree is written by sandboxed code, so every read is bounded:
+- FIFOs and sockets are refused without blocking;
+- files over ``HASH_LIMIT`` are not hashed;
+- ``.agentignore`` is capped;
+- entries that vanish mid-listing are skipped.
 
 **Async**
 - Blocking work runs in ``asyncio.to_thread``.
@@ -24,8 +32,10 @@ import errno
 import fcntl
 import hashlib
 import os
+import re
 import secrets
 import stat
+import time
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -38,20 +48,26 @@ from app.workspace.errors import (
     AlreadyExists,
     FileTooLarge,
     PatchConflict,
+    PatchRejected,
+    PatchRollbackFailed,
     PathViolation,
     VersionConflict,
+    WorkspaceBusy,
     WorkspaceNotFound,
 )
 from app.workspace.patches import FilePatch, HunkConflict, apply_hunks, parse_unified_diff
 from app.workspace.paths import open_parent, open_root, resolve
-from app.workspace.policy import AGENTIGNORE, Access, Policy
+from app.workspace.policy import AGENTIGNORE, Access, AgentignoreInvalid, Policy
 
 logger = get_logger(__name__)
 
 USER_READ_LIMIT = 1024 * 1024  # [Menebak] what the IDE opens as text
 AGENT_READ_LIMIT = 256 * 1024  # ARCHITECTURE §7: larger files never reach the LLM
 WRITE_LIMIT = 5 * 1024 * 1024  # [Menebak] per file written through the workspace API
+HASH_LIMIT = 64 * 1024 * 1024  # [Menebak] larger (or sparse) files are reported without a hash
 AGENTIGNORE_LIMIT = 64 * 1024
+LOCK_WAIT_S = 10.0  # [Menebak]
+LOCKS_DIRNAME = ".kk-locks"
 MAX_TREE_DEPTH = 10
 MAX_TREE_ENTRIES = 5000
 TEMP_PREFIX = ".kk-tmp-"
@@ -61,6 +77,10 @@ _CHUNK = 64 * 1024
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _TEMP_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_NOT_A_FILE = (errno.ENXIO, errno.ENODEV, errno.EOPNOTSUPP)  # sockets, devices without a driver, ...
+_READS = (Access.USER_READ, Access.AGENT_READ)
+_WRITES = (Access.USER_WRITE, Access.AGENT_WRITE)
+_LINES = re.compile(r"[^\n]*\n|[^\n]+")  # "\n" only: editor, diff and agent line numbers must agree
 
 
 class AnyVersion:
@@ -86,16 +106,18 @@ class FileContent:
     content: str | None
     encoding: Literal["utf-8", "binary"]
     size: int
-    sha256: str
+    sha256: str | None  # None only above HASH_LIMIT
     too_large: bool
 
 
 @dataclass(frozen=True)
 class FileChange:
+    """API_CONTRACTS §3 ``FileChange`` (``path, change, sha256``) plus the replaced version and size."""
+
     path: str
-    change: Literal["created", "modified", "deleted"]
+    change: Literal["added", "modified", "deleted"]
+    sha256: str | None  # the new content; None after a delete
     old_sha256: str | None
-    new_sha256: str | None
     size: int
 
 
@@ -118,13 +140,20 @@ class TreeResult:
 class Current:
     """The file a write would replace."""
 
-    sha256: str
+    sha256: str | None  # None when larger than WRITE_LIMIT: it cannot be version-checked
     mode: int
     size: int
 
 
 def _bad_request(message: str) -> AppError:
     return AppError("BAD_REQUEST", message)
+
+
+def _require(access: Access, allowed: tuple[Access, ...]) -> Access:
+    access = Access(access)
+    if access not in allowed:
+        raise ValueError(f"{access} is not valid for this operation")  # a caller bug, never client input
+    return access
 
 
 def _open_file(parent_fd: int, name: str) -> int:
@@ -135,6 +164,8 @@ def _open_file(parent_fd: int, name: str) -> int:
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise PathViolation("symlink") from None
+        if exc.errno in _NOT_A_FILE:
+            raise PathViolation("not_regular") from None
         raise
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
@@ -142,20 +173,26 @@ def _open_file(parent_fd: int, name: str) -> int:
     return fd
 
 
-def _hash_fd(fd: int, keep: int) -> tuple[str, int, bytes]:
-    """sha256 and size of the whole file, plus its first ``keep`` bytes."""
+def _read_fd(fd: int, keep: int, hash_limit: int) -> tuple[str | None, int, bytes]:
+    """sha256 of the whole file (``None`` above ``hash_limit``), its size, and its first ``keep`` bytes."""
+    size = os.fstat(fd).st_size
+    if size > hash_limit:
+        return None, size, os.read(fd, keep)
     digest = hashlib.sha256()
-    size = 0
+    total = 0
     head = bytearray()
     while chunk := os.read(fd, _CHUNK):
         digest.update(chunk)
-        size += len(chunk)
+        total += len(chunk)
         if len(head) < keep:
             head += chunk[: keep - len(head)]
-    return digest.hexdigest(), size, bytes(head)
+        if total > hash_limit:  # grew while being read
+            return None, total, bytes(head)
+    return digest.hexdigest(), total, bytes(head)
 
 
-def _current(parent_fd: int, name: str) -> Current | None:
+def _snapshot(parent_fd: int, name: str) -> tuple[Current, bytes] | None:
+    """The file at ``name`` and its bytes, from one bounded read (bytes only up to WRITE_LIMIT)."""
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -166,21 +203,29 @@ def _current(parent_fd: int, name: str) -> Current | None:
         raise PathViolation("not_regular")
     fd = _open_file(parent_fd, name)
     try:
-        digest, size, _ = _hash_fd(fd, 0)
+        digest, size, data = _read_fd(fd, WRITE_LIMIT + 1, WRITE_LIMIT)
     finally:
         os.close(fd)
-    return Current(digest, stat.S_IMODE(st.st_mode) & 0o777, size)
+    mode = stat.S_IMODE(st.st_mode) & 0o777
+    if digest is None:
+        return Current(None, mode, size), b""
+    return Current(digest, mode, size), data
 
 
-def _check_version(current: Current | None, expected: str | AnyVersion | None) -> None:
+def _check_version(path: str, current: Current | None, expected: str | AnyVersion | None) -> None:
     if isinstance(expected, AnyVersion):
         return
+    if isinstance(expected, str) and current is not None and current.sha256 is None:
+        raise FileTooLarge(WRITE_LIMIT)
     current_sha = current.sha256 if current else None
+    if current is not None and expected is None:
+        raise VersionConflict(path, current_sha)
     if expected != current_sha:
-        raise VersionConflict(current_sha)
+        raise VersionConflict(path, current_sha)
 
 
-def _replace(parent_fd: int, name: str, data: bytes, mode: int) -> None:
+def _stage(parent_fd: int, data: bytes, mode: int) -> str:
+    """A temp file next to the target holding ``data``, flushed to disk; returns its name."""
     temp = TEMP_PREFIX + secrets.token_hex(8)
     fd = os.open(temp, _TEMP_FLAGS, 0o600, dir_fd=parent_fd)
     try:
@@ -189,12 +234,29 @@ def _replace(parent_fd: int, name: str, data: bytes, mode: int) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             os.fchmod(handle.fileno(), mode)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp, dir_fd=parent_fd)
+        raise
+    return temp
+
+
+def _fsync_dir(parent_fd: int) -> None:
+    try:
+        os.fsync(parent_fd)
+    except OSError as exc:  # the rename is done; only its durability is unknown
+        logger.error("workspace_dir_fsync_failed", error_type=type(exc).__name__)
+
+
+def _replace(parent_fd: int, name: str, data: bytes, mode: int) -> None:
+    temp = _stage(parent_fd, data, mode)
+    try:
         os.replace(temp, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temp, dir_fd=parent_fd)
         raise
-    os.fsync(parent_fd)
+    _fsync_dir(parent_fd)
 
 
 def _decode(head: bytes, size: int, limit: int) -> tuple[str | None, Literal["utf-8", "binary"]]:
@@ -214,9 +276,22 @@ def _decode(head: bytes, size: int, limit: int) -> tuple[str | None, Literal["ut
         return None, "binary"
 
 
+def _encode(content: str) -> bytes:
+    try:
+        return content.encode("utf-8")
+    except UnicodeEncodeError:  # lone surrogates cannot be stored as UTF-8
+        raise _bad_request("Content is not valid text") from None
+
+
+def _read_limit(access: Access) -> int:
+    return AGENT_READ_LIMIT if access is Access.AGENT_READ else USER_READ_LIMIT
+
+
 class Workspace:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, lock_dir: Path | None = None) -> None:
         self.root = root
+        # Outside the root: sandboxed code that can write the root must not be able to hold the lock.
+        self.lock_dir = lock_dir if lock_dir is not None else root.parent / LOCKS_DIRNAME
 
     # --- public async API ---
 
@@ -229,22 +304,25 @@ class Workspace:
         start_line: int | None = None,
         end_line: int | None = None,
     ) -> FileContent:
+        access = _require(access, _READS)
         return await asyncio.to_thread(self._read_file, rel, access, max_bytes, start_line, end_line)
 
     async def write_file(
         self, rel: str, content: str, access: Access, *, expected_sha256: str | AnyVersion | None
     ) -> FileChange:
+        access = _require(access, _WRITES)
         return await asyncio.to_thread(self._write_file, rel, content, access, expected_sha256)
 
     async def delete_file(self, rel: str, access: Access, *, expected_sha256: str | AnyVersion) -> FileChange:
+        access = _require(access, _WRITES)
         return await asyncio.to_thread(self._delete_file, rel, access, expected_sha256)
 
     async def make_dir(self, rel: str, access: Access) -> str:
+        access = _require(access, _WRITES)
         return await asyncio.to_thread(self._make_dir, rel, access)
 
-    async def tree(
-        self, rel: str = ".", access: Access = Access.USER_READ, *, depth: int = 3, max_entries: int = 500
-    ) -> TreeResult:
+    async def tree(self, rel: str, access: Access, *, depth: int = 3, max_entries: int = 500) -> TreeResult:
+        access = _require(access, _READS)
         depth = min(max(depth, 1), MAX_TREE_DEPTH)
         max_entries = min(max(max_entries, 1), MAX_TREE_ENTRIES)
         return await asyncio.to_thread(self._tree, rel, access, depth, max_entries)
@@ -255,6 +333,7 @@ class Workspace:
 
     async def apply_patch(self, diff: str, access: Access) -> list[FileChange]:
         """Apply a unified diff all-or-nothing: any conflict → ``PatchConflict`` and no file changes."""
+        access = _require(access, _WRITES)
         return await asyncio.to_thread(self._apply_patch, diff, access)
 
     # --- plumbing ---
@@ -264,30 +343,60 @@ class Workspace:
         fd, real = open_root(self.root)
         try:
             if lock:
-                fcntl.flock(fd, fcntl.LOCK_EX)  # released when the fd is closed
-            yield fd, real
+                with self._locked(real):
+                    yield fd, real
+            else:
+                yield fd, real
         finally:
             os.close(fd)
 
+    @contextlib.contextmanager
+    def _locked(self, real: str) -> Iterator[None]:
+        os.makedirs(self.lock_dir, mode=0o700, exist_ok=True)
+        name = hashlib.sha256(os.fsencode(real)).hexdigest()[:32] + ".lock"
+        dir_fd = os.open(self.lock_dir, _DIR_FLAGS)
+        try:
+            lock_fd = os.open(
+                name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd
+            )
+        finally:
+            os.close(dir_fd)
+        try:
+            deadline = time.monotonic() + LOCK_WAIT_S
+            delay = 0.005
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise WorkspaceBusy() from None
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.1)
+            yield
+        finally:
+            os.close(lock_fd)  # releases the lock
+
     def _policy(self, root_fd: int, access: Access) -> Policy:
-        """The project's policy. An ``.agentignore`` that cannot be read denies everything but USER_READ."""
+        """The project policy; an unreadable or over-cap ``.agentignore`` denies agent access."""
         try:
             fd = _open_file(root_fd, AGENTIGNORE)
         except WorkspaceNotFound:
             return Policy()
         except PathViolation:
-            text = None
-        else:
-            try:
-                _, size, head = _hash_fd(fd, AGENTIGNORE_LIMIT + 1)
-            finally:
-                os.close(fd)
-            text = head.decode("utf-8", errors="replace") if size <= AGENTIGNORE_LIMIT else None
-        if text is None:
-            if access is Access.USER_READ:
-                return Policy()
-            raise PathViolation("agentignore")
-        return Policy.from_agentignore(text)
+            return _invalid_policy(access)
+        try:
+            if os.fstat(fd).st_size > AGENTIGNORE_LIMIT:
+                return _invalid_policy(access)
+            data = os.read(fd, AGENTIGNORE_LIMIT + 1)
+        finally:
+            os.close(fd)
+        if len(data) > AGENTIGNORE_LIMIT:
+            return _invalid_policy(access)
+        try:
+            return Policy.from_agentignore(data.decode("utf-8", errors="replace"))
+        except AgentignoreInvalid:
+            return _invalid_policy(access)
 
     def _target(self, root_fd: int, real: str, rel: str, access: Access) -> tuple[str, ...]:
         parts = resolve(real, rel, access, self._policy(root_fd, access))
@@ -309,7 +418,8 @@ class Workspace:
             end_line is not None and end_line < (start_line or 1)
         ):
             raise _bad_request("Invalid line range")
-        limit = max_bytes if max_bytes is not None else _read_limit(access)
+        ceiling = _read_limit(access)  # a caller can lower the limit, never raise it
+        limit = ceiling if max_bytes is None else min(max(max_bytes, 0), ceiling)
         with self._opened() as (root_fd, real):
             parts = self._target(root_fd, real, rel, access)
             parent = open_parent(root_fd, parts, create=False)
@@ -318,56 +428,60 @@ class Workspace:
             finally:
                 os.close(parent)
             try:
-                digest, size, head = _hash_fd(fd, limit + 1)
+                digest, size, head = _read_fd(fd, limit + 1, HASH_LIMIT)
             finally:
                 os.close(fd)
         content, encoding = _decode(head, size, limit)
         if content is not None and (start_line is not None or end_line is not None):
-            lines = content.splitlines(keepends=True)
+            lines = _LINES.findall(content)
             content = "".join(lines[(start_line or 1) - 1 : end_line])
         return FileContent("/".join(parts), content, encoding, size, digest, size > limit)
 
     def _write_file(
         self, rel: str, content: str, access: Access, expected: str | AnyVersion | None
     ) -> FileChange:
-        data = content.encode("utf-8")
+        data = _encode(content)
         if len(data) > WRITE_LIMIT:
             raise FileTooLarge(WRITE_LIMIT)
         with self._opened(lock=True) as (root_fd, real):
             parts = self._target(root_fd, real, rel, access)
+            path = "/".join(parts)
             try:
                 parent = open_parent(root_fd, parts, create=False)
             except WorkspaceNotFound:
-                _check_version(None, expected)  # a refused write must not leave folders behind
+                _check_version(path, None, expected)  # a refused write must not leave folders behind
                 parent = open_parent(root_fd, parts, create=True)
             try:
-                current = _current(parent, parts[-1])
-                _check_version(current, expected)
+                snapshot = _snapshot(parent, parts[-1])
+                current = snapshot[0] if snapshot else None
+                _check_version(path, current, expected)
                 _replace(parent, parts[-1], data, current.mode if current else 0o644)
             finally:
                 os.close(parent)
         return FileChange(
-            "/".join(parts),
-            "modified" if current else "created",
-            current.sha256 if current else None,
+            path,
+            "modified" if current else "added",
             hashlib.sha256(data).hexdigest(),
+            current.sha256 if current else None,
             len(data),
         )
 
     def _delete_file(self, rel: str, access: Access, expected: str | AnyVersion) -> FileChange:
         with self._opened(lock=True) as (root_fd, real):
             parts = self._target(root_fd, real, rel, access)
+            path = "/".join(parts)
             parent = open_parent(root_fd, parts, create=False)
             try:
-                current = _current(parent, parts[-1])
-                if current is None:
+                snapshot = _snapshot(parent, parts[-1])
+                if snapshot is None:
                     raise WorkspaceNotFound()
-                _check_version(current, expected)
+                current = snapshot[0]
+                _check_version(path, current, expected)
                 os.unlink(parts[-1], dir_fd=parent)
-                os.fsync(parent)
+                _fsync_dir(parent)
             finally:
                 os.close(parent)
-        return FileChange("/".join(parts), "deleted", current.sha256, None, 0)
+        return FileChange(path, "deleted", None, current.sha256, 0)
 
     def _make_dir(self, rel: str, access: Access) -> str:
         with self._opened(lock=True) as (root_fd, real):
@@ -393,8 +507,15 @@ class Workspace:
             policy = self._policy(root_fd, access)
             plans: list[_PatchPlan] = []
             conflicts: list[dict[str, object]] = []
+            seen: set[tuple[str, ...]] = set()
             for patch in patches:
-                plan = _plan(root_fd, real, patch, access, policy, fds)
+                parts = resolve(real, patch.path, access, policy)
+                if not parts:
+                    raise PathViolation("not_regular")
+                if parts in seen:  # "a.py" and "./a.py" are one file: two plans would overwrite each other
+                    raise PatchRejected("duplicate_path")
+                seen.add(parts)
+                plan = _plan(root_fd, parts, patch, fds)
                 if isinstance(plan, dict):
                     conflicts.append(plan)
                 else:
@@ -412,9 +533,17 @@ class Workspace:
             top: list[TreeEntry] = []
             queue: deque[tuple[tuple[str, ...], list[TreeEntry], int]] = deque([(start, top, 1)])
             count = 0
+            first = True
             while queue:
                 parts, into, level = queue.popleft()
-                for entry, child_parts in _list_dir(root_fd, real, parts, access, policy):
+                try:
+                    listed = _list_dir(root_fd, real, parts, access, policy)
+                except (WorkspaceNotFound, PathViolation):
+                    if first:
+                        raise
+                    continue  # a sub-folder that vanished or was swapped for a link mid-listing
+                first = False
+                for entry, child_parts in listed:
                     if count == max_entries:
                         return TreeResult(top, truncated=True)
                     if entry.type == "dir" and child_parts is not None and level < depth:
@@ -426,15 +555,58 @@ class Workspace:
         return TreeResult(top, truncated=False)
 
     def _disk_usage(self) -> int:
-        fd, real = open_root(self.root)  # raises WorkspaceNotFound for a missing root
-        os.close(fd)
         total = 0
-        for folder, _dirs, files in os.walk(real, followlinks=False):
-            for name in files:
-                st = os.lstat(os.path.join(folder, name))
-                if stat.S_ISREG(st.st_mode):
-                    total += st.st_size
+        with self._opened() as (root_fd, _):
+            walk = os.fwalk(".", dir_fd=root_fd, follow_symlinks=False, onerror=_log_walk_error)
+            for _folder, _dirs, files, dir_fd in walk:
+                for name in files:
+                    try:
+                        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISREG(st.st_mode):
+                        total += st.st_size
         return total
+
+
+def _invalid_policy(access: Access) -> Policy:
+    if access in (Access.AGENT_READ, Access.AGENT_WRITE):
+        raise PathViolation("agentignore")
+    return Policy()  # the user can still read, and repair the file
+
+
+def _log_walk_error(exc: OSError) -> None:
+    logger.warning("workspace_walk_error", error_type=type(exc).__name__)
+
+
+class TaskWorkspace:
+    """The agent's view of a task worktree (ARCHITECTURE §4.2): every call is AGENT_READ or AGENT_WRITE."""
+
+    def __init__(self, root: Path, *, lock_dir: Path | None = None) -> None:
+        self._workspace = Workspace(root, lock_dir=lock_dir)
+
+    async def read_text(
+        self,
+        rel: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        max_bytes: int | None = None,
+    ) -> FileContent:
+        return await self._workspace.read_file(
+            rel, Access.AGENT_READ, max_bytes=max_bytes, start_line=start_line, end_line=end_line
+        )
+
+    async def write_text(self, rel: str, content: str) -> FileChange:
+        return await self._workspace.write_file(rel, content, Access.AGENT_WRITE, expected_sha256=ANY_VERSION)
+
+    async def apply_unified_diff(self, diff: str) -> list[FileChange]:
+        return await self._workspace.apply_patch(diff, Access.AGENT_WRITE)
+
+    async def delete(self, rel: str) -> FileChange:
+        return await self._workspace.delete_file(rel, Access.AGENT_WRITE, expected_sha256=ANY_VERSION)
+
+    async def tree(self, rel: str = ".", depth: int = 3) -> TreeResult:
+        return await self._workspace.tree(rel, Access.AGENT_READ, depth=depth)
 
 
 @dataclass
@@ -444,41 +616,22 @@ class _PatchPlan:
     current: Current | None
     old: bytes
     new: bytes | None  # None: delete
+    mode: int
 
     @property
     def change(self) -> FileChange:
         path = "/".join(self.parts)
         old_sha = self.current.sha256 if self.current else None
         if self.new is None:
-            return FileChange(path, "deleted", old_sha, None, 0)
-        kind: Literal["created", "modified"] = "modified" if self.current else "created"
-        return FileChange(path, kind, old_sha, hashlib.sha256(self.new).hexdigest(), len(self.new))
-
-
-def _snapshot(parent: int, name: str) -> tuple[Current, bytes] | None:
-    current = _current(parent, name)
-    if current is None or current.size > WRITE_LIMIT:
-        return (current, b"") if current else None
-    fd = _open_file(parent, name)
-    try:
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            return current, handle.read()
-    finally:
-        os.close(fd)
+            return FileChange(path, "deleted", None, old_sha, 0)
+        kind: Literal["added", "modified"] = "modified" if self.current else "added"
+        return FileChange(path, kind, hashlib.sha256(self.new).hexdigest(), old_sha, len(self.new))
 
 
 def _plan(
-    root_fd: int,
-    real: str,
-    patch: FilePatch,
-    access: Access,
-    policy: Policy,
-    fds: contextlib.ExitStack,
+    root_fd: int, parts: tuple[str, ...], patch: FilePatch, fds: contextlib.ExitStack
 ) -> _PatchPlan | dict[str, object]:
     """What one file patch will write, or its conflict detail ``{path, hunk, reason}``."""
-    parts = resolve(real, patch.path, access, policy)
-    if not parts:
-        raise PathViolation("not_regular")
 
     def conflict(reason: str, hunk: int | None = None) -> dict[str, object]:
         return {"path": "/".join(parts), "hunk": hunk, "reason": reason}
@@ -492,12 +645,12 @@ def _plan(
     if patch.old_path is None:
         if snapshot is not None:
             return conflict("exists")
-        current, old_text = None, None
+        current, old_text, raw = None, None, b""
     elif snapshot is None:
         return conflict("missing")
     else:
         current, raw = snapshot
-        if current.size > WRITE_LIMIT:
+        if current.sha256 is None:
             return conflict("too_large")
         if b"\x00" in raw[:_SNIFF_BYTES]:
             return conflict("binary")
@@ -514,40 +667,69 @@ def _plan(
             return conflict("not_empty_after_delete")
         new = None
     else:
-        new = new_text.encode("utf-8")
+        try:
+            new = new_text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise PatchRejected("malformed") from None
         if len(new) > WRITE_LIMIT:
             return conflict("too_large")
-    return _PatchPlan(parts, parent, current, snapshot[1] if snapshot else b"", new)
+    mode = current.mode if current else (patch.new_mode or 0o644)
+    return _PatchPlan(parts, parent, current, raw, new, mode)
 
 
 def _commit(root_fd: int, plans: list[_PatchPlan], fds: contextlib.ExitStack) -> None:
-    """Write every planned file; on failure put back what was already written, then re-raise."""
-    done: list[_PatchPlan] = []
+    """Stage every file, then swap them in. On failure put back what was swapped, then re-raise."""
+    staged: list[tuple[_PatchPlan, str | None]] = []
     try:
         for plan in plans:
             if plan.parent is None:
                 plan.parent = open_parent(root_fd, plan.parts, create=True)
                 fds.callback(os.close, plan.parent)
-            if plan.new is None:
+            staged.append((plan, None if plan.new is None else _stage(plan.parent, plan.new, plan.mode)))
+    except BaseException:
+        _discard(staged)
+        raise
+    done: list[_PatchPlan] = []
+    try:
+        for plan, temp in staged:
+            assert plan.parent is not None
+            if temp is None:
                 os.unlink(plan.parts[-1], dir_fd=plan.parent)
             else:
-                _replace(plan.parent, plan.parts[-1], plan.new, plan.current.mode if plan.current else 0o644)
+                os.replace(temp, plan.parts[-1], src_dir_fd=plan.parent, dst_dir_fd=plan.parent)
             done.append(plan)
-    except BaseException:
-        for plan in reversed(done):
-            assert plan.parent is not None
-            try:
-                if plan.current is None:
-                    os.unlink(plan.parts[-1], dir_fd=plan.parent)
-                else:
-                    _replace(plan.parent, plan.parts[-1], plan.old, plan.current.mode)
-            except OSError as exc:
-                logger.error(
-                    "patch_rollback_failed",
-                    path="/".join(plan.parts),
-                    error_type=type(exc).__name__,
-                )
+    except BaseException as exc:
+        _discard(staged[len(done) :])
+        failed = _rollback(done)
+        if failed:
+            raise PatchRollbackFailed(failed) from exc
         raise
+    for parent in {plan.parent for plan in plans if plan.parent is not None}:
+        _fsync_dir(parent)
+
+
+def _discard(staged: list[tuple[_PatchPlan, str | None]]) -> None:
+    for plan, temp in staged:
+        if temp is not None and plan.parent is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp, dir_fd=plan.parent)
+
+
+def _rollback(done: list[_PatchPlan]) -> list[str]:
+    """Undo swapped files, newest first; returns the paths that could not be restored."""
+    failed: list[str] = []
+    for plan in reversed(done):
+        assert plan.parent is not None
+        try:
+            if plan.current is None:
+                os.unlink(plan.parts[-1], dir_fd=plan.parent)
+            else:
+                _replace(plan.parent, plan.parts[-1], plan.old, plan.current.mode)
+        except OSError as exc:
+            path = "/".join(plan.parts)
+            logger.error("patch_rollback_failed", path=path, error_type=type(exc).__name__)
+            failed.append(path)
+    return failed
 
 
 def _open_dir_at(root_fd: int, parts: tuple[str, ...]) -> int:
@@ -560,7 +742,10 @@ def _open_dir_at(root_fd: int, parts: tuple[str, ...]) -> int:
         raise WorkspaceNotFound() from None
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            try:
+                st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                raise WorkspaceNotFound() from None
             raise PathViolation("symlink" if stat.S_ISLNK(st.st_mode) else "not_regular") from None
         raise
     finally:
@@ -574,45 +759,51 @@ def _list_dir(
     fd = _open_dir_at(root_fd, parts)
     try:
         with os.scandir(fd) as scan:
-            raw = sorted(scan, key=lambda e: e.name)
+            names = sorted(entry.name for entry in scan)
         listed: list[tuple[TreeEntry, tuple[str, ...] | None]] = []
-        for item in raw:
-            child = (*parts, item.name)
-            if item.name.startswith(TEMP_PREFIX) or policy.denied(child, access):
+        for name in names:
+            child = (*parts, name)
+            if name.startswith(TEMP_PREFIX) or policy.denied(child, access):
                 continue
             path = "/".join(child)
-            st = os.stat(item.name, dir_fd=fd, follow_symlinks=False)
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue  # removed while listing
             if stat.S_ISDIR(st.st_mode):
-                listed.append((TreeEntry(path, item.name, "dir", None, None), child))
+                listed.append((TreeEntry(path, name, "dir", None, None), child))
             elif stat.S_ISREG(st.st_mode):
-                listed.append((TreeEntry(path, item.name, "file", st.st_size, None), None))
-            elif stat.S_ISLNK(st.st_mode) and (target := _link_target(real, child, access, policy)):
+                listed.append((TreeEntry(path, name, "file", st.st_size, None), None))
+            elif stat.S_ISLNK(st.st_mode) and (target := _link_target(root_fd, real, child, access, policy)):
                 kind, size = target
-                listed.append((TreeEntry(path, item.name, kind, size, None), None))  # never descended
+                listed.append((TreeEntry(path, name, kind, size, None), None))  # never descended
     finally:
         os.close(fd)
     return sorted(listed, key=lambda pair: pair[0].type != "dir")  # stable: names stay sorted
 
 
 def _link_target(
-    real: str, child: tuple[str, ...], access: Access, policy: Policy
+    root_fd: int, real: str, child: tuple[str, ...], access: Access, policy: Policy
 ) -> tuple[Literal["file", "dir"], int | None] | None:
     """What an in-root symlink points at; ``None`` hides escaping, dangling, or denied links."""
     try:
         resolved = resolve(real, "/".join(child), access, policy)
     except PathViolation:
         return None
-    target = os.path.join(real, *resolved)
+    if not resolved:
+        return "dir", None  # a link to the root itself
     try:
-        st = os.stat(target, follow_symlinks=False)  # resolved: no symlinks left in it
+        parent = open_parent(root_fd, resolved, create=False)  # no symlink is followed on the way
+    except (WorkspaceNotFound, PathViolation):
+        return None
+    try:
+        st = os.stat(resolved[-1], dir_fd=parent, follow_symlinks=False)
     except OSError:
         return None
+    finally:
+        os.close(parent)
     if stat.S_ISDIR(st.st_mode):
         return "dir", None
     if stat.S_ISREG(st.st_mode):
         return "file", st.st_size
     return None
-
-
-def _read_limit(access: Access) -> int:
-    return AGENT_READ_LIMIT if access in (Access.AGENT_READ, Access.AGENT_WRITE) else USER_READ_LIMIT

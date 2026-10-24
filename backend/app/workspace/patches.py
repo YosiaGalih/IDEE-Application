@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 
 from app.workspace.errors import PatchRejected
@@ -33,6 +34,7 @@ _HEADER_REJECTS = (
     (("Binary files", "GIT binary patch"), "binary"),
 )
 _HEADER_OK = ("index ", "new file mode", "deleted file mode")
+_FILE_MODES = {"100644": 0o644, "100755": 0o755}  # symlinks (120000) and submodules (160000) are refused
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,7 @@ class Hunk:
     new_count: int
     lines: list[tuple[str, str]]  # (" " | "-" | "+", text without EOL)
     new_no_eol: bool
+    old_no_eol: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class FilePatch:
     old_path: str | None  # None: the file is added
     new_path: str | None  # None: the file is deleted
     hunks: list[Hunk]
+    new_mode: int | None = None  # 0o644 / 0o755 for an added file when the diff says so
 
     @property
     def path(self) -> str:
@@ -81,6 +85,20 @@ def _git_header_path(rest: str) -> str:
     return path
 
 
+def _mode(header: str) -> int | None:
+    """The file mode a header line names; ``PatchRejected("mode")`` for anything but a regular file."""
+    words = header.split()
+    if header.startswith(("new file mode", "deleted file mode")):
+        value = words[-1]
+    elif header.startswith("index ") and len(words) == 3:
+        value = words[2]
+    else:
+        return None
+    if value not in _FILE_MODES:
+        raise PatchRejected("mode")
+    return _FILE_MODES[value]
+
+
 def _parse_hunk(lines: list[str], i: int) -> tuple[Hunk, int]:
     match = _HUNK_HEADER.match(lines[i])
     if match is None:
@@ -91,7 +109,7 @@ def _parse_hunk(lines: list[str], i: int) -> tuple[Hunk, int]:
     i += 1
     body: list[tuple[str, str]] = []
     old_seen = new_seen = 0
-    new_no_eol = False
+    old_no_eol = new_no_eol = False
     while old_seen < old_count or new_seen < new_count or (i < len(lines) and lines[i].startswith("\\")):
         if i >= len(lines):
             raise PatchRejected("malformed")
@@ -100,8 +118,8 @@ def _parse_hunk(lines: list[str], i: int) -> tuple[Hunk, int]:
         if line.startswith("\\"):  # "\ No newline at end of file" qualifies the line before it
             if not body:
                 raise PatchRejected("malformed")
-            if body[-1][0] in " +":
-                new_no_eol = True
+            old_no_eol = old_no_eol or body[-1][0] in " -"
+            new_no_eol = new_no_eol or body[-1][0] in " +"
             continue
         tag, text = (" ", "") if line == "" else (line[0], line[1:])  # LLMs drop the space of blank context
         if tag not in " -+":
@@ -111,16 +129,25 @@ def _parse_hunk(lines: list[str], i: int) -> tuple[Hunk, int]:
         if old_seen > old_count or new_seen > new_count:
             raise PatchRejected("malformed")
         body.append((tag, text))
-    return Hunk(old_start, old_count, new_start, new_count, body, new_no_eol), i
+    return Hunk(old_start, old_count, new_start, new_count, body, new_no_eol, old_no_eol), i
+
+
+def _starts_file(lines: list[str], i: int) -> bool:
+    return lines[i].startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ ")
 
 
 def parse_unified_diff(text: str) -> list[FilePatch]:
-    if len(text.encode("utf-8")) > MAX_DIFF_BYTES:
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError:  # lone surrogates: no file can hold this text
+        raise PatchRejected("malformed") from None
+    if size > MAX_DIFF_BYTES:
         raise PatchRejected("too_large")
     lines = [line.removesuffix("\r") for line in text.split("\n")]
     if lines and lines[-1] == "":
         lines.pop()
     patches: list[FilePatch] = []
+    mode: int | None = None  # from the diff --git header of the file being read
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -128,6 +155,7 @@ def parse_unified_diff(text: str) -> list[FilePatch]:
             git_path = line[len("diff --git ") :]
             i += 1
             created = deleted = False
+            mode = None
             while i < len(lines) and not lines[i].startswith(("--- ", "diff --git ")):
                 header = lines[i]
                 for prefixes, reason in _HEADER_REJECTS:
@@ -135,6 +163,7 @@ def parse_unified_diff(text: str) -> list[FilePatch]:
                         raise PatchRejected(reason)
                 if not header.startswith(_HEADER_OK):
                     raise PatchRejected("malformed")
+                mode = _mode(header) or mode
                 created = created or header.startswith("new file mode")
                 deleted = deleted or header.startswith("deleted file mode")
                 i += 1
@@ -143,7 +172,8 @@ def parse_unified_diff(text: str) -> list[FilePatch]:
             if created == deleted:  # neither, or both: nothing this apply path can do
                 raise PatchRejected("malformed")
             path = _git_header_path(git_path)
-            patches.append(FilePatch(None, path, []) if created else FilePatch(path, None, []))
+            patches.append(FilePatch(None, path, [], mode) if created else FilePatch(path, None, []))
+            mode = None
         elif line.startswith("--- "):
             if i + 1 >= len(lines) or not lines[i + 1].startswith("+++ "):
                 raise PatchRejected("malformed")
@@ -159,7 +189,10 @@ def parse_unified_diff(text: str) -> list[FilePatch]:
                 hunks.append(hunk)
             if not hunks:
                 raise PatchRejected("malformed")
-            patches.append(FilePatch(old_path, new_path, hunks))
+            if i < len(lines) and lines[i][:1] in (" ", "+", "-") and not _starts_file(lines, i):
+                raise PatchRejected("malformed")  # body lines beyond the header counts: never drop them
+            patches.append(FilePatch(old_path, new_path, hunks, mode if old_path is None else None))
+            mode = None
         elif line.startswith(("Binary files ", "GIT binary patch")):
             raise PatchRejected("binary")
         else:
@@ -174,51 +207,70 @@ def parse_unified_diff(text: str) -> list[FilePatch]:
     return patches
 
 
-def _split(text: str) -> tuple[list[str], bool, str]:
-    """Lines without EOL, whether the text ends with a newline, and its dominant EOL."""
-    crlf = text.count("\r\n")
-    eol = "\r\n" if crlf > text.count("\n") - crlf else "\n"
+def _split(text: str) -> tuple[list[tuple[str, str]], str]:
+    """Lines as ``(content, eol)`` (``eol=""``: last line without newline) and the dominant EOL."""
     if not text:
-        return [], True, eol
-    body = text[:-1] if text.endswith("\n") else text
-    return [line.removesuffix("\r") for line in body.split("\n")], text.endswith("\n"), eol
+        return [], "\n"
+    pieces = text.split("\n")
+    lines = [(piece[:-1], "\r\n") if piece.endswith("\r") else (piece, "\n") for piece in pieces[:-1]]
+    if pieces[-1]:
+        lines.append((pieces[-1], ""))
+    crlf = sum(eol == "\r\n" for _, eol in lines)
+    lf = sum(eol == "\n" for _, eol in lines)
+    return lines, "\r\n" if crlf > lf else "\n"
 
 
 def apply_hunks(old: str | None, hunks: list[Hunk]) -> str:
-    """The new text, or ``HunkConflict`` for the first hunk that does not apply."""
-    old_lines, trailing, eol = _split(old or "")
-    out: list[str] = []
+    """The new text, or ``HunkConflict`` for the first hunk that does not apply.
+
+    Unchanged lines keep their own line ending; added lines take the file's dominant one.
+    """
+    old_lines, eol = _split(old or "")
+    contents = [content for content, _ in old_lines]
+    at_line: defaultdict[str, list[int]] = defaultdict(list)
+    for index, content in enumerate(contents):
+        at_line[content].append(index)
+    out: list[tuple[str, str]] = []
     cursor = 0  # index in old_lines up to which the output is final
     delta = 0  # offset found for the previous hunk, carried to the next (as ``patch`` does)
+    eof_hunk: Hunk | None = None
     for index, hunk in enumerate(hunks):
         expected = [text for tag, text in hunk.lines if tag in " -"]
-        replacement = [text for tag, text in hunk.lines if tag in " +"]
+        size = len(expected)
         header_pos = hunk.old_start if hunk.old_count == 0 else hunk.old_start - 1
         preferred = header_pos + delta
-        size = len(expected)
 
         def matches(at: int, expected: list[str] = expected, size: int = size) -> bool:
-            return 0 <= at <= len(old_lines) - size and old_lines[at : at + size] == expected
+            return 0 <= at <= len(contents) - size and contents[at : at + size] == expected
 
         if preferred >= cursor and matches(preferred):
             pos = preferred
         elif not expected:
             raise HunkConflict(index, "context_mismatch")  # a pure insertion has no context to search for
         else:
-            found = [at for at in range(cursor, len(old_lines) - size + 1) if matches(at)]
+            found = [at for at in at_line.get(expected[0], ()) if at >= cursor and matches(at)]
             if len(found) > 1:
                 raise HunkConflict(index, "ambiguous")
             if not found:
-                earlier = any(matches(at) for at in range(cursor))
+                earlier = any(at < cursor and matches(at) for at in at_line.get(expected[0], ()))
                 raise HunkConflict(index, "overlap" if earlier else "context_mismatch")
             pos = found[0]
+        if old_lines and pos + size == len(old_lines) and hunk.old_no_eol != (old_lines[-1][1] == ""):
+            raise HunkConflict(index, "context_mismatch")  # the diff disagrees about the final newline
         out += old_lines[cursor:pos]
-        out += replacement
+        old_iter = iter(old_lines[pos : pos + size])
+        for tag, text in hunk.lines:
+            if tag == " ":
+                out.append(next(old_iter))  # the file's own line, with its own ending
+            elif tag == "-":
+                next(old_iter)
+            else:
+                out.append((text, eol))
         cursor = pos + size
         delta = pos - header_pos
-        if cursor == len(old_lines):
-            trailing = not hunk.new_no_eol
+        eof_hunk = hunk if cursor == len(old_lines) else None
     out += old_lines[cursor:]
-    if not out:
-        return ""
-    return eol.join(out) + (eol if trailing else "")
+    if out and eof_hunk is not None:
+        content, ending = out[-1]
+        out[-1] = (content, "" if eof_hunk.new_no_eol else (ending or eol))
+    return "".join(content + ending for content, ending in out)

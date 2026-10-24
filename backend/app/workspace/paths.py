@@ -14,7 +14,6 @@ Two layers, both required:
 
 from __future__ import annotations
 
-import contextlib
 import errno
 import os
 import stat
@@ -25,6 +24,7 @@ from app.workspace.policy import Access, Policy
 
 MAX_SEGMENT_BYTES = 255
 MAX_PATH_BYTES = 4096
+MAX_DEPTH = 128  # bounds the cost of every per-segment check, .agentignore matching included
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _WRITES = (Access.USER_WRITE, Access.AGENT_WRITE)
 _realpath = os.path.realpath  # module attribute so the race test can stub the check layer
@@ -38,7 +38,11 @@ def split_rel(rel: str) -> tuple[str, ...]:
         raise PathViolation("invalid")
     if rel.startswith("/"):
         raise PathViolation("absolute")
-    if len(os.fsencode(rel)) > MAX_PATH_BYTES:
+    try:
+        encoded = os.fsencode(rel)
+    except UnicodeEncodeError:  # a lone surrogate that no file system name can carry
+        raise PathViolation("invalid") from None
+    if len(encoded) > MAX_PATH_BYTES:
         raise PathViolation("too_long")
     parts: list[str] = []
     for segment in rel.split("/"):
@@ -49,6 +53,8 @@ def split_rel(rel: str) -> tuple[str, ...]:
         if len(os.fsencode(segment)) > MAX_SEGMENT_BYTES:
             raise PathViolation("too_long")
         parts.append(segment)
+    if len(parts) > MAX_DEPTH:
+        raise PathViolation("too_long")
     return tuple(parts)
 
 
@@ -57,7 +63,10 @@ def resolve(root_real: str, rel: str, access: Access, policy: Policy) -> tuple[s
     requested = split_rel(rel)
     if policy.denied(requested, access):
         raise PathViolation("denied")
-    real = _realpath(os.path.join(root_real, *requested))
+    try:
+        real = _realpath(os.path.join(root_real, *requested))
+    except RecursionError:  # a symlink chain deep enough to exhaust realpath
+        raise PathViolation("symlink") from None
     if os.path.commonpath([root_real, real]) != root_real:
         raise PathViolation("outside_root")
     resolved = Path(real).relative_to(root_real).parts
@@ -105,10 +114,18 @@ def open_parent(root_fd: int, parts: tuple[str, ...], *, create: bool) -> int:
             except FileNotFoundError:
                 if not create:
                     raise WorkspaceNotFound() from None
-                with contextlib.suppress(FileExistsError):
+                created = True
+                try:
                     os.mkdir(name, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    created = False  # lost a race: someone else's folder keeps its mode
                 child = _open_dir(fd, name)
-                os.fchmod(child, 0o755)  # mkdir's mode is masked by the umask
+                if created:
+                    try:
+                        os.fchmod(child, 0o755)  # mkdir's mode is masked by the umask
+                    except BaseException:
+                        os.close(child)
+                        raise
             os.close(fd)
             fd = child
         return fd

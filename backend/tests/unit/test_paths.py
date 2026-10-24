@@ -44,6 +44,19 @@ POLICY_CASES = [
             ".git-credentials",
             ".pypirc",
             "ID_RSA",
+            # the contract is ".env*" (ARCHITECTURE §7), not only ".env" / ".env.<x>"
+            ".envrc",
+            ".env-production",
+            ".env_local",
+            ".environment",
+            ".envs/.production/.postgres",
+            "home/.aws/credentials",
+            ".ssh/config",
+            ".docker/config.json",
+            ".kube/config",
+            "putty.ppk",
+            ".pgpass",
+            ".htpasswd",
         )
         for case in expect(secret, SECRET_DENIED)
     ],
@@ -53,6 +66,10 @@ POLICY_CASES = [
     *expect(".venv/lib/x.py", (Access.AGENT_READ,)),
     *expect("__pycache__/m.pyc", (Access.AGENT_READ,)),
     *expect("src/main.py", ()),
+    *expect(".GIT/config", ALL),
+    *expect(".github/workflows/ci.yml", (Access.AGENT_WRITE,)),
+    *expect(".GitHub/Actions/x/action.yml", (Access.AGENT_WRITE,)),
+    *expect(".github/CODEOWNERS", ()),
 ]
 
 
@@ -242,3 +259,39 @@ def test_missing_root(tmp_path: Path) -> None:
 )
 def test_agentignore_glob_syntax(pattern: str, path: str, matched: bool) -> None:
     assert Policy.from_agentignore(pattern).denied(parts(path), Access.AGENT_READ) is matched
+
+
+def test_plain_string_access_cannot_skip_checks() -> None:
+    assert Policy().denied((".agentignore",), "agent_write")  # type: ignore[arg-type]
+
+
+def test_user_may_always_write_agentignore_itself() -> None:
+    policy = Policy.from_agentignore("*\n")
+    assert not policy.denied((".agentignore",), Access.USER_WRITE)
+    assert policy.denied(("other.txt",), Access.USER_WRITE)
+
+
+def test_agentignore_escaped_hash_and_bang() -> None:
+    policy = Policy.from_agentignore("\\#notes\n\\!important\n")
+    assert policy.denied(("#notes",), Access.AGENT_READ)
+    assert policy.denied(("!important",), Access.AGENT_READ)
+
+
+def test_split_rel_depth_and_surrogates() -> None:
+    assert len(split_rel("/".join(["d"] * 128))) == 128
+    with pytest.raises(PathViolation) as caught:
+        split_rel("/".join(["d"] * 129))
+    assert caught.value.reason == "too_long"
+    with pytest.raises(PathViolation) as caught:
+        split_rel("bad\ud800.txt")
+    assert caught.value.reason == "invalid"
+
+
+def test_deep_symlink_chain_is_a_violation(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "l0").write_text("x")
+    for i in range(1, 1200):
+        os.symlink(f"l{i - 1}", root / f"l{i}")
+    with pytest.raises(PathViolation):
+        resolve(str(root), "l1199", Access.USER_READ, NO_POLICY)
