@@ -596,3 +596,40 @@ Bug yang ditemukan saat eksekusi (masing-masing dengan test regresi):
 Deviasi kontrak: konflik #36 (mekanisme artefak ADR-033 tidak bekerja di Docker 29/runc; diganti bind folder per run) dan #37 (klien memakai polling `/logs` karena `on_log`). Keduanya perlu keputusan PO; tercatat di spec sistem pengembangan §8.
 
 Belum dicakup: runsc hanya diuji di level spec (`test_runtime_runsc`); egress (ADR-007) hanya validasi, jaringan egress di WP-1.5; profil `node.npm_test` tanpa JUnit [Menebak].
+
+#### WP-1.3 — review putaran 1 dan perbaikannya (24 Okt 2026)
+
+Tiga reviewer berjalan paralel pada 0961666:
+- `kk-backend-reviewer`: REQUEST CHANGES, 4 HIGH;
+- `kk-silent-failure-hunter`: 21 temuan, 2 HIGH;
+- `kk-security-reviewer` (AG-13 pra-review): **TIDAK DITANDATANGANI**, blocker F1 HIGH.
+
+Perbaikan ada di 0ff8379 (sandbox manager) dan b676c04 (klien backend).
+
+| Temuan (sumber) | Perbaikan | Test |
+|---|---|---|
+| Folder artefak per run tak terbatas, tak dihitung, bisa tertinggal (AG-13 F1, backend HIGH, SF F2/F12) | Folder pindah ke `<project>/.kk-runs/<run_id>` (kuota per project); dibuat dengan dir fd + `O_NOFOLLOW`; watchdog 1 dtk, > 8 MiB → kill → `DISK_LIMIT`; dihitung dalam pertumbuhan untuk semua run termasuk read-only; `disk.py` mengukur gagal-tertutup dan menghapus secara iteratif (folder terkunci dibuka dulu); sapuan saat start | `test_disk.py` (6, juga lulus sebagai uid 65534); `test_watchdog_kills_on_artifact_folder_growth`; Docker: `test_read_only_run_cannot_flood_the_artifact_folder`, `test_hostile_artifact_tree_is_removed` (folder `chmod 000` + kedalaman 1500), `test_disk_helpers_as_sandbox_uid` (uid 10001 di container) |
+| Pengukuran disk buta terhadap folder tak terbaca (backend HIGH, SF F2b) | `tree_bytes` → `Unmeasurable` → `WORKSPACE_UNSAFE`/`DISK_UNMEASURABLE`; setiap entri dihitung ≥ 512 B | `test_locked_folder_is_unmeasurable` |
+| Log Docker tak terbatas (backend HIGH, AG-13 F7) | `LogConfig` json-file `max-size` max(4× output, 16 MiB), 2 file | `test_container_log_is_capped`; Docker: `test_container_log_cap_is_accepted_by_docker` |
+| Deadline klien menghitung antrean (backend HIGH, SF F9) | `/logs` memuat `status`; deadline mulai saat run keluar dari antrean; batas antre terpisah | `test_queue_time_is_not_run_time`, `test_queue_limit` |
+| Status final saat container mungkin masih hidup (AG-13 F2, SF F3) | remove 3×; gagal → `CONTAINER_NOT_REMOVED`, folder artefak tidak disentuh; reaper 60 dtk per instance | `test_container_not_removed_is_an_error`, `test_reaper_removes_only_inactive_own_containers` |
+| Registry tak pernah evict, chunk per frame, `/logs` tanpa halaman (AG-13 F3, backend MEDIUM) | eviction (1 jam / 500), gabung frame sampai terkirim, halaman ±256 KiB, `done` hanya setelah semua chunk terkirim | `test_finished_runs_are_evicted`, `test_chunks_merge_only_until_delivered`, `test_logs_are_paged` |
+| Kill run antre tidak segera; satu kill gagal menghentikan yang lain (backend MEDIUM) | antre → `killed` seketika; kill per run dengan hitungan `failed`; `DriverError` → 503 | `test_kill_while_queued_is_final_at_once`, `test_one_failed_kill_does_not_stop_the_others`, `test_kill_of_unreachable_container_is_503` |
+| Artefak ditolak tak terbedakan dari "tidak ada test" (SF F1) | profil menyatakan `artifacts: [junit]`; `artifact_status`; exit 0 tanpa laporan → `ARTIFACT_MISSING`/`ARTIFACT_REJECTED`; baca sampai EOF | `test_required_junit_missing_is_an_error`, `test_required_junit_too_large_is_rejected`, `test_missing_junit_on_a_failed_run_stays_failed` |
+| OOM tampil sebagai test gagal; kode error hilang (SF F5) | `State.OOMKilled` → `OOM_KILLED`; galat Docker dicatat dengan status dan pesan; exit code timeout dipertahankan | `test_oom_is_not_a_test_failure`; Docker: `test_memory_limit` |
+| Stream log putus dianggap lengkap; tail sebenarnya potongan awal (SF F4, backend LOW) | `log_incomplete`; tail = 64 KiB terakhir dalam byte; decoder inkremental per stream | `test_broken_log_stream_is_flagged`, `test_tail_is_the_last_bytes`, `test_multibyte_character_split_across_frames` |
+| Konfigurasi 0/negatif = tanpa batas; socket langsung di production (backend MEDIUM, SF F6) | semua batas > 0 dan finite; `DOCKER_HOST` default proxy, `unix://` ditolak di production; uid selain 0/10001 ditolak di production; `SANDBOX_TIMEOUT_SECONDS` dipakai | `test_bad_settings_refused` (19 kasus), `test_docker_socket_refused_in_production`, `test_process_user_checked_in_production`, `test_profile_without_timeout_uses_the_setting` |
+| Klien menerima record tak koheren; run yatim saat batal; tanpa idempotensi (SF F8/F9, backend MEDIUM) | cek `run_id`, `succeeded ⇒ exit 0`, `failed ⇒ exit ≠ 0`; kill saat batal atau `on_log` gagal; `client_request_id` | `test_incoherent_records_are_not_trusted` (7), `test_cancelled_caller_kills_the_run`, `test_failing_on_log_kills_the_run`, `test_client_request_id_returns_the_same_run`, `test_retry_with_client_request_id` |
+| Readiness hijau padahal tak bisa menjalankan run; penyebab tak dicatat (SF F7, backend MEDIUM) | `/healthz` memuat `images`; klien mensyaratkan Docker + semua image, menolak driver fake di production, mencatat alasan | `test_health` (8), `test_fake_driver_allowed_outside_production` |
+| Parser JUnit: `<skipped>` menutupi `<error>`; encoding jahat (SF F10, backend MEDIUM) | status terburuk per kasus, error tingkat suite, `inconsistent`, `cases_truncated` dengan kasus gagal di depan; encoding → `JUnitError`; coverage `lines-valid=0` → `None` | `test_worst_outcome_of_a_case_counts`, `test_suite_level_errors_count`, `test_claims_beyond_the_cases_are_flagged`, `test_failing_cases_survive_truncation`, `test_hostile_encoding_declarations`, `test_coverage_of_nothing_is_not_full_coverage` |
+| JUnit dapat dipalsukan project (SF F11, AG-13 catatan) | didokumentasikan: laporan = klaim, exit code = bukti; mitigasi di WP-4.x | docstring `junit.py`, spec keputusan #15 |
+| Token di `repr`, `/openapi.json` terbuka, `BASE_IMAGE` tak terikat digest, fallback 0777 (AG-13 F5/F6/F9/F8) | `field(repr=False)`, `openapi_url=None`, `FROM ${BASE_REPO}@sha256:…`, uid dicek di production | `test_token_is_not_in_repr`, `test_openapi_is_not_served` |
+| `FakeSandboxClient` sukses diam-diam (SF F18) | default `error`/`FAKE_NOT_PROGRAMMED`; fixture junit berisi testcase | `test_unprogrammed_fake_never_succeeds` |
+
+Bukti setelah perbaikan:
+- sandbox_manager `uv run pytest -q` → **146 passed, 1 skipped** (skip hanya saat root; test yang sama lulus sebagai uid 65534);
+- `-m docker` lokal → **22 passed**; CI `sandbox-isolation` (root) → **22 passed**;
+- backend `uv run pytest -q` → **1231 passed**; pyright 0; lint-imports 3 kontrak dipatuhi;
+- pip-audit bersih; gitleaks bersih.
+
+Konflik dokumen baru: #38 (API_CONTRACTS §10 tertinggal: field tambahan dan semantik `wait=true`). Tidak dikerjakan: F4 AG-13 (sapuan global saat start) dipertahankan dengan asumsi satu manager per daemon, terdokumentasi di spec.

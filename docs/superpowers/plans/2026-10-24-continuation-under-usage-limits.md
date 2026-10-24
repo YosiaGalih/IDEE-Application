@@ -15,31 +15,12 @@ Dokumen ini dipakai setiap kali sesi baru dimulai. Bagian §1 diperbarui di akhi
 |---|---|
 | Tanggal | 24 Okt 2026 |
 | Branch kerja | `claude/gracious-goodall-3hjh19` |
-| PR terbuka | [YosiaGalih/IDEE-Application#3](https://github.com/YosiaGalih/IDEE-Application/pull/3) (draft): ADR-026 (4) + WP-1.3 |
-| Commit hijau terakhir | 2060e1a (CI hijau semua job, termasuk `sandbox-isolation` 18 test Docker nyata) |
+| PR terbuka | [YosiaGalih/IDEE-Application#3](https://github.com/YosiaGalih/IDEE-Application/pull/3) (draft): ADR-026 (4) + WP-1.3 + perbaikan review |
+| Commit hijau terakhir | b676c04 (CI hijau, `sandbox-isolation` 22 test Docker nyata sebagai root) |
 | Di `main` | WP-1.1 (PR #1), WP-1.2 (PR #2) |
-| Sedang dikerjakan | U1: menutup temuan review WP-1.3 (lihat §3) |
-| Menunggu PO | konflik #36, #37 (spec sistem pengembangan §8); merge PR #3; G0/G1 |
-
-Temuan review WP-1.3 yang harus ditutup (sumber: laporan reviewer di sesi 24 Okt; ringkasannya masuk tracker §12 saat ditutup):
-- **Backend reviewer (REQUEST CHANGES):**
-  - HIGH: log Docker tak terbatas; folder `.kk` tak diukur; pengukuran disk buta terhadap folder `chmod 000`; deadline klien menghitung antrean.
-  - MEDIUM: kill run antre; kill beruntun; eviction registry; klien tidak kill saat batal; encoding XML; konfigurasi 0/negatif; default `DOCKER_HOST`; log health; test yang tidak membuktikan namanya.
-- **Silent-failure hunter:**
-  - HIGH: artefak ditolak tak terbedakan dari "tidak ada test" (F1); batas disk gagal terbuka (F2).
-  - MEDIUM:
-    - F3 container gagal dihapus tetap final;
-    - F4 stream log putus;
-    - F5 OOM/kode error hilang;
-    - F6 konfigurasi;
-    - F7 readiness;
-    - F8 koherensi record di klien;
-    - F9 run yatim + idempotensi;
-    - F10 parser JUnit (`<skipped>` menutupi `<error>`);
-    - F11 JUnit = klaim project;
-    - F12 rmtree.
-  - LOW: F13–F21 (termasuk konflik dokumen baru: `wait=true` di API_CONTRACTS §10, reaper di RUNBOOK).
-- **Security reviewer (AG-13 pra-review):** hasil belum masuk saat dokumen ini ditulis.
+| Selesai di sesi ini | U1 dan U2 (perbaikan review putaran 1; tabel lengkap di tracker §12 "WP-1.3 — review putaran 1") |
+| Berikutnya | U3: hasil review keamanan putaran 2 (lihat tracker). Bila ditandatangani, PR #3 keluar dari draft. Lalu U4 (sign-off formal AG-13, sesi terpisah) dan U5 (keputusan PO) |
+| Menunggu PO | konflik #36, #37, #38 (spec sistem pengembangan §8); merge PR #3; G0/G1 |
 
 ## 2. Aturan kerja di bawah limit
 
