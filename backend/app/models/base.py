@@ -36,3 +36,8 @@ class Timestamps:
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+def in_values(column: str, values: tuple[str, ...]) -> str:
+    """CHECK body for a VARCHAR enum (ADR-018)."""
+    return f"{column} IN ({', '.join(repr(v) for v in values)})"

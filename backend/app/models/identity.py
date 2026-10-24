@@ -20,13 +20,10 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, Timestamps, UUIDPrimaryKey
+from app.models.base import in_values as _in
 from app.models.enums import ROLES, USER_STATUSES
 
 SCOPE_PATTERN = "^project:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-
-
-def _in(column: str, values: tuple[str, ...]) -> str:
-    return f"{column} IN ({', '.join(repr(v) for v in values)})"
 
 
 class User(UUIDPrimaryKey, Timestamps, Base):
