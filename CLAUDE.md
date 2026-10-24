@@ -42,7 +42,7 @@ Tiga set skill terpasang. Setiap tahap punya **satu** pemilik supaya skill yang 
 | Tahap | Pakai | Hasil |
 |---|---|---|
 | Bahasa domain & keputusan | `/grill-with-docs`, `mattpocock-skills:domain-modeling` | `GLOSSARY.md`, ADR baru di `docs/DECISIONS.md` |
-| Peta pekerjaan besar (fase/gate) | `/wayfinder`, `/to-tickets` | GitHub Issues per WP dengan edge blocking |
+| Peta pekerjaan (fase/gate) | Issue WP dibangkitkan dari `docs/wbs/wbs_data.py`; `/wayfinder` untuk peta keputusan gate; `/to-tickets` hanya untuk memecah WP besar | GitHub Issues: 1 issue = 1 WP, edge blocked-by |
 | Desain satu WP | `superpowers:brainstorming` | `docs/superpowers/specs/YYYY-MM-DD-<wp>-design.md` |
 | Rencana satu WP | `superpowers:writing-plans` | `docs/superpowers/plans/YYYY-MM-DD-<wp>.md` |
 | Eksekusi | `superpowers:subagent-driven-development` + peran dari `docs/agents/delivery-roster.md` | commit di branch WP |
@@ -57,6 +57,10 @@ Tiga set skill terpasang. Setiap tahap punya **satu** pemilik supaya skill yang 
 
 - Pakai skill di kolom "Pakai" walaupun skill lain dengan nama serupa juga cocok (`mattpocock-skills:tdd`, `mattpocock-skills:implement`, `/implement-spec`).
 - Gate G0–G16 diputuskan PO. Agent menyiapkan bukti dan berhenti di gate.
+- Catatan pekerjaan:
+  - Rencana ada di `docs/wbs/wbs_data.py`.
+  - Status kerja ada di GitHub Issues.
+  - Bukti, sign-off 🔒, dan keputusan gate ada di `docs/IMPLEMENTATION_TRACKER.md`. Tracker diperbarui di PR yang sama dengan WP-nya.
 - Merge ke `main` hanya lewat PR dengan CI hijau; manusia yang me-merge.
 
 ## Perintah

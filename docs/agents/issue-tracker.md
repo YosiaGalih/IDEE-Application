@@ -18,6 +18,9 @@ Repo diambil dari `git remote -v`.
 
 ## Judul dan label untuk pekerjaan WBS
 
+- **Satu issue = satu WP.** Issue WP dibangkitkan dari `docs/wbs/wbs_data.py`, bukan ditulis bebas.
+  - `/to-tickets` hanya memecah satu WP besar menjadi tiket vertical slice sebagai sub-issue WP itu.
+  - `/wayfinder` hanya untuk peta keputusan per gate.
 - Judul diawali ID WBS: `WP-9.0: Kunci kontrak v2`. ID WBS tidak pernah diganti.
 - Label tambahan di luar label triage:
   - `phase:P<n>`: fase roadmap, mis. `phase:P1`.

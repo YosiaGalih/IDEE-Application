@@ -140,6 +140,7 @@ flowchart LR
   - Label tambahan: `phase:Pn`, `gate:Gn`, `prio:P0|P0e|P1|P2`, `owner:AG-nn`, `security-signoff`.
   - Milestone = gate. Dependensi WBS menjadi edge *blocked-by* native.
   - Issue dibuat bertahap per frontier gate berikutnya, bukan 137 sekaligus.
+  - Pembagian peran Pocock dan sumber status: §6 #8–#9.
 - **Delivery roster**: AG-00 = sesi utama. AG-01..21 = baris peran yang disisipkan ke brief implementer (`docs/agents/delivery-roster.md`), bukan 21 file subagent. Peran terikat fase dan kebanyakan belum aktif; satu tabel lebih mudah dirawat.
 - **Reviewer tetap** (`.claude/agents/`):
   - `kk-security-reviewer` (AG-13, Opus, sign-off 🔒 berbasis SECURITY_MODEL T1–T28);
@@ -169,13 +170,40 @@ flowchart LR
    - Satu PR per WP, merge oleh manusia, tanpa force push ke branch bersama.
    - Prefix `kk/` **tidak** dipakai karena itu namespace branch milik produk di repo pengguna.
 7. Dokumen sumber diimpor apa adanya, termasuk mockup (±25 MB PNG) dan workbook WBS. PDF/DOCX tidak di-commit karena turunan dari `PRD_v2.2.md`.
+8. **Unit issue = satu WP.** Issue WP dibangkitkan secara deterministik dari `docs/wbs/wbs_data.py` oleh script (D3), bukan disintesis LLM. Alasannya, traceability WP → FR → gate dan aturan path milik bergantung pada ID WP.
+   - `/to-tickets` hanya dipakai untuk memecah satu WP yang terlalu besar menjadi tiket vertical slice sebagai **sub-issue** WP tersebut.
+   - `/wayfinder` hanya dipakai untuk peta keputusan per gate (pertanyaan terbuka, fog), bukan untuk WP.
+   - Bila Q1 = B dan WBS dipotong ulang, ID WP baru harus disetujui PO sebelum issue dibuat.
+9. **Satu sumber per jenis catatan:**
+
+   | Catatan | Tempat | Pengubah |
+   |---|---|---|
+   | Rencana: scope, pemilik, dependensi, estimasi | `docs/wbs/wbs_data.py` | AG-00 lewat PR |
+   | Status kerja harian | GitHub Issues + milestone | — |
+   | Bukti per modul/AC, sign-off 🔒, keputusan gate | `docs/IMPLEMENTATION_TRACKER.md` | Diperbarui di PR yang sama dengan WP-nya |
+
+   Kolom status di `wbs_data.py` hanya disinkronkan AG-00 dari issue saat gate.
+10. **WP 🔒 dibangun agent.** Label `ready-for-agent` + `security-signoff`; `ready-for-human` hanya untuk WP yang hasilnya keputusan atau aksi manusia.
+    - `kk-security-reviewer` di sesi yang sama memberi pra-review.
+    - **Sign-off formal AG-13** untuk gate G4/G9/G11/G13–G16 dijalankan di **sesi terpisah** yang tidak membangun WP itu, lalu ditandatangani bersama PO.
+    - Bukti yang butuh Docker nyata (`-m docker`, isolasi sandbox) diambil dari CI, bukan dari sesi cloud.
+11. **Default cara kerja sesi** (⏳ Q5 untuk konfirmasi):
+    - Satu sesi per WP, dimulai manusia, tidak paralel lintas sesi.
+    - Di sesi cloud, branch `claude/*` yang ditetapkan menjadi branch WP; implementer memakai worktree lokal di dalam sesi itu.
+    - Tidak ada sesi tanpa pengawasan (Actions/terjadwal) sampai ada keputusan soal API key dan budget.
 
 ## 7. Pertanyaan yang hanya bisa dijawab kamu/PO
 
 - **Q1** (⏳, mengubah semua langkah berikutnya): apakah kode snapshot Wave 2 masih ada (di mesin lokal, repo lain, atau arsip)? Pilih A, B, atau C di §4.1.
-- **Q2** (⏳): apakah instruksi PO "rancangan saja, jangan implementasi" sudah dicabut? Siapa PO untuk repo ini: kamu atau "Tira"?
+- **Q2** (⏳): apakah instruksi PO "rancangan saja, jangan implementasi" sudah dicabut? Akun GitHub mana yang berperan sebagai PO, OPS, dan reviewer/merger PR?
+  - GitHub tidak mengizinkan akun menyetujui PR-nya sendiri. Bila agent membuka PR atas nama akun yang sama dengan pemberi approval, "manusia me-merge" dan "hanya PO yang menutup milestone" hanya bisa berupa konvensi, bukan branch protection/CODEOWNERS.
+  - Bila PO adalah "Tira", dia butuh akses repo.
 - **Q3** (⏳): izin membuat branch `main` dari commit akar repo ini agar PR dapat dibuka. Saat ini remote belum punya branch default.
 - **Q4** (⏳): setuju ECC dipakai selektif (§4.2), atau tetap ingin plugin ECC penuh?
+- **Q5** (⏳): konfirmasi default §6 #11.
+  - Apakah sesi berjalan di cloud, lokal, atau keduanya?
+  - Apakah boleh ada sesi paralel atau tanpa pengawasan?
+  - Apakah ada batas budget token? Batas ini menentukan berapa reviewer Opus per WP.
 - **G0** (bukan keputusan sistem pengembangan, tetapi memblokir implementasi): 25 keputusan di PRD v2.2 §15.3, 9 ADR v1 *Proposed*, review FR turunan, dan konflik §8 butir 5–11.
 
 ## 8. Konflik dan celah dokumen yang ditemukan
@@ -249,7 +277,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 | D0 (PR ini) | Impor dokumen; CLAUDE.md, GLOSSARY.md, `docs/agents/*`, `.claude/` (settings, rules, agents, hook), spec ini | AG-00 | PR di-review kamu |
 | D1 | Jawaban Q1–Q4; ADR-069 diputuskan; paket keputusan G0 disiapkan dari §7 dan §8 (`/to-questionnaire` Pocock) | kamu/PO + AG-00 | G0 diputuskan |
 | D2 | Basis kode sesuai Q1 (A: PR impor snapshot + jalankan suite; B: walking skeleton). Job CI pertama (lint/type/unit/security-scan) masuk bersama kodenya. Perintah nyata ditulis ke CLAUDE.md "Perintah". | AG-00 + AG-01/04/06 | CI hijau di `main`; G1 |
-| D3 | `/wayfinder` + `/to-tickets` untuk frontier gate berikutnya. Label dan milestone dibuat. | AG-00 | Issue frontier siap, `ready-for-agent` / `ready-for-human` |
+| D3 | Script `wbs_data.py` → issue WP untuk frontier gate berikutnya (label, milestone, edge blocked-by); `/wayfinder` untuk peta keputusan gate; `/to-tickets` hanya untuk memecah WP besar | AG-00 | Issue frontier siap, `ready-for-agent` / `ready-for-human` |
 | D4 | Loop per WP (§5) sampai gate | tim | Gate diputuskan PO |
 
 ## 10. Yang diserahkan ke pelaksana
