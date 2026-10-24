@@ -33,15 +33,20 @@ from pathlib import Path
 from typing import Final, Literal
 
 from app.core.errors import AppError
+from app.core.logging import get_logger
 from app.workspace.errors import (
     AlreadyExists,
     FileTooLarge,
+    PatchConflict,
     PathViolation,
     VersionConflict,
     WorkspaceNotFound,
 )
+from app.workspace.patches import FilePatch, HunkConflict, apply_hunks, parse_unified_diff
 from app.workspace.paths import open_parent, open_root, resolve
 from app.workspace.policy import AGENTIGNORE, Access, Policy
+
+logger = get_logger(__name__)
 
 USER_READ_LIMIT = 1024 * 1024  # [Menebak] what the IDE opens as text
 AGENT_READ_LIMIT = 256 * 1024  # ARCHITECTURE §7: larger files never reach the LLM
@@ -248,6 +253,10 @@ class Workspace:
         """Bytes in regular files under the root, symlinks not followed (quota input, ADR-005)."""
         return await asyncio.to_thread(self._disk_usage)
 
+    async def apply_patch(self, diff: str, access: Access) -> list[FileChange]:
+        """Apply a unified diff all-or-nothing: any conflict → ``PatchConflict`` and no file changes."""
+        return await asyncio.to_thread(self._apply_patch, diff, access)
+
     # --- plumbing ---
 
     @contextlib.contextmanager
@@ -378,6 +387,23 @@ class Workspace:
                 os.close(parent)
         return "/".join(parts)
 
+    def _apply_patch(self, diff: str, access: Access) -> list[FileChange]:
+        patches = parse_unified_diff(diff)
+        with self._opened(lock=True) as (root_fd, real), contextlib.ExitStack() as fds:
+            policy = self._policy(root_fd, access)
+            plans: list[_PatchPlan] = []
+            conflicts: list[dict[str, object]] = []
+            for patch in patches:
+                plan = _plan(root_fd, real, patch, access, policy, fds)
+                if isinstance(plan, dict):
+                    conflicts.append(plan)
+                else:
+                    plans.append(plan)
+            if conflicts:
+                raise PatchConflict(conflicts)  # nothing has been written yet
+            _commit(root_fd, plans, fds)
+        return [plan.change for plan in plans]
+
     def _tree(self, rel: str, access: Access, depth: int, max_entries: int) -> TreeResult:
         """Breadth-first, so a truncated listing still shows every entry of the upper levels."""
         with self._opened() as (root_fd, real):
@@ -409,6 +435,119 @@ class Workspace:
                 if stat.S_ISREG(st.st_mode):
                     total += st.st_size
         return total
+
+
+@dataclass
+class _PatchPlan:
+    parts: tuple[str, ...]
+    parent: int | None  # None: the parent folder does not exist yet (an added file)
+    current: Current | None
+    old: bytes
+    new: bytes | None  # None: delete
+
+    @property
+    def change(self) -> FileChange:
+        path = "/".join(self.parts)
+        old_sha = self.current.sha256 if self.current else None
+        if self.new is None:
+            return FileChange(path, "deleted", old_sha, None, 0)
+        kind: Literal["created", "modified"] = "modified" if self.current else "created"
+        return FileChange(path, kind, old_sha, hashlib.sha256(self.new).hexdigest(), len(self.new))
+
+
+def _snapshot(parent: int, name: str) -> tuple[Current, bytes] | None:
+    current = _current(parent, name)
+    if current is None or current.size > WRITE_LIMIT:
+        return (current, b"") if current else None
+    fd = _open_file(parent, name)
+    try:
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return current, handle.read()
+    finally:
+        os.close(fd)
+
+
+def _plan(
+    root_fd: int,
+    real: str,
+    patch: FilePatch,
+    access: Access,
+    policy: Policy,
+    fds: contextlib.ExitStack,
+) -> _PatchPlan | dict[str, object]:
+    """What one file patch will write, or its conflict detail ``{path, hunk, reason}``."""
+    parts = resolve(real, patch.path, access, policy)
+    if not parts:
+        raise PathViolation("not_regular")
+
+    def conflict(reason: str, hunk: int | None = None) -> dict[str, object]:
+        return {"path": "/".join(parts), "hunk": hunk, "reason": reason}
+
+    try:
+        parent: int | None = open_parent(root_fd, parts, create=False)
+        fds.callback(os.close, parent)
+    except WorkspaceNotFound:
+        parent = None
+    snapshot = _snapshot(parent, parts[-1]) if parent is not None else None
+    if patch.old_path is None:
+        if snapshot is not None:
+            return conflict("exists")
+        current, old_text = None, None
+    elif snapshot is None:
+        return conflict("missing")
+    else:
+        current, raw = snapshot
+        if current.size > WRITE_LIMIT:
+            return conflict("too_large")
+        if b"\x00" in raw[:_SNIFF_BYTES]:
+            return conflict("binary")
+        try:
+            old_text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return conflict("binary")
+    try:
+        new_text = apply_hunks(old_text, patch.hunks)
+    except HunkConflict as exc:
+        return conflict(exc.reason, exc.hunk_index)
+    if patch.new_path is None:
+        if new_text:
+            return conflict("not_empty_after_delete")
+        new = None
+    else:
+        new = new_text.encode("utf-8")
+        if len(new) > WRITE_LIMIT:
+            return conflict("too_large")
+    return _PatchPlan(parts, parent, current, snapshot[1] if snapshot else b"", new)
+
+
+def _commit(root_fd: int, plans: list[_PatchPlan], fds: contextlib.ExitStack) -> None:
+    """Write every planned file; on failure put back what was already written, then re-raise."""
+    done: list[_PatchPlan] = []
+    try:
+        for plan in plans:
+            if plan.parent is None:
+                plan.parent = open_parent(root_fd, plan.parts, create=True)
+                fds.callback(os.close, plan.parent)
+            if plan.new is None:
+                os.unlink(plan.parts[-1], dir_fd=plan.parent)
+            else:
+                _replace(plan.parent, plan.parts[-1], plan.new, plan.current.mode if plan.current else 0o644)
+            done.append(plan)
+    except BaseException:
+        for plan in reversed(done):
+            assert plan.parent is not None
+            try:
+                if plan.current is None:
+                    os.unlink(plan.parts[-1], dir_fd=plan.parent)
+                else:
+                    _replace(plan.parent, plan.parts[-1], plan.old, plan.current.mode)
+            except OSError as exc:
+                logger.error(
+                    "patch_rollback_failed",
+                    path="/".join(plan.parts),
+                    error_type=type(exc).__name__,
+                )
+        raise
 
 
 def _open_dir_at(root_fd: int, parts: tuple[str, ...]) -> int:
