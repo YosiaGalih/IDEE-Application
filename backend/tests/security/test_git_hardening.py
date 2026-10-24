@@ -26,6 +26,11 @@ def evil_script(tmp: Path, marker: Path) -> Path:
     return script
 
 
+def git_config(git_dir: Path, key: str, value: str) -> None:
+    """Write a repo config value directly, as an attacker with write access to .git would."""
+    subprocess.run(["git", "--git-dir", str(git_dir), "config", key, value], check=True)  # noqa: S603, S607
+
+
 def make_evil_repo(tmp: Path, script: Path) -> Path:
     """A bare repo whose config runs ``script`` through filters, fsmonitor and hooks."""
     evil = tmp / "evil.git"
@@ -70,8 +75,12 @@ async def test_hooks_never_run(tmp_path: Path, repo: GitTarget) -> None:
     assert not marker.exists()
 
 
-async def test_replaced_worktree_gitdir_is_ignored(tmp_path: Path, repo: GitTarget) -> None:
-    """Sandboxed code rewrites ``<worktree>/.git`` to point at a repo whose config runs commands."""
+async def test_forged_worktree_gitdir_is_refused(tmp_path: Path, repo: GitTarget) -> None:
+    """Sandboxed code rewrites ``<worktree>/.git`` to a repo whose config runs commands (ADR-026 (4)).
+
+    The adapter refuses the worktree (``git_metadata_unsafe``) and nothing from the evil repo runs; the task's
+    worktree can still be removed.
+    """
     marker = tmp_path / "pwned"
     script = evil_script(tmp_path, marker)
     git = GitAdapter()
@@ -84,11 +93,56 @@ async def test_replaced_worktree_gitdir_is_ignored(tmp_path: Path, repo: GitTarg
     (task.worktree / ".gitattributes").write_text("* filter=evil\n")
     (task.worktree / "f.txt").write_text("changed by the task\n")
 
-    status = await git.status(task)
-    assert status.branch == "kk/task-0000000b"
-    await git.diff(task)
-    await git.commit_all(task, "task", ME)
+    for call in (git.status(task), git.diff(task), git.commit_all(task, "task", ME)):
+        with pytest.raises(GitError) as caught:
+            await call
+        assert caught.value.reason == "git_metadata_unsafe"
     assert not marker.exists()
+    await git.remove_worktree(repo.repo, task.worktree)
+    assert not task.worktree.exists()
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("core.fsmonitor", "touch pwned"),
+        ("core.hooksPath", "hooks-elsewhere"),
+        ("core.sshCommand", "touch pwned"),
+        ("filter.lfs.smudge", "touch pwned"),
+        ("diff.external", "touch pwned"),
+        ("include.path", "evil.cfg"),
+        ("alias.st", "!touch pwned"),
+        ("extensions.worktreeConfig", "true"),
+        ("core.worktree", "/"),
+    ],
+)
+async def test_unsafe_repository_config_is_refused(repo: GitTarget, key: str, value: str) -> None:
+    git_config(repo.repo / ".git", key, value)
+    with pytest.raises(GitError) as caught:
+        await GitAdapter().status(repo)
+    assert caught.value.reason == "git_metadata_unsafe"
+
+
+async def test_object_alternates_are_refused(tmp_path: Path, repo: GitTarget) -> None:
+    (repo.repo / ".git" / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (repo.repo / ".git" / "objects" / "info" / "alternates").write_text(
+        str(tmp_path / "other.git/objects") + "\n"
+    )
+    with pytest.raises(GitError) as caught:
+        await GitAdapter().log(repo)
+    assert caught.value.reason == "git_metadata_unsafe"
+
+
+async def test_clone_style_config_is_allowed(repo: GitTarget) -> None:
+    for key, value in (
+        ("remote.origin.url", "https://example.test/x.git"),
+        ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+        ("branch.main.remote", "origin"),
+        ("branch.main.merge", "refs/heads/main"),
+    ):
+        git_config(repo.repo / ".git", key, value)
+    assert (await GitAdapter().status(repo)).branch == "main"
 
 
 async def test_worktree_must_belong_to_repo(tmp_path: Path, repo: GitTarget) -> None:

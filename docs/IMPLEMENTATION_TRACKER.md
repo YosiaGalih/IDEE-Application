@@ -551,3 +551,23 @@ Hasil: `uv run pytest -q` → **1140 passed**; ruff, format, pyright, dan lint-i
   - **Spec #7.** Keputusan `strip_single_root=False` perlu direkonsiliasi oleh Lead. Spec sudah diperbarui, tetapi rancangan awal berbeda.
   - **Log git.** `_log_failure` meredaksi `tree.parent` saja. Path git dir worktree bisa muncul di log server, tidak pernah di respons klien.
 - **Sign-off formal AG-13** untuk WP-1.2 🔒 tetap wajib dari **sesi terpisah** sebelum G1. Pra-review di atas dilakukan di sesi yang sama yang membangun WP ini (§6 #10 spec sistem pengembangan).
+
+### Perbaikan pasca-merge — ADR-026 (4) di GitAdapter (24 Okt 2026)
+
+Celah ini ditemukan agent sendiri saat membaca ADR untuk WP-1.3; tidak ditangkap oleh dua reviewer. WP-1.2c (sudah di `main` lewat PR #2) **belum memenuhi ADR-026 butir (4)**, padahal ADR tersebut berstatus Accepted. Butir itu mewajibkan GitAdapter *menolak*:
+- key config di luar allowlist;
+- object alternates;
+- file `.git` worktree yang dipalsukan.
+
+Implementasi sebelumnya hanya *mengabaikan* `.git` palsu lewat `--git-dir` eksplisit, dan tidak memeriksa config maupun alternates.
+
+| Perbaikan | Bukti |
+|---|---|
+| Config repo dibaca dengan `git config --file --no-includes --list --name-only`. Key di luar allowlist → `git_metadata_unsafe`. Allowlist: `core.{repositoryformatversion,filemode,bare,logallrefupdates,ignorecase,precomposeunicode,symlinks}`, `remote.*.{url,fetch}`, `branch.*.{remote,merge}` | `test_unsafe_repository_config_is_refused` (9 key: fsmonitor, hooksPath, sshCommand, filter, diff.external, include.path, alias, extensions.worktreeConfig, core.worktree); `test_clone_style_config_is_allowed` |
+| `objects/info/{alternates,http-alternates}` → `git_metadata_unsafe` | `test_object_alternates_are_refused` |
+| `<worktree>/.git` wajib file reguler `gitdir: <git dir terdaftar>`. Bila tidak → `git_metadata_unsafe`; `remove_worktree` tetap bisa membersihkan | `test_forged_worktree_gitdir_is_refused` |
+| Mutasi | allowlist dihapus → 9 merah; cek alternates dihapus → merah; verifikasi gitfile dihapus → merah |
+
+Hasil: `uv run pytest -q` → **1153 passed**; pyright 0 error; lint-imports 3 kontrak dipatuhi.
+
+Catatan proses: checklist kontrak per sub-WP belum memaksa pembacaan semua ADR *Accepted* yang menyebut modul terkait. Usulan retro: spec WP wajib punya tabel "ADR Accepted yang menyebut modul ini → butir → test".
