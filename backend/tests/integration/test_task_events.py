@@ -57,8 +57,8 @@ async def subscription(redis: Redis, task_id: uuid.UUID) -> AsyncIterator[PubSub
     await pubsub.aclose()
 
 
-async def next_message(pubsub: PubSub, timeout: float = 0.5) -> dict[str, Any] | None:
-    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout)
+async def next_message(pubsub: PubSub, wait: float = 0.5) -> dict[str, Any] | None:
+    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=wait)
     return json.loads(message["data"]) if message else None
 
 
@@ -100,7 +100,7 @@ async def test_publish_after_commit_only(
         await publish_pending(session, bus)
     await session.commit()
     await publish_pending(session, bus)
-    message = await next_message(subscription, timeout=2)
+    message = await next_message(subscription, wait=2)
     assert message is not None
     assert message["task_id"] == str(task_id)
     assert message["seq"] == seq
@@ -135,7 +135,7 @@ async def test_event_payload_is_redacted(
     await session.commit()
     await publish_pending(session, bus)
     stored = await session.scalar(select(TaskEvent.payload).where(TaskEvent.task_id == task_id))
-    published = await next_message(subscription, timeout=2)
+    published = await next_message(subscription, wait=2)
     for rendered in (json.dumps(stored), json.dumps(published)):
         assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in rendered
         assert "plain-value-1" not in rendered
@@ -149,7 +149,7 @@ async def test_ephemeral_is_published_not_stored(
         session, bus, task_id, "agent.delta", {"agent_run_id": "r1", "text": "partial"}, ephemeral=True
     )
     assert seq is None
-    message = await next_message(subscription, timeout=2)
+    message = await next_message(subscription, wait=2)
     assert message is not None and message["seq"] is None and message["type"] == "agent.delta"
     await session.commit()
     assert await session.scalar(select(TaskEvent.id).where(TaskEvent.task_id == task_id)) is None
