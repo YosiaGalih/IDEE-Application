@@ -15,6 +15,8 @@ from app.models.identity import User, UserRole
 # Not fixed by the docs; 12 follows NIST SP 800-63B guidance for user-chosen
 # passwords [Kemungkinan Besar].
 MIN_PASSWORD_LENGTH = 12
+# Upper bound keeps one argon2 hash cheap enough that long inputs cannot be used for DoS [Kemungkinan Besar].
+MAX_PASSWORD_LENGTH = 1024
 
 # Serialises owner bootstrap so the "no owner yet" check and the insert cannot interleave (ADR-002).
 _OWNER_BOOTSTRAP_LOCK = "kodekantor.create_owner"
@@ -26,6 +28,11 @@ class OwnerExistsError(Exception):
 
 class EmailTakenError(Exception):
     pass
+
+
+def validate_new_password(password: str) -> None:
+    if not MIN_PASSWORD_LENGTH <= len(password) <= MAX_PASSWORD_LENGTH:
+        raise ValueError(f"password must be {MIN_PASSWORD_LENGTH}-{MAX_PASSWORD_LENGTH} characters")
 
 
 async def create_owner(
@@ -42,8 +49,7 @@ async def create_owner(
         raise ValueError("email is not valid")
     if not display_name.strip() or len(display_name) > 120:
         raise ValueError("display_name must be 1-120 characters")
-    if len(password) < MIN_PASSWORD_LENGTH:
-        raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+    validate_new_password(password)
     async with sessions() as session:
         await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(_OWNER_BOOTSTRAP_LOCK))))
         owner_exists = await session.scalar(

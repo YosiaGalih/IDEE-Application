@@ -56,12 +56,14 @@ class AppError(Exception):
         *,
         http_status: int = 400,
         details: list[dict[str, Any]] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.message = message
         self.http_status = http_status
         self.details = details
+        self.headers = headers
 
 
 def envelope(
@@ -112,7 +114,12 @@ async def _app_error(request: Request, exc: Exception) -> JSONResponse:
             "app_error", code=exc.code, http_status=exc.http_status, request_id=request_id_of(request)
         )
     return error_response(
-        request, http_status=exc.http_status, code=exc.code, message=exc.message, details=exc.details
+        request,
+        http_status=exc.http_status,
+        code=exc.code,
+        message=exc.message,
+        details=exc.details,
+        headers=exc.headers,
     )
 
 

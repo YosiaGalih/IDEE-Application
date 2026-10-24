@@ -16,10 +16,10 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from redis.asyncio import Redis
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
-from app.core.db import make_engine
+from app.core.db import make_engine, make_sessionmaker
 from app.core.logging import get_logger
 
 ReadinessCheck = Callable[[], Awaitable[bool]]
@@ -45,16 +45,19 @@ class Dependencies:
     http: httpx.AsyncClient
     sandbox_manager_url: str
     migration_heads: frozenset[str]
+    sessions: async_sessionmaker[AsyncSession]
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Dependencies:
+        engine = make_engine(settings.database_url)
         return cls(
-            engine=make_engine(settings.database_url),
+            engine=engine,
             redis=Redis.from_url(settings.redis_url),
             http=httpx.AsyncClient(timeout=CHECK_TIMEOUT_SECONDS),
             sandbox_manager_url=settings.sandbox_manager_url.rstrip("/"),
             # Read once at startup: building ScriptDirectory imports every revision module (blocking I/O).
             migration_heads=frozenset(alembic_heads()),
+            sessions=make_sessionmaker(engine),
         )
 
     async def aclose(self) -> None:
