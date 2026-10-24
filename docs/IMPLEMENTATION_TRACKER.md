@@ -336,3 +336,22 @@ Temuan tambahan dari `kk-backend-reviewer`. Review ini dibuat atas commit sebelu
 Hasil akhir: `uv run pytest -q` → **630 passed** (DB baru `kodekantor_main`). Migrasi naik-turun dan `check` exit 0.
 
 `0003_tasks` diedit di tempat, karena belum pernah diterapkan di luar DB uji. Akibatnya DB lokal yang sudah berada di 0003 versi lama harus dibuat ulang; CI selalu memakai DB baru.
+
+### WP-1.1f — Celery worker, lease, recovery sweep, Idempotency-Key (NFR-05, AC-17 bagian state, API_CONTRACTS §1)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.1f-worker-lease-recovery-idempotency-design.md`. Plan: `docs/superpowers/plans/2026-10-24-wp-1.1f-worker-lease-recovery-idempotency.md`.
+
+| Pemeriksaan | Hasil aktual (24 Okt 2026) |
+|---|---|
+| `uv run pytest -q` (DB `kodekantor_main`) | **655 passed**. Mencakup:<br>• lease: satu pemenang dari 6 claim paralel; overlap deterministik `MAX_ACTIVE` (mutan tanpa advisory lock terbunuh); renew dan release hanya oleh pemilik<br>• recovery: kedaluwarsa → `interrupted`/`cancelled`; lease hidup tidak disentuh; 3 sweep paralel tanpa kegagalan (mutan tanpa `SKIP LOCKED` terbunuh); satu task gagal tidak menghentikan sweep; CLI `recover`; job Celery<br>• idempotency: replay, tanpa `Set-Cookie`, beda body → 409, in-flight → 409, scope per sesi (mutan tanpa scope terbunuh), 5xx tidak disimpan, kunci invalid → 400, Redis mati → 503 |
+| `celery -A app.worker.celery_app report` | exit 0; `accept_content: ['json']`, `task_acks_late: True`, `include: ['app.worker.jobs']` |
+| `pip-audit --strict` (setelah menambah celery 5.6.3) | No known vulnerabilities found |
+| ruff · pyright · lint-imports | bersih · 0 error · 3 kontrak dipatuhi (`app.main | app.worker` sejajar) |
+
+Keputusan yang perlu dicek ada di spec bagian "Keputusan saya (cek)":
+- scope kunci = sesi;
+- 5xx tidak disimpan;
+- batas 1 MiB;
+- Redis mati → 503;
+- `MAX_ACTIVE` dihitung dari semua lease yang hidup (diperketat dari §5.3);
+- marker pending 300 dtk [Menebak].
