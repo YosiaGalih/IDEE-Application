@@ -396,3 +396,27 @@ Risiko yang dicatat:
   - WP-1.1d (🔒) masuk `main` **tanpa sign-off formal AG-13 di sesi terpisah** (§6 #10 spec sistem pengembangan). Yang ada hanya pra-review `kk-security-reviewer` di sesi yang sama.
   - Sign-off formal tetap wajib sebelum G1 diputuskan.
 - **Aturan CLAUDE.md** "manusia yang me-merge": merge dijalankan agent atas perintah eksplisit PO di sesi ini, bukan oleh manusia lewat UI GitHub. Ini dicatat sebagai pengecualian, bukan perubahan aturan.
+
+### WP-1.2a (🔒) — safe path, operasi file, patch atomik (FR-028, FR-029, FR-031 apply, FR-032, T2, T9)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.2-workspace-git-design.md`. Plan: `docs/superpowers/plans/2026-10-24-wp-1.2a-safe-paths-fs-patches.md`.
+
+| Pemeriksaan | Hasil aktual (24 Okt 2026) |
+|---|---|
+| `uv run pytest -q` (DB `kodekantor_main`) | **882 passed** (sebelum test sintaks glob ditambahkan; test workspace saja: 219 passed) |
+| ruff · ruff format · pyright · lint-imports | bersih · 89 file terformat · 0 error · 3 kontrak dipatuhi (layer baru `app.workspace \| app.gitops`) |
+| Coverage `app/workspace` (`coverage` 7.x sementara lewat `uv run --with`, tidak masuk lock) | total 96%: `paths.py` 98%, `policy.py` 95%, `fs.py` 95%, `patches.py` 95% (target TEST_STRATEGY ≥ 85% untuk `paths.py`) |
+| `tests/security/test_no_host_exec.py` | proses hanya di `app/gitops/`; self-test membuktikan checker bisa gagal |
+
+Mutasi yang membuktikan test bisa gagal (setiap mutan dikembalikan setelahnya):
+
+| Kontrol dihapus | Hasil |
+|---|---|
+| `O_NOFOLLOW` di walk folder | `test_race_swap_detected` merah |
+| cek `commonpath` (containment) | 12 test merah |
+| larangan tulis lewat symlink | `test_write_through_symlink_rejected` merah |
+| `flock` pada root | `test_concurrent_writers_one_conflict` merah (8 penulis sukses) |
+| cek konflik sebelum commit patch | `test_conflict_changes_nothing` merah |
+| `O_NONBLOCK` saat membuka file | test FIFO menggantung sampai di-kill `timeout 40` |
+
+Keputusan yang perlu dicek ada di spec bagian "Keputusan saya (cek)" no. 1–5 dan 8. Konflik dokumen #33–#35 ada di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8.

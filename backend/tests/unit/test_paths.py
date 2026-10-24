@@ -221,3 +221,24 @@ def test_race_swap_detected(root_fd: tuple[int, str], root: Path, monkeypatch: p
 def test_missing_root(tmp_path: Path) -> None:
     with pytest.raises(WorkspaceNotFound):
         open_root(tmp_path / "missing")
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "matched"),
+    [
+        ("*.lo?", "a/x.log", True),
+        ("*.lo?", "a/x.longer", False),
+        ("[ab].txt", "b.txt", True),
+        ("[ab].txt", "c.txt", False),
+        ("[!ab].txt", "c.txt", True),
+        ("[!ab].txt", "a.txt", False),
+        ("logs/**", "logs/2026/x.txt", True),
+        ("logs/**", "src/logs/x.txt", False),
+        ("a/**/b", "a/b", True),
+        ("a/**/b", "a/x/y/b", True),
+        ("[unclosed", "[unclosed", True),
+        ("/", "anything", False),
+    ],
+)
+def test_agentignore_glob_syntax(pattern: str, path: str, matched: bool) -> None:
+    assert Policy.from_agentignore(pattern).denied(parts(path), Access.AGENT_READ) is matched
