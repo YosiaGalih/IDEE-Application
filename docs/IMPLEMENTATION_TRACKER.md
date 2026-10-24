@@ -224,3 +224,17 @@ Wajib di WP-1.5 (deployment):
 - Migrasi dijalankan oleh role pemilik.
 - `api`/`worker` memakai role terpisah dengan `INSERT, SELECT ON audit_events` + `USAGE` pada sequence. Tanpa itu, production tidak akan start (fail-closed, disengaja).
 - Purge retensi audit 365 hari tetap terbuka (spec sistem pengembangan §8 #17).
+
+### WP-1.1c — skema identitas, RBAC, hash password, `create-owner` (FR-003, dasar FR-001/002/004/005)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.1c-identity-rbac-design.md`. Dibangun di atas ADR-002 (*Proposed*) atas perintah PO.
+
+| Pemeriksaan | Hasil aktual (24 Okt 2026) |
+|---|---|
+| `uv run pytest -q` | **159 passed**. Mencakup:<br>• `test_rbac.py`: matriks role, global vs project, global-only, owner project<br>• argon2id<br>• skema identitas: email lower-case unik, CHECK role/scope, cascade<br>• `create-owner` sekali + audit<br>• CLI lewat stdin |
+| ruff · pyright · lint-imports | bersih · 0 error · 2 kontrak dipatuhi |
+| `alembic downgrade base → upgrade head → downgrade -1 → upgrade head → check` | exit 0 |
+
+Catatan:
+- Panjang password minimum 12 adalah pilihan saya (dokumen tidak menetapkan) [Kemungkinan Besar, NIST SP 800-63B].
+- Endpoint `/auth/*`, CSRF, rate limit, dan lockout = WP-1.1d (🔒).

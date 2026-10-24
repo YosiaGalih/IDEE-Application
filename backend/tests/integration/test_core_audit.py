@@ -13,8 +13,6 @@ from app.core.audit import AuditWriter
 from app.core.context import request_id_var
 from app.core.redaction import Redactor
 
-pytestmark = pytest.mark.asyncio
-
 
 async def insert_row(session: AsyncSession) -> int:
     writer = AuditWriter(Redactor())
