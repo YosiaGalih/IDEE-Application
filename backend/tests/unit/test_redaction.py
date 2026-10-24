@@ -119,3 +119,87 @@ def test_redact_obj_walks_nested_structures() -> None:
     assert FAKE_ANTHROPIC not in repr(out)
     assert "configured-secret-value" not in repr(out)
     assert out["c"][1] == 3 and out["d"] is None
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "password",
+        "github_token",
+        "SECRET_KEY",
+        "client_secret",
+        "api_key",
+        "Authorization",
+        "kk_session_cookie",
+    ],
+)
+def test_values_under_sensitive_keys_are_redacted(redactor: Redactor, key: str) -> None:
+    out = redactor.redact_obj({key: "plainvalue123", "nested": [{key: 42}]})
+    assert out[key] == REDACTED
+    assert out["nested"][0][key] == REDACTED
+
+
+@pytest.mark.parametrize(
+    "key", ["token_count", "max_tokens", "input_tokens", "password_policy", "secret_santa"]
+)
+def test_ordinary_keys_are_kept(redactor: Redactor, key: str) -> None:
+    assert redactor.redact_obj({key: 3}) == {key: 3}
+
+
+def test_url_credentials_with_empty_user(redactor: Redactor) -> None:
+    assert "pw1longer" not in redactor.redact("redis://:pw1longer@redis:6379/0")
+
+
+def test_non_string_values_are_stringified_and_redacted(redactor: Redactor) -> None:
+    out = redactor.redact_obj(
+        {
+            "error": ConnectionError("postgresql://u:pw123456@h/db"),
+            "raw": b"Authorization: Bearer abc.def.ghi",
+        },
+        stringify=True,
+    )
+    assert "pw123456" not in out["error"]
+    assert "abc.def.ghi" not in out["raw"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'curl -H "Authorization: Bearer abc.def.ghi" https://x.test',
+        "curl -H 'Cookie: kk_session=abc.def.ghi' https://x.test",
+        '{"Authorization": "Bearer abc.def.ghi"}',
+        "{'x-api-key': 'abc.def.ghi'}",
+        '{\\"password\\": \\"abc.def.ghi\\"}',
+        "token: Bearer abc.def.ghi",
+        'password: "abc def.ghi"',
+        "clone https://glpat-abc.def.ghi@gitlab.test/x.git",
+    ],
+)
+def test_reviewer_reported_pattern_gaps(redactor: Redactor, text: str) -> None:
+    out = redactor.redact(text)
+    assert "abc.def.ghi" not in out and "def.ghi" not in out, out
+
+
+def test_truncated_pem_without_end_marker(redactor: Redactor) -> None:
+    out = redactor.redact("key:\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nMIIEvQIBADA")
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" not in out
+
+
+def test_ssh_style_user_is_not_shredded(redactor: Redactor) -> None:
+    assert redactor.redact("ssh://git@github.com/org/repo.git") == "ssh://git@github.com/org/repo.git"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "GITHUB_TOKEN=abc12345xyz",
+        "SECRET_KEY=abc12345xyz",
+        "ANTHROPIC_API_KEY=abc12345xyz",
+        "DATABASE_PASSWORD=abc12345xyz",
+        "access_token=abc12345xyz",
+        "client_secret: abc12345xyz",
+        '{"refresh_token": "abc12345xyz"}',
+    ],
+)
+def test_compound_sensitive_names(redactor: Redactor, line: str) -> None:
+    assert "abc12345xyz" not in redactor.redact(line)

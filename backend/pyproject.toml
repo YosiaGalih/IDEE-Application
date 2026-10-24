@@ -29,6 +29,9 @@ dev = [
 [tool.uv]
 # Libraries must be released at least two weeks before they are adopted (PRD v2.2 §8).
 exclude-newer = "2026-10-10T00:00:00Z"
+# Security fixes override the age rule, per package, recorded in IMPLEMENTATION_TRACKER §12:
+# certifi 2026.10.19 fixes PYSEC-2026-4320 (found by pip-audit, 24 Oct 2026).
+exclude-newer-package = { certifi = "2026-10-24T00:00:00Z" }
 package = false
 
 [tool.ruff]
@@ -72,11 +75,11 @@ layers = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "Vendor SDK only in its adapter (CLAUDE.md #6)"
+name = "Vendor SDK only in its adapter; no subprocess outside app.gitops (CLAUDE.md #3, #6)"
 type = "forbidden"
 source_modules = ["app"]
-forbidden_modules = ["anthropic", "requests"]
-# WP-3.1 adds: ignore_imports = ["app.llm.anthropic_provider -> anthropic"]
+forbidden_modules = ["anthropic", "requests", "subprocess"]
+# WP-2.x adds app.gitops -> subprocess; WP-3.1 adds: ignore_imports = ["app.llm.anthropic_provider -> anthropic"]
 allow_indirect_imports = true
 
 [tool.ruff.lint.isort]

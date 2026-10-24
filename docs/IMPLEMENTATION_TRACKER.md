@@ -164,14 +164,40 @@ Spec: `docs/superpowers/specs/2026-10-24-wp-1.1a-backend-core-skeleton-design.md
 
 | Pemeriksaan | Perintah | Hasil aktual (24 Okt 2026, container cloud, PostgreSQL 16 + Redis lokal) |
 |---|---|---|
-| Test backend | `cd backend && uv run pytest -q` | **77 passed** (unit 70 + integrasi 7, termasuk readiness terhadap DB/Redis nyata); stabil 4× run |
+| Test backend | `cd backend && uv run pytest -q` | **117 passed** setelah perbaikan review, termasuk readiness terhadap DB/Redis nyata; stabil berulang |
 | Lint & format | `uv run ruff check .` · `uv run ruff format --check .` | All checks passed · 24 files already formatted |
 | Tipe | `uv run pyright` | 0 errors, 0 warnings |
 | Layer | `uv run lint-imports` | Contracts: 2 kept, 0 broken |
 | Migrasi | `alembic upgrade head` → `downgrade base` → `upgrade head` | exit 0 ×3 (belum ada revisi; `0001_initial` = WP-1.1b) |
 | Registry | `python scripts/validate_registry.py agents/registry.v2.yaml` | `OK: 53 agents (41 specialists + ORCH + 11 K2) — schema_version 2` |
+| Audit dependensi | `uvx pip-audit --strict -r <uv export>` | No known vulnerabilities found. Sebelumnya `certifi 2026.7.22` PYSEC-2026-4320; dinaikkan ke 2026.10.23 lewat pengecualian umur per paket di `pyproject.toml`. |
 | CI | `.github/workflows/backend.yml` | ⬜ belum berjalan — push ke GitHub ditolak 403 (akses Claude GitHub App belum ada) |
 
 Gap yang diketahui:
 - `/health/ready` akan `503` (`sandbox_manager: unavailable`) sampai WP-1.3 membangun sandbox-manager.
 - Test kontrak "setiap variabel terdokumentasi ada di `Settings`" baru mencakup tabel variabel aplikasi v1. Variabel infra dan v2+ masuk bersama WP-nya.
+
+Review WP-1.1a: `kk-backend-reviewer`, `kk-security-reviewer` (pra-review, bukan sign-off gate), `kk-silent-failure-hunter`; semuanya model Sonnet demi budget.
+
+Awalnya: BLOCK, 4 HIGH. Sudah ditutup dengan test regresi:
+- redaksi berdasarkan nama kunci dan nama majemuk (`GITHUB_TOKEN=`);
+- nilai non-string (exception/bytes) dan header di tengah baris/JSON;
+- JSON ter-escape, nilai multi-kata, PEM terpotong, userinfo tanpa password;
+- log stdlib/uvicorn (traceback dan `?ticket=`) lewat filter redaksi + format JSON;
+- head Alembic dibaca sekali saat startup (bukan I/O blocking per poll);
+- `APP_ENV` wajib eksplisit (fail-closed);
+- `repr(settings)` tanpa secret;
+- header `Allow` dipertahankan;
+- error ≥ 500 di-log;
+- `request_id` stabil per request;
+- deteksi tabel `alembic_version` lewat `to_regclass`;
+- `aclose` berantai `try/finally`;
+- OpenAPI tidak disajikan di production;
+- import-linter melarang `subprocess`.
+
+Ditunda dengan alasan:
+- `ANTHROPIC_API_KEY` wajib bila `LLM_PROVIDER=anthropic` → menunggu `KK_PROCESS_ROLE` (ADR-053), karena `api` memang tidak memegang kunci.
+- Literal secret < 8 karakter tidak dicocokkan, untuk menghindari penyensoran kata biasa. `gen-secrets.sh` (WP-1.5) wajib membangkitkan password panjang.
+- Logging dan lock pada `alembic/env.py` → WP-1.1b.
+- Rate limit `/health/ready` → bersama rate limiter WP-1.1.
+- Digest image service CI.

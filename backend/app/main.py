@@ -59,7 +59,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="KodeKantor API",
         version="0.1.0",
-        openapi_url="/api/v1/openapi.json",
+        # Schema served outside production only (API_CONTRACTS does not publish it).
+        openapi_url=None if settings.is_production else "/api/v1/openapi.json",
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,

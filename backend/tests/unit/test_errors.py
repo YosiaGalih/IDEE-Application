@@ -132,3 +132,71 @@ def test_configured_secret_literals_are_redacted_in_logs(
     out = capsys.readouterr().out
     assert settings.secret_key not in out
     assert "[REDACTED]" in out
+
+
+def test_stdlib_logging_with_traceback_is_redacted(
+    settings: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import logging
+
+    create_app(settings)
+    capsys.readouterr()
+    try:
+        raise RuntimeError("dsn postgresql://kk:hunter2secret@db/x")
+    except RuntimeError:
+        logging.getLogger("uvicorn.error").exception("Exception in ASGI application")
+    out = capsys.readouterr()
+    assert "Exception in ASGI application" in out.out + out.err
+    assert "hunter2secret" not in out.out + out.err
+
+
+def test_structured_secret_fields_are_redacted(
+    settings: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from app.core.logging import get_logger
+
+    create_app(settings)
+    capsys.readouterr()
+    get_logger("t").info(
+        "x", password="hunter22", token="abcd1234", error=ConnectionError("redis://:pw77long@r/0")
+    )
+    out = capsys.readouterr().out
+    assert "hunter22" not in out and "abcd1234" not in out and "pw77long" not in out
+
+
+def test_405_keeps_allow_header(client: TestClient) -> None:
+    response = client.delete("/api/v1/_test/conflict")
+    assert response.status_code == 405
+    assert "GET" in response.headers.get("allow", "")
+
+
+def test_request_id_is_stable_within_a_request(app: FastAPI) -> None:
+    from starlette.requests import Request
+
+    from app.core.errors import request_id_of
+
+    request = Request({"type": "http", "state": {}})
+    assert request_id_of(request) == request_id_of(request)
+
+
+def test_query_string_ticket_is_redacted_in_stdlib_logs(
+    settings: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import logging
+
+    create_app(settings)
+    capsys.readouterr()
+    logging.getLogger("uvicorn.access").info('"GET /api/v1/x?ticket=SUPERSECRETTICKET1 HTTP/1.1" 200')
+    out = capsys.readouterr()
+    assert "SUPERSECRETTICKET1" not in out.out + out.err
+
+
+def test_openapi_is_not_served_in_production(settings: Settings) -> None:
+    from app.core.config import load_settings
+    from tests.conftest import make_test_env
+
+    prod = load_settings(
+        make_test_env(APP_ENV="production", LLM_PROVIDER="anthropic", SANDBOX_DRIVER="docker")
+    )
+    assert TestClient(create_app(prod)).get("/api/v1/openapi.json").status_code == 404
+    assert TestClient(create_app(settings)).get("/api/v1/openapi.json").status_code == 200

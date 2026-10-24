@@ -29,19 +29,20 @@ class ConfigError(Exception):
 class Settings(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
-    app_env: Literal["development", "test", "production"] = "development"
+    # Required with no default: a missing APP_ENV must never silently skip the production guards.
+    app_env: Literal["development", "test", "production"]
     app_url: str = "http://localhost:5173"
     app_domain: str = "localhost"
-    secret_key: str = Field(min_length=_MIN_SECRET_LENGTH)
+    secret_key: str = Field(min_length=_MIN_SECRET_LENGTH, repr=False)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     cors_origins: str = ""
     cookie_secure: bool = True
     session_ttl_hours: int = Field(default=12, gt=0)
     session_absolute_days: int = Field(default=7, gt=0)
-    database_url: str
-    redis_url: str
+    database_url: str = Field(repr=False)
+    redis_url: str = Field(repr=False)
     llm_provider: Literal["anthropic", "scripted"] = "anthropic"
-    anthropic_api_key: str | None = None
+    anthropic_api_key: str | None = Field(default=None, repr=False)
     anthropic_base_url: str | None = None
     claude_model_default: str = Field(min_length=1)
     claude_model_fast: str | None = None
@@ -62,7 +63,7 @@ class Settings(BaseModel):
     upload_max_mb: int = Field(default=200, gt=0)
     git_import_allowed_hosts: str = "github.com,gitlab.com,codeberg.org"
     sandbox_manager_url: str = "http://sandbox-manager:8100"
-    sandbox_manager_token: str = Field(min_length=_MIN_SECRET_LENGTH)
+    sandbox_manager_token: str = Field(min_length=_MIN_SECRET_LENGTH, repr=False)
     sandbox_image_python: str = "kodekantor/sandbox-python:1"
     sandbox_image_node: str = "kodekantor/sandbox-node:1"
     sandbox_cpu_limit: float = Field(default=1.0, gt=0)
@@ -109,9 +110,9 @@ class Settings(BaseModel):
 
     def model_post_init(self, __context: object) -> None:
         # Settings are frozen; fill the documented "= default" fallbacks without mutating validation input.
-        if self.claude_model_fast is None:
+        if not self.claude_model_fast:
             object.__setattr__(self, "claude_model_fast", self.claude_model_default)
-        if self.claude_model_complex is None:
+        if not self.claude_model_complex:
             object.__setattr__(self, "claude_model_complex", self.claude_model_default)
 
 

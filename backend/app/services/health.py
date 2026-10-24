@@ -16,7 +16,6 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from redis.asyncio import Redis
 from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.core.config import Settings
@@ -44,6 +43,7 @@ class Dependencies:
     redis: Redis
     http: httpx.AsyncClient
     sandbox_manager_url: str
+    migration_heads: frozenset[str]
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Dependencies:
@@ -52,12 +52,18 @@ class Dependencies:
             redis=Redis.from_url(settings.redis_url),
             http=httpx.AsyncClient(timeout=CHECK_TIMEOUT_SECONDS),
             sandbox_manager_url=settings.sandbox_manager_url.rstrip("/"),
+            # Read once at startup: building ScriptDirectory imports every revision module (blocking I/O).
+            migration_heads=frozenset(alembic_heads()),
         )
 
     async def aclose(self) -> None:
-        await self.http.aclose()
-        await self.redis.aclose()
-        await self.engine.dispose()
+        try:
+            await self.http.aclose()
+        finally:
+            try:
+                await self.redis.aclose()
+            finally:
+                await self.engine.dispose()
 
     async def check_db(self) -> bool:
         async with self.engine.connect() as conn:
@@ -71,14 +77,13 @@ class Dependencies:
         return response.status_code == 200
 
     async def check_migrations(self) -> bool:
-        heads = alembic_heads()
         async with self.engine.connect() as conn:
-            try:
-                rows = await conn.execute(text("SELECT version_num FROM alembic_version"))
-            except ProgrammingError:
-                return not heads  # no version table is only fine when there is nothing to apply
+            table = (await conn.execute(text("SELECT to_regclass('alembic_version')"))).scalar_one()
+            if table is None:
+                return not self.migration_heads  # fine only when there is nothing to apply yet
+            rows = await conn.execute(text("SELECT version_num FROM alembic_version"))
             current = {row[0] for row in rows}
-        return current == heads
+        return current == self.migration_heads
 
     def readiness_checks(self) -> dict[str, ReadinessCheck]:
         return {
@@ -93,7 +98,8 @@ async def _run_check(name: str, check: ReadinessCheck) -> str:
     try:
         ok = await asyncio.wait_for(check(), timeout=CHECK_TIMEOUT_SECONDS)
     except Exception as exc:  # any failure means "not ready"; only the type is logged
-        logger.warning("readiness_check_failed", check=name, error_type=type(exc).__name__)
+        # The message passes through the redactor (DSNs carry passwords); it never reaches the response.
+        logger.warning("readiness_check_failed", check=name, error_type=type(exc).__name__, error=str(exc))
         return "unavailable"
     return "ok" if ok else "unavailable"
 

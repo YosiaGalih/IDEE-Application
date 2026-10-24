@@ -138,3 +138,23 @@ def test_secret_values_include_credentials_inside_urls() -> None:
     assert SECRET in secrets and TOKEN in secrets
     assert "dbpass1234" in secrets and "redispass99" in secrets
     assert "sk-ant-test-" + "0" * 30 in secrets
+
+
+def test_app_env_must_be_explicit() -> None:
+    env = base_env()
+    del env["APP_ENV"]
+    with pytest.raises(ConfigError) as exc:
+        load_settings(env)
+    assert any(problem.startswith("APP_ENV") for problem in exc.value.problems)
+
+
+def test_empty_model_tiers_fall_back_to_default() -> None:
+    settings = load_settings(base_env(CLAUDE_MODEL_FAST="", CLAUDE_MODEL_COMPLEX=""))
+    assert settings.claude_model_fast == settings.claude_model_complex == "claude-model-id-from-config"
+
+
+def test_repr_never_shows_secrets_or_dsn() -> None:
+    settings = load_settings(base_env(ANTHROPIC_API_KEY="sk-ant-test-" + "9" * 30))
+    text = repr(settings) + str(settings)
+    for secret in (SECRET, TOKEN, "dbpass1234", "redispass99", "sk-ant-test-"):
+        assert secret not in text

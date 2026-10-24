@@ -76,7 +76,11 @@ def envelope(
 
 
 def request_id_of(request: Request) -> str:
-    return getattr(request.state, "request_id", None) or new_request_id()
+    request_id = getattr(request.state, "request_id", None)
+    if request_id is None:
+        request_id = new_request_id()
+        request.state.request_id = request_id
+    return request_id
 
 
 def error_response(
@@ -87,6 +91,7 @@ def error_response(
     message: str,
     details: list[dict[str, Any]] | None = None,
     data: Any = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     request_id = request_id_of(request)
     body = envelope(
@@ -95,11 +100,17 @@ def error_response(
         data=data,
         error={"code": code, "message": message, "details": details or []},
     )
-    return JSONResponse(body, status_code=http_status, headers={REQUEST_ID_HEADER: request_id})
+    return JSONResponse(
+        body, status_code=http_status, headers={**(headers or {}), REQUEST_ID_HEADER: request_id}
+    )
 
 
 async def _app_error(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)
+    if exc.http_status >= 500:
+        logger.error(
+            "app_error", code=exc.code, http_status=exc.http_status, request_id=request_id_of(request)
+        )
     return error_response(
         request, http_status=exc.http_status, code=exc.code, message=exc.message, details=exc.details
     )
@@ -110,7 +121,11 @@ async def _http_error(request: Request, exc: Exception) -> JSONResponse:
     status = exc.status_code
     code = _HTTP_CODES.get(status, "INTERNAL_ERROR" if status >= 500 else "BAD_REQUEST")
     message = _HTTP_MESSAGES.get(status, "Request failed")
-    return error_response(request, http_status=status, code=code, message=message)
+    if status >= 500:
+        logger.error("http_error", http_status=status, request_id=request_id_of(request))
+    return error_response(
+        request, http_status=status, code=code, message=message, headers=dict(exc.headers or {})
+    )
 
 
 async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
