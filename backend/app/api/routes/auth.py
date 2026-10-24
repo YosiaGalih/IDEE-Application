@@ -14,12 +14,15 @@ from app.api.deps import CurrentUser, audit_writer, client_ip, db_sessions, rate
 from app.core.context import REQUEST_ID_HEADER
 from app.core.csrf import CSRF_COOKIE, SESSION_COOKIE
 from app.core.errors import envelope, request_id_of
+from app.core.logging import get_logger
 from app.core.rbac import effective_permissions
 from app.models.identity import User
 from app.services import auth
-from app.services.users import MAX_PASSWORD_LENGTH
+from app.services.users import MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = get_logger(__name__)
+NewPassword = Field(min_length=MIN_PASSWORD_LENGTH, max_length=MAX_PASSWORD_LENGTH)
 
 
 class LoginIn(BaseModel):
@@ -28,6 +31,26 @@ class LoginIn(BaseModel):
     email: str = Field(min_length=1, max_length=320)
     password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
     remember_me: bool = False
+
+
+class ForgotIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=1, max_length=320)
+
+
+class ResetIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, max_length=128)
+    new_password: str = NewPassword
+
+
+class ChangeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+    new_password: str = NewPassword
 
 
 class UserOut(BaseModel):
@@ -119,3 +142,45 @@ async def me(request: Request, ctx: CurrentUser) -> JSONResponse:
             "permissions": sorted(permissions),
         },
     )
+
+
+@router.post("/password/forgot")
+async def forgot_password(body: ForgotIn, request: Request) -> JSONResponse:
+    token = await auth.request_password_reset(
+        db_sessions(request),
+        audit_writer(request),
+        rate_limiter(request),
+        email=body.email,
+        ip=client_ip(request),
+    )
+    # Email delivery is P1. Only a development install prints the link; production never writes the token.
+    if token is not None and request.app.state.settings.app_env == "development":
+        logger.info("password_reset_link", reset_path=f"/reset-password/{token}")
+    return ok(request, {})
+
+
+@router.post("/password/reset")
+async def reset_password(body: ResetIn, request: Request) -> JSONResponse:
+    await auth.reset_password(
+        db_sessions(request),
+        audit_writer(request),
+        rate_limiter(request),
+        token=body.token,
+        new_password=body.new_password,
+        ip=client_ip(request),
+    )
+    return ok(request, {})
+
+
+@router.post("/password/change")
+async def change_password(body: ChangeIn, request: Request, ctx: CurrentUser) -> JSONResponse:
+    await auth.change_password(
+        db_sessions(request),
+        audit_writer(request),
+        user_id=ctx.user.id,
+        session_id=ctx.session.id,
+        current_password=body.current_password,
+        new_password=body.new_password,
+        ip=client_ip(request),
+    )
+    return ok(request, {})

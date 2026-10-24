@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import case, select, update
+from sqlalchemy import case, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
@@ -21,7 +21,8 @@ from app.core.errors import AppError
 from app.core.ratelimit import FixedWindowLimiter, RateLimiterUnavailable
 from app.core.rbac import RoleGrant
 from app.core.security import hash_password, hash_token, needs_rehash, new_token, verify_password
-from app.models.identity import Session, User, UserRole
+from app.models.identity import PasswordResetToken, Session, User, UserRole
+from app.services.users import validate_new_password
 
 MAX_FAILED_LOGINS = 5
 LOCKOUT = timedelta(minutes=15)
@@ -29,6 +30,8 @@ RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 60
 LAST_SEEN_RESOLUTION = timedelta(seconds=60)
 INVALID_CREDENTIALS = "Invalid email or password"
+# Not fixed by the docs (spec decision #3) [Menebak].
+RESET_TOKEN_TTL = timedelta(minutes=30)
 
 # Verified against when the email is unknown, so that path costs one argon2 verification like the others.
 _DUMMY_HASH = hash_password(secrets.token_urlsafe(16))
@@ -230,3 +233,144 @@ async def logout(
             ip=ip,
         )
         await db.commit()
+
+
+async def request_password_reset(
+    sessions: Sessions, audit: AuditWriter, limiter: FixedWindowLimiter, *, email: str, ip: str | None
+) -> str | None:
+    """Create a single-use reset token for an active user; return it raw, or None if there is no such user.
+
+    The caller never reveals which case happened. Older unused tokens of that user stop working.
+    """
+    await enforce_rate_limit(limiter, f"kk:rl:forgot:{ip}")
+    async with sessions() as db:
+        user = await db.scalar(select(User).where(User.email == email.strip().lower()))
+        if user is None or user.status != "active":
+            return None
+        await db.execute(
+            delete(PasswordResetToken).where(
+                PasswordResetToken.user_id == user.id, PasswordResetToken.used_at.is_(None)
+            )
+        )
+        token = new_token()
+        db.add(
+            PasswordResetToken(
+                user_id=user.id,
+                token_hash=hash_token(token),
+                expires_at=datetime.now(UTC) + RESET_TOKEN_TTL,
+            )
+        )
+        await audit.write(
+            db,
+            actor_type="user",
+            actor_id=str(user.id),
+            action="auth.password_reset_requested",
+            result="success",
+            resource_type="user",
+            resource_id=str(user.id),
+            ip=ip,
+        )
+        await db.commit()
+        return token
+
+
+async def reset_password(
+    sessions: Sessions,
+    audit: AuditWriter,
+    limiter: FixedWindowLimiter,
+    *,
+    token: str,
+    new_password: str,
+    ip: str | None,
+) -> None:
+    await enforce_rate_limit(limiter, f"kk:rl:reset:{ip}")
+    validate_new_password(new_password)
+    now = datetime.now(UTC)
+    async with sessions() as db:
+        # FOR UPDATE: a concurrent use of the same token waits, then no longer matches ``used_at IS NULL``.
+        reset = await db.scalar(
+            select(PasswordResetToken)
+            .where(
+                PasswordResetToken.token_hash == hash_token(token),
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > now,
+            )
+            .with_for_update()
+        )
+        if reset is None:
+            raise AppError("BAD_REQUEST", "Reset token is invalid or expired", http_status=400)
+        reset.used_at = now
+        await db.execute(
+            update(User)
+            .where(User.id == reset.user_id)
+            .values(password_hash=hash_password(new_password), failed_login_count=0, locked_until=None)
+        )
+        await _revoke_sessions(db, reset.user_id, now)
+        await audit.write(
+            db,
+            actor_type="user",
+            actor_id=str(reset.user_id),
+            action="auth.password_reset",
+            result="success",
+            resource_type="user",
+            resource_id=str(reset.user_id),
+            ip=ip,
+        )
+        await db.commit()
+
+
+async def change_password(
+    sessions: Sessions,
+    audit: AuditWriter,
+    *,
+    user_id: uuid.UUID,
+    session_id: uuid.UUID,
+    current_password: str,
+    new_password: str,
+    ip: str | None,
+) -> None:
+    validate_new_password(new_password)
+    now = datetime.now(UTC)
+    async with sessions() as db:
+        user = await db.get(User, user_id, with_for_update=True)
+        if user is None:
+            raise unauthenticated()
+        locked = user.locked_until is not None and user.locked_until > now
+        if locked or not verify_password(user.password_hash, current_password):
+            if not locked:
+                # Counts toward the login lockout, so a stolen session cannot brute-force the password.
+                await record_failure(db, user.id, now)
+            await audit.write_detached(
+                sessions,
+                actor_type="user",
+                actor_id=str(user_id),
+                action="auth.password_change",
+                result="denied",
+                resource_type="user",
+                resource_id=str(user_id),
+                metadata={"reason": "locked" if locked else "bad_password"},
+                ip=ip,
+            )
+            raise AppError("FORBIDDEN", "Current password is incorrect", http_status=403)
+        user.password_hash = hash_password(new_password)
+        await _revoke_sessions(db, user_id, now, keep=session_id)
+        await audit.write(
+            db,
+            actor_type="user",
+            actor_id=str(user_id),
+            action="auth.password_change",
+            result="success",
+            resource_type="user",
+            resource_id=str(user_id),
+            ip=ip,
+        )
+        await db.commit()
+
+
+async def _revoke_sessions(
+    db: AsyncSession, user_id: uuid.UUID, now: datetime, *, keep: uuid.UUID | None = None
+) -> None:
+    condition = (Session.user_id == user_id) & Session.revoked_at.is_(None)
+    if keep is not None:
+        condition &= Session.id != keep
+    await db.execute(update(Session).where(condition).values(revoked_at=now))

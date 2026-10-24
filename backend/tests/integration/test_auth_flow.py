@@ -19,11 +19,14 @@ from app.api.deps import AuthContext, require_permission
 from app.core.audit import AuditWriter
 from app.core.config import load_settings
 from app.core.db import make_sessionmaker
+from app.core.errors import AppError
+from app.core.ratelimit import FixedWindowLimiter
 from app.core.redaction import Redactor
 from app.core.security import hash_password, hash_token
 from app.main import create_app
 from app.models.audit import AuditEvent
 from app.models.identity import Session, User, UserRole
+from app.services import auth
 from app.services.users import create_owner
 from tests.conftest import make_test_env
 
@@ -288,3 +291,153 @@ async def test_require_permission_guards_global_only_routes(
     assert denied.json()["error"]["code"] == "FORBIDDEN"
     await login(client)
     assert (await client.get("/api/v1/_test/audit")).status_code == 200
+
+
+FORGOT = "/api/v1/auth/password/forgot"
+RESET = "/api/v1/auth/password/reset"
+CHANGE = "/api/v1/auth/password/change"
+NEW_PASSWORD = "brand-new-passphrase"
+
+
+async def presession_csrf(client: httpx.AsyncClient) -> dict[str, str]:
+    await client.get("/api/v1/health/live")
+    return csrf(client)
+
+
+async def issue_reset_token(engine: AsyncEngine, email: str = EMAIL) -> str | None:
+    redis = Redis.from_url(make_test_env()["REDIS_URL"])
+    try:
+        return await auth.request_password_reset(
+            make_sessionmaker(engine),
+            AuditWriter(Redactor()),
+            FixedWindowLimiter(redis),
+            email=email,
+            ip=None,
+        )
+    finally:
+        await redis.aclose()
+
+
+async def test_forgot_always_200(client: httpx.AsyncClient, owner_id: uuid.UUID) -> None:
+    headers = await presession_csrf(client)
+    known = await client.post(FORGOT, json={"email": EMAIL}, headers=headers)
+    unknown = await client.post(FORGOT, json={"email": "nobody@example.test"}, headers=headers)
+    assert known.status_code == unknown.status_code == 200
+    assert known.json()["data"] == unknown.json()["data"] == {}
+
+
+async def test_reset_changes_password_and_revokes_all_sessions(
+    app: FastAPI, client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    await login(client)
+    token = await issue_reset_token(engine)
+    assert token is not None
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as other:
+        response = await other.post(
+            RESET, json={"token": token, "new_password": NEW_PASSWORD}, headers=await presession_csrf(other)
+        )
+        assert response.status_code == 200, response.text
+        assert (await login(other)).status_code == 401
+        assert (await login(other, password=NEW_PASSWORD)).status_code == 200
+    assert (await client.get(ME)).status_code == 401
+    assert await count_audit(engine, "auth.password_reset", owner_id) == 1
+
+
+async def test_reset_token_is_single_use_and_expires(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    headers = await presession_csrf(client)
+    token = await issue_reset_token(engine)
+    body = {"token": token, "new_password": NEW_PASSWORD}
+    assert (await client.post(RESET, json=body, headers=headers)).status_code == 200
+    reused = await client.post(RESET, json=body, headers=headers)
+    assert reused.status_code == 400
+    assert reused.json()["error"]["code"] == "BAD_REQUEST"
+
+    expired = await issue_reset_token(engine)
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE password_reset_tokens SET expires_at = now() - interval '1 second'"))
+    late = await client.post(RESET, json={"token": expired, "new_password": NEW_PASSWORD}, headers=headers)
+    assert late.status_code == 400
+
+
+async def test_new_reset_request_supersedes_older_token(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    first = await issue_reset_token(engine)
+    await issue_reset_token(engine)
+    response = await client.post(
+        RESET, json={"token": first, "new_password": NEW_PASSWORD}, headers=await presession_csrf(client)
+    )
+    assert response.status_code == 400
+
+
+async def test_reset_token_single_use_under_race(owner_id: uuid.UUID, engine: AsyncEngine) -> None:
+    token = await issue_reset_token(engine)
+    assert token is not None
+    redis = Redis.from_url(make_test_env()["REDIS_URL"])
+    try:
+        results = await asyncio.gather(
+            *(
+                auth.reset_password(
+                    make_sessionmaker(engine),
+                    AuditWriter(Redactor()),
+                    FixedWindowLimiter(redis),
+                    token=token,
+                    new_password=f"{NEW_PASSWORD}-{i}",
+                    ip=None,
+                )
+                for i in range(2)
+            ),
+            return_exceptions=True,
+        )
+    finally:
+        await redis.aclose()
+    failures = [r for r in results if isinstance(r, BaseException)]
+    assert len(failures) == 1
+    assert isinstance(failures[0], AppError) and failures[0].code == "BAD_REQUEST"
+
+
+async def test_change_password_keeps_current_session_revokes_others(
+    app: FastAPI, client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    await login(client)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as other:
+        await login(other)
+        response = await client.post(
+            CHANGE, json={"current_password": PASSWORD, "new_password": NEW_PASSWORD}, headers=csrf(client)
+        )
+        assert response.status_code == 200, response.text
+        assert (await other.get(ME)).status_code == 401
+    assert (await client.get(ME)).status_code == 200
+    assert await count_audit(engine, "auth.password_change", owner_id) == 1
+
+
+async def test_change_with_wrong_current_is_403_and_counts_toward_lockout(
+    client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    await login(client)
+    response = await client.post(
+        CHANGE,
+        json={"current_password": "not-the-password", "new_password": NEW_PASSWORD},
+        headers=csrf(client),
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "FORBIDDEN"
+    async with make_sessionmaker(engine)() as session:
+        user = await session.get(User, owner_id)
+    assert user is not None and user.failed_login_count == 1
+
+
+@pytest.mark.parametrize("length", [11, 1025])
+async def test_new_password_length_rules(client: httpx.AsyncClient, owner_id: uuid.UUID, length: int) -> None:
+    await login(client)
+    response = await client.post(
+        CHANGE, json={"current_password": PASSWORD, "new_password": "x" * length}, headers=csrf(client)
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
