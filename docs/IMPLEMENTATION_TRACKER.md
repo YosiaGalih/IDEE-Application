@@ -258,3 +258,35 @@ Scanner belum dijalankan oleh reviewer:
 - semgrep dan trivy belum ada.
 
 Sign-off formal AG-13 tetap diperlukan sebelum G1.
+
+### WP-1.1d (🔒) — auth, sesi, CSRF, rate limit, lockout, reset password (FR-001–006 dasar, AC-01 backend)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.1d-auth-session-csrf-design.md`. Plan: `docs/superpowers/plans/2026-10-24-wp-1.1d-auth-session-csrf.md`.
+
+Eksekusi inline (native), bukan subagent per task, demi batas kredit. Rulings dicatat di ledger plan.
+
+| Pemeriksaan | Hasil aktual (24 Okt 2026) |
+|---|---|
+| `uv run pytest -q` | **206 passed** setelah WP-1.1d. Test kontrak:<br>• `test_auth_flow.py::test_login_sets_cookies_and_me`, `::test_logout_revokes_session_and_clears_cookies`, `::test_lockout_after_five_failures`<br>• rate limit, sesi kedaluwarsa, rotasi, CSRF terikat sesi, lockout paralel, fail-closed Redis<br>• forgot/reset/change<br>• `tests/security/test_auth_hardening.py`: 8 test, masing-masing dibuktikan merah lewat sabotase |
+| ruff · format · pyright · lint-imports | bersih · 0 error · 2 kontrak dipatuhi |
+| alembic upgrade + check | exit 0, "No new upgrade operations detected" (tanpa migrasi baru) |
+
+Keputusan yang perlu dicek PO ada di spec bagian "Keputusan saya (cek)":
+- TTL token reset 30 menit [Menebak].
+- `remember_me` hanya mengatur `Max-Age`.
+- Token reset hanya muncul di log development. Ini **konflik dokumen #27**.
+
+### WP-1.1e — state machine task + task events (FR-048, dasar FR-145, AC-14 bagian state)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.1e-task-state-machine-design.md`. Plan: `docs/superpowers/plans/2026-10-24-wp-1.1e-task-state-machine.md`.
+
+| Pemeriksaan | Hasil aktual (24 Okt 2026) |
+|---|---|
+| `uv run pytest -q` (DB terpisah `kodekantor_main`) | **412 passed**. Mencakup:<br>• matriks 13×13 `ALLOWED` vs tabel edge diagram §5.1 (ADR-006/021)<br>• `transition`: 409 `INVALID_TRANSITION` / `VERSION_CONFLICT`, writer paralel, objek basi, iterasi, timestamp<br>• event: seq tanpa celah pada 20 emit paralel, publish hanya setelah commit, rollback dibuang, payload diredaksi, ephemeral tidak disimpan<br>• schema `0003_tasks` |
+| Penjaga "satu penulis status" | `tests/unit/test_status_writer_guard.py`. Test sanity menemukan celah `.values(**dict)`, lalu detektor diperluas. |
+| `alembic downgrade base → upgrade head → downgrade -1 → upgrade head → check` | exit 0 |
+| ruff · format · pyright · lint-imports | bersih · 0 error · 2 kontrak dipatuhi (`app.workflow` masuk kontrak layers) |
+
+Catatan:
+- Reviewer paralel yang memakai DB uji yang sama membuat test saling mengganggu. Mulai sekarang setiap proses memakai DB sendiri: `kodekantor_main`, `kodekantor_review`.
+- `dump.rdb` Redis sempat ter-commit, lalu dihapus dari tracking dan diabaikan.
