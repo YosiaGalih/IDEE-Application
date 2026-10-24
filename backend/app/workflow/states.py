@@ -99,6 +99,9 @@ async def transition(
 
     ``audit`` carries the redactor with the configured secret literals; ``reason`` is redacted with it.
     """
+    expired = inspect(task).expired_attributes
+    if "status" in expired or "version" in expired:
+        raise ValueError("task object is expired (e.g. after a rollback); reload it before transitioning")
     source = TaskStatus(task.status)
     target = TaskStatus(to)
     if target not in ALLOWED[source]:
@@ -121,7 +124,10 @@ async def transition(
     if target is S.RUNNING:
         values["started_at"] = func.coalesce(Task.started_at, func.now())
     if target in _FINISHED:
-        values["completed_at"] = func.now()
+        # failed -> cancelled keeps the original finish time.
+        values["completed_at"] = (
+            func.coalesce(Task.completed_at, func.now()) if source in _FINISHED else func.now()
+        )
     if target is S.QUEUED:
         values["completed_at"] = None
         if source in _NEW_ITERATION_FROM:

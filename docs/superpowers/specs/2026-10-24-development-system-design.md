@@ -268,6 +268,16 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 29. **Nama cookie `kk_session` / `kk_csrf`** (API_CONTRACTS §2) vs usul prefix `__Host-`:
     - Prefix `__Host-` melindungi dari cookie yang ditanam subdomain saudara, misalnya preview P1.
     - Pre-review keamanan WP-1.1d mengusulkan agar ini diputuskan sebelum fitur preview.
+30. **Kenaikan `iteration`:**
+    - API_CONTRACTS §5 menulis `request-changes (needs_changes/waiting_approval/completed → queued, iteration+1)`.
+    - `waiting_approval → queued` juga berarti "approval disetujui → resume", yang tidak menaikkan iterasi.
+    - WP-1.1e hanya menaikkan iterasi dari `completed` dan `needs_changes`. Pemanggil `waiting_approval → queued` di WP-3.x butuh penanda eksplisit.
+    - Menunggu keputusan Lead.
+31. **`task_dependencies.created_at`:** konvensi DATA_MODEL (baris 3) menyatakan semua tabel punya `created_at`, tetapi daftar kolom tabel ini tidak memilikinya. Implementasi mengikuti daftar kolom.
+32. **ON DELETE yang tidak tertulis di DATA_MODEL:**
+    - `tasks.parent_task_id` dan `tasks.conversation_id` memakai SET NULL.
+    - `tasks.created_by` dan `conversations.user_id` memakai RESTRICT.
+    - Spec WP-1.1e menandainya [Menebak]. Lead perlu mencatat keputusannya di DATA_MODEL.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

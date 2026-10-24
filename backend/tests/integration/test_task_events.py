@@ -222,7 +222,7 @@ async def test_publish_after_commit_even_when_a_new_transaction_began(
 
 
 class FailingBus:
-    def __init__(self, fail_seq: int) -> None:
+    def __init__(self, fail_seq: int | None) -> None:
         self.fail_seq = fail_seq
         self.sent: list[int | None] = []
 
@@ -261,3 +261,42 @@ async def test_commit_and_publish_is_one_step(
     await commit_and_publish(session, bus)
     message = await next_message(subscription, wait=2)
     assert message is not None and message["seq"] == seq
+
+
+async def test_ephemeral_publish_failure_is_logged_not_raised(
+    session: AsyncSession, task_id: uuid.UUID, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from app.core.logging import configure_logging
+
+    configure_logging("INFO", REDACTOR)
+    bus = FailingBus(fail_seq=None)
+    seq = await emit_task_event(
+        session,
+        bus,
+        task_id,
+        "agent.delta",
+        {"agent_run_id": "r", "text": "t"},
+        redactor=REDACTOR,
+        ephemeral=True,
+    )
+    assert seq is None
+    assert "task_event_publish_failed" in capsys.readouterr().out
+
+
+async def test_non_json_payload_is_normalised(session: AsyncSession, task_id: uuid.UUID) -> None:
+    await emit_task_event(
+        session, None, task_id, "task.log", {"ratio": float("nan"), "tags": {"b", "a"}}, redactor=REDACTOR
+    )
+    await session.commit()
+    stored = await session.scalar(select(TaskEvent.payload).where(TaskEvent.task_id == task_id))
+    assert stored == {"ratio": None, "tags": ["a", "b"]}
+
+
+async def test_hung_bus_does_not_block_publishing_forever(session: AsyncSession, task_id: uuid.UUID) -> None:
+    class HungBus:
+        async def publish(self, channel: str, message: dict[str, Any]) -> None:
+            await asyncio.sleep(3600)
+
+    await emit_task_event(session, None, task_id, "task.log", {"m": 1}, redactor=REDACTOR)
+    await session.commit()
+    await asyncio.wait_for(publish_pending(session, HungBus()), timeout=10)

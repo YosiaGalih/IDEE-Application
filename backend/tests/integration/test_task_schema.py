@@ -142,3 +142,17 @@ async def test_task_ids_are_application_generated(session: AsyncSession) -> None
     project = await make_project(session)
     task = await make_task(session, project)
     assert isinstance(task.id, uuid.UUID)
+
+
+async def test_foreign_keys_used_by_cascades_are_indexed(session: AsyncSession) -> None:
+    rows = await session.execute(
+        text("SELECT tablename, indexdef FROM pg_indexes WHERE schemaname = 'public'")
+    )
+    defs = [f"{table}: {indexdef}" for table, indexdef in rows]
+    for table, column in [
+        ("tasks", "parent_task_id"),
+        ("tasks", "conversation_id"),
+        ("tasks", "created_by"),
+        ("conversations", "user_id"),
+    ]:
+        assert any(d.startswith(f"{table}:") and f"({column})" in d for d in defs), (table, column)

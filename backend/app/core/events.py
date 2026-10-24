@@ -15,6 +15,7 @@ clients recover through replay from the database.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime
@@ -25,11 +26,13 @@ from sqlalchemy import event, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, SessionTransaction
 
+from app.core.audit import json_safe
 from app.core.logging import get_logger
 from app.core.redaction import Redactor
 from app.models.tasks import Task, TaskEvent
 
 MAX_TYPE_LENGTH = 60
+PUBLISH_TIMEOUT_SECONDS = 2.0
 _UNCOMMITTED = "kk.task_events.uncommitted"
 _COMMITTED = "kk.task_events.committed"
 _SAVEPOINTS = "kk.task_events.savepoints"
@@ -70,12 +73,14 @@ async def emit_task_event(
     """
     if not type or len(type) > MAX_TYPE_LENGTH:
         raise ValueError(f"event type must be 1-{MAX_TYPE_LENGTH} characters")
-    safe_payload = redactor.redact_obj(payload, stringify=True)
+    # Redacted, then made JSON-safe (NaN, sets, non-str keys) before it reaches the database or Redis.
+    safe_payload = json_safe(redactor.redact_obj(payload, stringify=True))
     now = datetime.now(UTC)
     if ephemeral:
         if bus is None:
             raise ValueError("an ephemeral event needs a bus: it is never stored")
-        await bus.publish(task_channel(task_id), _message(task_id, None, type, now, safe_payload))
+        # Ephemeral events are lossy by design (deltas, output chunks): a Redis blip must not abort a run.
+        await _publish(bus, _message(task_id, None, type, now, safe_payload))
         return None
 
     seq = (
@@ -105,21 +110,26 @@ async def publish_pending(db: AsyncSession, bus: EventBus) -> None:
     sent = 0
     try:
         for message in committed:
-            try:
-                await bus.publish(task_channel(uuid.UUID(message["task_id"])), message)
-            except Exception as exc:
-                # Live delivery only; the event is stored and clients replay it (ARCHITECTURE §9).
-                logger.warning(
-                    "task_event_publish_failed",
-                    task_id=message["task_id"],
-                    seq=message["seq"],
-                    type=message["type"],
-                    error_type=type(exc).__name__,
-                )
+            await _publish(bus, message)
             sent += 1
     finally:
         if sent < len(committed):  # cancelled mid-way (shutdown, client gone)
             logger.warning("task_event_publish_abandoned", remaining=len(committed) - sent)
+
+
+async def _publish(bus: EventBus, message: dict[str, Any]) -> None:
+    """Live delivery only: failures and hangs are logged; the stored event is replayed (ARCHITECTURE §9)."""
+    try:
+        async with asyncio.timeout(PUBLISH_TIMEOUT_SECONDS):
+            await bus.publish(task_channel(uuid.UUID(message["task_id"])), message)
+    except Exception as exc:
+        logger.warning(
+            "task_event_publish_failed",
+            task_id=message["task_id"],
+            seq=message["seq"],
+            type=message["type"],
+            error_type=type(exc).__name__,
+        )
 
 
 async def commit_and_publish(db: AsyncSession, bus: EventBus) -> None:
@@ -143,6 +153,9 @@ def _on_transaction_create(session: Session, transaction: SessionTransaction) ->
 
 
 def _on_commit(session: Session) -> None:
+    # SQLAlchemy also dispatches after_commit when a savepoint is released; only the outermost commit counts.
+    if session.in_nested_transaction():
+        return
     session.info.setdefault(_COMMITTED, []).extend(session.info.get(_UNCOMMITTED, []))
     session.info[_UNCOMMITTED] = []
     session.info[_SAVEPOINTS] = {}

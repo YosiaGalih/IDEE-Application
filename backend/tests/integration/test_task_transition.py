@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import pytest
 from sqlalchemy import func, select, text
@@ -283,3 +284,78 @@ async def test_database_rejects_status_writes_outside_transition(
                 ),
                 {"p": task.project_id, "u": task.created_by},
             )
+
+
+async def test_aba_stale_version_conflicts(engine: AsyncEngine, task_id: uuid.UUID) -> None:
+    """Same status, older version: only the version predicate can catch it (backend review WP-1.1e)."""
+    S = TaskStatus
+    sessions = make_sessionmaker(engine)
+    async with sessions() as session:
+        await walk(session, task_id, S.PLANNED, S.QUEUED, S.RUNNING, S.FAILED)
+        stale = await load(session, task_id)
+    async with sessions() as other:
+        await walk(other, task_id, S.QUEUED, S.RUNNING, S.FAILED)  # back to "failed", newer version
+    async with sessions() as session:
+        session.add(stale)
+        with pytest.raises(AppError) as caught:
+            await transition(session, stale, S.QUEUED, reason=None, actor=ACTOR, audit=AUDIT)
+    assert caught.value.code == "VERSION_CONFLICT"
+
+
+async def test_cancelling_a_failed_task_keeps_its_finish_time(
+    session: AsyncSession, task_id: uuid.UUID
+) -> None:
+    S = TaskStatus
+    task = await walk(session, task_id, S.PLANNED, S.QUEUED, S.RUNNING, S.FAILED)
+    finished = task.completed_at
+    task = await walk(session, task_id, S.CANCELLED)
+    assert task.completed_at == finished
+
+
+async def test_status_change_reaches_a_subscriber(session: AsyncSession, task_id: uuid.UUID) -> None:
+    from redis.asyncio import Redis
+
+    from app.core.events import RedisEventBus, commit_and_publish, task_channel
+    from tests.conftest import make_test_env
+
+    redis = Redis.from_url(make_test_env()["REDIS_URL"])
+    pubsub = redis.pubsub()
+    try:
+        await pubsub.subscribe(task_channel(task_id))
+        await pubsub.get_message(timeout=1)
+        task = await load(session, task_id)
+        await transition(session, task, TaskStatus.PLANNED, reason="ready", actor=ACTOR, audit=AUDIT)
+        await commit_and_publish(session, RedisEventBus(redis))
+        message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=2)
+    finally:
+        await pubsub.aclose()
+        await redis.aclose()
+    assert message is not None
+    assert '"task.status_changed"' in message["data"].decode() and '"planned"' in message["data"].decode()
+
+
+async def test_rolled_back_transition_leaves_nothing(session: AsyncSession, task_id: uuid.UUID) -> None:
+    from app.core.events import publish_pending
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.sent: list[Any] = []
+
+        async def publish(self, channel: str, message: dict[str, Any]) -> None:
+            self.sent.append(message)
+
+    task = await load(session, task_id)
+    await transition(session, task, TaskStatus.PLANNED, reason=None, actor=ACTOR, audit=AUDIT)
+    await session.rollback()
+    bus = Recorder()
+    await publish_pending(session, bus)
+    assert bus.sent == []
+    fresh = await load(session, task_id)
+    assert (fresh.status, fresh.event_seq) == ("draft", 0)
+
+
+async def test_expired_task_object_is_refused_clearly(session: AsyncSession, task_id: uuid.UUID) -> None:
+    task = await load(session, task_id)
+    session.expire(task)
+    with pytest.raises(ValueError, match="reload"):
+        await transition(session, task, TaskStatus.PLANNED, reason=None, actor=ACTOR, audit=AUDIT)

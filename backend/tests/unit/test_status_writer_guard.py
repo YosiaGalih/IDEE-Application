@@ -121,6 +121,16 @@ def status_writes(source: str) -> list[str]:
             if isinstance(func, ast.Attribute) and func.attr == "values":
                 if _values_sets_status(node, status_dicts):
                     found.append(f"line {node.lineno}: .values(status=...)")
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "Task"
+                and any(k.arg == "status" for k in node.keywords)
+            ):
+                found.append(f"line {node.lineno}: Task(status=...)")
+            if isinstance(func, ast.Name) and func.id == "set_committed_value" and len(node.args) >= 2:
+                name = node.args[1]
+                if isinstance(name, ast.Constant) and name.value == "status":
+                    found.append(f"line {node.lineno}: set_committed_value(..., 'status', ...)")
             if isinstance(func, ast.Name) and func.id == "setattr" and len(node.args) >= 2:
                 name = node.args[1]
                 if isinstance(name, ast.Constant) and name.value == "status":
@@ -210,3 +220,22 @@ def test_guard_detects_split_raw_sql() -> None:
         "OTHER = 'UPDATE tasks SET ' + 'status = :s'\n"
     )
     assert len(status_writes(source)) == 2
+
+
+def test_guard_detects_constructor_and_committed_value_writes() -> None:
+    source = (
+        "from sqlalchemy.orm.attributes import set_committed_value\nfrom app.models.tasks import Task\n\n"
+        "t = Task(status='completed')\nset_committed_value(t, 'status', 'x')\n"
+    )
+    assert len(status_writes(source)) == 2
+
+
+def test_only_states_module_names_the_writer_marker() -> None:
+    """The DB trigger trusts kk.status_writer; nothing but the state machine may set it."""
+    offenders = [
+        str(path.relative_to(APP))
+        for path in APP.rglob("*.py")
+        if path not in {ALLOWED_WRITER, APP / "models" / "tasks.py"}
+        and ("kk.status_writer" in path.read_text() or "STATUS_WRITER" in path.read_text())
+    ]
+    assert offenders == []

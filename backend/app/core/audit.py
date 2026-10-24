@@ -28,13 +28,13 @@ _MAX_LENGTHS = {
 }
 
 
-def _json_safe(value: Any) -> Any:
+def json_safe(value: Any) -> Any:
     if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        return {str(key): json_safe(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
-        return [_json_safe(item) for item in value]
+        return [json_safe(item) for item in value]
     if isinstance(value, set | frozenset):
-        return sorted((_json_safe(item) for item in value), key=str)
+        return sorted((json_safe(item) for item in value), key=str)
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if value is None or isinstance(value, str | int | float | bool):
@@ -65,7 +65,7 @@ class AuditWriter:
                     raise ValueError(f"{name} exceeds {limit} characters")
                 fields[name] = value
         metadata = self._redactor.redact_obj(fields.pop("metadata") or {}, stringify=True)
-        return AuditEvent(metadata_=_json_safe(metadata), **fields)
+        return AuditEvent(metadata_=json_safe(metadata), **fields)
 
     async def write(
         self,

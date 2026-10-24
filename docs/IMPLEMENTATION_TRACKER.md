@@ -306,7 +306,7 @@ Catatan:
 - Reviewer paralel yang memakai DB uji yang sama membuat test saling mengganggu. Mulai sekarang setiap proses memakai DB sendiri: `kodekantor_main`, `kodekantor_review`.
 - `dump.rdb` Redis sempat ter-commit, lalu dihapus dari tracking dan diabaikan.
 
-**Review WP-1.1e** (`kk-silent-failure-hunter`; hasil `kk-backend-reviewer` menyusul):
+**Review WP-1.1e** (`kk-silent-failure-hunter` + `kk-backend-reviewer`):
 
 | Temuan | Status | Bukti |
 |---|---|---|
@@ -317,4 +317,22 @@ Catatan:
 | LOW F8–F11 | **ditutup**:<br>• masuk `queued` menghapus `completed_at`<br>• task yang dihapus → NOT_FOUND; detail versi saat konflik<br>• task dari sesi lain atau status lokal yang diubah ditolak<br>• guard statis diperluas<br>• **trigger DB `tasks_status_guard`** sebagai backstop CLAUDE.md #4 | test per butir |
 | LOW F7 (lock/publish timeout); audit transisi yang ditolak | **ditunda ke WP-3.x**: `write_detached` butuh koneksi kedua, bahaya pool yang sama seperti WP-1.1d | — |
 
-Hasil setelah perbaikan: `uv run pytest -q` → **450 passed**; migrasi naik-turun dan `check` exit 0. `0003_tasks` diedit di tempat untuk trigger karena belum pernah diterapkan di luar DB uji.
+Temuan tambahan dari `kk-backend-reviewer`. Review ini dibuat atas commit sebelum fix pass, jadi HIGH-1, HIGH-3, MEDIUM-5, dan sebagian HIGH-2 sudah tertutup di fa30f1b. Yang ditutup di pass berikutnya:
+
+| Temuan | Status | Bukti |
+|---|---|---|
+| Bug baru dari fix pass sendiri: `after_commit` juga terpicu saat savepoint di-release, sehingga event transisi yang di-rollback tetap terpublish | **ditutup**: hanya commit akar yang dihitung | `test_rolled_back_transition_leaves_nothing` merah → hijau |
+| MEDIUM-4: predikat `version` tidak dilindungi test | **ditutup** | `test_aba_stale_version_conflicts`; mutan tanpa predikat terbunuh |
+| MEDIUM-6a: `failed → cancelled` menimpa `completed_at` | **ditutup**: `coalesce` | test |
+| MEDIUM-6b: aturan iterasi vs API_CONTRACTS §5 | **konflik dokumen #30** | — |
+| MEDIUM-7: lokasi test sesuai TEST_STRATEGY | **ditutup**: `tests/integration/test_states_transition.py` menguji 169 pasangan lewat `transition()` | 169 test |
+| MEDIUM-8: publish tanpa timeout; kegagalan ephemeral merambat | **ditutup**: timeout 2 dtk per publish; ephemeral di-log, tidak dilempar | 2 test |
+| MEDIUM-9: test glue | **ditutup**: subscriber menerima `task.status_changed`; rollback bersih | 2 test |
+| LOW-10: indeks FK | **ditutup**: `tasks.parent_task_id`, `conversation_id`, `created_by`, `conversations.user_id` | test `pg_indexes` |
+| LOW-12/13: instance kedaluwarsa; payload tidak aman-JSON | **ditutup** | 2 test |
+| HIGH-2 sisa: bypass penanda trigger | **ditutup**: hanya `states.py` dan `models/tasks.py` yang boleh menyebut `kk.status_writer`; guard menangkap `Task(status=)` dan `set_committed_value` | 2 test |
+| LOW-11 (`now()` = awal transaksi), LOW-14 (urutan publish antar-committer: WP-3.2 wajib mengisi celah seq dari DB), LOW-15 (isolasi DB test), NIT-16/20 (konflik #31, #32) | dicatat | — |
+
+Hasil akhir: `uv run pytest -q` → **630 passed** (DB baru `kodekantor_main`). Migrasi naik-turun dan `check` exit 0.
+
+`0003_tasks` diedit di tempat, karena belum pernah diterapkan di luar DB uji. Akibatnya DB lokal yang sudah berada di 0003 versi lama harus dibuat ulang; CI selalu memakai DB baru.
