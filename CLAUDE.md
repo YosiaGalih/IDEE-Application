@@ -79,7 +79,21 @@ uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml
 - PostgreSQL dan Redis lokal di container cloud: `pg_ctlcluster 16 main start` dan `redis-server --daemonize yes`.
 - DB uji default: `kodekantor:kodekantor@localhost:5432/kodekantor_test`.
 - Library baru hanya yang dirilis sebelum tanggal `exclude-newer` di `backend/pyproject.toml`. Majukan tanggal itu lewat PR.
-- Frontend, sandbox-manager, dan e2e belum di-scaffold; perintahnya menyusul di WP-nya.
+- Frontend dan e2e belum di-scaffold; perintahnya menyusul di WP-nya.
+
+Sandbox manager (`cd sandbox_manager`, pyproject dan uv.lock sendiri):
+
+```bash
+uv sync --locked
+uv run ruff check . && uv run ruff format --check . && uv run pyright
+uv run pytest -q                       # unit, tanpa Docker
+KK_REQUIRE_DOCKER=1 uv run pytest -q -m docker   # isolasi nyata; butuh dockerd + image di bawah
+docker build -t kodekantor/sandbox-python:1 ../sandbox-images/python
+docker build -t kodekantor/sandbox-node:1 ../sandbox-images/node
+```
+
+- dockerd di container cloud: `nohup dockerd >/tmp/dockerd.log 2>&1 &`. Docker Hub bisa 429: build dengan `--build-arg BASE_IMAGE=mirror.gcr.io/library/<image>@<digest yang sama>`; di balik proxy TLS tambahkan `--network host --build-arg HTTPS_PROXY --secret id=extra_ca,src=/root/.ccr/ca-bundle.crt`.
+- Dependensi image Python: ubah `sandbox-images/python/requirements.in`, lalu `sandbox-images/lock.sh`.
 
 ## Agent skills
 

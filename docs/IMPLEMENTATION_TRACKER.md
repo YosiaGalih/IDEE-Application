@@ -571,3 +571,28 @@ Implementasi sebelumnya hanya *mengabaikan* `.git` palsu lewat `--git-dir` ekspl
 Hasil: `uv run pytest -q` → **1153 passed**; pyright 0 error; lint-imports 3 kontrak dipatuhi.
 
 Catatan proses: checklist kontrak per sub-WP belum memaksa pembacaan semua ADR *Accepted* yang menyebut modul terkait. Usulan retro: spec WP wajib punya tabel "ADR Accepted yang menyebut modul ini → butir → test".
+
+### WP-1.3 (🔒) — sandbox manager + image + klien (FR-068–083 runtime, AC-07, AC-08 bagian runner)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.3-sandbox-manager-design.md` (dengan tabel ADR → test). Plan: `docs/superpowers/plans/2026-10-24-wp-1.3-sandbox-manager.md`. Commit 0961666.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `cd sandbox_manager && uv run ruff check . && uv run ruff format --check . && uv run pyright` | bersih; pyright 0 error |
+| `uv run pytest -q` (sandbox_manager, tanpa Docker) | **101 passed**, 18 deselected |
+| `uv run pytest -q -m docker` (dockerd nyata, image `sandbox-python:1`/`sandbox-node:1` dibangun dari `sandbox-images/`) | **18 passed**: uid 10001 + CapEff/CapBnd 0 + NoNewPrivs; rootfs EROFS (termasuk `/var/tmp` yang 1777); hanya `lo`, tanpa DNS/IP; env tanpa token/secret; fork bomb ≤ pids 64; timeout → kill; kill per task; `.git` folder dan file worktree tersembunyi; output terpotong; run `repo` read-only + artefak; DISK_LIMIT; OOM → 137; profil nyata `python.pytest`/`python.ruff`/`node.npm_test`; tidak ada container/folder artefak tersisa; container yatim dihapus saat start |
+| Backend `uv run pytest -q` (PostgreSQL 16 + Redis 7) | **1205 passed** (1153 + 52 baru); pyright 0 error; lint-imports 3 kontrak dipatuhi (layer `app.workspace \| app.gitops \| app.sandbox`) |
+| pip-audit | `sandbox_manager/uv.lock` dan `sandbox-images/python/requirements.txt` → no known vulnerabilities (setelah pengecualian certifi yang sama dengan backend, PYSEC-2026-4320) |
+| gitleaks `protect --staged` | no leaks found |
+| Mutasi (dijalankan, lalu dipulihkan) | kill setelah start dihapus → merah; `CapDrop` kosong → merah (docker); `ReadonlyRootfs` false → merah (docker, setelah probe diperkuat ke EROFS); `.git` tidak disembunyikan → 2 merah; `PidsLimit` 0 → merah; cek realpath subpath dihapus → 2 merah; skema `Bearer` tidak dicek → 2 merah; artefak tanpa `O_NOFOLLOW` → merah. `NetworkMode` saja dibuka → hijau karena `NetworkDisabled` masih menutup; keduanya dibuka → merah |
+
+Bug yang ditemukan saat eksekusi (masing-masing dengan test regresi):
+- status final ditulis sebelum container dihapus;
+- kill yang datang saat container dibuat hilang, sehingga container jalan sampai timeout (ditemukan test Docker nyata);
+- tmpfs `/home/sandbox` milik root, sehingga HOME tidak bisa ditulis (ditemukan test Docker nyata);
+- `wait=true` lewat batas → 500;
+- `/health/ready` (WP-1.1) memanggil manager tanpa token Bearer.
+
+Deviasi kontrak: konflik #36 (mekanisme artefak ADR-033 tidak bekerja di Docker 29/runc; diganti bind folder per run) dan #37 (klien memakai polling `/logs` karena `on_log`). Keduanya perlu keputusan PO; tercatat di spec sistem pengembangan §8.
+
+Belum dicakup: runsc hanya diuji di level spec (`test_runtime_runsc`); egress (ADR-007) hanya validasi, jaringan egress di WP-1.5; profil `node.npm_test` tanpa JUnit [Menebak].
