@@ -3,3 +3,5 @@
 4faf0ffa12c03fe1b2b5d4b241a9bfad81e1d91c:backend/tests/unit/test_redaction.py:curl-auth-header:168
 6b7b588e842654f07f483d299ec6c07e8f0555cc:backend/tests/unit/test_redaction.py:jwt:227
 6b7b588e842654f07f483d299ec6c07e8f0555cc:backend/tests/integration/test_core_audit.py:generic-api-key:108
+# False positive: "max_bytes=50 * 1024 * 1024" (a size literal) matched generic-api-key (WP-1.2a review tests).
+5cb94ead09c5dfaf7b1d43a694dfbc4d000d550b:backend/tests/security/test_workspace_hostile.py:generic-api-key:155
