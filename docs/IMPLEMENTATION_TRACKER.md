@@ -492,4 +492,42 @@ Plan dan implementasi dikerjakan bersamaan. Ini deviasi proses: plan terpisah ti
 | `uv run pytest -q` (DB `kodekantor_main`) | **1109 passed** |
 | ruff · format · pyright · lint-imports | bersih · 101 file · 0 error · 3 kontrak dipatuhi |
 | Coverage `app/workspace` + `app/gitops` (`coverage` sementara) | total 95%: `paths.py` 93%, `policy.py` 100%, `fs.py` 94%, `patches.py` 96%, `archive.py` 95%, `adapter.py` 95% |
-| Re-review | dijalankan; hasilnya dicatat di bawah setelah selesai |
+| Re-review putaran 2 | lihat tabel di bawah |
+
+**Re-review putaran 2** (atas 9868bfa). Hasilnya:
+
+| Sub-WP | Security | Backend |
+|---|---|---|
+| 1.2a | belum lolos (1 HIGH) | BLOCK (sisa H1) |
+| 1.2b | lolos bersyarat (1 MEDIUM) | WARN |
+| 1.2c | lolos | WARN |
+| 1.2d | — | WARN |
+
+Semua temuan berikut ditutup di 0ffc109:
+
+| Temuan | Perbaikan | Bukti (mutan membuat test merah) |
+|---|---|---|
+| Security HIGH: pola `.agentignore` seragam dalam batas = 1 dtk per `denied()`, diperbesar `tree` menjadi ±82 menit | DP iteratif dengan biaya pasti dibebankan ke `Budget`; `DENY_BUDGET` per panggilan (habis → ditolak); `TREE_POLICY_BUDGET` per `tree()` (habis → `truncated`); batas 200 pola / 2 `**` | `test_uniform_worst_case_single_call_is_bounded`, `test_tree_with_hostile_agentignore_is_bounded` (tanpa budget tree: 14 dtk, merah) |
+| Security MEDIUM: path hasil resolve lebih dalam dari batas → `RecursionError` | `resolve()` menolak > `MAX_DEPTH`; DP tanpa rekursi | `test_link_into_a_deeper_tree_is_too_long` |
+| Security MEDIUM: pencarian offset O(n²) di bawah lock | anggaran `OFFSET_SEARCH_BUDGET` → `HunkConflict("too_complex")` | `test_offset_search_is_bounded` |
+| Security MEDIUM (1.2b): member zip LZMA/BZIP2 di-inflate tanpa batas di RAM | hanya STORED/DEFLATED | `test_rejects[lzma_zip]`, `test_rejects[bzip2_zip]` |
+| Backend HIGH (sisa H1): hunk setelah baris kosong/prosa dilewati | `@@` di luar konteks file → `malformed` | `test_hunk_after_blank_or_prose_line_is_rejected` |
+| Backend MEDIUM: `disk_usage` `RecursionError` pada tree dalam | walk fd iteratif, maks 256 folder terbuka → `too_deep` | `test_disk_usage_survives_deep_trees` |
+| Backend MEDIUM (1.2b): zip korup → 500 | `ValueError`, `struct.error`, `OSError(EINVAL)` → `format`; `.GIT` case-insensitive | `test_corrupt_zips_are_format_rejections`, `test_rejects[git_dir_upper]` |
+| Backend MEDIUM (1.2c) | type change memasangkan 2 blok; output besar → diff `truncated`; diff working tree memakai object store sementara (repo tidak ditulis); `merge_branch(into=)` → `wrong_branch`; I/O registry worktree via `to_thread`; karakter kontrol di pesan commit ditolak | 5 test baru di `test_git_adapter.py` + kasus input |
+| Backend MEDIUM (1.2d) | parser marker tahan tipe salah dan nesting dalam; nama project di-escape di `.html`; `materialize` lewat staging | `test_hostile_markers_never_crash`, `test_project_name_is_escaped_in_html`, `test_failed_materialize_leaves_nothing` |
+
+Hasil: `uv run pytest -q` → **1140 passed**; ruff, format, pyright, dan lint-imports bersih; gitleaks lokal (v8.24.3) tidak menemukan temuan baru.
+
+**Hand-off ke WP-2.1 / WP-3.1** (usulan ke Lead, belum diubah):
+
+| Area | Hand-off |
+|---|---|
+| Diff untuk LLM | Tool `git.diff` wajib menyaring file dengan `Policy.denied(AGENT_READ)`; `diff()` mengembalikan isi semua path, termasuk `.env` yang untracked. |
+| `commit_all` | `POST /git/commit {paths?}` butuh parameter `paths`; sekarang `commit_all` men-stage semuanya. |
+| Lock bersama | Satu serialiser per project untuk tulis IDE, `commit_all`, dan `merge`, karena sandbox tidak ikut `flock`. |
+| ARCHITECTURE §4.2 dan SECURITY_MODEL T2 | Signature perlu diperbarui: `TaskWorkspace` async dengan `tree` → `TreeResult`, tanpa `resolve`; `GitTarget`; `merge_branch(..., into=)`; `commit_all -> str \| None`; `ff_only` dihapus; `clone_https` ditunda. |
+| Panggilan sync | `import_archive` dan `materialize` sinkron, jadi service memanggilnya lewat `to_thread`. |
+| Sisa folder | Folder `.*.importing-*`, `.*.creating-*`, dan file `.kk-locks/*.lock` yang tertinggal saat crash belum di-sweep. |
+| `*.env` | Nama dengan akhiran `.env` (mis. `config/prod.env`) tidak tercakup kontrak `.env*`; perlu keputusan Lead. |
+
