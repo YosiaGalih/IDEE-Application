@@ -9,10 +9,11 @@ from fastapi import FastAPI
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.router import api_router
+from app.core.audit import audit_guard_problems
 from app.core.config import Settings, load_settings
 from app.core.context import REQUEST_ID_HEADER, accept_request_id, request_id_var
 from app.core.errors import install_error_handlers
-from app.core.logging import configure_logging
+from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
 from app.services.health import Dependencies
 
@@ -53,6 +54,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if settings.is_production:
+            # Fail closed: the audit trail is only append-only if this role cannot alter it (T10).
+            async with dependencies.engine.connect() as conn:
+                problems = await audit_guard_problems(conn)
+            if problems:
+                get_logger(__name__).error("audit_guard_failed", problems=problems)
+                raise RuntimeError(
+                    "audit_events is not protected from the runtime role: " + "; ".join(problems)
+                )
         yield
         await dependencies.aclose()
 

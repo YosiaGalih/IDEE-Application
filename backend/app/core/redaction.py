@@ -19,8 +19,8 @@ REDACTED = "[REDACTED]"
 # A key is sensitive when its *last* segment(s) name a secret: GITHUB_TOKEN, client_secret, api-key.
 # "token_count", "max_tokens", "secret_santa" and "password_policy" stay readable.
 _SENSITIVE_TAIL = (
-    r"password|passwd|passphrase|secret|secret_key|token|api_key|apikey|access_key|private_key"
-    r"|ticket|credential|credentials|authorization|cookie|set_cookie|session"
+    r"passwords?|passwd|passphrase|secrets?|secret_key|token|api_key|apikey|access_key|private_key"
+    r"|ticket|credentials?|authorization|cookies?|set_cookie|session|jwt|bearer"
 )
 _SENSITIVE_KEY_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{_SENSITIVE_TAIL})$")
 
@@ -31,6 +31,7 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"),  # JWT
     # PEM blocks, including a truncated block with no END marker.
     re.compile(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\Z)",
@@ -71,8 +72,13 @@ _MIN_LITERAL_LENGTH = 8
 _PRIMITIVES = (str, int, float, bool, type(None))
 
 
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
 def is_sensitive_key(name: str) -> bool:
-    return bool(_SENSITIVE_KEY_NAME.match(name))
+    """``accessToken``, ``x-api-key`` and ``CLIENT_SECRET`` all normalise to a sensitive snake_case tail."""
+    normalised = _CAMEL_BOUNDARY.sub("_", name).replace("-", "_")
+    return bool(_SENSITIVE_KEY_NAME.match(normalised))
 
 
 class Redactor:
@@ -103,8 +109,8 @@ class Redactor:
             return self.redact(obj)
         if isinstance(obj, dict):
             return {
-                key: REDACTED
-                if isinstance(key, str) and is_sensitive_key(key) and obj[key] is not None
+                (self.redact(key) if isinstance(key, str) else key): REDACTED
+                if isinstance(key, str) and is_sensitive_key(key) and value is not None
                 else self.redact_obj(value, stringify=stringify)
                 for key, value in obj.items()
             }

@@ -201,3 +201,26 @@ Ditunda dengan alasan:
 - Logging dan lock pada `alembic/env.py` → WP-1.1b.
 - Rate limit `/health/ready` → bersama rate limiter WP-1.1.
 - Digest image service CI.
+
+### WP-1.1b — audit append-only (FR-146, sebagian AC-19)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.1b-audit-append-only-design.md`.
+
+| Pemeriksaan | Hasil aktual (24 Okt 2026) |
+|---|---|
+| `uv run pytest -q` | **138 passed**. Termasuk `test_core_audit.py`: UPDATE/DELETE/TRUNCATE ditolak, role runtime tidak bisa `ALTER … DISABLE TRIGGER`, trigger `ENABLE ALWAYS`, dan redaksi metadata. |
+| ruff · pyright · lint-imports | bersih · 0 error · 2 kontrak dipatuhi |
+| `alembic downgrade base → upgrade head → check` | exit 0; "No new upgrade operations detected" |
+
+Review `kk-backend-reviewer` (Sonnet): BLOCK 2 HIGH + 3 MEDIUM, semuanya ditutup dengan test.
+- **HIGH 1:** role aplikasi bisa mematikan trigger. Perbaikan:
+  - trigger `ENABLE ALWAYS`;
+  - `REVOKE ALL … FROM PUBLIC`;
+  - `audit_guard_problems()` yang membuat app **gagal start di production** bila role runtime adalah superuser, pemilik tabel, atau punya UPDATE/DELETE/TRUNCATE.
+- **HIGH 2:** redaksi belum lengkap. Ditambahkan kunci camelCase/hyphen/jamak, `jwt`/`bearer`, pola JWT, kunci dict, dan kolom teks bebas.
+- **MEDIUM:** metadata dinormalisasi ke JSON (set → list, NaN → null); panjang kolom divalidasi; `write_detached()` untuk event denied/error agar tidak hilang saat rollback.
+
+Wajib di WP-1.5 (deployment):
+- Migrasi dijalankan oleh role pemilik.
+- `api`/`worker` memakai role terpisah dengan `INSERT, SELECT ON audit_events` + `USAGE` pada sequence. Tanpa itu, production tidak akan start (fail-closed, disengaja).
+- Purge retensi audit 365 hari tetap terbuka (spec sistem pengembangan §8 #17).

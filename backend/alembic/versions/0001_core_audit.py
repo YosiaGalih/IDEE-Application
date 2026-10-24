@@ -60,6 +60,11 @@ def upgrade() -> None:
         "CREATE TRIGGER audit_events_no_truncate BEFORE TRUNCATE ON audit_events "
         "FOR EACH STATEMENT EXECUTE FUNCTION audit_events_no_mutation()"
     )
+    # ALWAYS: still fires with session_replication_role = replica.
+    op.execute("ALTER TABLE audit_events ENABLE ALWAYS TRIGGER audit_events_no_mutation")
+    op.execute("ALTER TABLE audit_events ENABLE ALWAYS TRIGGER audit_events_no_truncate")
+    # The runtime role gets INSERT/SELECT from the deployment (migration role owns the table; WP-1.5).
+    op.execute("REVOKE ALL ON audit_events FROM PUBLIC")
 
 
 def downgrade() -> None:

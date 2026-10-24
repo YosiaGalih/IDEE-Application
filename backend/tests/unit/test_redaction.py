@@ -203,3 +203,31 @@ def test_ssh_style_user_is_not_shredded(redactor: Redactor) -> None:
 )
 def test_compound_sensitive_names(redactor: Redactor, line: str) -> None:
     assert "abc12345xyz" not in redactor.redact(line)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "accessToken",
+        "clientSecret",
+        "privateKey",
+        "api-key",
+        "x-api-key",
+        "passwords",
+        "cookies",
+        "jwt",
+        "bearer",
+    ],
+)
+def test_camel_hyphen_and_plural_sensitive_keys(redactor: Redactor, key: str) -> None:
+    assert redactor.redact_obj({key: "plainvalue123"})[key] == REDACTED
+
+
+def test_bare_jwt_is_redacted(redactor: Redactor) -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+    assert "dozjgNryP4J3jVmNHl0w5N" not in redactor.redact(f"token {jwt} end")
+
+
+def test_secret_in_dict_key_is_redacted(redactor: Redactor) -> None:
+    out = redactor.redact_obj({FAKE_ANTHROPIC: 1})
+    assert FAKE_ANTHROPIC not in repr(out)
