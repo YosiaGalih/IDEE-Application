@@ -420,3 +420,76 @@ Mutasi yang membuktikan test bisa gagal (setiap mutan dikembalikan setelahnya):
 | `O_NONBLOCK` saat membuka file | test FIFO menggantung sampai di-kill `timeout 40` |
 
 Keputusan yang perlu dicek ada di spec bagian "Keputusan saya (cek)" no. 1–5 dan 8. Konflik dokumen #33–#35 ada di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8.
+
+**Review WP-1.2a** (`kk-security-reviewer` pra-review + `kk-backend-reviewer`). Keduanya awalnya **BLOCK**. Tidak ada workspace escape; temuan yang ditutup di 5cb94ea:
+
+| Temuan | Perbaikan | Bukti |
+|---|---|---|
+| HIGH (keduanya): ReDoS `.agentignore`. Pola 21 byte membekukan proses 13 dtk (PoC reviewer) | matcher per segmen dengan `fnmatch.translate` + walk `**` ber-memo; batas 1000 pola / 256 karakter / 8 run `*` / 4 `**` / kedalaman path 128; melewati batas → gagal tertutup untuk AGENT_* saja | `test_agentignore_patterns_cannot_freeze_matching`, `test_worst_case_policy_is_bounded`, `test_over_cap_agentignore_fails_closed_for_agents_only`. Matcher lama dengan pola `"*a"*8+"b"` tidak selesai dalam 120 dtk |
+| HIGH (keduanya): denylist lebih sempit dari kontrak `.env*` (`.envrc`, `.env-prod`, `.envs/` lolos ke LLM) | `.env*` per segmen + `.aws`, `.ssh`, `.docker`, `.kube`, `.gnupg`, `*.ppk`, `.pgpass`, `.htpasswd` | `test_policy_matrix` (mutan `.env` sempit → 18 test merah) |
+| HIGH: body hunk melebihi hitungan header dibuang diam-diam | `PatchRejected("malformed")` | `test_body_longer_than_header_counts_is_rejected` |
+| HIGH/MEDIUM: path alias (`./a.py`, `a.py/`, `src//b.py`) saling menimpa | dedup pada path hasil resolve → `duplicate_path` | `test_alias_paths_are_one_file` (3 kasus) |
+| MEDIUM: `flock` pada root bisa ditahan sandbox | file lock di `<root>/../.kk-locks/` (di luar mount sandbox), `LOCK_NB` dengan batas tunggu → `WorkspaceBusy` | `test_sandbox_lock_on_root_does_not_block_writes`, `test_lock_wait_is_bounded` |
+| MEDIUM: hashing tanpa batas (file sparse 4 GiB = 23 dtk) | tanpa hash di atas 64 MiB; `.agentignore` dibatasi `fstat` + baca terbatas; snapshot satu pembacaan terbatas | `test_sparse_file_is_not_hashed`, `test_sparse_agentignore_is_not_read` |
+| MEDIUM: commit patch tidak di-stage dulu; celah rollback | semua temp di-stage dulu, lalu swap; rollback menghapus file yang ditambahkan; rollback gagal → `PatchRollbackFailed` (500) | `test_rollback_removes_added_files`, `test_failed_rollback_is_reported` |
+| MEDIUM: newline akhir file, EOL campuran, mode, range baris `splitlines`, jenis akses | EOF wajib cocok dengan file; baris tak tersentuh mempertahankan EOL-nya; mode 120000/160000 ditolak dan 100755 diterapkan; range baris hanya memakai `\n`; jenis akses wajib cocok dengan operasi | `test_final_newline_must_agree_with_the_file`, `test_mixed_line_endings_*`, `test_non_regular_modes_rejected`, `test_executable_mode_is_applied`, `test_line_range_counts_newlines_only`, `test_access_kind_must_match_operation` |
+| MEDIUM: guard T3 bisa di-bypass; AGENT_WRITE ke `.github/workflows` | checker menangkap alias `os`, `posix_spawn`, `loop.subprocess_*`, `ctypes`, `multiprocessing`, import dinamis; `.github/workflows\|actions` ditolak untuk AGENT_WRITE (TOOL_CATALOG R4) | self-test checker (17 kasus), `test_policy_matrix` |
+| LOW (beberapa) | socket, entri yang hilang saat listing, rantai symlink 1200, lone surrogate → error klien; `disk_usage` via `fwalk`+`dir_fd`; `max_bytes` agen di-clamp; `.GIT` case-insensitive; `Access` di-coerce; escape `\#`/`\!` | `tests/security/test_workspace_hostile.py`, `tests/unit/test_paths.py` |
+
+Diserahkan ke WP-2.1/WP-3.1 (usulan ke Lead, belum diubah):
+- **Kontrak API.**
+  - `TreeResult.truncated` belum punya tempat di respons tree API_CONTRACTS §3 yang berupa list polos. Usulan: `meta.truncated`.
+  - Route harus memetakan `?path=` kosong ke `"."`.
+  - `FileChange` sudah diselaraskan (`added`, `sha256`) ditambah field `old_sha256` dan `size`.
+- **Thread dan lock (WP-3.1).**
+  - Tool yang timeout/cancel tidak menghentikan thread `to_thread`. Hasilnya harus dianggap "outcome unknown".
+  - Sandbox tidak ikut `flock`, sehingga version check tidak mencegah lost update dari tulisan sandbox.
+- **`.agentignore` tidak tepercaya.** File ini dibaca dari worktree yang bisa ditulis sandbox. Pertimbangkan memuat policy dari `repo/` dan mengandalkan content scan WP-3.1.
+- **Mutan yang selamat (redundan):**
+  - cek ukuran `.agentignore`. Kontrol yang menahan beban adalah `os.read` berbatas;
+  - test FIFO yang menggantung (bukan merah) di bawah mutan `O_NONBLOCK`.
+
+### WP-1.2b (🔒) — import arsip aman (FR-015, AC-02, T2, T4)
+
+Plan: `docs/superpowers/plans/2026-10-24-wp-1.2b-archive-import.md`. Commit f2728fd.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `tests/security/test_archive_import.py` | **29 passed**. Kasus `test_rejects`: traversal, absolute, symlink (tar dan zip), hardlink, device, fifo, zip_bomb, gzip_bomb, pax_bomb, too_many_files (50.001 entri, < 15 dtk), oversize, total_oversize, overwrite, file_then_dir, git_dir, backslash, not_an_archive, corrupt_gzip, encrypted_zip, size_lie. Setiap kasus memastikan `dest` tidak ada dan tidak ada folder staging tersisa |
+| Mutasi | penghitung stream dihapus → `pax_bomb` merah; cek link tar → 2 merah; cek `.git` → merah. Map duplikat dan `O_EXCL` saling menjaga: masing-masing sendiri selamat, keduanya dihapus → merah. Rasio per entri zip dijaga juga oleh penghitung output |
+| Coverage `archive.py` | 95% |
+
+Revisi rancangan: folder pembungkus tunggal **tidak** dikupas secara default. Test menemukan bahwa pengupasan default mengubah project yang hanya berisi `src/` secara diam-diam. Spec keputusan #7 diperbarui.
+
+Risiko sisa: header pax besar bisa memakan memori sampai batas penghitung stream, yaitu ≤ 100 × ukuran arsip dan maksimal 1 GiB.
+
+### WP-1.2c (🔒) — GitAdapter ter-hardening (FR-113–116, ADR-016, T3; temuan snapshot ".git/config → eksekusi host")
+
+Plan: `docs/superpowers/plans/2026-10-24-wp-1.2c-git-adapter.md`. Commit 8def94a.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `tests/integration/test_git_adapter.py` + `tests/security/test_git_hardening.py` | **56 passed** (git 2.43 nyata di folder tmp). Mencakup: unborn repo; status/log/branch/commit; worktree `kk/task-*` yang tidak menyentuh main; diff working tree (untracked sebagai `added`, biner, nomor baris, truncation, index user tidak berubah); merge bersih/up_to_date/konflik (abort, tree bersih, HEAD tetap)/dirty/untracked-overwrite; remove_worktree; timeout membunuh process group; batas stdout; error tanpa path absolut |
+| Keamanan | hook (`pre-commit`, `post-commit`, `post-merge`, …) tidak berjalan. `<worktree>/.git` yang ditulis ulang ke repo jahat (`filter.evil.clean`, `core.fsmonitor`, `core.hooksPath`) tidak dibaca dan marker tidak muncul. Env persis allowlist (tidak mewarisi env proses), flag `-c`, `--git-dir` eksplisit. Input branch/ref/pesan/author ditolak. Tidak ada `push`/`fetch`/`clone`/`reset`/`clean`/`--force` selain `worktree remove` |
+| Mutasi | percaya `<worktree>/.git` → merah; tanpa `core.hooksPath` → merah (post-commit); index asli dipakai → merah; tanpa `merge --abort` → merah; `proc.kill()` alih-alih `killpg` → merah (anak proses selamat) |
+| Coverage | `adapter.py` 95%, `diffparse.py` 98% |
+
+Ditunda: `clone_https` (FR-016, P1) ke WP yang mengerjakan `git_https`. Flag protokol sudah dipasang di setiap panggilan.
+
+### WP-1.2d — deteksi stack + 6 template (FR-014, FR-022)
+
+Plan dan implementasi dikerjakan bersamaan. Ini deviasi proses: plan terpisah tidak ditulis sebelum kode, dan test ditulis setelah kode, lalu dibuktikan dengan mutasi. Commit 9868bfa.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `tests/unit/test_stack.py` + `tests/integration/test_templates.py` | **22 passed**. Deteksi uv/poetry/pipenv/pip, fastapi/flask/django, pnpm/yarn/npm, react/vite/express, monorepo satu level, Go/Rust/Java, marker rusak diabaikan, folder denylist/dependensi tidak dibaca. Enam template (`python-basic`, `python-cli`, `python-fastapi`, `node-basic`, `node-http-api`, `static-site`) di-materialize lalu test-nya lulus **offline**: pytest + `ruff check/format --isolated` untuk Python, `npm test` (`node --test`) untuk Node. Nama project disisipkan literal |
+| Mutasi | akses USER (tanpa denylist) → merah; `pip` untuk folder mana pun → 2 merah; skrip test default npm dihitung → merah |
+
+### Ringkasan WP-1.2 (24 Okt 2026)
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `uv run pytest -q` (DB `kodekantor_main`) | **1109 passed** |
+| ruff · format · pyright · lint-imports | bersih · 101 file · 0 error · 3 kontrak dipatuhi |
+| Coverage `app/workspace` + `app/gitops` (`coverage` sementara) | total 95%: `paths.py` 93%, `policy.py` 100%, `fs.py` 94%, `patches.py` 96%, `archive.py` 95%, `adapter.py` 95% |
+| Re-review | dijalankan; hasilnya dicatat di bawah setelah selesai |
