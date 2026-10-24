@@ -6,6 +6,7 @@ paths, exception messages or client input.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 from fastapi import FastAPI, Request
@@ -158,3 +159,30 @@ def install_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(StarletteHTTPException, _http_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_exception_handler(Exception, _unhandled_error)
+
+
+async def send_error(
+    scope: Any,
+    send: Any,
+    *,
+    http_status: int,
+    code: str,
+    message: str,
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
+    """Write a failed envelope straight from ASGI middleware (outside the exception handlers)."""
+    request_id = (scope.get("state") or {}).get("request_id") or new_request_id()
+    body = envelope(request_id, status="failed", error={"code": code, "message": message, "details": []})
+    payload = json.dumps(body).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": http_status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode()),
+                *(headers or []),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": payload})

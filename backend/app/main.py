@@ -14,6 +14,7 @@ from app.core.config import Settings, load_settings
 from app.core.context import REQUEST_ID_HEADER, accept_request_id, request_id_var
 from app.core.csrf import CsrfMiddleware
 from app.core.errors import install_error_handlers
+from app.core.idempotency import IdempotencyMiddleware
 from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
 from app.services.health import Dependencies
@@ -81,7 +82,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.dependencies = dependencies
     install_error_handlers(app)
     app.include_router(api_router, prefix="/api/v1")
-    # Order: the last added runs outermost, so CSRF rejections still carry X-Request-ID.
+    # Order: the last added runs outermost. RequestId > CSRF > Idempotency: CSRF rejections carry
+    # X-Request-ID, and a request that fails CSRF never touches the idempotency store.
+    app.add_middleware(IdempotencyMiddleware, redis=dependencies.redis, exempt_prefix="/api/v1/auth/")
     app.add_middleware(
         CsrfMiddleware,
         secure=settings.cookie_secure,

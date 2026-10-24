@@ -9,14 +9,12 @@ password-reset forms can satisfy the check too.
 from __future__ import annotations
 
 import hmac
-import json
 import secrets
 
 from starlette.requests import cookie_parser
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.core.context import new_request_id
-from app.core.errors import envelope
+from app.core.errors import send_error
 
 CSRF_COOKIE = "kk_csrf"
 CSRF_HEADER = "x-csrf-token"
@@ -73,21 +71,6 @@ class CsrfMiddleware:
         await self.app(scope, receive, send_with_cookie)
 
     async def _reject(self, scope: Scope, send: Send) -> None:
-        request_id = scope.get("state", {}).get("request_id") or new_request_id()
-        body = envelope(
-            request_id,
-            status="failed",
-            error={"code": "CSRF_FAILED", "message": "CSRF token missing or invalid", "details": []},
+        await send_error(
+            scope, send, http_status=403, code="CSRF_FAILED", message="CSRF token missing or invalid"
         )
-        payload = json.dumps(body).encode()
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 403,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(payload)).encode()),
-                ],
-            }
-        )
-        await send({"type": "http.response.body", "body": payload})
