@@ -150,7 +150,18 @@ class ComposePolicy(unittest.TestCase):
             binds = [v for v in svc["volumes"] if v.get("target") == root]
             self.assertEqual(len(binds), 1, f"{name}: workspace bind at WORKSPACE_ROOT")
             self.assertEqual(binds[0]["source"], root, f"{name}: host and container paths must match")
-            self.assertIs(binds[0]["bind"]["create_host_path"], False)
+            # Rendering differs by compose version (v2 drops false, v5 drops the default true), so the
+            # rendered flag may be absent; test_workspace_bind_never_creates_the_host_path checks the source.
+            self.assertIn(binds[0].get("bind", {}).get("create_host_path"), (False, None))
+
+    def test_workspace_bind_never_creates_the_host_path(self) -> None:
+        """ADR-005: the workspace folder must already exist (owner 10001, 0750); compose never makes it."""
+        lines = (ROOT / "infra" / "compose.yml").read_text().splitlines()
+        sources = [i for i, line in enumerate(lines) if line.strip() == "source: ${WORKSPACE_HOST_PATH:-/srv/kodekantor/workspaces}"]
+        self.assertEqual(len(sources), 2, "backend volumes anchor + sandbox-manager")
+        for index in sources:
+            block = [line.strip() for line in lines[index : index + 3]]
+            self.assertIn("bind: {create_host_path: false}", block)
 
     def test_anthropic_key_only_in_worker(self) -> None:
         holders = {name for name, svc in self.services.items() if svc.get("environment", {}).get("ANTHROPIC_API_KEY")}
