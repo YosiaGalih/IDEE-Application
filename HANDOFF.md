@@ -10,9 +10,9 @@ Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-
 |---|---|
 | `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3, di-merge PO 25 Okt) |
 | Branch kerja | `claude/gracious-goodall-3hjh19` (dimulai ulang dari `main` setelah PR #3 di-merge) |
-| Sedang dikerjakan | **WP-1.5a**: compose produksi, jaringan privat, socket-proxy (unit U6) |
-| Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3. PR #3 di-merge tanpa itu; review putaran 2 menolak karena N1, lalu N1–N5 diperbaiki tetapi belum diverifikasi reviewer (U4, sesi terpisah) |
-| Menunggu PO | konflik dokumen #36–#39 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8, plus #40–#43 dari WP-1.5a (lihat spec WP-1.5a); gate G0/G1 |
+| Sedang dikerjakan | **WP-1.5a**: compose produksi, jaringan privat, socket-proxy (unit U6). Review AG-13 **signed off**; temuan M1, M2, L2–L5 ditutup; PR #4 menunggu merge PO |
+| Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3. PR #3 di-merge tanpa itu; review putaran 2 menolak karena N1, lalu N1–N5 diperbaiki tetapi belum diverifikasi reviewer (U4, sesi terpisah). Dari WP-1.5a: L1 `--forwarded-allow-ips`, role owner non-superuser untuk migrate, Trivy/Semgrep sebelum G1 (tracker WP-1.5a) |
+| Menunggu PO | konflik dokumen #36–#44 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; pengecualian EX-01 (uv, `DECISIONS.md`, kedaluwarsa 2026-11-03); merge PR #4; gate G0/G1 |
 
 ### WP-1.5a: yang sudah ada (di branch kerja)
 
@@ -26,15 +26,18 @@ Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-
 - `infra/caddy/Caddyfile`, `infra/web/` (placeholder nginx-unprivileged sampai WP-1.4), `infra/postgres/10-runtime-role.sh`.
 - `.env.example`, `scripts/gen-secrets.sh`, `scripts/healthcheck.sh`, `Makefile` (setup, config, up, down, ps, logs, healthcheck).
 - **Role DB terpisah.** migrate memakai owner; api/worker/scheduler memakai `kodekantor_app`. Perintah baru `python -m app.cli grant-runtime-role` dijalankan migrate, dan `audit_events` hanya mendapat SELECT/INSERT (`backend/app/core/db_roles.py`, `backend/tests/integration/test_db_roles.py`).
-- `infra/tests/test_compose_policy.py`: 17 test kebijakan, stdlib.
+- `infra/tests/test_compose_policy.py` (18 test kebijakan) dan `infra/tests/test_prepare_workspace.py` (5), stdlib.
+- `scripts/prepare-workspace.sh` (`make workspace`): menolak path yang bisa membuat salah chown folder sistem.
+- `.dockerignore`: allowlist berkas yang di-COPY Dockerfile.
 - Spec: `docs/superpowers/specs/2026-10-25-wp-1.5a-compose-design.md`.
 
 **Bukti lokal** (container cloud, 25 Okt):
-- `python3 -m unittest discover -s infra/tests` → 17 OK.
+- `python3 -m unittest discover -s infra/tests` → 23 OK.
 - Stack jalan dengan `docker compose -f infra/compose.yml --env-file infra/tests/ci.env up -d --wait` → 10 service healthy, migrate exit 0.
 - `KK_ENV_FILE=infra/tests/ci.env scripts/healthcheck.sh` → live/ready/`/` 200 lewat Caddy. `/health/ready` ok untuk db, redis, sandbox_manager, migrations.
 - Socket-proxy menolak `/info`, `/volumes`, `/networks`, `/events`, dan `POST /exec/x/start` (403).
-- Backend: test role DB 8 passed; ruff, pyright, dan lint-imports bersih.
+- Backend: 1243 passed, 1 skipped (butuh superuser; jalan di CI); ruff, pyright, dan lint-imports bersih.
+- CI PR #4 (runner GitHub): `clean-install` hijau, termasuk healthcheck lewat Caddy.
 
 ### WP-1.5a: yang belum (urutan)
 
@@ -44,10 +47,20 @@ Sudah selesai sejak HANDOFF pertama:
 - suite backend 1239 passed;
 - plan doc, konflik #40–#43, tracker.
 
+Review AG-13 WP-1.5a (25 Okt): **SIGNED OFF**. M1 ditutup dengan pengecualian EX-01 yang kedaluwarsa sendiri di CI; M2, L2–L5 diperbaiki dengan test dan mutan; L1 menjadi utang. Rinciannya di tracker bagian WP-1.5a.
+
 Sisa:
-1. Pastikan CI PR [#4](https://github.com/YosiaGalih/IDEE-Application/pull/4) hijau, terutama `clean-install` yang baru pertama kali berjalan di runner GitHub. Bila merah, baca log job dan perbaiki di branch yang sama.
-2. Hasil review `kk-security-reviewer` atas WP-1.5a: tutup temuannya, catat di tracker §12, lalu keluarkan PR #4 dari draft.
-3. Berikutnya: WP-1.5b (egress-proxy + hadolint/shellcheck/actionlint), WP-1.5c (backup/restore), WP-1.4 (frontend), WP-1.6 (G1).
+1. Pastikan CI PR [#4](https://github.com/YosiaGalih/IDEE-Application/pull/4) hijau pada commit terakhir, lalu PO me-merge.
+2. **Sebelum 2026-11-04:** naikkan uv ke ≥ 0.13.4 di `infra/build/lock-uv.sh` (lalu jalankan skrip itu) dan di `setup-uv` semua workflow. Mulai 2026-11-04 langkah "Build tool audit" sengaja merah (EX-01).
+3. Berikutnya: WP-1.5b (egress-proxy + hadolint/shellcheck/actionlint, plus L1 `--forwarded-allow-ips`), WP-1.5c (backup/restore), WP-1.4 (frontend), WP-1.6 (G1: Trivy dan Semgrep wajib berjalan di security-scan).
+
+Catatan build lokal di balik proxy TLS (container cloud): `docker compose ... up --build` tidak bisa membaca CA di luar folder proyek. Build image langsung lalu `up --no-build`:
+
+```bash
+B="docker build --network host --build-arg HTTPS_PROXY --build-arg BASE_REPO=mirror.gcr.io/library/python --secret id=build_ca,src=/root/.ccr/ca-bundle.crt"
+$B -f backend/Dockerfile -t kodekantor/backend:dev . && $B -f sandbox_manager/Dockerfile -t kodekantor/sandbox-manager:dev .
+docker compose -f infra/compose.yml --env-file infra/tests/ci.env up -d --no-build --wait
+```
 
 ## Cara melanjutkan dengan langganan (bukan kredit cloud)
 
