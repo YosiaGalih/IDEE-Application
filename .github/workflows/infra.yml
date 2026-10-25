@@ -1,0 +1,56 @@
+name: infra
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 2 * * *"  # nightly clean install (TEST_STRATEGY §6)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Policy checks on the rendered compose file (spec WP-1.5a; ADR-009, ADR-026 (3), ADR-005, infra.md).
+  infra-config:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Compose policy
+        run: python3 -m unittest discover -s infra/tests -v
+      - name: Caddyfile
+        run: |
+          docker run --rm -v "$PWD/infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -e APP_DOMAIN=localhost -e CADDY_EMAIL=ops@kodekantor.test \
+            caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+  # AC-20: the stack from a clean checkout, all containers healthy, /health/ready ok through Caddy.
+  clean-install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KK_ENV_FILE: infra/tests/ci.env
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Sandbox images and workspace folder
+        run: |
+          make sandbox-images
+          sudo install -d -m 0750 -o 10001 -g 10001 /srv/kodekantor/workspaces
+      - name: Build and start the stack
+        run: docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" up -d --build --wait --wait-timeout 300
+      - name: Health through Caddy
+        run: scripts/healthcheck.sh --wait 120
+      - name: Diagnostics
+        if: failure()
+        run: |
+          docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" ps -a
+          docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" logs --tail 80
+      - name: Stop
+        if: always()
+        run: docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" down -v

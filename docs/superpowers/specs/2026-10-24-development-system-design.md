@@ -285,6 +285,10 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 37. **Klien sandbox `wait=true` vs `on_log`:** spec WP-1.3 awal menulis `run()` memakai `wait=true`, tetapi kontrak `SandboxClient.run(..., on_log=...)` di ARCHITECTURE §4.2 butuh log berjalan. WP-1.3 mengikuti kontrak: submit lalu polling `/logs`.
 38. **API_CONTRACTS §10 tertinggal dari WP-1.3** (temuan review). Field tambahan:
 39. **Satu sandbox-manager per daemon Docker (usulan ADR, review keamanan F4):** saat start manager menghapus semua container `kk.managed=1` milik daemon itu, termasuk milik instance lain bila ada. Desain tier S memang satu node dan satu manager, tetapi asumsi ini belum tertulis sebagai ADR. Tier M/L (node executor, ADR-060) perlu memutuskan apakah sapuan dibatasi label `kk.manager`.
+40. **Pemegang `ANTHROPIC_API_KEY`:** ADR-004 dan DEPLOYMENT §7 memberikannya ke `worker` dan `api` (smoke test), sedangkan ARCHITECTURE §2 menyebut worker "satu-satunya pemegang". `api` tidak berada di network `outbound`, jadi kunci di sana tidak bisa dipakai. WP-1.5a memberikannya hanya ke worker; smoke test dijalankan lewat `docker compose exec worker`.
+41. **Flag `INFO` docker-socket-proxy:** DEPLOYMENT §2 menulis `INFO=1`, ADR-026 (3) dan `.claude/rules/infra.md` menulis `INFO=0`. WP-1.5a memakai `INFO=0`; sandbox-manager tidak memanggil `/info` (`test_only_allowed_endpoints`).
+42. **Job CI `infra-config`** belum ada di tabel TEST_STRATEGY §6. Kebijakan compose perlu dicek di setiap PR, sedangkan `clean-install` (ada di tabel) nightly. WP-1.5a menjalankan `clean-install` juga pada PR.
+43. **Role DB runtime:** CONFIGURATION hanya mengenal `POSTGRES_PASSWORD`, dan DATA_MODEL tidak menyebut role. Agar audit guard WP-1.1b terpenuhi, WP-1.5a menambah role `kodekantor_app` dengan `DB_APP_PASSWORD`; migrate tetap memakai owner. Kontrak perlu diperbarui oleh AG-00.
     - request `read_only` (ADR-033) dan `client_request_id`;
     - respons POST `timeout_s`;
     - `/logs` `status`, dengan `done` hanya setelah semua chunk terkirim;

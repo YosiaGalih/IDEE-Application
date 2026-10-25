@@ -391,6 +391,6 @@ volumes:
   caddy_config: {}
 
 secrets:
-  # Optional CA bundle of a TLS-intercepting build proxy (RUNBOOK §2); an empty file means none.
+  # Optional CA bundle of a TLS-intercepting build proxy (RUNBOOK §2); the empty default means none.
   build_ca:
-    file: ${KK_BUILD_CA_FILE:-/dev/null}
+    file: ${KK_BUILD_CA_FILE:-./build/empty-ca.txt}
