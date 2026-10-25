@@ -1,0 +1,8 @@
+# Tools preinstalled in kodekantor/sandbox-python. Runs have no network by default, so a project's tests can
+# only use what is here (dependency installation is the egress profile, WP-4.x / ADR-064).
+# Versions match backend/uv.lock; regenerate requirements.txt with sandbox-images/lock.sh.
+pytest==9.1.1
+ruff==0.17.0
+fastapi==0.143.0
+httpx==0.28.1
+uvicorn==0.54.0

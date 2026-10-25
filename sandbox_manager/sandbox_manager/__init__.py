@@ -1,0 +1,1 @@
+"""KodeKantor sandbox manager (ARCHITECTURE §8, API_CONTRACTS §10, SECURITY_MODEL §4, ADR-009/026/033)."""

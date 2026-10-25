@@ -551,3 +551,108 @@ Hasil: `uv run pytest -q` → **1140 passed**; ruff, format, pyright, dan lint-i
   - **Spec #7.** Keputusan `strip_single_root=False` perlu direkonsiliasi oleh Lead. Spec sudah diperbarui, tetapi rancangan awal berbeda.
   - **Log git.** `_log_failure` meredaksi `tree.parent` saja. Path git dir worktree bisa muncul di log server, tidak pernah di respons klien.
 - **Sign-off formal AG-13** untuk WP-1.2 🔒 tetap wajib dari **sesi terpisah** sebelum G1. Pra-review di atas dilakukan di sesi yang sama yang membangun WP ini (§6 #10 spec sistem pengembangan).
+
+### Perbaikan pasca-merge — ADR-026 (4) di GitAdapter (24 Okt 2026)
+
+Celah ini ditemukan agent sendiri saat membaca ADR untuk WP-1.3; tidak ditangkap oleh dua reviewer. WP-1.2c (sudah di `main` lewat PR #2) **belum memenuhi ADR-026 butir (4)**, padahal ADR tersebut berstatus Accepted. Butir itu mewajibkan GitAdapter *menolak*:
+- key config di luar allowlist;
+- object alternates;
+- file `.git` worktree yang dipalsukan.
+
+Implementasi sebelumnya hanya *mengabaikan* `.git` palsu lewat `--git-dir` eksplisit, dan tidak memeriksa config maupun alternates.
+
+| Perbaikan | Bukti |
+|---|---|
+| Config repo dibaca dengan `git config --file --no-includes --list --name-only`. Key di luar allowlist → `git_metadata_unsafe`. Allowlist: `core.{repositoryformatversion,filemode,bare,logallrefupdates,ignorecase,precomposeunicode,symlinks}`, `remote.*.{url,fetch}`, `branch.*.{remote,merge}` | `test_unsafe_repository_config_is_refused` (9 key: fsmonitor, hooksPath, sshCommand, filter, diff.external, include.path, alias, extensions.worktreeConfig, core.worktree); `test_clone_style_config_is_allowed` |
+| `objects/info/{alternates,http-alternates}` → `git_metadata_unsafe` | `test_object_alternates_are_refused` |
+| `<worktree>/.git` wajib file reguler `gitdir: <git dir terdaftar>`. Bila tidak → `git_metadata_unsafe`; `remove_worktree` tetap bisa membersihkan | `test_forged_worktree_gitdir_is_refused` |
+| Mutasi | allowlist dihapus → 9 merah; cek alternates dihapus → merah; verifikasi gitfile dihapus → merah |
+
+Hasil: `uv run pytest -q` → **1153 passed**; pyright 0 error; lint-imports 3 kontrak dipatuhi.
+
+Catatan proses: checklist kontrak per sub-WP belum memaksa pembacaan semua ADR *Accepted* yang menyebut modul terkait. Usulan retro: spec WP wajib punya tabel "ADR Accepted yang menyebut modul ini → butir → test".
+
+### WP-1.3 (🔒) — sandbox manager + image + klien (FR-068–083 runtime, AC-07, AC-08 bagian runner)
+
+Spec: `docs/superpowers/specs/2026-10-24-wp-1.3-sandbox-manager-design.md` (dengan tabel ADR → test). Plan: `docs/superpowers/plans/2026-10-24-wp-1.3-sandbox-manager.md`. Commit 0961666.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `cd sandbox_manager && uv run ruff check . && uv run ruff format --check . && uv run pyright` | bersih; pyright 0 error |
+| `uv run pytest -q` (sandbox_manager, tanpa Docker) | **101 passed**, 18 deselected |
+| `uv run pytest -q -m docker` (dockerd nyata, image `sandbox-python:1`/`sandbox-node:1` dibangun dari `sandbox-images/`) | **18 passed**: uid 10001 + CapEff/CapBnd 0 + NoNewPrivs; rootfs EROFS (termasuk `/var/tmp` yang 1777); hanya `lo`, tanpa DNS/IP; env tanpa token/secret; fork bomb ≤ pids 64; timeout → kill; kill per task; `.git` folder dan file worktree tersembunyi; output terpotong; run `repo` read-only + artefak; DISK_LIMIT; OOM → 137; profil nyata `python.pytest`/`python.ruff`/`node.npm_test`; tidak ada container/folder artefak tersisa; container yatim dihapus saat start |
+| Backend `uv run pytest -q` (PostgreSQL 16 + Redis 7) | **1205 passed** (1153 + 52 baru); pyright 0 error; lint-imports 3 kontrak dipatuhi (layer `app.workspace \| app.gitops \| app.sandbox`) |
+| pip-audit | `sandbox_manager/uv.lock` dan `sandbox-images/python/requirements.txt` → no known vulnerabilities (setelah pengecualian certifi yang sama dengan backend, PYSEC-2026-4320) |
+| gitleaks `protect --staged` | no leaks found |
+| Mutasi (dijalankan, lalu dipulihkan) | kill setelah start dihapus → merah; `CapDrop` kosong → merah (docker); `ReadonlyRootfs` false → merah (docker, setelah probe diperkuat ke EROFS); `.git` tidak disembunyikan → 2 merah; `PidsLimit` 0 → merah; cek realpath subpath dihapus → 2 merah; skema `Bearer` tidak dicek → 2 merah; artefak tanpa `O_NOFOLLOW` → merah. `NetworkMode` saja dibuka → hijau karena `NetworkDisabled` masih menutup; keduanya dibuka → merah |
+
+Bug yang ditemukan saat eksekusi (masing-masing dengan test regresi):
+- status final ditulis sebelum container dihapus;
+- kill yang datang saat container dibuat hilang, sehingga container jalan sampai timeout (ditemukan test Docker nyata);
+- tmpfs `/home/sandbox` milik root, sehingga HOME tidak bisa ditulis (ditemukan test Docker nyata);
+- `wait=true` lewat batas → 500;
+- `/health/ready` (WP-1.1) memanggil manager tanpa token Bearer.
+
+Deviasi kontrak: konflik #36 (mekanisme artefak ADR-033 tidak bekerja di Docker 29/runc; diganti bind folder per run) dan #37 (klien memakai polling `/logs` karena `on_log`). Keduanya perlu keputusan PO; tercatat di spec sistem pengembangan §8.
+
+Belum dicakup: runsc hanya diuji di level spec (`test_runtime_runsc`); egress (ADR-007) hanya validasi, jaringan egress di WP-1.5; profil `node.npm_test` tanpa JUnit [Menebak].
+
+#### WP-1.3 — review putaran 1 dan perbaikannya (24 Okt 2026)
+
+Tiga reviewer berjalan paralel pada 0961666:
+- `kk-backend-reviewer`: REQUEST CHANGES, 4 HIGH;
+- `kk-silent-failure-hunter`: 21 temuan, 2 HIGH;
+- `kk-security-reviewer` (AG-13 pra-review): **TIDAK DITANDATANGANI**, blocker F1 HIGH.
+
+Perbaikan ada di 0ff8379 (sandbox manager) dan b676c04 (klien backend).
+
+| Temuan (sumber) | Perbaikan | Test |
+|---|---|---|
+| Folder artefak per run tak terbatas, tak dihitung, bisa tertinggal (AG-13 F1, backend HIGH, SF F2/F12) | Folder pindah ke `<project>/.kk-runs/<run_id>` (kuota per project); dibuat dengan dir fd + `O_NOFOLLOW`; watchdog 1 dtk, > 8 MiB → kill → `DISK_LIMIT`; dihitung dalam pertumbuhan untuk semua run termasuk read-only; `disk.py` mengukur gagal-tertutup dan menghapus secara iteratif (folder terkunci dibuka dulu); sapuan saat start | `test_disk.py` (6, juga lulus sebagai uid 65534); `test_watchdog_kills_on_artifact_folder_growth`; Docker: `test_read_only_run_cannot_flood_the_artifact_folder`, `test_hostile_artifact_tree_is_removed` (folder `chmod 000` + kedalaman 1500), `test_disk_helpers_as_sandbox_uid` (uid 10001 di container) |
+| Pengukuran disk buta terhadap folder tak terbaca (backend HIGH, SF F2b) | `tree_bytes` → `Unmeasurable` → `WORKSPACE_UNSAFE`/`DISK_UNMEASURABLE`; setiap entri dihitung ≥ 512 B | `test_locked_folder_is_unmeasurable` |
+| Log Docker tak terbatas (backend HIGH, AG-13 F7) | `LogConfig` json-file `max-size` max(4× output, 16 MiB), 2 file | `test_container_log_is_capped`; Docker: `test_container_log_cap_is_accepted_by_docker` |
+| Deadline klien menghitung antrean (backend HIGH, SF F9) | `/logs` memuat `status`; deadline mulai saat run keluar dari antrean; batas antre terpisah | `test_queue_time_is_not_run_time`, `test_queue_limit` |
+| Status final saat container mungkin masih hidup (AG-13 F2, SF F3) | remove 3×; gagal → `CONTAINER_NOT_REMOVED`, folder artefak tidak disentuh; reaper 60 dtk per instance | `test_container_not_removed_is_an_error`, `test_reaper_removes_only_inactive_own_containers` |
+| Registry tak pernah evict, chunk per frame, `/logs` tanpa halaman (AG-13 F3, backend MEDIUM) | eviction (1 jam / 500), gabung frame sampai terkirim, halaman ±256 KiB, `done` hanya setelah semua chunk terkirim | `test_finished_runs_are_evicted`, `test_chunks_merge_only_until_delivered`, `test_logs_are_paged` |
+| Kill run antre tidak segera; satu kill gagal menghentikan yang lain (backend MEDIUM) | antre → `killed` seketika; kill per run dengan hitungan `failed`; `DriverError` → 503 | `test_kill_while_queued_is_final_at_once`, `test_one_failed_kill_does_not_stop_the_others`, `test_kill_of_unreachable_container_is_503` |
+| Artefak ditolak tak terbedakan dari "tidak ada test" (SF F1) | profil menyatakan `artifacts: [junit]`; `artifact_status`; exit 0 tanpa laporan → `ARTIFACT_MISSING`/`ARTIFACT_REJECTED`; baca sampai EOF | `test_required_junit_missing_is_an_error`, `test_required_junit_too_large_is_rejected`, `test_missing_junit_on_a_failed_run_stays_failed` |
+| OOM tampil sebagai test gagal; kode error hilang (SF F5) | `State.OOMKilled` → `OOM_KILLED`; galat Docker dicatat dengan status dan pesan; exit code timeout dipertahankan | `test_oom_is_not_a_test_failure`; Docker: `test_memory_limit` |
+| Stream log putus dianggap lengkap; tail sebenarnya potongan awal (SF F4, backend LOW) | `log_incomplete`; tail = 64 KiB terakhir dalam byte; decoder inkremental per stream | `test_broken_log_stream_is_flagged`, `test_tail_is_the_last_bytes`, `test_multibyte_character_split_across_frames` |
+| Konfigurasi 0/negatif = tanpa batas; socket langsung di production (backend MEDIUM, SF F6) | semua batas > 0 dan finite; `DOCKER_HOST` default proxy, `unix://` ditolak di production; uid selain 0/10001 ditolak di production; `SANDBOX_TIMEOUT_SECONDS` dipakai | `test_bad_settings_refused` (19 kasus), `test_docker_socket_refused_in_production`, `test_process_user_checked_in_production`, `test_profile_without_timeout_uses_the_setting` |
+| Klien menerima record tak koheren; run yatim saat batal; tanpa idempotensi (SF F8/F9, backend MEDIUM) | cek `run_id`, `succeeded ⇒ exit 0`, `failed ⇒ exit ≠ 0`; kill saat batal atau `on_log` gagal; `client_request_id` | `test_incoherent_records_are_not_trusted` (7), `test_cancelled_caller_kills_the_run`, `test_failing_on_log_kills_the_run`, `test_client_request_id_returns_the_same_run`, `test_retry_with_client_request_id` |
+| Readiness hijau padahal tak bisa menjalankan run; penyebab tak dicatat (SF F7, backend MEDIUM) | `/healthz` memuat `images`; klien mensyaratkan Docker + semua image, menolak driver fake di production, mencatat alasan | `test_health` (8), `test_fake_driver_allowed_outside_production` |
+| Parser JUnit: `<skipped>` menutupi `<error>`; encoding jahat (SF F10, backend MEDIUM) | status terburuk per kasus, error tingkat suite, `inconsistent`, `cases_truncated` dengan kasus gagal di depan; encoding → `JUnitError`; coverage `lines-valid=0` → `None` | `test_worst_outcome_of_a_case_counts`, `test_suite_level_errors_count`, `test_claims_beyond_the_cases_are_flagged`, `test_failing_cases_survive_truncation`, `test_hostile_encoding_declarations`, `test_coverage_of_nothing_is_not_full_coverage` |
+| JUnit dapat dipalsukan project (SF F11, AG-13 catatan) | didokumentasikan: laporan = klaim, exit code = bukti; mitigasi di WP-4.x | docstring `junit.py`, spec keputusan #15 |
+| Token di `repr`, `/openapi.json` terbuka, `BASE_IMAGE` tak terikat digest, fallback 0777 (AG-13 F5/F6/F9/F8) | `field(repr=False)`, `openapi_url=None`, `FROM ${BASE_REPO}@sha256:…`, uid dicek di production | `test_token_is_not_in_repr`, `test_openapi_is_not_served` |
+| `FakeSandboxClient` sukses diam-diam (SF F18) | default `error`/`FAKE_NOT_PROGRAMMED`; fixture junit berisi testcase | `test_unprogrammed_fake_never_succeeds` |
+
+Bukti setelah perbaikan:
+- sandbox_manager `uv run pytest -q` → **146 passed, 1 skipped** (skip hanya saat root; test yang sama lulus sebagai uid 65534);
+- `-m docker` lokal → **22 passed**; CI `sandbox-isolation` (root) → **22 passed**;
+- backend `uv run pytest -q` → **1231 passed**; pyright 0; lint-imports 3 kontrak dipatuhi;
+- pip-audit bersih; gitleaks bersih.
+
+Konflik dokumen baru: #38 (API_CONTRACTS §10 tertinggal: field tambahan dan semantik `wait=true`). Tidak dikerjakan: F4 AG-13 (sapuan global saat start) dipertahankan dengan asumsi satu manager per daemon, terdokumentasi di spec.
+
+#### WP-1.3 — review keamanan putaran 2 (24 Okt 2026)
+
+`kk-security-reviewer` pada diff perbaikan (9711b56..b676c04): **TIDAK DITANDATANGANI**.
+- F1–F9 putaran 1 tertutup, atau tertutup sebagian dengan sisa yang terdokumentasi.
+- Blocker baru: N1 HIGH.
+
+| Temuan | Perbaikan | Test |
+|---|---|---|
+| N1 HIGH: pohon artefak lebih dalam dari PATH_MAX (≈ 2000 level lewat `chdir`) tidak bisa dihapus, juga oleh sapuan start; disk bocor ≈ 316 MiB per run | `remove_tree` berbasis descriptor folder: isi sub-folder diangkat ke atas dengan `rename` antar-descriptor (nama acak), folder dibuka (`chmod`) sebelum diangkat; tanpa path panjang. Gagal hapus → `ARTIFACTS_NOT_REMOVED` | `test_tree_deeper_than_path_max_is_removed`, `test_name_clashes_do_not_stop_removal`, `test_artifact_folder_not_removed_is_reported`; Docker: `test_artifact_tree_deeper_than_path_max_is_removed`, `test_disk_helpers_as_sandbox_uid` (uid 10001: kedalaman 2100 + folder terdalam terkunci) |
+| N2 MEDIUM: `client_request_id` mengembalikan run milik task/args/mode lain | fingerprint lengkap request tervalidasi; beda → `IDEMPOTENCY_CONFLICT` | `test_client_request_id_returns_the_same_run` (5 varian) |
+| N3 LOW: batas 8 MiB tidak dicek setelah run | `tree_bytes(artifacts) > 8 MiB` setelah run → `DISK_LIMIT` | `test_artifact_folder_over_cap_after_run` |
+| N4 LOW: rotasi log Docker membuang entri tanpa flag | batas dinaikkan ke max(8 × output, 64 MiB); sisa risiko dicatat di spec keputusan #18 | `test_hardened_hostconfig`, `test_container_log_is_capped`; Docker: `test_container_log_cap_is_accepted_by_docker` |
+| N5 LOW: reaper memakai snapshot run aktif yang basi | run aktif dibaca setelah listing | `test_reaper_reads_active_runs_after_listing` |
+| F4 (sisa): sapuan start global | usulan ADR, konflik #39 | – |
+
+Bukti:
+- sandbox_manager `uv run pytest -q` → **151 passed, 1 skipped**;
+- test disk sebagai uid 65534 → **8 passed**;
+- `-m docker` lokal (root) → **23 passed**;
+- ruff dan pyright bersih.
+
+Verifikasi AG-13 atas N1–N5 dilakukan di sesi sign-off formal (rencana lanjutan U4). PR #3 tetap draft sampai sign-off itu ada.

@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,14 @@ _BASE_ENV = {
     "GIT_EDITOR": "/bin/false",
     "GIT_LITERAL_PATHSPECS": "1",
 }
+# Repository config keys git itself writes for a local repo, a worktree, or a clone. Anything else (hooks,
+# fsmonitor, filter/diff drivers, include, alias, extensions) is refused, not just overridden (ADR-026 (4)).
+_ALLOWED_CONFIG = re.compile(
+    r"core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)"
+    r"|remote\..+\.(url|fetch)"
+    r"|branch\..+\.(remote|merge)"
+)
+_ALTERNATES = ("alternates", "http-alternates")
 _DIFF_FLAGS = ("diff", "--raw", "-z", "-p", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color")
 
 logger = get_logger(__name__)
@@ -297,21 +306,46 @@ class GitAdapter:
 
     # --- targets -----------------------------------------------------------------------------------------
 
-    async def _adirs(self, target: GitTarget) -> tuple[Path, Path]:
-        """``_dirs`` off the event loop: it reads the worktree registry from disk."""
-        return await asyncio.to_thread(self._dirs, target)
+    async def _adirs(self, target: GitTarget, *, verify_gitfile: bool = True) -> tuple[Path, Path]:
+        """The trusted git dir and work tree for ``target``, after checking the repository (ADR-026 (4)).
 
-    def _dirs(self, target: GitTarget) -> tuple[Path, Path]:
+        Refused with ``git_metadata_unsafe``:
+        - a repository config key outside ``_ALLOWED_CONFIG`` (hooks, fsmonitor, filters, includes, aliases);
+        - object alternates;
+        - a worktree whose ``.git`` file does not point at its registered git dir (``verify_gitfile``).
+        """
+        git_dir, tree = await asyncio.to_thread(self._dirs, target, verify_gitfile)
+        await self._verify_repository(target.repo / ".git")
+        return git_dir, tree
+
+    async def _verify_repository(self, common: Path) -> None:
+        unsafe = await asyncio.to_thread(
+            lambda: any(os.path.lexists(common / "objects" / "info" / name) for name in _ALTERNATES)
+        )
+        if unsafe:
+            raise GitError("git_metadata_unsafe")
+        listed = await self._run(
+            ["config", "--file", str(common / "config"), "--no-includes", "--list", "--name-only", "-z"],
+            git_dir=common,
+            work_tree=None,
+            cwd=common,
+        )
+        for key in listed.stdout.decode("utf-8", "surrogateescape").split("\0"):
+            if key and not _ALLOWED_CONFIG.fullmatch(key.strip()):
+                logger.warning("git_config_key_refused", key=key.strip()[:120])
+                raise GitError("git_metadata_unsafe")
+
+    def _dirs(self, target: GitTarget, verify_gitfile: bool = True) -> tuple[Path, Path]:
         git_dir = target.repo / ".git"
         if git_dir.is_symlink() or not git_dir.is_dir():
             raise GitError("not_a_repo")
         if target.worktree is None:
             return git_dir, target.repo
-        return self._worktree_gitdir(target.repo, target.worktree), target.worktree
+        return self._worktree_gitdir(target.repo, target.worktree, verify_gitfile), target.worktree
 
     @staticmethod
-    def _worktree_gitdir(repo: Path, worktree: Path) -> Path:
-        """The worktree's git dir from the repo's registry; ``<worktree>/.git`` itself is never trusted."""
+    def _worktree_gitdir(repo: Path, worktree: Path, verify_gitfile: bool = True) -> Path:
+        """The worktree's git dir from the repo's registry; ``<worktree>/.git`` must point back at it."""
         expected = os.path.join(os.path.realpath(worktree), ".git")
         registry = repo / ".git" / "worktrees"
         with contextlib.suppress(FileNotFoundError):
@@ -322,6 +356,8 @@ class GitAdapter:
                     continue
                 normalised = os.path.join(os.path.realpath(os.path.dirname(recorded)), ".git")
                 if normalised == expected:
+                    if verify_gitfile and not _gitfile_points_at(expected, registry / name):
+                        raise GitError("git_metadata_unsafe")  # rewritten by code that ran in the worktree
                     return registry / name
         raise GitError("not_a_worktree")
 
@@ -551,7 +587,8 @@ class GitAdapter:
         """Remove a task worktree (dirty or not); its branch stays for the audit trail."""
         if not path.is_absolute():
             raise GitInputError("path")
-        git_dir, _ = await self._adirs(GitTarget(repo, path))  # refuses an unregistered worktree
+        # Registered worktrees only; a tampered .git file must not stop the cleanup.
+        git_dir, _ = await self._adirs(GitTarget(repo, path), verify_gitfile=False)
         common = repo / ".git"
         try:
             await self._run(
@@ -614,6 +651,20 @@ class GitAdapter:
             return MergeResult(False, None, [], "dirty")
         self._log_failure("merge", result, tree)
         raise GitError("merge_failed")
+
+
+def _gitfile_points_at(gitfile: str, registered: Path) -> bool:
+    """``<worktree>/.git`` is a regular file reading ``gitdir: <registered git dir>``."""
+    try:
+        if not stat.S_ISREG(os.lstat(gitfile).st_mode):
+            return False
+        with open(gitfile, "rb") as handle:
+            content = handle.read(4097).decode("utf-8", "replace").strip()
+    except OSError:
+        return False
+    if not content.startswith("gitdir: "):
+        return False
+    return os.path.realpath(content.removeprefix("gitdir: ")) == os.path.realpath(registered)
 
 
 def _ensure_excludes(git_dir: Path) -> None:

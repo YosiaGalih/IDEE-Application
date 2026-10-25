@@ -11,7 +11,6 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from redis.asyncio import Redis
@@ -21,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.core.config import Settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.logging import get_logger
+from app.sandbox.client import HttpSandboxClient
 
 ReadinessCheck = Callable[[], Awaitable[bool]]
 
@@ -43,8 +43,7 @@ class Dependencies:
 
     engine: AsyncEngine
     redis: Redis
-    http: httpx.AsyncClient
-    sandbox_manager_url: str
+    sandbox: HttpSandboxClient
     migration_heads: frozenset[str]
     sessions: async_sessionmaker[AsyncSession]
 
@@ -60,8 +59,11 @@ class Dependencies:
                 socket_timeout=REDIS_TIMEOUT_SECONDS,
                 socket_connect_timeout=REDIS_TIMEOUT_SECONDS,
             ),
-            http=httpx.AsyncClient(timeout=CHECK_TIMEOUT_SECONDS),
-            sandbox_manager_url=settings.sandbox_manager_url.rstrip("/"),
+            sandbox=HttpSandboxClient(
+                settings.sandbox_manager_url,
+                settings.sandbox_manager_token,
+                allow_fake_driver=not settings.is_production,
+            ),
             # Read once at startup: building ScriptDirectory imports every revision module (blocking I/O).
             migration_heads=frozenset(alembic_heads()),
             sessions=make_sessionmaker(engine),
@@ -69,7 +71,7 @@ class Dependencies:
 
     async def aclose(self) -> None:
         try:
-            await self.http.aclose()
+            await self.sandbox.aclose()
         finally:
             try:
                 await self.redis.aclose()
@@ -84,8 +86,7 @@ class Dependencies:
         return bool(await self.redis.ping())
 
     async def check_sandbox_manager(self) -> bool:
-        response = await self.http.get(f"{self.sandbox_manager_url}/healthz")
-        return response.status_code == 200
+        return await self.sandbox.health()  # authenticated, and Docker behind it reachable
 
     async def check_migrations(self) -> bool:
         async with self.engine.connect() as conn:
