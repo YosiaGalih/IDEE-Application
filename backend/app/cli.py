@@ -1,6 +1,10 @@
-"""Operator CLI: ``python -m app.cli create-owner --email ... --display-name ...`` (ARCHITECTURE §3).
+"""Operator CLI (ARCHITECTURE §3).
 
-The password is read from an interactive prompt, or from stdin with ``--password-stdin``; never from argv.
+- ``create-owner --email ... --display-name ...``: the password comes from an interactive prompt, or from
+  stdin with ``--password-stdin``; never from argv.
+- ``recover``: one recovery sweep.
+- ``grant-runtime-role --role NAME``: privileges of the runtime DB role, run by the deployment after every
+  migration (``app.core.db_roles``).
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import sys
 from app.core.audit import AuditWriter
 from app.core.config import ConfigError, load_settings
 from app.core.db import make_engine, make_sessionmaker
+from app.core.db_roles import InvalidRoleName, grant_runtime_role
 from app.core.redaction import Redactor
 from app.services.users import EmailTakenError, OwnerExistsError, create_owner
 
@@ -48,6 +53,17 @@ def _recover() -> int:
     return 0 if counts["failed"] == 0 else 1
 
 
+async def _grant_runtime_role(role: str) -> int:
+    engine = make_engine(load_settings().database_url)
+    try:
+        async with engine.begin() as conn:
+            await grant_runtime_role(conn, role)
+    finally:
+        await engine.dispose()
+    print(f"runtime role {role}: privileges granted (audit_events append-only)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -56,7 +72,17 @@ def main(argv: list[str] | None = None) -> int:
     owner.add_argument("--display-name", required=True)
     owner.add_argument("--password-stdin", action="store_true", help="read the password from stdin")
     commands.add_parser("recover", help="run the task recovery sweep once (RUNBOOK)")
+    grant = commands.add_parser(
+        "grant-runtime-role", help="privileges of the runtime DB role (after migrations)"
+    )
+    grant.add_argument("--role", required=True)
     args = parser.parse_args(argv)
+    if args.command == "grant-runtime-role":
+        try:
+            return asyncio.run(_grant_runtime_role(args.role))
+        except (ConfigError, InvalidRoleName) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     if args.command == "recover":
         try:
             return _recover()

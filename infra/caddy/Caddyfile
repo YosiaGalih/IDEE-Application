@@ -1,0 +1,65 @@
+# KodeKantor ingress (DEPLOYMENT §6). The only service with public ports.
+# Env: APP_DOMAIN (certificate host; "localhost" uses Caddy's internal CA), CADDY_EMAIL (ACME account),
+# CADDY_HSTS_MAX_AGE (0 in development).
+{
+	email {$CADDY_EMAIL}
+	admin localhost:2019
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age={$CADDY_HSTS_MAX_AGE:31536000}"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		-Server
+	}
+}
+
+{$APP_DOMAIN} {
+	import security_headers
+	encode zstd gzip
+
+	# Archive import: the one route with a large body (ADR-005: archives up to 200 MB).
+	@import {
+		method POST
+		path_regexp ^/api/v1/projects/[^/]+/imports$
+	}
+	handle @import {
+		request_body {
+			max_size 210MB
+		}
+		reverse_proxy api:8000
+	}
+
+	handle /api/* {
+		request_body {
+			max_size 10MB
+		}
+		reverse_proxy api:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 1h
+			}
+			header_down -Server
+		}
+	}
+
+	handle {
+		request_body {
+			max_size 10MB
+		}
+		reverse_proxy web:8080 {
+			header_down -Server
+		}
+	}
+
+	handle_errors {
+		import security_headers
+		respond "{err.status_code} {err.status_text}"
+	}
+}

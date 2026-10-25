@@ -1,6 +1,6 @@
 # Rencana lanjutan bila kredit cloud habis: kerja di bawah limit sesi dan limit mingguan
 
-Dokumen ini dipakai setiap kali sesi baru dimulai. Bagian §1 diperbarui di akhir setiap sesi; bagian lain hanya berubah bila aturannya berubah.
+Dokumen ini dipakai setiap kali sesi baru dimulai. Status terakhir ada di `HANDOFF.md`; dokumen ini hanya berubah bila aturan atau antrian berubah.
 
 ## 0. Yang perlu diketahui dulu
 
@@ -9,18 +9,9 @@ Dokumen ini dipakai setiap kali sesi baru dimulai. Bagian §1 diperbarui di akhi
 - **PR #3 sudah besar** (ADR-026 (4) + WP-1.3 + perbaikan review). Mulai WP-1.5, satu PR = satu sub-WP.
 - Angka limit sesi dan mingguan tergantung paket langganan dan tidak saya ketahui. Satuan kerja di bawah memakai ukuran relatif, bukan angka token. [Menebak] untuk semua perkiraan jumlah sesi.
 
-## 1. Status terakhir (perbarui di akhir setiap sesi)
+## 1. Status terakhir
 
-| | |
-|---|---|
-| Tanggal | 24 Okt 2026 |
-| Branch kerja | `claude/gracious-goodall-3hjh19` |
-| PR terbuka | [YosiaGalih/IDEE-Application#3](https://github.com/YosiaGalih/IDEE-Application/pull/3) (draft): ADR-026 (4) + WP-1.3 + perbaikan review |
-| Commit hijau terakhir | b676c04 (CI hijau, `sandbox-isolation` 22 test Docker nyata sebagai root) |
-| Di `main` | WP-1.1 (PR #1), WP-1.2 (PR #2) |
-| Selesai di sesi ini | U1 dan U2 (perbaikan review putaran 1; tabel lengkap di tracker §12 "WP-1.3 — review putaran 1") |
-| Berikutnya | U4: sign-off formal AG-13 WP-1.2 + WP-1.3 di sesi terpisah. Putaran 2 menolak karena N1; N1–N5 sudah diperbaiki, tetapi belum diverifikasi reviewer. Bila ditandatangani, PR #3 keluar dari draft. Lalu U5 (keputusan PO) |
-| Menunggu PO | konflik #36–#39 (spec sistem pengembangan §8); merge PR #3; G0/G1 |
+Status terkini dan langkah berikutnya ada di **`HANDOFF.md`** (root repo). Perbarui file itu di akhir setiap sesi.
 
 ## 2. Aturan kerja di bawah limit
 
