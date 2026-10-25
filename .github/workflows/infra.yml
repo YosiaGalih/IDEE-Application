@@ -55,7 +55,7 @@ jobs:
       - name: Sandbox images and workspace folder
         run: |
           make sandbox-images
-          sudo install -d -m 0750 -o 10001 -g 10001 /srv/kodekantor/workspaces
+          sudo KK_ENV_FILE="$KK_ENV_FILE" scripts/prepare-workspace.sh
       - name: Build and start the stack
         run: docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" up -d --build --wait --wait-timeout 300
       - name: Health through Caddy

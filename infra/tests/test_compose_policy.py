@@ -168,12 +168,14 @@ class ComposePolicy(unittest.TestCase):
         self.assertEqual(holders, {"worker"})
 
     def test_secrets_per_service(self) -> None:
+        """DEPLOYMENT §7: each service gets only what it uses; migrate and scheduler get placeholders where
+        Settings demands a value they never use."""
         allowed = {
-            "SECRET_KEY": BACKEND,
-            "SANDBOX_MANAGER_TOKEN": BACKEND | {"sandbox-manager"},
+            "SECRET_KEY": {"api", "worker"},
+            "SANDBOX_MANAGER_TOKEN": {"api", "worker", "sandbox-manager"},
             "POSTGRES_PASSWORD": {"migrate", "postgres"},  # the owner: migrations only
             "DB_APP_PASSWORD": {"api", "worker", "scheduler", "postgres"},  # the runtime role
-            "REDIS_PASSWORD": BACKEND | {"redis"},  # inside REDIS_URL for the backend
+            "REDIS_PASSWORD": {"api", "worker", "scheduler", "redis"},  # inside REDIS_URL; migrate needs no broker
             "ANTHROPIC_API_KEY": {"worker"},
         }
         for key, value in secrets_from_env_file().items():

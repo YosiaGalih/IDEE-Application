@@ -76,6 +76,10 @@ x-backend-env: &backend-env
   CELERY_TASK_ALWAYS_EAGER: "false"
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
+# migrate and scheduler never sign, verify or call sandbox-manager, but Settings demands these values; they
+# get this non-secret placeholder instead of the real ones (DEPLOYMENT §7). Never use it to sign anything.
+x-unused-secret: &unused-secret unused-by-this-service-00000000000000000000
+
 x-backend-volumes: &backend-volumes
   - type: bind
     source: ${WORKSPACE_HOST_PATH:-/srv/kodekantor/workspaces}
@@ -171,6 +175,9 @@ services:
     environment:
       <<: *backend-env
       DATABASE_URL: postgresql+asyncpg://kodekantor:${POSTGRES_PASSWORD:?run make setup}@postgres:5432/kodekantor
+      REDIS_URL: redis://unused.invalid:6379/0
+      SECRET_KEY: *unused-secret
+      SANDBOX_MANAGER_TOKEN: *unused-secret
     tmpfs: [/tmp]
     networks: [app]
     depends_on:
@@ -216,6 +223,8 @@ services:
     command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel", "INFO", "--schedule", "/tmp/celerybeat-schedule"]
     environment:
       <<: *backend-env
+      SECRET_KEY: *unused-secret
+      SANDBOX_MANAGER_TOKEN: *unused-secret
     tmpfs: [/tmp]
     networks: [app]
     depends_on:

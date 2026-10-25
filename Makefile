@@ -15,8 +15,7 @@ sandbox-images: ## built locally, never pulled (ADR-026 (2))
 	docker build -t kodekantor/sandbox-node:1 sandbox-images/node
 
 workspace: ## WORKSPACE_HOST_PATH owned by 10001:10001, mode 0750 (ADR-005); needs root
-	@path=$$(sed -n 's/^WORKSPACE_HOST_PATH=//p' "$(KK_ENV_FILE)" | tail -1); \
-	  install -d -m 0750 -o 10001 -g 10001 "$$path" && echo "workspace: $$path ready"
+	scripts/prepare-workspace.sh
 
 config: ## validate the compose file against the env file
 	$(COMPOSE) config --quiet && echo "config: infra/compose.yml is valid"
