@@ -38,20 +38,16 @@ Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-
 
 ### WP-1.5a: yang belum (urutan)
 
-1. Job CI `infra-config` di `.github/workflows/`:
-   - `python3 -m unittest discover -s infra/tests`;
-   - `caddy validate` dengan image caddy yang dipin;
-   - opsional: stack live + `scripts/healthcheck.sh` (butuh membangun image backend, sandbox-manager, dan sandbox).
-2. Bukti mutasi untuk test kebijakan. Contoh: beri `ports` ke api, mount docker.sock ke sandbox-manager, set `INFO=1`, beri `ANTHROPIC_API_KEY` ke api. Masing-masing harus membuat test merah.
-3. Jalankan suite backend penuh (`uv run pytest -q`, harus ≥ 1239 passed) dan sandbox_manager.
-4. Plan doc `docs/superpowers/plans/2026-10-25-wp-1.5a-compose.md`.
-5. Konflik #40–#43 di spec sistem pengembangan §8:
-   - #40: `ANTHROPIC_API_KEY` hanya di worker, padahal ADR-004 juga menyebut api;
-   - #41: `INFO=0` (ADR-026) vs `INFO=1` (DEPLOYMENT §2);
-   - #42: job `infra-config` tidak ada di TEST_STRATEGY §6;
-   - #43: variabel baru `DB_APP_PASSWORD` dan role `kodekantor_app` belum ada di CONFIGURATION/DATA_MODEL.
-6. Review `kk-security-reviewer` atas diff WP-1.5a (satu putaran; jatah review di rencana §2.4), tracker §12, PR (template `.github/pull_request_template.md`).
-7. Berikutnya: WP-1.5b (egress-proxy + hadolint/shellcheck/actionlint), WP-1.5c (backup/restore), WP-1.4 (frontend), WP-1.6 (G1).
+Sudah selesai sejak HANDOFF pertama:
+- job CI `infra-config` dan `clean-install` (`.github/workflows/infra.yml`);
+- 14 mutasi compose semuanya merah;
+- suite backend 1239 passed;
+- plan doc, konflik #40–#43, tracker.
+
+Sisa:
+1. Pastikan CI PR [#4](https://github.com/YosiaGalih/IDEE-Application/pull/4) hijau, terutama `clean-install` yang baru pertama kali berjalan di runner GitHub. Bila merah, baca log job dan perbaiki di branch yang sama.
+2. Hasil review `kk-security-reviewer` atas WP-1.5a: tutup temuannya, catat di tracker §12, lalu keluarkan PR #4 dari draft.
+3. Berikutnya: WP-1.5b (egress-proxy + hadolint/shellcheck/actionlint), WP-1.5c (backup/restore), WP-1.4 (frontend), WP-1.6 (G1).
 
 ## Cara melanjutkan dengan langganan (bukan kredit cloud)
 
@@ -75,6 +71,6 @@ Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-
 
 ```text
 Baca CLAUDE.md, HANDOFF.md, dan docs/superpowers/plans/2026-10-24-continuation-under-usage-limits.md.
-Lanjutkan WP-1.5a dari daftar "yang belum" di HANDOFF.md, urut dari nomor 1.
+Lanjutkan dari daftar "Sisa" di HANDOFF.md, urut dari nomor 1.
 Commit setiap langkah hijau, push sebelum sesi berakhir, dan perbarui bagian Status di HANDOFF.md.
 ```
