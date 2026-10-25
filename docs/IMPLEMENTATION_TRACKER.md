@@ -663,21 +663,23 @@ Spec: `docs/superpowers/specs/2026-10-25-wp-1.5a-compose-design.md`. Plan: `docs
 
 | Pemeriksaan | Hasil aktual |
 |---|---|
-| `python3 -m unittest discover -s infra/tests` | **17 OK** |
+| `python3 -m unittest discover -s infra/tests` | **18 OK** |
 | Mutasi compose (14) | merah semua: port di api, sandbox-manager di edge, worker di exec, `INFO=1`, `EXEC=1`, socket rw, socket di sandbox-manager, kunci API ke semua backend, runtime sebagai owner, edge tidak internal, path workspace beda, image tanpa digest, worker tanpa pids |
 | `docker compose -f infra/compose.yml --env-file infra/tests/ci.env up -d --wait` (container cloud) | 10 service healthy, migrate `Exited (0)` |
 | `KK_ENV_FILE=infra/tests/ci.env scripts/healthcheck.sh` | live 200, ready 200 (db, redis, sandbox_manager, migrations ok), `/` 200 lewat Caddy; header CSP/HSTS/XFO ada |
 | Probe socket-proxy dari network `exec` | `_ping`, `version`, `containers/json`, `images/json` 200; `info`, `volumes`, `networks`, `events`, `POST exec/x/start` 403 |
 | Backend `uv run pytest -q` | **1239 passed** (8 baru, role runtime); pyright 0; lint-imports 3 kontrak dipatuhi |
 | `caddy validate` | Valid configuration |
+| CI `clean-install` di runner GitHub ([run 40171760603](https://github.com/YosiaGalih/IDEE-Application/actions/runs/40171760603/job/121104016297), commit fcbdcb6) | `compose up --build --wait` sukses; `healthcheck.sh`: semua container healthy, migrate exit 0, live/ready/`/` 200 lewat Caddy |
 
 Temuan saat menjalankan stack (masing-masing diperbaiki):
 - API menolak start sebagai superuser (audit guard WP-1.1b) → role runtime `kodekantor_app` + `grant-runtime-role`;
 - socket-proxy mati tanpa IPv6;
 - biner caddy ber-file-capability tidak bisa exec sebagai uid 101;
 - path jadwal beat;
-- parsing status di `healthcheck.sh`.
+- parsing status di `healthcheck.sh`;
+- CI `infra-config` merah di runner: Compose v2 membuang `create_host_path: false` saat render (v5 membuang default `true`) → test membaca flag dari teks sumber; dua mutasi `create_host_path: true` merah.
 
 Konflik dokumen baru: #40–#43.
 
-Belum: review `kk-security-reviewer` atas diff ini; CI `infra-config` dan `clean-install` pertama kali berjalan di PR #4.
+Belum: review `kk-security-reviewer` atas diff ini; CI `infra-config` hijau setelah perbaikan di atas.
