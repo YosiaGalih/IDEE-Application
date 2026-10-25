@@ -114,7 +114,7 @@ async def audit_guard_problems(conn: AsyncConnection) -> list[str]:
             text(
                 """
                 SELECT r.rolsuper,
-                       pg_get_userbyid(c.relowner) = current_user AS is_owner,
+                       pg_has_role(current_user, c.relowner, 'MEMBER') AS is_owner,
                        has_table_privilege(current_user, 'audit_events', 'UPDATE') AS can_update,
                        has_table_privilege(current_user, 'audit_events', 'DELETE') AS can_delete,
                        has_table_privilege(current_user, 'audit_events', 'TRUNCATE') AS can_truncate
@@ -126,9 +126,29 @@ async def audit_guard_problems(conn: AsyncConnection) -> list[str]:
     ).one()
     labels = {
         "rolsuper": "runtime role is a superuser",
-        "is_owner": "runtime role owns audit_events (can disable or drop the trigger)",
+        "is_owner": (
+            "runtime role owns audit_events or is a member of its owner (can disable or drop the trigger)"
+        ),
         "can_update": "runtime role has UPDATE on audit_events",
         "can_delete": "runtime role has DELETE on audit_events",
         "can_truncate": "runtime role has TRUNCATE on audit_events",
     }
-    return [message for key, message in labels.items() if getattr(row, key)]
+    problems = [message for key, message in labels.items() if getattr(row, key)]
+    # A SECURITY DEFINER function runs with its owner's rights, around the table privileges above.
+    definers = await conn.execute(
+        text(
+            """
+            SELECT n.nspname || '.' || p.proname
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE p.prosecdef
+              AND NOT pg_has_role(current_user, p.proowner, 'MEMBER')
+              AND has_function_privilege(current_user, p.oid, 'EXECUTE')
+            ORDER BY 1
+            """
+        )
+    )
+    problems += [
+        f"runtime role can execute SECURITY DEFINER function {name} (it runs with its owner's rights)"
+        for name in definers.scalars()
+    ]
+    return problems

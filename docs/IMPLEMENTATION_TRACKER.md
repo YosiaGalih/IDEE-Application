@@ -656,3 +656,50 @@ Bukti:
 - ruff dan pyright bersih.
 
 Verifikasi AG-13 atas N1–N5 dilakukan di sesi sign-off formal (rencana lanjutan U4). PR #3 tetap draft sampai sign-off itu ada.
+
+### WP-1.5a (🔒) — compose produksi, image service, role DB runtime (FR-136–137, FR-149, AC-20)
+
+Spec: `docs/superpowers/specs/2026-10-25-wp-1.5a-compose-design.md`. Plan: `docs/superpowers/plans/2026-10-25-wp-1.5a-compose.md`. PR [YosiaGalih/IDEE-Application#4](https://github.com/YosiaGalih/IDEE-Application/pull/4).
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `python3 -m unittest discover -s infra/tests` | **23 OK** (kebijakan compose 18, `prepare-workspace.sh` 5; 1 skip bila bukan root) |
+| Mutasi compose (14) | merah semua: port di api, sandbox-manager di edge, worker di exec, `INFO=1`, `EXEC=1`, socket rw, socket di sandbox-manager, kunci API ke semua backend, runtime sebagai owner, edge tidak internal, path workspace beda, image tanpa digest, worker tanpa pids |
+| `docker compose -f infra/compose.yml --env-file infra/tests/ci.env up -d --wait` (container cloud) | 10 service healthy, migrate `Exited (0)` |
+| `KK_ENV_FILE=infra/tests/ci.env scripts/healthcheck.sh` | live 200, ready 200 (db, redis, sandbox_manager, migrations ok), `/` 200 lewat Caddy; header CSP/HSTS/XFO ada |
+| Probe socket-proxy dari network `exec` | `_ping`, `version`, `containers/json`, `images/json` 200; `info`, `volumes`, `networks`, `events`, `POST exec/x/start` 403 |
+| Backend `uv run pytest -q` | **1243 passed, 1 skipped** (13 test role runtime; yang di-skip butuh koneksi superuser dan berjalan di CI); pyright 0; lint-imports 3 kontrak dipatuhi |
+| `caddy validate` | Valid configuration |
+| CI `clean-install` di runner GitHub ([run 40171760603](https://github.com/YosiaGalih/IDEE-Application/actions/runs/40171760603/job/121104016297), commit fcbdcb6) | `compose up --build --wait` sukses; `healthcheck.sh`: semua container healthy, migrate exit 0, live/ready/`/` 200 lewat Caddy |
+
+Temuan saat menjalankan stack (masing-masing diperbaiki):
+- API menolak start sebagai superuser (audit guard WP-1.1b) → role runtime `kodekantor_app` + `grant-runtime-role`;
+- socket-proxy mati tanpa IPv6;
+- biner caddy ber-file-capability tidak bisa exec sebagai uid 101;
+- path jadwal beat;
+- parsing status di `healthcheck.sh`;
+- CI `infra-config` merah di runner: Compose v2 membuang `create_host_path: false` saat render (v5 membuang default `true`) → test membaca flag dari teks sumber; dua mutasi `create_host_path: true` merah.
+
+Konflik dokumen baru: #40–#43.
+
+#### Review AG-13 (`kk-security-reviewer`) @ de47716 — **SIGNED OFF** [Kemungkinan Besar]
+
+Tanpa CRITICAL/HIGH. Ancaman T3, T5, T8, T10 diuji dengan test dan probe live (proxy, network, Caddy, scan kebocoran, gitleaks, pip-audit). Temuan dan penutupannya:
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| M1 uv 0.11.32 `PYSEC-2026-4321` (build image dan CI) | Pengecualian **EX-01** di `DECISIONS.md` (menunggu persetujuan PO), kedaluwarsa 2026-11-03; langkah "Build tool audit" di `infra-config` mengabaikannya hanya sampai tanggal itu | simulasi tanggal: 2026-11-03 → exit 0, 2026-11-04 → exit 1 |
+| M2 fungsi bisa dieksekusi PUBLIC; guard hanya cek owner; deny-list append-only | `grant_runtime_role` mencabut EXECUTE fungsi `public` dari PUBLIC (juga default privileges global milik owner); guard gagal pada keanggotaan role owner dan pada fungsi SECURITY DEFINER yang bisa dieksekusi; `APPEND_ONLY_TABLES` dicocokkan test dengan trigger `<table>_no_mutation` | 5 test baru; 5 mutan merah (satu butuh superuser, dijalankan lokal dengan superuser sementara); live: runtime role tidak bisa EXECUTE kedua fungsi trigger, trigger tetap jalan |
+| L2 password role runtime di argv psql dan log server | `\getenv` + `log_statement=none` + `log_min_error_statement=panic` di sesi init | re-run gagal: password muncul di 0 baris log (skrip lama: 1) |
+| L3 secret berlebih ke migrate/scheduler | placeholder non-rahasia (DEPLOYMENT §7); `SECRET_KEY` hanya api dan worker | test kebijakan diperketat, 3 mutan merah; `docker inspect` live |
+| L4 `make workspace` bisa chown path apa pun | `scripts/prepare-workspace.sh` (dipakai `make workspace` dan CI): hanya path absolut polos tanpa `.`/`..`; path yang ada harus folder milik 10001 | 5 test, 4 mutan merah; `/srv` ditolak dan tidak berubah |
+| L5 checkout menyimpan kredensial; konteks build memuat `.git`/`.env` | `persist-credentials: false`; `.dockerignore` allowlist | konteks build 129 berkas, tanpa `.git`/`.env`/cache; kedua image ter-build |
+| L1 `--forwarded-allow-ips "*"` | **belum**: butuh subnet `edge` tetap (konfigurasi operator); lewat Caddy aman (XFF ditimpa) | utang di bawah |
+
+Konflik dokumen dari review: #44 (jaringan token sandbox-manager); spec WP-1.5a diperbarui (image `web`, `pull_policy`, `clean-install`).
+
+Utang terbuka (repo belum punya issue; issue WP dibangkitkan dari `wbs_data.py`, jadi dicatat di sini):
+- L1: subnet `edge` tetap + `--forwarded-allow-ips=<subnet>` + test kebijakan.
+- M2 jangka menengah: role owner non-superuser untuk `migrate`.
+- Trivy dan Semgrep belum pernah berjalan (unduhan DB/ruleset diblokir proxy cloud); wajib di job security-scan sebelum G1 (SECURITY_MODEL §11).
+- hadolint, shellcheck, actionlint: WP-1.5b.

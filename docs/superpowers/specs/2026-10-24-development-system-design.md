@@ -284,7 +284,6 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 36. **Artefak run read-only (ADR-033, ARCHITECTURE §8):** dokumen meminta `/workspace/.kk` berupa tmpfs yang dibaca lewat Docker archive API, dan "mount hanya" workspace. Diukur di Docker 29/runc (WP-1.3): tmpfs di dalam bind read-only gagal tanpa mountpoint, dan archive API tidak membaca isi tmpfs. WP-1.3 memakai bind kedua: folder baru per run `<WORKSPACE_ROOT>/<project>/.kk-runs/<run_id>` → `/workspace/.kk`, di dalam folder project agar kuota XFS per project mencakupnya. Folder ini dibatasi watchdog (8 MiB, kill → `DISK_LIMIT`), dihitung dalam batas pertumbuhan untuk semua run, dibaca manager dengan `O_NOFOLLOW`, lalu dihapus. Akibatnya ARCHITECTURE §8 ("mount hanya workspace") dan ADR-033 ("archive API", tmpfs) perlu diamandemen; perlu keputusan PO (AG-00 pemilik dokumen).
 37. **Klien sandbox `wait=true` vs `on_log`:** spec WP-1.3 awal menulis `run()` memakai `wait=true`, tetapi kontrak `SandboxClient.run(..., on_log=...)` di ARCHITECTURE §4.2 butuh log berjalan. WP-1.3 mengikuti kontrak: submit lalu polling `/logs`.
 38. **API_CONTRACTS §10 tertinggal dari WP-1.3** (temuan review). Field tambahan:
-39. **Satu sandbox-manager per daemon Docker (usulan ADR, review keamanan F4):** saat start manager menghapus semua container `kk.managed=1` milik daemon itu, termasuk milik instance lain bila ada. Desain tier S memang satu node dan satu manager, tetapi asumsi ini belum tertulis sebagai ADR. Tier M/L (node executor, ADR-060) perlu memutuskan apakah sapuan dibatasi label `kk.manager`.
     - request `read_only` (ADR-033) dan `client_request_id`;
     - respons POST `timeout_s`;
     - `/logs` `status`, dengan `done` hanya setelah semua chunk terkirim;
@@ -293,6 +292,13 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - `/v1/tasks/{id}/kill` `failed`.
 
     Selain itu, `wait=true` setelah `timeout_s + 30` dtk mengembalikan run apa adanya, bukan selalu final. Semua penambahan bersifat aditif, tetapi kontrak perlu diperbarui oleh AG-00.
+
+39. **Satu sandbox-manager per daemon Docker (usulan ADR, review keamanan F4):** saat start manager menghapus semua container `kk.managed=1` milik daemon itu, termasuk milik instance lain bila ada. Desain tier S memang satu node dan satu manager, tetapi asumsi ini belum tertulis sebagai ADR. Tier M/L (node executor, ADR-060) perlu memutuskan apakah sapuan dibatasi label `kk.manager`.
+40. **Pemegang `ANTHROPIC_API_KEY`:** ADR-004 dan DEPLOYMENT §7 memberikannya ke `worker` dan `api` (smoke test), sedangkan ARCHITECTURE §2 menyebut worker "satu-satunya pemegang". `api` tidak berada di network `outbound`, jadi kunci di sana tidak bisa dipakai. WP-1.5a memberikannya hanya ke worker; smoke test dijalankan lewat `docker compose exec worker`.
+41. **Flag `INFO` docker-socket-proxy:** DEPLOYMENT §2 menulis `INFO=1`, ADR-026 (3) dan `.claude/rules/infra.md` menulis `INFO=0`. WP-1.5a memakai `INFO=0`; sandbox-manager tidak memanggil `/info` (`test_only_allowed_endpoints`).
+42. **Job CI `infra-config`** belum ada di tabel TEST_STRATEGY §6. Kebijakan compose perlu dicek di setiap PR, sedangkan `clean-install` (ada di tabel) nightly. WP-1.5a menjalankan `clean-install` juga pada PR.
+43. **Role DB runtime:** CONFIGURATION hanya mengenal `POSTGRES_PASSWORD`, dan DATA_MODEL tidak menyebut role. Agar audit guard WP-1.1b terpenuhi, WP-1.5a menambah role `kodekantor_app` dengan `DB_APP_PASSWORD`; migrate tetap memakai owner. Kontrak perlu diperbarui oleh AG-00.
+44. **Jaringan token sandbox-manager:** SECURITY_MODEL §4 (baris Worker/API ↔ sandbox-manager) menulis "network `exec` privat", sedangkan ARCHITECTURE §2 dan DEPLOYMENT §5 menaruh port 8100 sandbox-manager di network `app`, dan api/worker tidak boleh bergabung ke `exec` (infra.md). WP-1.5a mengikuti ARCHITECTURE: token bearer melintas di `app`; `exec` hanya memuat sandbox-manager dan docker-socket-proxy. Temuan review AG-13 WP-1.5a; SECURITY_MODEL perlu diperbarui oleh AG-00.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

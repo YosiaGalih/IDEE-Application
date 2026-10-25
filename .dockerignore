@@ -1,0 +1,15 @@
+# Build context of kodekantor/backend and kodekantor/sandbox-manager: the repository root (infra/compose.yml).
+# Send the daemon only what the Dockerfiles copy, never .git, .env or local virtualenvs. A new COPY source
+# must be added here; the build fails loudly until it is.
+*
+!infra/build/uv-requirements.txt
+!backend/pyproject.toml
+!backend/uv.lock
+!backend/alembic.ini
+!backend/alembic/
+!backend/app/
+!sandbox_manager/pyproject.toml
+!sandbox_manager/uv.lock
+!sandbox_manager/sandbox_manager/
+**/__pycache__
+**/*.pyc

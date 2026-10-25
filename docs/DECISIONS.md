@@ -346,3 +346,11 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 ## ADR-068 — Target non-Linux di luar sandbox
 **Keputusan:** Build iOS/macOS (Flutter/React Native iOS), Windows/.NET Framework, dan emulator Android untuk E2E tidak dijalankan di sandbox VPS; KodeKantor menandainya dan membaca status CI eksternal (runner macOS/Windows milik pengguna) sebagai bukti. Build Android dan web Flutter tetap di sandbox.
 **Konsekuensi:** Tidak ada janji build iOS dari KodeKantor; PO memutuskan runner eksternal bila dibutuhkan (OQ-05).
+
+## Pengecualian keamanan (SECURITY_MODEL §11)
+
+Temuan audit yang belum dapat diperbaiki dicatat di sini: siapa, alasan, mitigasi, tanggal kedaluwarsa. Job CI yang mengabaikan temuan hanya mengabaikannya sampai tanggal kedaluwarsa, lalu merah lagi.
+
+| ID | Temuan | Komponen | Siapa | Alasan | Mitigasi | Kedaluwarsa |
+|---|---|---|---|---|---|---|
+| EX-01 | `PYSEC-2026-4321` (GHSA-hq85-5cpj-mr62): bundle root bawaan uv masih memuat emSign ECC G3 yang kunci intermediate-nya bocor; diperbaiki di uv 0.13.4 | uv 0.11.32: build image (`infra/build/uv-requirements.txt`) dan job CI (`setup-uv`) | Diusulkan Lead (sesi WP-1.5a, temuan M1 review AG-13, 25 Okt 2026); **menunggu persetujuan PO** | uv 0.13.4 dirilis 20 Okt 2026, belum lolos aturan umur dua minggu (PRD v2.2 §8) | `uv sync --locked` memverifikasi hash setiap paket dari `uv.lock`, sehingga MITM TLS tidak dapat menukar paket; uv sendiri dipasang dengan `--require-hashes`; uv tidak ada di image runtime | 2026-11-03. Setelah itu job `infra-config` (langkah "Build tool audit") merah sampai uv dinaikkan ke ≥ 0.13.4 di `infra/build/lock-uv.sh` dan `setup-uv` |

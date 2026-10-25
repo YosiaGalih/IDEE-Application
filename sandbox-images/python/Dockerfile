@@ -14,7 +14,7 @@ COPY requirements.txt /tmp/requirements.txt
 
 # extra_ca (optional build secret): CA bundle for a TLS-intercepting build proxy. Never stored in a layer.
 RUN --mount=type=secret,id=extra_ca,required=false \
-    if [ -f /run/secrets/extra_ca ]; then export PIP_CERT=/run/secrets/extra_ca; fi \
+    if [ -s /run/secrets/extra_ca ]; then export PIP_CERT=/run/secrets/extra_ca; fi \
     && pip install --require-hashes -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt \
     && groupadd --gid 10001 sandbox \
