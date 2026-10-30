@@ -700,7 +700,32 @@ Tanpa CRITICAL/HIGH. Ancaman T3, T5, T8, T10 diuji dengan test dan probe live (p
 Konflik dokumen dari review: #44 (jaringan token sandbox-manager); spec WP-1.5a diperbarui (image `web`, `pull_policy`, `clean-install`).
 
 Utang terbuka (repo belum punya issue; issue WP dibangkitkan dari `wbs_data.py`, jadi dicatat di sini):
-- L1: subnet `edge` tetap + `--forwarded-allow-ips=<subnet>` + test kebijakan.
+- ~~L1: subnet `edge` tetap + `--forwarded-allow-ips=<subnet>` + test kebijakan~~ → ditutup di WP-1.5b.
 - M2 jangka menengah: role owner non-superuser untuk `migrate`.
 - Trivy dan Semgrep belum pernah berjalan (unduhan DB/ruleset diblokir proxy cloud); wajib di job security-scan sebelum G1 (SECURITY_MODEL §11).
-- hadolint, shellcheck, actionlint: WP-1.5b.
+- ~~hadolint, shellcheck, actionlint~~ → WP-1.5b.
+
+### WP-1.5b (🔒) — egress-proxy, linter CI, IP klien hanya dari Caddy (FR-136–137, FR-149, AC-20)
+
+Spec: `docs/superpowers/specs/2026-10-30-wp-1.5b-egress-lint-design.md`. Plan: `docs/superpowers/plans/2026-10-30-wp-1.5b-egress-lint.md`.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `python3 -m unittest discover -s infra/tests` | **35 OK** (kebijakan compose 25, `healthcheck.sh` 5, `prepare-workspace.sh` 5; dirender dengan profil `egress` dan tanpa profil) |
+| Mutasi compose/konfigurasi (10) | merah semua: proxy juga di `app`, `kk-egress` tanpa `name`, `kk-egress` tidak internal, proxy tanpa profil, api percaya `*`, image percaya `*`, entri allowlist tanpa jangkar, `ConnectPort 80` tambahan, `Upstream`, caddy tanpa IP tetap |
+| Mutasi `healthcheck.sh` | tanpa penjaga egress → merah |
+| `tinyproxy.conf` + `allowlist` di tinyproxy 1.11.1 (harness Ubuntu sekali pakai; repo apk Alpine diblokir proxy cloud) | `egress_probe.py` 12/12: tiga registry membuka tunnel; `github.com`, `evilpypi.org`, `pypi.org.evil.com`, IP mentah, port 80/22, HTTP polos → 403; tanpa DNS dan rute langsung; 10 penolakan tercatat di log |
+| Probe terhadap proxy yang salah konfigurasi | `FilterDefaultDeny No` → 7 cek gagal; `ConnectPort 80` tambahan tidak tertangkap probe (filter URL tetap menolak), tertangkap test kebijakan |
+| Linter lokal (image sama dengan CI) | hadolint 2.14.0, shellcheck 0.11.0, actionlint 1.7.12: bersih; mutan `RUN cd`, `ls $x`, `${{ github.event.pull_request.title }}` di `run` → merah |
+| Stack `ci.env` (tanpa profil egress) | healthy; `xff_probe.sh` PASS: XFF palsu dari `web` → kunci `10.231.231.9` (IP web); lewat Caddy → `172.21.0.1` (klien yang dilihat Caddy), bukan IP Caddy |
+| Mutan `FORWARDED_ALLOW_IPS="*"` | `xff_probe.sh` FAIL: `198.51.100.9` dipercaya |
+
+Temuan saat menjalankan:
+- IP tetap caddy diambil container lain (`Address already in use`), lalu diperbaiki dengan `ip_range` dinamis di luar IP caddy, dan test kebijakan ditambah.
+- `xff_probe.sh` versi awal hanya menghapus satu kunci karena `docker compose exec` menelan stdin loop; sekarang dihapus dengan satu perintah di container redis.
+
+Konflik dokumen baru: #45–#48.
+
+Belum:
+- run CI pertama (build image alpine + versi apk tinyproxy yang dipin, probe dengan TLS asli, probe XFF di runner);
+- review AG-13.
