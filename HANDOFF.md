@@ -51,7 +51,7 @@ Review AG-13 WP-1.5a (25 Okt): **SIGNED OFF**. M1 ditutup dengan pengecualian EX
 
 Sisa:
 1. ~~PR #4~~ di-merge 25 Okt. ~~Naikkan uv ke ≥ 0.13.4 (EX-01)~~: PR [#5](https://github.com/YosiaGalih/IDEE-Application/pull/5), CI hijau, menunggu merge.
-2. WP-1.5b: setelah PR #5 di-merge, push commit WP-1.5b dan buka PR. Run CI pertama memastikan versi apk `tinyproxy` (ARG `TINYPROXY_VERSION` di `infra/egress-proxy/Dockerfile` masih tebakan) dan probe egress dengan TLS asli; tutup temuan review AG-13.
+2. WP-1.5b: setelah PR #5 di-merge, push commit WP-1.5b dan buka PR. Versi apk `tinyproxy` dipin 1.11.3-r0 dari run CI pertama; pastikan probe egress dengan TLS asli hijau di CI; tutup temuan review AG-13.
 3. Berikutnya: WP-1.5c (backup/restore), WP-1.4 (frontend), WP-1.6 (G1: Trivy dan Semgrep wajib berjalan di security-scan).
 
 Catatan build lokal di balik proxy TLS (container cloud): `docker compose ... up --build` tidak bisa membaca CA di luar folder proyek. Build image langsung lalu `up --no-build`:

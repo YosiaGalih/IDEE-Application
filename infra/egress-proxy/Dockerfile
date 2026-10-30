@@ -8,7 +8,7 @@
 ARG BASE_REPO=docker.io/library/alpine
 
 FROM ${BASE_REPO}@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-ARG TINYPROXY_VERSION=1.11.2-r1
+ARG TINYPROXY_VERSION=1.11.3-r0
 RUN --mount=type=secret,id=build_ca,required=false \
     cp /etc/ssl/certs/ca-certificates.crt /tmp/ca-bundle.orig \
     && if [ -s /run/secrets/build_ca ]; then cat /run/secrets/build_ca >> /etc/ssl/certs/ca-certificates.crt; fi \

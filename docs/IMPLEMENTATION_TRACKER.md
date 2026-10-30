@@ -727,5 +727,5 @@ Temuan saat menjalankan:
 Konflik dokumen baru: #45–#48.
 
 Belum:
-- run CI pertama (build image alpine + versi apk tinyproxy yang dipin, probe dengan TLS asli, probe XFF di runner);
+- CI: run pertama gagal di build karena versi tebakan `tinyproxy=1.11.2-r1` (alpine 3.24 memuat 1.11.3-r0) → dipin 1.11.3-r0; probe dengan TLS asli dan probe XFF di runner belum berjalan;
 - review AG-13.
