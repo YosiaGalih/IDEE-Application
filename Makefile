@@ -4,7 +4,7 @@ KK_ENV_FILE ?= .env
 export KK_ENV_FILE
 COMPOSE := docker compose -f infra/compose.yml --env-file $(KK_ENV_FILE)
 
-.PHONY: setup sandbox-images workspace config up down ps logs healthcheck
+.PHONY: setup sandbox-images workspace config up down ps logs healthcheck egress-off
 
 setup: ## env file with fresh secrets, sandbox images, workspace folder
 	scripts/gen-secrets.sh
@@ -34,3 +34,7 @@ logs: ## make logs SERVICE=api
 
 healthcheck: ## containers healthy + health endpoints through Caddy
 	scripts/healthcheck.sh --wait 180
+
+egress-off: ## after SANDBOX_EGRESS=off and removing egress from COMPOSE_PROFILES: stop the proxy, drop kk-egress
+	$(COMPOSE) --profile egress rm --stop --force egress-proxy
+	docker network rm kk-egress

@@ -430,9 +430,14 @@ networks:
   exec: {internal: true}
   outbound: {}
   # sandbox-manager attaches task containers to this network by its literal name (SANDBOX_EGRESS_NETWORK).
+  # inhibit_ipv4: the host takes no address on this bridge, so task code reaches egress-proxy and nothing on
+  # the host (review AG-13 WP-1.5b M1); no IPv6 either.
   kk-egress:
     name: kk-egress
     internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: "true"
   egress-out: {}
 
 volumes:

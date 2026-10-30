@@ -75,11 +75,15 @@ jobs:
       - name: Health through Caddy
         run: scripts/healthcheck.sh --wait 120
       # From kk-egress, the way sandbox-manager attaches a task: the three registries answer over real TLS,
-      # everything else is refused, and the refusals reach the proxy log (ADR-007).
+      # everything else is refused and logged, and a service on the runner (0.0.0.0:18999) stays out of
+      # reach, while the same service is reachable from Docker's default bridge (the control).
       - name: Egress allowlist
         run: |
+          python3 -c "import socket; s = socket.create_server(('0.0.0.0', 18999)); [s.accept()[0].close() for _ in iter(int, 1)]" &
+          docker run --rm --entrypoint python kodekantor/sandbox-python:1 -c \
+            "import socket; socket.create_connection(('172.17.0.1', 18999), timeout=5); print('control: runner listener reachable from the default bridge')"
           docker run --rm --network kk-egress -v "$PWD/infra/tests/egress_probe.py:/probe.py:ro" \
-            --entrypoint python kodekantor/sandbox-python:1 /probe.py --strict-tls
+            --entrypoint python kodekantor/sandbox-python:1 /probe.py --strict-tls --host-port 18999
           refused=$(docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" logs egress-proxy | grep -c "Proxying refused")
           echo "refusals logged: $refused"
           test "$refused" -ge 5

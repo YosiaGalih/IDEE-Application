@@ -7,7 +7,8 @@
 # 1. From web (also on edge) straight to api with a forged X-Forwarded-For: the rate-limit key must carry
 #    web's own address, not the forged one.
 # 2. Through Caddy with a forged X-Forwarded-For: Caddy replaces it, api believes Caddy, so the key carries
-#    the client address Caddy saw: neither the forged one nor Caddy's own.
+#    the client address Caddy saw (this host, the gateway of the public network): neither the forged one
+#    nor Caddy's own.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -26,6 +27,7 @@ in_redis "redis-cli --scan --pattern 'kk:rl:login:*' | xargs -r redis-cli del >/
 
 web_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$("${compose[@]}" ps -q web)")
 web_ip=${web_ip%% *}
+client_ip=$(docker network inspect kodekantor_public -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')
 "${compose[@]}" exec -T web wget -q -O /dev/null --header 'X-Forwarded-For: 198.51.100.9' \
   --header 'Content-Type: application/json' --post-data "$body" http://api:8000/api/v1/auth/login || true
 
@@ -36,11 +38,12 @@ code=$(curl "${curl_opts[@]}" -H 'X-Forwarded-For: 198.51.100.10' -H 'Content-Ty
 [[ "$code" == "401" || "$code" == "429" ]] || fail "login through Caddy answered $code, expected 401"
 
 mapfile -t keys < <(in_redis "redis-cli --scan --pattern 'kk:rl:login:*'" | sed 's/^kk:rl:login://' | sort)
-echo "xff probe: rate-limit keys: ${keys[*]} (web $web_ip, caddy $caddy_ip)"
+echo "xff probe: rate-limit keys: ${keys[*]} (web $web_ip, client $client_ip, caddy $caddy_ip)"
 for ip in "${keys[@]}"; do
   [[ "$ip" == 198.51.100.* ]] && fail "a forged X-Forwarded-For was believed ($ip)"
   [[ "$ip" == "$caddy_ip" ]] && fail "the key is Caddy's address: api does not believe Caddy's X-Forwarded-For"
 done
 printf '%s\n' "${keys[@]}" | grep -qx "$web_ip" || fail "no key for web ($web_ip)"
+printf '%s\n' "${keys[@]}" | grep -qx "$client_ip" || fail "no key for the client Caddy saw ($client_ip)"
 (( ${#keys[@]} == 2 )) || fail "expected 2 keys (web and the client behind Caddy), got ${#keys[@]}"
 echo "xff probe: PASS (forged headers ignored; Caddy's X-Forwarded-For believed)"

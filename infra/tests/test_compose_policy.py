@@ -235,6 +235,10 @@ class ComposePolicy(unittest.TestCase):
         egress-out is the proxy's only way out. No compose service but the proxy joins either."""
         networks = self.config["networks"]
         self.assertEqual(networks["kk-egress"]["name"], "kk-egress", "fixed name: no compose project prefix")
+        # Review AG-13 WP-1.5b M1: without this the host owns the bridge gateway address, and task code on
+        # kk-egress reaches every host service listening on 0.0.0.0.
+        self.assertEqual(networks["kk-egress"].get("driver_opts"), {"com.docker.network.bridge.inhibit_ipv4": "true"})
+        self.assertIs(networks["kk-egress"].get("enable_ipv6"), False)
         for network in ("kk-egress", "egress-out"):
             members = {name for name, svc in self.services.items() if network in svc.get("networks", {})}
             self.assertEqual(members, {"egress-proxy"}, network)
@@ -264,6 +268,7 @@ class ComposePolicy(unittest.TestCase):
         for key, value in {
             "FilterURLs": "On", "FilterType": "ere", "FilterDefaultDeny": "Yes", "ConnectPort": "443",
             "DisableViaHeader": "Yes", "XTinyproxy": "No",
+            "LogLevel": "Connect",  # every requested target is logged, allowed or refused (review M1.5b L1)
         }.items():
             self.assertEqual(conf.get(key), [value], key)
         for key in ("Upstream", "Allow", "Deny", "BasicAuth", "ReverseOnly", "ReversePath"):
