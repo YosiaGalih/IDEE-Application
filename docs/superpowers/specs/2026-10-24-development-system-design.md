@@ -307,6 +307,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - TOOL_CATALOG `pip install --target /workspace/.kk/site` menulis ke `.kk` yang per run, 8 MiB, dan dihapus (lihat #36).
     - Nilai profil `network`: TOOL_CATALOG `egress`, kode `egress-allowed`.
 48. **Variabel infra baru belum ada di CONFIGURATION:** `COMPOSE_PROFILES` (menyalakan egress-proxy), `KK_EDGE_SUBNET`, `KK_EDGE_IP_RANGE`, `KK_EDGE_CADDY_IP` (IP Caddy yang dipercaya api, temuan L1). Daftar image Trivy di SECURITY_MODEL §11 belum memuat `egress-proxy`. Kontrak perlu diperbarui oleh AG-00.
+49. **Risiko sisa egress belum tercatat di SECURITY_MODEL** (review AG-13 WP-1.5b, M2): allowlist CONNECT tidak mencegah eksfiltrasi lewat CDN multi-tenant (SNI) atau penulisan ke `registry.npmjs.org`. SECURITY_MODEL §4/§13 dan gate G4 perlu memuat syarat "dep-proxy read-only (ADR-064) atau SNI splice + install tanpa skrip sebelum profil `egress-allowed` pertama". Rinciannya di spec WP-1.5b bagian "Risiko sisa".
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
