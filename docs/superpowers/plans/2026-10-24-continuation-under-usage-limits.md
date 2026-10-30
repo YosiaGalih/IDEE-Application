@@ -59,7 +59,7 @@ U1 dan U2 sedang berjalan di sesi 24 Okt; sebagian perubahan U1 mungkin sudah te
 
 Prasyarat:
 - git;
-- `uv` 0.11.x;
+- `uv` 0.13.x;
 - Python 3.12;
 - Docker Engine;
 - PostgreSQL 16 dan Redis 7 (atau container);

@@ -171,6 +171,7 @@ Spec: `docs/superpowers/specs/2026-10-24-wp-1.1a-backend-core-skeleton-design.md
 | Migrasi | `alembic upgrade head` → `downgrade base` → `upgrade head` | exit 0 ×3 (belum ada revisi; `0001_initial` = WP-1.1b) |
 | Registry | `python scripts/validate_registry.py agents/registry.v2.yaml` | `OK: 53 agents (41 specialists + ORCH + 11 K2) — schema_version 2` |
 | Audit dependensi | `uvx pip-audit --strict -r <uv export>` | No known vulnerabilities found. Sebelumnya `certifi 2026.7.22` PYSEC-2026-4320; dinaikkan ke 2026.10.23 lewat pengecualian umur per paket di `pyproject.toml`. |
+| Audit uv (alat build, 30 Okt) | `uvx pip-audit --strict -r infra/build/uv-requirements.txt` | No known vulnerabilities found. Sebelumnya uv 0.11.32 PYSEC-2026-4321 (EX-01); dinaikkan ke 0.13.4 (rilis 20 Okt) lewat pengecualian umur per paket di `infra/build/lock-uv.sh`. Dengan uv 0.13.4: `uv sync --locked` tidak mengubah kedua `uv.lock`; backend 1243 passed, 1 skipped; sandbox_manager 151 passed; image ter-build; stack `ci.env` healthy, live/ready/`/` 200 lewat Caddy. |
 | CI | `.github/workflows/backend.yml` | ⬜ belum berjalan — push ke GitHub ditolak 403 (akses Claude GitHub App belum ada) |
 
 Gap yang diketahui:

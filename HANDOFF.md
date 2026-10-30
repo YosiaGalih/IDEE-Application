@@ -51,7 +51,7 @@ Review AG-13 WP-1.5a (25 Okt): **SIGNED OFF**. M1 ditutup dengan pengecualian EX
 
 Sisa:
 1. Pastikan CI PR [#4](https://github.com/YosiaGalih/IDEE-Application/pull/4) hijau pada commit terakhir, lalu PO me-merge.
-2. **Sebelum 2026-11-04:** naikkan uv ke ≥ 0.13.4 di `infra/build/lock-uv.sh` (lalu jalankan skrip itu) dan di `setup-uv` semua workflow. Mulai 2026-11-04 langkah "Build tool audit" sengaja merah (EX-01).
+2. ~~Naikkan uv ke ≥ 0.13.4 sebelum 2026-11-04 (EX-01)~~: selesai 30 Okt (uv 0.13.4).
 3. Berikutnya: WP-1.5b (egress-proxy + hadolint/shellcheck/actionlint, plus L1 `--forwarded-allow-ips`), WP-1.5c (backup/restore), WP-1.4 (frontend), WP-1.6 (G1: Trivy dan Semgrep wajib berjalan di security-scan).
 
 Catatan build lokal di balik proxy TLS (container cloud): `docker compose ... up --build` tidak bisa membaca CA di luar folder proyek. Build image langsung lalu `up --no-build`:
@@ -65,7 +65,7 @@ docker compose -f infra/compose.yml --env-file infra/tests/ci.env up -d --no-bui
 ## Cara melanjutkan dengan langganan (bukan kredit cloud)
 
 1. **Di mesin sendiri (disarankan; tanpa biaya cloud).**
-   - Pasang git, Docker Engine ≥ 27 + Compose, uv 0.11.x, Python 3.12, PostgreSQL 16, dan Redis 7 (atau jalankan keduanya sebagai container).
+   - Pasang git, Docker Engine ≥ 27 + Compose, uv 0.13.x, Python 3.12, PostgreSQL 16, dan Redis 7 (atau jalankan keduanya sebagai container).
    - Clone repo, `git checkout claude/gracious-goodall-3hjh19`, `git pull`.
    - Login Claude Code dengan akun langganan, lalu jalankan `claude` di folder repo. Pemakaian dihitung ke limit sesi dan limit mingguan, bukan kredit.
 2. **Cek kuota di awal sesi** (`/usage` atau `/status`), lalu pilih satu unit yang muat (rencana §3).

@@ -25,14 +25,10 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
         with:
-          version: "0.11.32"
-      # The uv that builds the images (SECURITY_MODEL §11). PYSEC-2026-4321 is excepted until 2026-11-03
-      # (DECISIONS.md, EX-01); from 2026-11-04 this step fails until uv is raised to >= 0.13.4.
+          version: "0.13.4"
+      # The uv that builds the images (SECURITY_MODEL §11): no exception (EX-01 closed by uv 0.13.4).
       - name: Build tool audit (pip-audit)
-        run: |
-          ignore=()
-          if [[ "$(date -u +%F)" < "2026-11-04" ]]; then ignore=(--ignore-vuln PYSEC-2026-4321); fi
-          uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict "${ignore[@]}" -r infra/build/uv-requirements.txt
+        run: uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict -r infra/build/uv-requirements.txt
       - name: Compose policy
         run: python3 -m unittest discover -s infra/tests -v
       - name: Caddyfile
