@@ -9,8 +9,10 @@
 # - every service runs with no-new-privileges, cap_drop ALL and a read-only rootfs;
 # - each service gets only the variables it needs (DEPLOYMENT §7); ANTHROPIC_API_KEY only reaches worker;
 # - the workspace is bind-mounted at the same path as on the host, and WORKSPACE_ROOT is derived from it
-#   (ADR-005).
-# egress-proxy and the kk-egress network arrive in WP-1.5b; the real web image in WP-1.4.
+#   (ADR-005);
+# - egress-proxy and kk-egress exist only with COMPOSE_PROFILES=egress (ADR-007, RUNBOOK §11);
+# - api believes proxy headers only from Caddy's fixed address on edge.
+# The real web image arrives in WP-1.4.
 
 name: kodekantor
 
@@ -108,7 +110,10 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     tmpfs: [/tmp]
-    networks: [public, edge]
+    networks:
+      public: {}
+      # api trusts X-Forwarded-For only from this address (FORWARDED_ALLOW_IPS); review AG-13 WP-1.5a L1.
+      edge: {ipv4_address: "${KK_EDGE_CADDY_IP:-10.231.231.2}"}
     depends_on:
       web: {condition: service_healthy}
       api: {condition: service_started}
@@ -148,6 +153,7 @@ services:
     init: true
     environment:
       <<: *backend-env
+      FORWARDED_ALLOW_IPS: "${KK_EDGE_CADDY_IP:-10.231.231.2}"  # uvicorn: proxy headers from Caddy only
     volumes: *backend-volumes
     tmpfs: ["/tmp:size=512m"]
     networks: [edge, app]
@@ -386,12 +392,48 @@ services:
       resources:
         limits: {cpus: "0.25", memory: 128M, pids: 128}
 
+  # ADR-007: the only way out of kk-egress, for dependency installs when SANDBOX_EGRESS=allowlist. CONNECT to
+  # pypi.org, files.pythonhosted.org and registry.npmjs.org on 443; everything else is refused and logged.
+  # Started only with COMPOSE_PROFILES=egress, after the security gate (RUNBOOK §11).
+  egress-proxy:
+    <<: *hardened
+    profiles: [egress]
+    image: kodekantor/egress-proxy:${KK_IMAGE_TAG:-dev}
+    build:
+      context: ..
+      dockerfile: infra/egress-proxy/Dockerfile
+      secrets: [build_ca]
+    pull_policy: never
+    user: "100:101"
+    tmpfs: [/tmp]
+    networks: [kk-egress, egress-out]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "3128"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits: {cpus: "0.25", memory: 128M, pids: 128}
+
 networks:
   public: {}
-  edge: {internal: true}
+  # Fixed so api can name Caddy in FORWARDED_ALLOW_IPS. Other containers get addresses from ip_range only,
+  # which leaves Caddy's address free whatever the start order. Change the three KK_EDGE_* values together.
+  edge:
+    internal: true
+    ipam:
+      config:
+        - subnet: "${KK_EDGE_SUBNET:-10.231.231.0/28}"
+          ip_range: "${KK_EDGE_IP_RANGE:-10.231.231.8/29}"
   app: {internal: true}
   exec: {internal: true}
   outbound: {}
+  # sandbox-manager attaches task containers to this network by its literal name (SANDBOX_EGRESS_NETWORK).
+  kk-egress:
+    name: kk-egress
+    internal: true
+  egress-out: {}
 
 volumes:
   pgdata: {}

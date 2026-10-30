@@ -11,5 +11,7 @@
 !sandbox_manager/pyproject.toml
 !sandbox_manager/uv.lock
 !sandbox_manager/sandbox_manager/
+!infra/egress-proxy/tinyproxy.conf
+!infra/egress-proxy/allowlist
 **/__pycache__
 **/*.pyc

@@ -4,7 +4,8 @@
 #   scripts/healthcheck.sh [--wait SECONDS]          (env file: KK_ENV_FILE, default .env)
 #
 # Healthy means: all 10 services exist, every long-running one reports "healthy", migrate exited 0, and
-# through Caddy /api/v1/health/live, /api/v1/health/ready and / answer 200. Exit 1 otherwise.
+# through Caddy /api/v1/health/live, /api/v1/health/ready and / answer 200. With SANDBOX_EGRESS=allowlist the
+# egress-proxy (COMPOSE_PROFILES=egress) must run and be healthy too (ADR-007). Exit 1 otherwise.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,14 +15,16 @@ if [[ "${1:-}" == "--wait" ]]; then wait_s=${2:?--wait needs seconds}; fi
 compose=(docker compose -f infra/compose.yml --env-file "$env_file")
 domain=$(sed -n 's/^APP_DOMAIN=//p' "$env_file" | tail -1)
 [[ -n "$domain" ]] || { echo "healthcheck: APP_DOMAIN missing in $env_file" >&2; exit 1; }
+egress=$(sed -n 's/^SANDBOX_EGRESS=//p' "$env_file" | tail -1)
 
 report=$(mktemp)
 trap 'rm -f "$report"' EXIT
 
 containers_ok() {
-  local bad=0 count=0 service health status
+  local bad=0 count=0 proxy=0 service health status
   while IFS='|' read -r service health status; do  # '|' is not whitespace: an empty health stays empty
     count=$((count + 1))
+    [[ "$service" == "egress-proxy" ]] && proxy=1
     if [[ "$service" == "migrate" ]]; then
       [[ "$status" == Exited\ \(0\)* ]] || { echo "  migrate: $status"; bad=1; }
     elif [[ "$health" != "healthy" ]]; then
@@ -29,6 +32,9 @@ containers_ok() {
     fi
   done < <("${compose[@]}" ps -a --format '{{.Service}}|{{.Health}}|{{.Status}}')
   (( count >= 10 )) || { echo "  only $count of 10 services exist"; bad=1; }
+  if [[ "$egress" == "allowlist" ]] && (( ! proxy )); then
+    echo "  SANDBOX_EGRESS=allowlist but egress-proxy is not running (set COMPOSE_PROFILES=egress)"; bad=1
+  fi
   return "$bad"
 }
 
