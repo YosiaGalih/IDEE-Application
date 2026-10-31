@@ -12,8 +12,9 @@
 #   SHA256SUMS           checksums of the four files above
 # The backup is assembled in kodekantor-<UTC>.partial/ and renamed only when complete. Then backups older
 # than BACKUP_RETENTION_DAYS are removed: only folders named exactly kodekantor-YYYYMMDDTHHMMSSZ.
-# .env and other secrets are never copied. --quiesce stops api, worker and scheduler while the database
-# and workspaces are copied (upgrades); without it the dump is consistent but the workspace tar is live.
+# .env and other secrets are never copied. --quiesce stops api, worker, scheduler and sandbox-manager while
+# the database and workspaces are copied (upgrades). Without it the dump is consistent but the workspace tar
+# is live: a file that changes while it is read is kept as read, with "workspace_consistent": false.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,6 +41,7 @@ image_tag=$(setting KK_IMAGE_TAG); image_tag=${image_tag:-dev}
 plain_path BACKUP_DIR "$backup_dir"
 plain_path WORKSPACE_HOST_PATH "$workspace"
 [[ "$retention" =~ ^[1-9][0-9]{0,3}$ ]] || fail "BACKUP_RETENTION_DAYS must be a whole number of days (got: $retention)"
+[[ "$image_tag" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || fail "KK_IMAGE_TAG has unexpected characters (got: $image_tag)"
 [[ -d "$workspace" ]] || fail "$workspace does not exist"
 
 compose=(docker compose -f infra/compose.yml --env-file "$env_file")
@@ -49,6 +51,7 @@ query() { in_pg "psql -X -A -t -F '|' -v ON_ERROR_STOP=1 -h 127.0.0.1 -U kodekan
 
 umask 077
 mkdir -p "$backup_dir"
+[[ -O "$backup_dir" && ! -L "$backup_dir" && ! -L "$backup_dir/.lock" ]] || fail "$backup_dir must be a folder owned by $(id -un)"
 chmod 0700 "$backup_dir"
 exec 9>"$backup_dir/.lock"
 flock -n 9 || fail "another backup or restore holds $backup_dir/.lock"
@@ -60,17 +63,20 @@ work="$final.partial"
 mkdir "$work"
 
 stopped=0
+quiesced=(api worker scheduler sandbox-manager)
 cleanup() {
   local status=$?
-  if (( stopped )); then "${compose[@]}" start api worker scheduler >/dev/null 2>&1 || true; fi
+  if (( stopped )) && ! "${compose[@]}" start "${quiesced[@]}" >/dev/null; then
+    echo "backup: could not start ${quiesced[*]} again: start them with make up" >&2
+  fi
   if (( status != 0 )); then rm -rf -- "$work"; echo "backup: failed, nothing kept" >&2; fi
 }
 trap cleanup EXIT
 
 if (( quiesce )); then
-  echo "backup: stopping api, worker and scheduler"
+  echo "backup: stopping ${quiesced[*]}"
   stopped=1
-  "${compose[@]}" stop api worker scheduler >/dev/null
+  "${compose[@]}" stop "${quiesced[@]}" >/dev/null
 fi
 
 echo "backup: database -> postgres.dump"
@@ -88,13 +94,21 @@ done
 
 echo "backup: $workspace -> workspaces.tar.gz"
 # posix (pax) format: keeps sub-second mtimes and long names; GNU's default keeps whole seconds only.
+# Exit 1 means a file changed while it was read (live backup): it is kept as read and the manifest says so.
+consistent=true
+tar_status=0
 tar --create --gzip --format=posix --numeric-owner --file "$work/workspaces.tar.gz" --directory "$workspace" \
-  --exclude=node_modules --exclude=.venv --exclude=__pycache__ \
-  --no-wildcards-match-slash --exclude='./*/uploads' --exclude='./*/.kk-runs' .  # project level only
+  --exclude=node_modules --exclude=.venv --exclude=__pycache__ --exclude='./.pre-restore-*' \
+  --no-wildcards-match-slash --exclude='./*/uploads' --exclude='./*/.kk-runs' . || tar_status=$?  # project level only
+case "$tar_status" in
+  0) ;;
+  1) consistent=false; echo "backup: warning: files changed while being archived; use --quiesce for a consistent copy" >&2 ;;
+  *) fail "tar failed with status $tar_status" ;;
+esac
 tar --list --verbose --gzip --numeric-owner --file "$work/workspaces.tar.gz" > "$work/workspaces.manifest"
 
 if (( stopped )); then
-  "${compose[@]}" start api worker scheduler >/dev/null
+  "${compose[@]}" start "${quiesced[@]}" >/dev/null
   stopped=0
 fi
 
@@ -111,6 +125,7 @@ cat > "$work/manifest.json" <<JSON
   "sizes": {"postgres.dump": $(size postgres.dump), "workspaces.tar.gz": $(size workspaces.tar.gz), "workspaces.manifest": $(size workspaces.manifest)},
   "workspace_path": "$workspace",
   "quiesced": $( (( quiesce )) && echo true || echo false ),
+  "workspace_consistent": $consistent,
   "retention_days": $retention
 }
 JSON

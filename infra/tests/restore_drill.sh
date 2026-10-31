@@ -25,7 +25,8 @@ cat "$env_file" > "$drill_env"
 printf 'BACKUP_DIR=%s/backups\nBACKUP_RETENTION_DAYS=14\n' "$work" >> "$drill_env"
 export KK_ENV_FILE="$drill_env"
 
-sql() { "${compose[@]}" exec -T postgres sh -c "export PGPASSWORD=\"\$POSTGRES_PASSWORD\"; psql -X -A -t -v ON_ERROR_STOP=1 -h 127.0.0.1 -U kodekantor -d kodekantor -c \"$1\"" </dev/null; }
+sql_in() { "${compose[@]}" exec -T postgres sh -c "export PGPASSWORD=\"\$POSTGRES_PASSWORD\"; psql -X -A -t -v ON_ERROR_STOP=1 -h 127.0.0.1 -U kodekantor -d $1 -c \"$2\"" </dev/null; }
+sql() { sql_in kodekantor "$1"; }
 as_owner() { setpriv --reuid=10001 --regid=10001 --clear-groups env HOME=/tmp "$@"; }
 # Everything backup keeps, with nanosecond mtimes and content hashes.
 snapshot() {
@@ -83,7 +84,11 @@ as_owner git -C "$project/repo" fsck --no-progress >/dev/null || fail "git fsck 
 [[ "$(sql 'SELECT count(*) FROM audit_events')" == $((manifest_audits + 1)) ]] || fail "audit rows are not backup + ops.restore"
 previous=$(find "$(dirname "$workspace")" -maxdepth 1 -name "$(basename "$workspace").pre-restore-*" -type d | sort | tail -1)
 [[ -f "$previous/drill-$$/repo/new.txt" ]] || fail "pre-restore copy does not hold the damaged state"
-pass "restore: database and workspace equal the backup (modes, owners, mtimes, sha256), git fsck clean, ops.restore recorded"
+pre_db=$(sql_in postgres "SELECT datname FROM pg_database WHERE datname LIKE 'kodekantor_pre_restore_%' ORDER BY datname DESC LIMIT 1")
+[[ -n "$pre_db" ]] || fail "the previous database was not kept"
+[[ "$(sql_in "$pre_db" "SELECT count(*) FROM audit_events WHERE action = 'drill.damage'")" == 1 ]] \
+  || fail "$pre_db does not hold the damaged state"
+pass "restore: database and workspace equal the backup (modes, owners, mtimes, sha256), git fsck clean, ops.restore recorded, previous database and workspace kept"
 
 # --- a changed byte is refused before anything stops ------------------------------------------------------
 tampered="$work/backups/kodekantor-20000101T000000Z"
@@ -95,5 +100,6 @@ grep -q "checksums do not match" "$work/tampered.log" || fail "tampered backup r
 [[ "$("${compose[@]}" ps -q --status running api)" == "$api_before" && -n "$api_before" ]] || fail "services stopped for a refused restore"
 pass "tampered backup refused before any service stopped"
 
+sql_in postgres "DROP DATABASE $pre_db" >/dev/null
 rm -rf -- "$previous" "$project"
 echo "restore drill: all checks passed"

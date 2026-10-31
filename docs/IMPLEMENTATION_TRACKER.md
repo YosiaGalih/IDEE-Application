@@ -771,6 +771,35 @@ Temuan saat menjalankan:
 - Format tar GNU hanya menyimpan mtime per detik → diganti format pax.
 - Ekstraksi sebagai uid 10001 gagal bila folder induk tidak bisa dijangkau 10001, padahal workspace lama sudah dipindah → sekarang dicek sebelum apa pun disentuh.
 
-Konflik dokumen baru: #50–#54. RUNBOOK §7 diselaraskan.
+Konflik dokumen baru: #50–#55. RUNBOOK §7 diselaraskan.
 
-Belum: run CI pertama (drill di runner), review AG-13.
+CI di runner GitHub, [job clean-install 124445841969](https://github.com/YosiaGalih/IDEE-Application/actions/runs/41170047303/job/124445841969) (43a4ef6, profil `egress`): drill `all checks passed`, restore 35 dtk.
+
+#### Review AG-13 (`kk-security-reviewer`) @ 43a4ef6 — **SIGNED OFF** [Kemungkinan Besar]
+
+Tanpa CRITICAL/HIGH. Yang terbukti saat review:
+- 14 arsip jahat (path absolut, `..`, symlink/hardlink keluar, device) tidak bisa menulis di luar workspace saat diekstrak sebagai 10001.
+- Interpolasi SQL `ops.restore` aman.
+- 0 secret di 113.296 sampel argv selama drill nyata.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| M1 `pg_restore` sebagai superuser; `SHA256SUMS` hanya integritas | sesudah load, role harus tepat `kodekantor:true,kodekantor_app:false`; RUNBOOK dan header skrip menyatakan keaslian datang dari alat off-site; risiko sisa → konflik #55 | test dump yang menambah role/superuser ditolak; mutan tanpa cek → merah |
+| M2 DB di-drop sebelum dump terbukti | pre-flight `pg_restore --list` sebelum service berhenti; DB lama di-rename `kodekantor_pre_restore_<utc>` (bukan DROP); trap mencetak langkah kembali | test load gagal → DB lama tersimpan + instruksi; mutan DROP → merah; drill memeriksa DB lama berisi keadaan rusak. **Live:** cek role yang salah di drill menghentikan restore dan mencetak instruksi rollback yang benar |
+| M3 arsip melonggarkan mode root / setuid | `chmod 0750` root + buang bit setuid/setgid setelah ekstraksi; RUNBOOK: mount `nosuid,nodev` | test root 0777 + file 4755 → 0750 / 0755; mutan → merah |
+| M4 nama file ber-newline mematahkan hitungan | hitung entri dengan `find -printf . \| wc -c` | test nama `two\nlines.txt` lulus; mutan → merah |
+| M5 backup live gagal bila file berubah | exit 1 tar diterima, `workspace_consistent: false` + peringatan; exit ≥ 2 tetap gagal; RUNBOOK: alert umur backup > 26 jam | 2 test (status 1 / 2); mutan → merah |
+| M6 workspace sebagai mount point; ruang disk | mount point: pohon lama ke `<path>/.pre-restore-<UTC>` (0700, dikecualikan backup); cek folder asli milik 10001 dan ruang untuk salinan kedua sebelum apa pun berhenti | test tmpfs mount point + test ruang kurang; mutan → merah |
+| L1 kunci setelah verifikasi / dilewati | `mkdir` + `flock` paling awal | test kunci dipegang → ditolak tanpa panggilan docker |
+| L2 folder backup bisa ditulis pihak lain / symlink | wajib milik root, tanpa tulis g/o, file biasa | test 0777 dan symlink ditolak |
+| L3 quiesce tanpa sandbox-manager / restart diam | sandbox-manager ikut dihentikan; gagal start dilaporkan | test quiesce |
+| L4 pemilik `BACKUP_DIR`, symlink `.lock` | wajib milik user yang menjalankan, tanpa symlink | test folder milik 65534 ditolak |
+| L5 symlink keluar workspace bertahan | sudah dimitigasi `sandbox_manager/validation.py` (subpath tidak boleh melintasi symlink); konsumen lain (gitops) wajib memakai cek yang sama | catatan |
+| L6 `KK_IMAGE_TAG` tidak divalidasi | divalidasi pola `[A-Za-z0-9._-]` | test setting tidak aman |
+
+Bukti setelah perbaikan:
+- `test_backup_restore.py` 28 test: OK sebagai root (1 skip), dan sebagai non-root (5 skip, butuh root).
+- 6 mutan baru merah.
+- Drill lokal PASS: restore 34 dtk, DB lama tersimpan.
+
+Utang: scanner (gitleaks, semgrep, trivy) belum pernah dijalankan atas diff ini; gate security-scan sebelum G1.

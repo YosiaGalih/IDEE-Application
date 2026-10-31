@@ -191,7 +191,9 @@ Aturan backup:
 - **Atomik:** backup disusun di `kodekantor-<UTC>.partial/` dan di-rename hanya bila semua langkah lulus. Backup yang gagal dihapus.
 - **Kunci:** `$BACKUP_DIR/.lock` mencegah backup dan restore berjalan bersamaan.
 - **Retensi:** `BACKUP_RETENTION_DAYS` (default 14). Retensi hanya menghapus folder bernama persis `kodekantor-YYYYMMDDTHHMMSSZ` yang lebih tua dari batas itu; folder lain di `BACKUP_DIR` tidak disentuh.
-- **Konsistensi:** tanpa `--quiesce`, dump DB konsisten tetapi tar workspace diambil saat stack berjalan. `--quiesce` menghentikan api/worker/scheduler selama penyalinan; pakai saat upgrade (§6).
+- **Konsistensi:** tanpa `--quiesce`, dump DB konsisten tetapi tar workspace diambil saat stack berjalan. File yang berubah saat dibaca disimpan apa adanya dengan peringatan, dan `manifest.json` mencatat `"workspace_consistent": false`. `--quiesce` menghentikan api/worker/scheduler/sandbox-manager selama penyalinan; pakai saat upgrade (§6).
+- **Pantau:** backup gagal hanya tercatat di log cron. Pasang alert bila backup terbaru di `$BACKUP_DIR` berumur lebih dari 26 jam, mis. `find /var/backups/kodekantor -maxdepth 1 -name 'kodekantor-*' -mmin -1560 | grep -q .`.
+- **Volume:** mount `/srv/kodekantor` dengan `nosuid,nodev`.
 - **Secret:** `.env` **tidak** ikut. Simpan salinannya di password manager / secret store.
 - **Yang tidak di-backup:** Redis (dapat dibuang) dan sertifikat Caddy (diterbitkan ulang, perhatikan rate limit Let's Encrypt saat pindah VM).
 
@@ -212,24 +214,32 @@ scripts/restore.sh --workspace-only <dir>
 ```
 
 Langkah skrip (sebagai root):
-1. **Validasi, sebelum apa pun disentuh.**
-   - Nama folder `kodekantor-<UTC>`.
-   - `SHA256SUMS` memuat tepat keempat file dan harus lulus `sha256sum --check --strict`.
-   - Untuk restore workspace, uid 10001 harus bisa menjangkau folder induk `WORKSPACE_HOST_PATH` (0755).
-   - Konfirmasi `RESTORE`.
+1. **Validasi, sebelum apa pun disentuh:**
+   - kunci `$BACKUP_DIR/.lock`;
+   - folder `kodekantor-<UTC>` milik root, tidak bisa ditulis pihak lain, dan berisi file biasa (bukan symlink);
+   - `SHA256SUMS` memuat tepat keempat file dan lulus `sha256sum --check --strict`;
+   - `pg_restore --list` bisa membaca dump;
+   - untuk workspace: folder asli milik 10001:10001, folder induknya bisa dijangkau uid 10001 (0755), dan ruang cukup untuk salinan kedua.
+
+   Lalu konfirmasi `RESTORE`.
+
+   `SHA256SUMS` hanya membuktikan salinan utuh, **bukan** asal-usulnya: `pg_restore` menjalankan SQL dari dump sebagai owner (superuser). Keaslian datang dari alat off-site yang terautentikasi (restic, rclone crypt); jangan me-restore folder yang bisa diubah pihak lain.
 2. **Hentikan semua penulis:** caddy, web, api, worker, scheduler, sandbox-manager, egress-proxy, dan container task sandbox (`kk.managed=1`). postgres tetap jalan.
 3. **DB.**
    - Role `kodekantor_app` harus ada; bila belum, jalankan `make up` sekali agar postgres menginisialisasinya.
-   - `DROP DATABASE … WITH (FORCE)` → `CREATE DATABASE … OWNER kodekantor` → ACL database dipasang ulang: `REVOKE ALL … FROM PUBLIC`, `GRANT CONNECT … TO kodekantor_app`. ACL ini hilang bersama `DROP`.
+   - DB lama **disimpan** sebagai `kodekantor_pre_restore_<utc>` (rename, CONNECT dicabut).
+   - DB baru dibuat dengan ACL `REVOKE ALL … FROM PUBLIC` dan `GRANT CONNECT … TO kodekantor_app`.
    - `pg_restore --exit-on-error --single-transaction`.
+   - Setelah load, tidak boleh muncul role baru atau superuser selain `kodekantor`.
    - Event audit `ops.restore` (actor `restore.sh`, metadata `backup`, `backup_time`, `restored_at`) dicatat di DB hasil restore, karena restore memutar balik jejak audit.
 4. **Workspace.**
-   - Folder lama dipindah ke `<path>.pre-restore-<UTC>`, lalu folder baru dibuat 10001:10001 0750.
+   - Pohon lama dipindah ke `<path>.pre-restore-<UTC>`. Bila `<path>` adalah mount point (volume terpisah, §9), pohon lama masuk ke `<path>/.pre-restore-<UTC>` (0700 root); folder itu tidak ikut backup berikutnya.
    - Arsip diekstrak **sebagai uid 10001**, jadi arsip yang diubah tidak bisa menulis di luar wilayah 10001.
+   - Setelah ekstraksi, folder root dikembalikan ke 0750 dan bit setuid/setgid dibuang.
    - Jumlah entri harus sama dengan `workspaces.manifest`.
 5. **Nyalakan:** `docker compose up -d --wait` (migrate ke head + `grant-runtime-role`) → `healthcheck.sh --wait 180`. Skrip lalu menampilkan RTO dan waktu backup (RPO).
 
-Redis **tidak** di-restore (hanya broker/pub-sub); task yang terputus menjadi `interrupted` dan bisa di-resume. Hapus `<path>.pre-restore-*` setelah verifikasi.
+Bila gagal setelah langkah 2, service tetap mati dan skrip mencetak apa yang disimpan serta perintah untuk kembali (rename DB lama, folder pre-restore, `make up`). Redis **tidak** di-restore (hanya broker/pub-sub); task yang terputus menjadi `interrupted` dan bisa di-resume. Setelah verifikasi, hapus `kodekantor_pre_restore_*` (`DROP DATABASE`) dan folder `pre-restore`; perintah persisnya dicetak skrip.
 
 ### 7.3 Restore drill (bulanan, wajib PRD §7.5)
 

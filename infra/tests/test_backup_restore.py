@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -22,8 +23,10 @@ printf '%s\\n' "$*" >> "$KK_STUB_LOG"
 case "$*" in
   *"pg_dump"*) [ -n "$KK_STUB_DUMP_FAIL" ] && exit 1; cat "$KK_STUB_DUMP" ;;
   *"pg_restore --list"*) cat >/dev/null; printf '%s\\n' "$KK_STUB_LIST" ;;
-  *"pg_restore --exit-on-error"*) cat > "$KK_STUB_RESTORED" ;;
+  *"pg_restore --exit-on-error"*) cat > "$KK_STUB_RESTORED"; [ -z "$KK_STUB_RESTORE_FAIL" ] ;;
+  *"string_agg(rolname"*) echo "${KK_STUB_ROLES:-kodekantor:true,kodekantor_app:false}" ;;
   *"FROM pg_roles"*) echo 1 ;;
+  *"FROM pg_database"*) echo 1 ;;
   *"string_agg(version_num"*) echo '0003_tasks|1|2|3|4|16.15' ;;
   *"ps -a --format"*) cat "$KK_STUB_PS" ;;
 esac
@@ -88,6 +91,12 @@ class Scripts(unittest.TestCase):
             path = self.workspace / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
+        self.own_workspace()
+
+    def own_workspace(self) -> None:
+        """As in production (prepare-workspace.sh): the tree belongs to uid 10001. Only root can arrange that."""
+        if os.geteuid() == 0:
+            subprocess.run(["chown", "-R", "10001:10001", str(self.workspace)], check=True)
 
     def run_script(self, *args: str, stdin: str = "") -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -123,6 +132,7 @@ class Backup(Scripts):
         self.assertEqual(manifest["counts"], {"users": 1, "projects": 2, "tasks": 3, "audit_events": 4})
         self.assertEqual(manifest["alembic_revision"], "0003_tasks")
         self.assertIs(manifest["quiesced"], False)
+        self.assertIs(manifest["workspace_consistent"], True)
 
     def test_workspace_archive_skips_only_rebuildable_and_temporary_files(self) -> None:
         listing = (self.backup() / "workspaces.manifest").read_text()
@@ -148,8 +158,8 @@ class Backup(Scripts):
         self.env["KK_STUB_DUMP_FAIL"] = "1"
         self.assertNotEqual(self.run_script("backup.sh", "--quiesce").returncode, 0)
         calls = self.docker_calls()
-        stops = [i for i, c in enumerate(calls) if c.endswith("stop api worker scheduler")]
-        starts = [i for i, c in enumerate(calls) if c.endswith("start api worker scheduler")]
+        stops = [i for i, c in enumerate(calls) if c.endswith("stop api worker scheduler sandbox-manager")]
+        starts = [i for i, c in enumerate(calls) if c.endswith("start api worker scheduler sandbox-manager")]
         self.assertTrue(stops and starts and starts[-1] > stops[0], calls)
 
     def test_retention_removes_only_old_backups_named_exactly(self) -> None:
@@ -162,9 +172,34 @@ class Backup(Scripts):
         self.assertEqual(left, sorted([".lock", folder.name, "kodekantor-20000101T000000Z-copy", "notes",
                                        "kodekantor-29990101T000000Z"]))
 
+    def test_files_changing_while_archived_are_kept_and_flagged(self) -> None:
+        """Review AG-13 WP-1.5c M5: a live backup must not fail every night because a file changed."""
+        tar = self.tmp / "bin" / "tar"
+        tar.write_text('#!/bin/sh\n/usr/bin/tar "$@" || exit $?\ncase " $* " in *" --create "*) exit 1 ;; esac\n')
+        tar.chmod(0o755)
+        folder = self.backup()
+        self.assertIs(json.loads((folder / "manifest.json").read_text())["workspace_consistent"], False)
+
+    def test_a_tar_error_still_fails(self) -> None:
+        tar = self.tmp / "bin" / "tar"
+        tar.write_text('#!/bin/sh\ncase " $* " in *" --create "*) exit 2 ;; esac\nexec /usr/bin/tar "$@"\n')
+        tar.chmod(0o755)
+        self.assertNotEqual(self.run_script("backup.sh").returncode, 0)
+        self.assertEqual(sorted(p.name for p in self.backups.iterdir()), [".lock"])
+
+    @unittest.skipUnless(os.geteuid() == 0, "needs a folder owned by someone else")
+    def test_a_backup_folder_owned_by_someone_else_is_refused(self) -> None:
+        """Review AG-13 WP-1.5c L4: its owner could plant a .lock symlink that root then truncates."""
+        self.backups.mkdir()
+        os.chown(self.backups, 65534, 65534)
+        result = self.run_script("backup.sh")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must be a folder owned by", result.stderr)
+
     def test_unsafe_settings_are_refused_before_any_work(self) -> None:
         for key, value in (("BACKUP_DIR", "relative/backups"), ("BACKUP_DIR", "/"), ("BACKUP_RETENTION_DAYS", "0"),
-                           ("BACKUP_RETENTION_DAYS", "14d"), ("WORKSPACE_HOST_PATH", "/srv/../etc")):
+                           ("BACKUP_RETENTION_DAYS", "14d"), ("WORKSPACE_HOST_PATH", "/srv/../etc"),
+                           ("KK_IMAGE_TAG", 'dev",\n"x')):
             with self.subTest(key=key, value=value):
                 self.write_env(**{key: value})
                 result = self.run_script("backup.sh")
@@ -206,18 +241,67 @@ class Restore(Scripts):
         result = self.run_script("restore.sh", "--db-only", str(self.folder), stdin="yes\n")
         self.assertEqual(result.returncode, 1)
         self.assertIn("not confirmed", result.stderr)
-        self.assertEqual(self.docker_calls(), [])
+        # Only the read-only check of the dump ran before the question.
+        self.assertEqual([c for c in self.docker_calls() if "pg_restore --list" not in c], [])
 
     @unittest.skipIf(os.geteuid() == 0, "checks the message a non-root operator gets")
     def test_workspace_restore_needs_root(self) -> None:
         result = self.run_script("restore.sh", "--yes", str(self.folder))
         self.assertEqual(result.returncode, 1)
         self.assertIn("needs root", result.stderr)
-        self.assertEqual(self.docker_calls(), [])
+        self.assertEqual([c for c in self.docker_calls() if "pg_restore --list" not in c], [])
 
     def test_conflicting_modes_are_a_usage_error(self) -> None:
         result = self.run_script("restore.sh", "--db-only", "--workspace-only", str(self.folder))
         self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.docker_calls(), [])
+
+    def test_failed_load_keeps_the_previous_database_and_explains(self) -> None:
+        """Review AG-13 WP-1.5c M2: a dump that cannot be loaded must not leave an empty database and silence."""
+        self.env["KK_STUB_RESTORE_FAIL"] = "1"
+        result = self.run_script("restore.sh", "--yes", "--db-only", str(self.folder))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("services are stopped", result.stderr)
+        self.assertRegex(result.stderr, r"previous database is kept as kodekantor_pre_restore_\d{8}t\d{6}z")
+        self.assertIn("make up", result.stderr)
+        self.assertFalse(any("up -d --wait" in call for call in self.docker_calls()))
+
+    def test_unreadable_dump_is_refused_before_anything_stops(self) -> None:
+        self.env["KK_STUB_LIST"] = "215; 0 16400 TABLE DATA public tasks kodekantor"
+        result = self.run_script("restore.sh", "--yes", "--db-only", str(self.folder))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no alembic_version data", result.stderr)
+        self.assertFalse(any(" stop " in f" {call} " for call in self.docker_calls()))
+
+    def test_a_dump_that_adds_roles_is_rejected(self) -> None:
+        """Review AG-13 WP-1.5c M1: the dump runs as a superuser; a new role or superuser must not pass."""
+        for roles in ("evil:true,kodekantor:true,kodekantor_app:false", "kodekantor:true,kodekantor_app:true"):
+            with self.subTest(roles=roles):
+                self.env["KK_STUB_ROLES"] = roles
+                result = self.run_script("restore.sh", "--yes", "--db-only", str(self.folder))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("unexpected roles after pg_restore", result.stderr)
+
+    def test_the_lock_is_taken_before_anything_else(self) -> None:
+        import fcntl
+
+        with (self.backups / ".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.run_script("restore.sh", "--yes", "--db-only", str(self.folder))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("another backup or restore", result.stderr)
+        self.assertEqual(self.docker_calls(), [])
+
+    def test_backup_folders_others_can_write_or_with_links_are_refused(self) -> None:
+        """Review AG-13 WP-1.5c L2: a file could change between its check and its use."""
+        self.folder.chmod(0o777)
+        self.assertIn("not writable by others", self.run_script("restore.sh", "--yes", "--db-only", str(self.folder)).stderr)
+        self.folder.chmod(0o700)
+        dump = self.folder / "postgres.dump"
+        real = self.tmp / "elsewhere.dump"
+        dump.rename(real)
+        dump.symlink_to(real)
+        self.assertIn("not a regular file", self.run_script("restore.sh", "--yes", "--db-only", str(self.folder)).stderr)
         self.assertEqual(self.docker_calls(), [])
 
     def test_database_restore_order(self) -> None:
@@ -228,11 +312,14 @@ class Restore(Scripts):
         def first(fragment: str) -> int:
             return next(i for i, call in enumerate(calls) if fragment in call)
 
-        order = [first("stop caddy web api worker scheduler sandbox-manager egress-proxy"), first("FROM pg_roles"),
-                 first("DROP DATABASE IF EXISTS kodekantor WITH (FORCE)"), first("pg_restore --exit-on-error"),
-                 first("'ops.restore'"), first("up -d --wait")]
+        order = [first("pg_restore --list"), first("stop caddy web api worker scheduler sandbox-manager egress-proxy"),
+                 first("FROM pg_roles"), first("ALTER DATABASE kodekantor RENAME TO kodekantor_pre_restore_"),
+                 first("CREATE DATABASE kodekantor OWNER kodekantor"), first("pg_restore --exit-on-error"),
+                 first("string_agg(rolname"), first("'ops.restore'"), first("up -d --wait")]
         self.assertEqual(order, sorted(order), calls)
-        self.assertIn("GRANT CONNECT ON DATABASE kodekantor TO kodekantor_app", calls[order[2]])
+        self.assertIn("GRANT CONNECT ON DATABASE kodekantor TO kodekantor_app", calls[order[4]])
+        self.assertNotIn("DROP DATABASE", "\n".join(calls), "the previous database is kept, never dropped")
+        self.assertIn("DROP DATABASE kodekantor_pre_restore_", result.stdout, "the operator is told what to delete")
         self.assertEqual((self.tmp / "restored.bin").read_bytes(), DUMP)
         self.assertTrue((self.workspace / "p1/repo/file with space.txt").exists(), "db-only leaves workspaces alone")
 
@@ -244,6 +331,74 @@ class Restore(Scripts):
         self.assertIn("uid 10001 cannot reach", result.stderr)
         self.assertEqual(self.docker_calls(), [])
         self.assertTrue((self.workspace / "p1/repo/file with space.txt").exists())
+
+    @unittest.skipUnless(os.geteuid() == 0, "extraction as uid 10001 needs root")
+    def test_restored_workspace_has_no_setuid_bits_and_a_closed_root(self) -> None:
+        """Review AG-13 WP-1.5c M3: the archive must not loosen the root folder or bring setuid files back."""
+        tool = self.workspace / "p1/repo/tool"
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o4755)
+        self.workspace.chmod(0o777)
+        self.own_workspace()
+        tool.chmod(0o4755)  # chown clears the setuid bit
+        shutil.rmtree(self.folder)  # backup names are per second
+        folder = self.backup()
+        result = self.run_script("restore.sh", "--yes", "--workspace-only", str(folder))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.workspace.stat().st_mode & 0o7777, 0o750)
+        self.assertEqual(tool.stat().st_mode & 0o7777, 0o755)
+
+    @unittest.skipUnless(os.geteuid() == 0, "extraction as uid 10001 needs root")
+    def test_names_with_newlines_restore(self) -> None:
+        """Review AG-13 WP-1.5c M4: one odd file name must not make every restore of that backup fail."""
+        (self.workspace / "p1/repo/two\nlines.txt").write_text("x")
+        self.own_workspace()
+        shutil.rmtree(self.folder)  # backup names are per second
+        folder = self.backup()
+        result = self.run_script("restore.sh", "--yes", "--workspace-only", str(folder))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.workspace / "p1/repo/two\nlines.txt").read_text(), "x")
+
+    @unittest.skipUnless(os.geteuid() == 0, "mounting needs root")
+    def test_workspace_that_is_a_mount_point(self) -> None:
+        """Review AG-13 WP-1.5c M6 / RUNBOOK §11: the workspaces may sit on their own volume; it cannot be renamed."""
+        if subprocess.run(["mount", "-t", "tmpfs", "-o", "size=32m", "tmpfs", str(self.workspace)], check=False).returncode:
+            self.skipTest("cannot mount tmpfs here")
+        self.addCleanup(subprocess.run, ["umount", "-l", str(self.workspace)], check=False)
+        self.seed_workspace()
+        shutil.rmtree(self.folder)
+        folder = self.backup()
+        (self.workspace / "p1/repo/file with space.txt").write_text("damaged")
+        result = self.run_script("restore.sh", "--yes", "--workspace-only", str(folder))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.workspace / "p1/repo/file with space.txt").read_text(), "hello")
+        kept = [p for p in self.workspace.iterdir() if p.name.startswith(".pre-restore-")]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].stat().st_mode & 0o777, 0o700)
+        self.assertEqual((kept[0] / "p1/repo/file with space.txt").read_text(), "damaged")
+        listing = (self.backup_again() / "workspaces.manifest").read_text()
+        self.assertNotIn(".pre-restore-", listing, "the kept copy never lands in later backups")
+
+    def backup_again(self) -> Path:
+        for old in self.backups.glob("kodekantor-*"):
+            shutil.rmtree(old)
+        return self.backup()
+
+    def test_not_enough_space_is_refused_before_anything_stops(self) -> None:
+        manifest = self.folder / "workspaces.manifest"
+        manifest.write_text("-rw-r--r-- 10001/10001 99999999999999999 2026-10-31 05:00 ./huge\n")
+        sums = self.folder / "SHA256SUMS"
+        digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        sums.write_text("".join(
+            f"{digest}  workspaces.manifest\n" if line.endswith("workspaces.manifest") else line + "\n"
+            for line in sums.read_text().splitlines()
+        ))
+        if os.geteuid() != 0:
+            self.skipTest("the workspace part needs root")
+        result = self.run_script("restore.sh", "--yes", "--workspace-only", str(self.folder))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not enough space", result.stderr)
+        self.assertEqual(self.docker_calls(), [])
 
     @unittest.skipUnless(os.geteuid() == 0, "extraction as uid 10001 needs root")
     def test_workspace_restore_keeps_the_old_folder_and_extracts_as_10001(self) -> None:

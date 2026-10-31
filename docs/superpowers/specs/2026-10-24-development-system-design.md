@@ -316,6 +316,9 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - SECURITY_MODEL V14 meminta "backup terenkripsi di host", sedangkan RUNBOOK hanya mengenkripsi salinan off-site, dan IMPLEMENTATION_DESIGN_V2/WBS menaruh enkripsi `backup.sh` di WP-14.4 (tier L). WP-1.5c: salinan lokal 0700/0600 milik root, tanpa enkripsi.
     - PRD §7.5/§8.1 menulis "metadata workspace", sedangkan RUNBOOK/DEPLOYMENT/ADR-005 meminta isi penuh. WP-1.5c mem-backup isi penuh.
     - IMPLEMENTATION_DESIGN_V2 §8.4 merujuk "prosedur secret snapshot" yang tidak didefinisikan di dokumen mana pun.
+55. **Risiko sisa restore (review AG-13 WP-1.5c, M1):** `pg_restore` berjalan sebagai `kodekantor`, superuser bootstrap. `SHA256SUMS` hanya membuktikan integritas, bukan keaslian, sehingga dump yang dimanipulasi bisa menjalankan SQL sebagai superuser. WP-1.5c memitigasi dengan dua hal: menolak role baru atau superuser setelah load, dan menulis di RUNBOOK bahwa keaslian bergantung pada alat off-site yang terautentikasi. Yang masih terbuka dan perlu ditulis AG-00 di SECURITY_MODEL §13:
+    - restore lewat role owner non-superuser (terkait utang "migrate non-superuser" WP-1.5a);
+    - tanda tangan `SHA256SUMS`.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
