@@ -803,3 +803,95 @@ Bukti setelah perbaikan:
 - Drill lokal PASS: restore 34 dtk, DB lama tersimpan.
 
 Utang: scanner (gitleaks, semgrep, trivy) belum pernah dijalankan atas diff ini; gate security-scan sebelum G1.
+
+### WP-1.5d (🔒) — Semgrep dan Trivy di `security-scan` (SECURITY_MODEL §11, T8; prasyarat G1)
+
+Spec: `docs/superpowers/specs/2026-10-31-wp-1.5d-security-scan-design.md`. Plan: `docs/superpowers/plans/2026-10-31-wp-1.5d-security-scan.md`.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `python3 -m unittest discover -s infra/tests` | OK (1 skip). `test_scan_gate.py`: 30 test (gate Trivy/Semgrep dengan JSON sintetis, daftar image dari compose, kebijakan repo) |
+| Mutan gate (16) | merah semua: CRITICAL tanpa perbaikan lolos, EOSL diabaikan, laporan hilang, laporan tanpa OS, laporan liar, CVE exception tidak terpakai, `pkg_path` tidak terpakai, exception berlaku untuk image lain, tanggal DECISIONS tidak dicek, batas 92 hari, kedaluwarsa, file penanda Semgrep, ERROR Semgrep lolos, error Semgrep lolos, daftar image kosong |
+| Mutan kebijakan repo (2) | `postgres.user` bukan `70:70` selama EX-04 ada → merah; tanggal EX-03 di DECISIONS berbeda dari TOML → merah |
+| Trivy lokal (DB 31 Okt) | 9 dari 10 image; egress-proxy tidak bisa dibangun di container ini (mirror apk diblokir) dan gate memblokir laporan yang hilang itu |
+| Semgrep lokal | ruleset registry tidak bisa diunduh (semgrep.dev diblokir proxy); semantik `nosemgrep` diuji dengan rule lokal pada semgrep 1.180.0: ID lengkap dan bagian terakhirnya dikenali, prefix tidak; kontrol tanpa komentar → ditandai |
+| `sandbox-isolation` (CI) | hijau dengan base sandbox-node baru (node 22 trixie) |
+
+CI di runner GitHub, [job security-scan 124457098515](https://github.com/YosiaGalih/IDEE-Application/actions/runs/41173808138/job/124457098515) (86b85f8):
+- **Semgrep.** 199 rule, 186 file. Hasilnya 1 ERROR, yang dicatat sebagai false positive EX-05 (`sqlalchemy.text` pada GRANT/REVOKE dengan nama role tervalidasi), dan 6 WARNING `chmod` yang disengaja.
+- **Trivy.** `scan: 10 images`, semuanya punya laporan.
+  - Debian 13: 43–44 HIGH tanpa perbaikan per image, 175 baris "allowed EX-02".
+  - 55 baris "excepted" (EX-03, EX-04).
+  - egress-proxy: Alpine 3.24.3, 0 temuan.
+  - `gate: PASS (0 blocking)`.
+
+Temuan saat menjalankan:
+- Perintah literal SECURITY_MODEL §11 merah permanen pada setiap image Debian → konflik #56, exception EX-02.
+- Tag nginx-unprivileged `1.29-alpine` tidak lagi diperbarui upstream (47 temuan berperbaikan) → pin `1.30-alpine`.
+- Image Node bookworm membawa CRITICAL zlib `will_not_fix` → base `22-trixie-slim`.
+- `nosemgrep` dengan prefix ID rule registry tidak berlaku (ID registry mengulang bagian terakhirnya) → ID lengkap.
+- Image pihak ketiga terbaru (31 Okt) masih membawa temuan yang hanya bisa diperbaiki upstream → konflik #57, EX-03 (30 hari) dan EX-04.
+
+Konflik dokumen baru: #56, #57. DECISIONS: EX-02..EX-05 (menunggu persetujuan PO). RUNBOOK §12.1: prosedur exception bulanan dan saat merah.
+
+#### Review silent-failure (`kk-silent-failure-hunter`) @ 86b85f8
+
+3 HIGH, 9 MEDIUM, dan 7 LOW, semuanya direproduksi dengan JSON sintetis. Ditutup di aef5e62:
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| H1 laporan basi menutupi scan yang gagal | skrip menghapus `report-*.json` lama; dua laporan untuk satu image memblokir | test + mutan; uji lokal dengan `report-99.json` yang ditanam: terhapus, egress-proxy yang gagal tetap memblokir |
+| H2 error Semgrep level `warn`/tanpa level lolos | semua error memblokir; `--timeout 30` | test 4 bentuk error; mutan |
+| H3 severity tak terduga dibuang | memblokir sebagai "unexpected severity" | test `critical`/`UNKNOWN`/kosong; mutan |
+| M1 laporan tanpa paket lolos | wajib ada hasil `os-pkgs` (Trivy selalu menulisnya, termasuk redis dengan 0 temuan) | test; mutan |
+| M2 umur DB tidak dicek | `trivy version --format json` → blok bila > 2 hari; tanggal dicetak | test basi/tidak terbaca; CI: `trivy DB updated 2026-10-31T01:14:32` |
+| M3 `--quiet` menyembunyikan penyebab | tanpa `--quiet`; `::error::` dengan exit code | uji lokal |
+| M4 prefix image | cocok persis (digest boleh) | test `caddy:20`/`caddy:2-debug`; mutan |
+| M5 baris DECISIONS tertutup diterima; status persetujuan diabaikan | sel kedaluwarsa harus tanggal polos (baris tertutup ditolak); status "menunggu persetujuan PO" dicetak di setiap baris yang dikecualikan. Persetujuan itu sendiri keputusan PO | test EX-01 tertutup; mutan |
+| M6 severity Semgrep fail-open | blok kecuali WARNING/INFO | test 5 nilai; mutan |
+| M7 cakupan Semgrep menyusut | `--expect` dan `--min-files` wajib | test; mutan |
+| M8 CVE mencakup paket lain | `vulns` wajib disertai `pkgs` (go-jose v3 caddy pindah ke EX-02) | test; mutan |
+| M9 `nosemgrep` longgar | wajib ID rule lengkap dan EX terbuka yang menyebut file itu; dicek juga di `security-scan` | test; mutan |
+| L1 concurrency menjatuhkan run tertunda | grup sendiri per run untuk main/nightly/manual | actionlint |
+| L2 nightly merah tanpa alert | tidak diubah: GitHub mengirim email kegagalan scheduled run ke pengubah cron terakhir; langkah "buka issue" butuh `issues: write` | catatan |
+| L3 `.semgrepignore` tanpa jangkar | `/docs/`, `/…/tests/` | test daftar terkunci |
+| L4 service tanpa image | ditolak | test; mutan |
+| L5 spec drift | spec diperbarui | – |
+| L6 tanggal lokal di test | `today_utc()` | – |
+| L7 Alpine 3.21 EOL 1 Nov | `eosl = true` EX-06 sampai 2026-11-30, konflik #58 | test exception EOSL; CI: "EX-06 … not needed today" |
+
+#### Review AG-13 (`kk-security-reviewer`) @ aef5e62 — **SIGNED OFF** [Kemungkinan Besar]
+
+Tidak ada CRITICAL/HIGH. Yang terverifikasi:
+- **Justifikasi:** caddy (curl/brotli tidak dipakai), gosu tidak dieksekusi pada `user: "70:70"`, socket-proxy, dan EX-05 bertahan.
+- **Probe silent-green:** 7 probe lolos di 86b85f8 dan ditolak semua di aef5e62.
+- **Scanner lain:** gitleaks bersih (89 commit); pip-audit bersih; `-m docker` 23 passed dengan base node trixie.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| M1 `# nosem` / `NOSEMGREP` lolos dari test; `.semgrepignore` bisa membuang file diam-diam | test mencari `(?i)nosem` dan mewajibkan `# nosemgrep: <ID lengkap> (EX-nn)`; isi `.semgrepignore` dikunci test; `--min-files 180` | mutan `# nosem`, `NOSEMGREP`, tanpa EX, dan `/backend/app/` di `.semgrepignore` → merah |
+| M2 CVE-2026-78669 (HTTP/2 DoS) caddy dapat dipicu di :443 publik; teks EX-03 menyesatkan | teks EX-03 per CVE; **item terbuka: syarat sebelum deploy publik (WP-7.1/G7)**, yaitu caddy dibangun ulang (Go ≥ 1.26.10, x/net 0.60.0) atau `protocols h1 h3` sementara; RUNBOOK §12.1 langkah 7 | DECISIONS EX-03, TOML |
+| L brotli di nginx juga dari freetype; npm akan butuh network | teks EX-03; pemicu evaluasi ulang di RUNBOOK §12.1 | – |
+| L docker.sock + cache persisten di skrip scan | RUNBOOK §12.1 langkah 8 dan header skrip: hanya CI/mesin pengembang; konflik #59 (bunyi `infra.md`, alternatif `docker save` + `--input`) | – |
+| L checkout tanpa `persist-credentials: false` | ditambahkan | actionlint |
+| L daftar image hanya profil `egress` | skrip merender semua profil (`config --profiles`) | shellcheck |
+| L EX-02 sebagai kelas | usul baseline per image → konflik #59/#56 | – |
+| L test EX-04 membaca teks mentah | memakai `services.postgres.user` dari config yang dirender | test |
+| L dua digest lebih muda dari aturan umur | konflik #59 | – |
+| L semgrep tanpa hash lock; ruleset registry tidak dipin | diterima untuk Phase 1: `exclude-newer` membatasi versi; jumlah rule tercetak di log (199) | catatan |
+
+Item terbuka sebelum G1/G7:
+- PO memutuskan EX-02..EX-06 dan konflik #56–#59.
+- CVE-2026-78669 caddy ditutup sebelum deploy publik.
+- EX-03 kedaluwarsa 2026-11-30.
+
+Review delta AG-13 @ 3977424: **SIGNED OFF**. M1 tertutup di kode. M2 menjadi syarat tertulis sebelum deploy publik. Dua LOW baru dari delta itu ditutup di commit berikutnya, persis seperti usul reviewer:
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| `config --profiles` lewat process substitution: kegagalannya tertelan, egress-proxy bisa tidak di-scan (regresi commit 3977424) | assignment biasa (`profile_list=$(…)`), sehingga `set -e` menghentikan skrip | stub `docker` yang menggagalkan `config --profiles` → skrip berhenti dengan exit 3 |
+| `:include .gitignore` mengeluarkan file ter-track dari SAST | dihapus; Semgrep hanya men-scan file yang di-track git; daftar terkunci test diperbarui | test `.semgrepignore` |
+
+LOW yang tetap terbuka, tidak memblokir:
+- cache Trivy di host persisten (didokumentasikan; runner GitHub sekali pakai);
+- semgrep dan ruleset registry tidak dipin hash.

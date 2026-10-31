@@ -1,0 +1,63 @@
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 3 * * *"  # nightly: the CVE database changes even when the code does not (spec WP-1.5d)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # PRs: a new push replaces the older run. Main, nightly and manual runs each get their own group, so none is
+  # cancelled or dropped while pending (security-scan evidence must complete).
+  group: security-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # SECURITY_MODEL §11, TEST_STRATEGY §6. What blocks and what is excepted: infra/security/scan_gate.py,
+  # infra/security/scan-exceptions.toml and DECISIONS "Pengecualian keamanan" (EX-nn, each with an expiry date).
+  security-scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      UV_PYTHON: "3.12"
+      KK_ENV_FILE: infra/tests/ci.env
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          version: "0.13.4"
+      - name: Dependency audit (pip-audit on uv.lock)
+        working-directory: backend
+        run: |
+          uv export --locked --no-hashes --no-emit-project --format requirements-txt > "$RUNNER_TEMP/requirements.txt"
+          uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict -r "$RUNNER_TEMP/requirements.txt"
+      # Exceptions EX-nn: the TOML and every inline Semgrep suppression match an open DECISIONS row in the window.
+      - name: Exception policy
+        run: python3 -m unittest -v infra.tests.test_scan_gate.RepositoryPolicy
+      # Findings other than WARNING/INFO and every scan error block; the expected files and the file floor prove
+      # the scan covered the code (186 files on 31 Oct 2026).
+      - name: SAST (Semgrep)
+        run: |
+          uvx --exclude-newer 2026-10-10T00:00:00Z semgrep==1.180.0 scan --metrics=off --disable-version-check \
+            --timeout 30 --config p/python --config p/secrets --config p/docker-compose \
+            --json-output="$RUNNER_TEMP/semgrep.json"
+          python3 infra/security/scan_gate.py semgrep --report "$RUNNER_TEMP/semgrep.json" --min-files 180 \
+            --expect backend/app/main.py --expect sandbox_manager/sandbox_manager/app.py --expect infra/compose.yml
+      - name: Build and pull every image the stack runs
+        run: |
+          make sandbox-images
+          docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" --profile egress build
+          docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" --profile egress pull --ignore-buildable --quiet
+      - name: Image scan (Trivy) and gate
+        run: infra/security/scan-images.sh "$RUNNER_TEMP/trivy"

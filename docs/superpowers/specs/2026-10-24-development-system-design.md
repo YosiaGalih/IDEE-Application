@@ -319,6 +319,27 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 55. **Risiko sisa restore (review AG-13 WP-1.5c, M1):** `pg_restore` berjalan sebagai `kodekantor`, superuser bootstrap. `SHA256SUMS` hanya membuktikan integritas, bukan keaslian, sehingga dump yang dimanipulasi bisa menjalankan SQL sebagai superuser. WP-1.5c memitigasi dengan dua hal: menolak role baru atau superuser setelah load, dan menulis di RUNBOOK bahwa keaslian bergantung pada alat off-site yang terautentikasi. Yang masih terbuka dan perlu ditulis AG-00 di SECURITY_MODEL §13:
     - restore lewat role owner non-superuser (terkait utang "migrate non-superuser" WP-1.5a);
     - tanda tangan `SHA256SUMS`.
+56. **Perintah Trivy literal vs CVE tanpa perbaikan (WP-1.5d):** SECURITY_MODEL §11 menulis `trivy image --severity HIGH,CRITICAL --exit-code 1` dengan kriteria "0 critical/high tanpa exception". Pada 31 Okt 2026, setiap image Debian 13 membawa 43–44 HIGH yang belum punya perbaikan dari Debian, sehingga perintah itu merah permanen. WP-1.5d memakai gate `infra/security/scan_gate.py`:
+    - CRITICAL selalu memblokir;
+    - HIGH yang punya perbaikan memblokir;
+    - HIGH tanpa perbaikan dicetak dan dibolehkan oleh EX-02 (kedaluwarsa 2027-01-31).
+
+    Usul: §11 merujuk aturan gate itu, bukan perintah literal. Keputusan PO: setujui atau tolak EX-02..EX-05.
+57. **Cakupan Trivy (WP-1.5d):** §11 hanya menyebut image api/worker/web/sandbox-manager/sandbox-python/sandbox-node. WP-1.5d men-scan semua image yang dijalankan compose, termasuk caddy (publik), postgres, redis, docker-socket-proxy, dan egress-proxy. Temuan yang hanya bisa diperbaiki upstream dicatat sebagai EX-03 per CVE, kedaluwarsa 30 hari. Biayanya:
+    - pengecekan ulang bulanan (RUNBOOK §12.1);
+    - CVE baru di image upstream membuat PR merah sampai digest dinaikkan atau exception ditulis.
+
+    Keputusan PO: pertahankan cakupan ini, atau batasi ke daftar §11.
+58. **Redis 7.4 di OS end of life (WP-1.5d):** `redis:7.4.11-alpine`, dan image 7.4 terbaru (7.4.12, 26 Okt), dibangun di Alpine 3.21. Dukungan Alpine 3.21 berakhir 1 Nov 2026 [Kemungkinan Besar], sehingga gate Trivy memblokir image itu (EOSL). Sementara ini dicatat sebagai EX-06 sampai 2026-11-30. Pilihannya:
+    - Redis 8.x (lisensi tri: AGPLv3/SSPLv1/RSALv2);
+    - Valkey (fork BSD dari Redis 7.2/7.4; API kompatibel untuk broker Celery dan cache);
+    - perpanjang exception selama upstream 7.4 masih memakai Alpine 3.21.
+
+    Keputusan PO; ADR-001/stack menyebut Redis 7.
+59. **Catatan review AG-13 WP-1.5d:**
+    - `.claude/rules/infra.md` menulis "docker.sock hanya di-mount ke docker-socket-proxy". Scanner Trivy di CI (`infra/security/scan-images.sh`) juga memegang socket itu. Aturan tersebut dimaksudkan untuk stack runtime; skrip scan dibatasi ke CI dan mesin pengembang (RUNBOOK §12.1 langkah 8). Usul: perjelas bunyi aturannya. Alternatif yang lebih aman: `docker save` lalu `trivy image --input`.
+    - Dua pin digest lebih muda dari aturan umur dua minggu: nginx-unprivileged 1.30-alpine (19 Okt) dan node 22-trixie-slim (28 Okt). Alasannya perbaikan keamanan mengalahkan umur, mengikuti preseden certifi dan uv 0.13.4. Perlu dicatat oleh PO/AG-00.
+    - EX-02 berlaku sebagai kelas untuk semua image. Usul untuk konflik #56: baseline jumlah per image, dan kenaikan memblokir sampai diakui.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

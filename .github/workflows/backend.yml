@@ -10,7 +10,6 @@ permissions:
 
 concurrency:
   group: backend-${{ github.ref }}
-  # Never cancel runs on main (security-scan evidence must complete).
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -92,21 +91,3 @@ jobs:
           uv run alembic upgrade head
           uv run alembic check
       - run: uv run pytest -q
-
-  security-scan:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
-        with:
-          version: "0.13.4"
-      - name: Dependency audit (pip-audit on uv.lock)
-        working-directory: backend
-        run: |
-          uv export --locked --no-hashes --no-emit-project --format requirements-txt > "$RUNNER_TEMP/requirements.txt"
-          uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict -r "$RUNNER_TEMP/requirements.txt"
