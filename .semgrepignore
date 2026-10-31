@@ -2,8 +2,8 @@
 # Tests are left out on purpose: security fixtures hold dangerous patterns by design; gitleaks still covers them.
 :include .gitignore
 .git/
-docs/
-backend/tests/
-sandbox_manager/tests/
-infra/tests/
+/docs/
+/backend/tests/
+/sandbox_manager/tests/
+/infra/tests/
 uv.lock

@@ -9,6 +9,7 @@ until = 2027-01-31
 
 # Fixed upstream, but only upstream can rebuild these images (EX-03): the newest digests (31 Oct 2026) still carry
 # them. Checked again monthly (RUNBOOK §12.1): bump the digest when a fixed image appears, then drop the CVE here.
+# An entry covers a listed CVE only in a listed package of that one image (same CVE elsewhere still blocks).
 
 # caddy: brotli/curl only serve the curl binary, which nothing runs (the healthcheck uses busybox wget);
 # the Go findings wait for a Caddy release.
@@ -20,6 +21,7 @@ vulns = [
   "CVE-2026-111497", "CVE-2026-92392", "CVE-2026-116587", "CVE-2026-78669", "CVE-2026-111943", "CVE-2026-78667",
   "CVE-2026-97031",
 ]
+pkgs = ["brotli-libs", "curl", "libcurl", "github.com/go-jose/go-jose/v4", "golang.org/x/net", "stdlib"]
 
 # web placeholder (until WP-1.4): the same brotli/curl, curl not run (healthcheck: busybox wget).
 [[exception]]
@@ -27,6 +29,7 @@ id = "EX-03"
 until = 2026-11-30
 image = "nginxinc/nginx-unprivileged:1.30-alpine"
 vulns = ["CVE-2026-111497", "CVE-2026-92392"]
+pkgs = ["brotli-libs", "curl", "libcurl"]
 
 # docker-socket-proxy: only on the private exec network, fixed HAProxy config, plain HTTP.
 [[exception]]
@@ -34,6 +37,7 @@ id = "EX-03"
 until = 2026-11-30
 image = "tecnativa/docker-socket-proxy:v0.5.0"
 vulns = ["CVE-2026-14456", "CVE-2026-103111", "CVE-2026-86145", "CVE-2026-89157", "CVE-2026-89161"]
+pkgs = ["libcrypto3", "libssl3", "pcre2"]
 
 # npm's own bundled packages in the Node base image: npm runs inside the sandbox, without network, next to code
 # that is untrusted by design.
@@ -45,6 +49,7 @@ vulns = [
   "CVE-2026-102276", "CVE-2026-102278", "CVE-2026-13149", "CVE-2026-14257", "CVE-2026-69152", "CVE-2026-69192",
   "CVE-2026-9496", "CVE-2026-33671", "CVE-2026-48815",
 ]
+pkgs = ["brace-expansion", "ip-address", "pacote", "picomatch", "sigstore"]
 
 # gosu is only called by docker-entrypoint.sh when the container starts as root; compose runs postgres as 70:70
 # (EX-04, kept true by infra/tests/test_scan_gate.py).
@@ -53,3 +58,12 @@ id = "EX-04"
 until = 2027-01-31
 image = "postgres:16.15-alpine"
 pkg_path = "usr/local/bin/gosu"
+
+# redis 7.4 is still built on Alpine 3.21, which reaches end of life on 1 Nov 2026 (EX-06): no more Alpine security
+# fixes for its OS packages. Redis runs only on the private app network with requirepass. The way out (Redis 8,
+# AGPL/SSPL/RSAL, or Valkey) is a PO decision (conflict #58).
+[[exception]]
+id = "EX-06"
+until = 2026-11-30
+image = "redis:7.4.11-alpine"
+eosl = true

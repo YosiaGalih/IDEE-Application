@@ -330,6 +330,12 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - CVE baru di image upstream membuat PR merah sampai digest dinaikkan atau exception ditulis.
 
     Keputusan PO: pertahankan cakupan ini, atau batasi ke daftar §11.
+58. **Redis 7.4 di OS end of life (WP-1.5d):** `redis:7.4.11-alpine`, dan image 7.4 terbaru (7.4.12, 26 Okt), dibangun di Alpine 3.21. Dukungan Alpine 3.21 berakhir 1 Nov 2026 [Kemungkinan Besar], sehingga gate Trivy memblokir image itu (EOSL). Sementara ini dicatat sebagai EX-06 sampai 2026-11-30. Pilihannya:
+    - Redis 8.x (lisensi tri: AGPLv3/SSPLv1/RSALv2);
+    - Valkey (fork BSD dari Redis 7.2/7.4; API kompatibel untuk broker Celery dan cache);
+    - perpanjang exception selama upstream 7.4 masih memakai Alpine 3.21.
+
+    Keputusan PO; ADR-001/stack menyebut Redis 7.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
