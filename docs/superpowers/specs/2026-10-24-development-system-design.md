@@ -351,6 +351,8 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - aturan link (`mailto`, `nofollow`);
     - endpoint CSRF awal (dipenuhi oleh GET `/auth/me`);
     - `compose.e2e.yml` belum ada.
+63. **Cakupan WP-1.4 (WP-1.4b).** WBS WP-1.4 dan rencana lanjutan U10 memasukkan layar dashboard, projects, agents, dan approvals. Backend baru punya route `auth` dan `health`, jadi layar itu hanya bisa dibangun di atas mock. Keputusan Lead: WP-1.4b berisi login, logout, lupa/reset/ganti password, penjaga sesi, dan menu pengguna; layar lain dibangun bersama WP backend-nya (WP-2.1, WP-3.1, WP-INT-03) dalam satu PR.
+64. **Email reset password belum ada (WP-1.4b).** Alur lupa password mengandaikan email, tetapi pengiriman email dijadwalkan di P1. Backend hanya mencetak tautan ke log pada `APP_ENV=development`; produksi tidak mengirim apa pun. Layar tidak mengklaim "terkirim" dan menyuruh menghubungi admin. Perlu keputusan PO: majukan email ke P0, atau sediakan reset oleh admin/CLI.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
