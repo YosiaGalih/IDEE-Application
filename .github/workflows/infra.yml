@@ -16,25 +16,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Policy checks on the rendered compose file (spec WP-1.5a; ADR-009, ADR-026 (3), ADR-005, infra.md).
+  # Policy checks on the rendered compose file (specs WP-1.5a/1.5b; ADR-007, ADR-009, ADR-026 (3), ADR-005,
+  # infra.md) and the linters of the WP-1.5 definition of done. Linter images are pinned by digest.
   infra-config:
     runs-on: ubuntu-24.04
+    env:
+      HADOLINT: hadolint/hadolint:v2.14.0@sha256:27086352fd5e1907ea2b934eb1023f217c5ae087992eb59fde121dce9c9ff21e
+      SHELLCHECK: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+      ACTIONLINT: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
         with:
-          version: "0.11.32"
-      # The uv that builds the images (SECURITY_MODEL §11). PYSEC-2026-4321 is excepted until 2026-11-03
-      # (DECISIONS.md, EX-01); from 2026-11-04 this step fails until uv is raised to >= 0.13.4.
+          version: "0.13.4"
+      # The uv that builds the images (SECURITY_MODEL §11): no exception (EX-01 closed by uv 0.13.4).
       - name: Build tool audit (pip-audit)
-        run: |
-          ignore=()
-          if [[ "$(date -u +%F)" < "2026-11-04" ]]; then ignore=(--ignore-vuln PYSEC-2026-4321); fi
-          uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict "${ignore[@]}" -r infra/build/uv-requirements.txt
+        run: uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict -r infra/build/uv-requirements.txt
       - name: Compose policy
         run: python3 -m unittest discover -s infra/tests -v
+      - name: Dockerfiles (hadolint)
+        run: |
+          status=0
+          while IFS= read -r -d '' file; do
+            echo "hadolint $file"
+            docker run --rm -i "$HADOLINT" hadolint - < "$file" || status=1
+          done < <(git ls-files -z '*Dockerfile*')
+          exit "$status"
+      - name: Shell scripts (shellcheck)
+        run: git ls-files -z '*.sh' | xargs -0 docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK"
+      - name: Workflows (actionlint)
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT" -no-color
       - name: Caddyfile
         run: |
           docker run --rm -v "$PWD/infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
@@ -48,6 +61,7 @@ jobs:
     timeout-minutes: 30
     env:
       KK_ENV_FILE: infra/tests/ci.env
+      COMPOSE_PROFILES: egress  # the full production set, egress-proxy included (spec WP-1.5b)
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -60,6 +74,21 @@ jobs:
         run: docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" up -d --build --wait --wait-timeout 300
       - name: Health through Caddy
         run: scripts/healthcheck.sh --wait 120
+      # From kk-egress, the way sandbox-manager attaches a task: the three registries answer over real TLS,
+      # everything else is refused and logged, and a service on the runner (0.0.0.0:18999) stays out of
+      # reach, while the same service is reachable from Docker's default bridge (the control).
+      - name: Egress allowlist
+        run: |
+          python3 -c "import socket; s = socket.create_server(('0.0.0.0', 18999)); [s.accept()[0].close() for _ in iter(int, 1)]" &
+          docker run --rm --entrypoint python kodekantor/sandbox-python:1 -c \
+            "import socket; socket.create_connection(('172.17.0.1', 18999), timeout=5); print('control: runner listener reachable from the default bridge')"
+          docker run --rm --network kk-egress -v "$PWD/infra/tests/egress_probe.py:/probe.py:ro" \
+            --entrypoint python kodekantor/sandbox-python:1 /probe.py --strict-tls --host-port 18999
+          refused=$(docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" logs egress-proxy | grep -c "Proxying refused")
+          echo "refusals logged: $refused"
+          test "$refused" -ge 5
+      - name: Client IP only from Caddy
+        run: infra/tests/xff_probe.sh
       - name: Diagnostics
         if: failure()
         run: |

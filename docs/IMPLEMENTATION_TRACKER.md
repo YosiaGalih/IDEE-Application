@@ -171,6 +171,7 @@ Spec: `docs/superpowers/specs/2026-10-24-wp-1.1a-backend-core-skeleton-design.md
 | Migrasi | `alembic upgrade head` → `downgrade base` → `upgrade head` | exit 0 ×3 (belum ada revisi; `0001_initial` = WP-1.1b) |
 | Registry | `python scripts/validate_registry.py agents/registry.v2.yaml` | `OK: 53 agents (41 specialists + ORCH + 11 K2) — schema_version 2` |
 | Audit dependensi | `uvx pip-audit --strict -r <uv export>` | No known vulnerabilities found. Sebelumnya `certifi 2026.7.22` PYSEC-2026-4320; dinaikkan ke 2026.10.23 lewat pengecualian umur per paket di `pyproject.toml`. |
+| Audit uv (alat build, 30 Okt) | `uvx pip-audit --strict -r infra/build/uv-requirements.txt` | No known vulnerabilities found. Sebelumnya uv 0.11.32 PYSEC-2026-4321 (EX-01); dinaikkan ke 0.13.4 (rilis 20 Okt) lewat pengecualian umur per paket di `infra/build/lock-uv.sh`. Dengan uv 0.13.4: `uv sync --locked` tidak mengubah kedua `uv.lock`; backend 1243 passed, 1 skipped; sandbox_manager 151 passed; image ter-build; stack `ci.env` healthy, live/ready/`/` 200 lewat Caddy. |
 | CI | `.github/workflows/backend.yml` | ⬜ belum berjalan — push ke GitHub ditolak 403 (akses Claude GitHub App belum ada) |
 
 Gap yang diketahui:
@@ -699,7 +700,57 @@ Tanpa CRITICAL/HIGH. Ancaman T3, T5, T8, T10 diuji dengan test dan probe live (p
 Konflik dokumen dari review: #44 (jaringan token sandbox-manager); spec WP-1.5a diperbarui (image `web`, `pull_policy`, `clean-install`).
 
 Utang terbuka (repo belum punya issue; issue WP dibangkitkan dari `wbs_data.py`, jadi dicatat di sini):
-- L1: subnet `edge` tetap + `--forwarded-allow-ips=<subnet>` + test kebijakan.
+- ~~L1: subnet `edge` tetap + `--forwarded-allow-ips=<subnet>` + test kebijakan~~ → ditutup di WP-1.5b.
 - M2 jangka menengah: role owner non-superuser untuk `migrate`.
 - Trivy dan Semgrep belum pernah berjalan (unduhan DB/ruleset diblokir proxy cloud); wajib di job security-scan sebelum G1 (SECURITY_MODEL §11).
-- hadolint, shellcheck, actionlint: WP-1.5b.
+- ~~hadolint, shellcheck, actionlint~~ → WP-1.5b.
+
+### WP-1.5b (🔒) — egress-proxy, linter CI, IP klien hanya dari Caddy (FR-136–137, FR-149, AC-20)
+
+Spec: `docs/superpowers/specs/2026-10-30-wp-1.5b-egress-lint-design.md`. Plan: `docs/superpowers/plans/2026-10-30-wp-1.5b-egress-lint.md`.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `python3 -m unittest discover -s infra/tests` | **35 OK** (kebijakan compose 25, `healthcheck.sh` 5, `prepare-workspace.sh` 5; dirender dengan profil `egress` dan tanpa profil) |
+| Mutasi compose/konfigurasi (10) | merah semua: proxy juga di `app`, `kk-egress` tanpa `name`, `kk-egress` tidak internal, proxy tanpa profil, api percaya `*`, image percaya `*`, entri allowlist tanpa jangkar, `ConnectPort 80` tambahan, `Upstream`, caddy tanpa IP tetap |
+| Mutasi `healthcheck.sh` | tanpa penjaga egress → merah |
+| `tinyproxy.conf` + `allowlist` di tinyproxy 1.11.1 (harness Ubuntu sekali pakai; repo apk Alpine diblokir proxy cloud) | `egress_probe.py` 12/12: tiga registry membuka tunnel; `github.com`, `evilpypi.org`, `pypi.org.evil.com`, IP mentah, port 80/22, HTTP polos → 403; tanpa DNS dan rute langsung; 10 penolakan tercatat di log |
+| Probe terhadap proxy yang salah konfigurasi | `FilterDefaultDeny No` → 7 cek gagal; `ConnectPort 80` tambahan tidak tertangkap probe (filter URL tetap menolak), tertangkap test kebijakan |
+| Linter lokal (image sama dengan CI) | hadolint 2.14.0, shellcheck 0.11.0, actionlint 1.7.12: bersih; mutan `RUN cd`, `ls $x`, `${{ github.event.pull_request.title }}` di `run` → merah |
+| Stack `ci.env` (tanpa profil egress) | healthy; `xff_probe.sh` PASS: XFF palsu dari `web` → kunci `10.231.231.9` (IP web); lewat Caddy → `172.21.0.1` (klien yang dilihat Caddy), bukan IP Caddy |
+| Mutan `FORWARDED_ALLOW_IPS="*"` | `xff_probe.sh` FAIL: `198.51.100.9` dipercaya |
+
+Temuan saat menjalankan:
+- IP tetap caddy diambil container lain (`Address already in use`), lalu diperbaiki dengan `ip_range` dinamis di luar IP caddy, dan test kebijakan ditambah.
+- `xff_probe.sh` versi awal hanya menghapus satu kunci karena `docker compose exec` menelan stdin loop; sekarang dihapus dengan satu perintah di container redis.
+
+Konflik dokumen baru: #45–#49.
+
+CI di runner GitHub:
+- Run pertama gagal di build karena versi tebakan `tinyproxy=1.11.2-r1` (alpine 3.24 memuat `1.11.3-r0`). Versi lalu dipin ke 1.11.3-r0.
+- Run berikutnya, [job clean-install 123976143238](https://github.com/YosiaGalih/IDEE-Application/actions/runs/41029693176/job/123976143238) (fd6a06e, image alpine asli, `COMPOSE_PROFILES=egress`):
+  - 11 service healthy; live/ready/`/` 200;
+  - `egress_probe.py --strict-tls` 12/12 (TLS asli ke tiga registry; 403 untuk sisanya; 5 penolakan tercatat);
+  - `xff_probe.sh` PASS (kunci `10.231.231.9` dan `172.20.0.1`).
+
+#### Review AG-13 (`kk-security-reviewer`) @ 4f037b1/8c8a7c1 + delta fd6a06e — **SIGNED OFF** [Kemungkinan Besar]
+
+Tanpa CRITICAL/HIGH. Penutupan L1 WP-1.5a terbukti live: XFF palsu dari web dan worker, XFF berganda, `Forwarded`, `X-Real-IP`, dan h2 lewat Caddy semuanya diabaikan. Probe adversarial 24 kasus terhadap tinyproxy 1.11.1/1.11.3 ditolak semua. Trivy: alpine 3.24.3 dan tinyproxy 1.11.3-r0 0 temuan; kontrol 1.11.1 → CVE-2022-40468, CVE-2023-49606. gitleaks bersih.
+
+Syarat sign-off: (1) `clean-install` dengan profil `egress` hijau di head PR, termasuk kedua probe; (2) M1 dan M2 dicatat sebagai item terbuka.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| M1 container di `kk-egress` menjangkau host lewat gateway bridge | `inhibit_ipv4` + `enable_ipv6: false` pada `kk-egress`; test kebijakan; `egress_probe.py --host-port` + listener runner di CI (kontrol dari bridge default) | lokal: tanpa opsi → `CONNECTED hello-from-host`; dengan opsi → refused; probe pada mutan → FAIL |
+| M2 allowlist CONNECT bukan penghalang eksfiltrasi (SNI/CDN multi-tenant, npm bisa ditulis) | **terbuka**, syarat sebelum profil `egress-allowed` pertama / G4: spec "Risiko sisa", konflik #49 | – |
+| L1 penolakan port dan tunnel yang dibuka tidak tercatat | `LogLevel Connect` | 10 target yang diminta tercatat di log (stack lokal) |
+| L2 compose mengadopsi `kk-egress` asing | `healthcheck.sh` memeriksa internal, label project, dan `inhibit_ipv4` | network asing ditanam → healthcheck exit 1 dengan ketiga alasan; 3 subtest |
+| L3 mematikan egress tidak menghentikan proxy | peringatan di `healthcheck.sh`; `make egress-off` | live: proxy dan `kk-egress` hilang, stack 10 service healthy |
+| L4 celah probe | cek DNS eksplisit, cek listener host, kunci jalur Caddy = gateway network `public` | stack lokal dengan profil `egress` (image pengganti tinyproxy Ubuntu, konfigurasi sama): semua PASS |
+| L5 tinyproxy menghadapi kode tidak tepercaya | keputusan PO di konflik #45; `egress-proxy` masuk daftar Trivy (#48) | Trivy 1.11.3-r0: 0 |
+| L6 URL ditolak dicatat apa adanya (userinfo) | didokumentasikan di `tinyproxy.conf` dan spec: log proxy tidak diteruskan tanpa redaksi | – |
+
+Utang terbuka:
+- M2: syarat G4, lihat di atas.
+- Keputusan produk proxy: #45.
+- Trivy/Semgrep di security-scan sebelum G1.

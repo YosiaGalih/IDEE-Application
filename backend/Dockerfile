@@ -36,4 +36,5 @@ COPY backend/alembic ./alembic
 COPY backend/app ./app
 USER 10001:10001
 EXPOSE 8000
-CMD ["uvicorn", "--factory", "app.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Proxy headers are believed only from FORWARDED_ALLOW_IPS (uvicorn default 127.0.0.1; compose sets Caddy).
+CMD ["uvicorn", "--factory", "app.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

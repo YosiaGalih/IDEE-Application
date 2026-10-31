@@ -299,6 +299,15 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 42. **Job CI `infra-config`** belum ada di tabel TEST_STRATEGY §6. Kebijakan compose perlu dicek di setiap PR, sedangkan `clean-install` (ada di tabel) nightly. WP-1.5a menjalankan `clean-install` juga pada PR.
 43. **Role DB runtime:** CONFIGURATION hanya mengenal `POSTGRES_PASSWORD`, dan DATA_MODEL tidak menyebut role. Agar audit guard WP-1.1b terpenuhi, WP-1.5a menambah role `kodekantor_app` dengan `DB_APP_PASSWORD`; migrate tetap memakai owner. Kontrak perlu diperbarui oleh AG-00.
 44. **Jaringan token sandbox-manager:** SECURITY_MODEL §4 (baris Worker/API ↔ sandbox-manager) menulis "network `exec` privat", sedangkan ARCHITECTURE §2 dan DEPLOYMENT §5 menaruh port 8100 sandbox-manager di network `app`, dan api/worker tidak boleh bergabung ke `exec` (infra.md). WP-1.5a mengikuti ARCHITECTURE: token bearer melintas di `app`; `exec` hanya memuat sandbox-manager dan docker-socket-proxy. Temuan review AG-13 WP-1.5a; SECURITY_MODEL perlu diperbarui oleh AG-00.
+45. **Produk egress-proxy:** ADR-007 (Proposed) menulis "Squid/tinyproxy", DEPLOYMENT §2 "tinyproxy, alpine 3.24", dan IMPLEMENTATION_DESIGN_V2 §15 "Squid". WP-1.5b mengikuti DEPLOYMENT (paling spesifik: image, uid 100, healthcheck). Klien proxy adalah kode sandbox yang tidak tepercaya, sedangkan tinyproxy pernah punya bug memori yang bisa dieksploitasi klien (CVE-2023-49606) [Kemungkinan Besar]. PO/AG-00 perlu memutuskan apakah tinyproxy tetap dipakai sampai dep-proxy WP-15.0.
+46. **Daftar network ARCHITECTURE §12** ("`public`, `app`, `exec`, `sandbox-none`") tertinggal dari daftar mengikat §2 dan DEPLOYMENT §3 (`edge`, `outbound`, `kk-egress`, `egress-out`). WP-1.5a/1.5b mengikuti §2.
+47. **Install dependency belum bisa jalan walau egress hidup** (untuk WP-6.5):
+    - SECURITY_MODEL §4 mengunci env sandbox ke `HOME`, `PATH`, `LANG`, `CI=1`, jadi alamat proxy harus lewat argv profil (`--proxy http://egress-proxy:3128`); v2.2 `client_env` (IMPLEMENTATION_DESIGN_V2 §15) justru menyuntik env.
+    - `sandbox-images/node/Dockerfile` memasang `NPM_CONFIG_OFFLINE=true`, bertentangan dengan profil `node.npm_ci`.
+    - TOOL_CATALOG `pip install --target /workspace/.kk/site` menulis ke `.kk` yang per run, 8 MiB, dan dihapus (lihat #36).
+    - Nilai profil `network`: TOOL_CATALOG `egress`, kode `egress-allowed`.
+48. **Variabel infra baru belum ada di CONFIGURATION:** `COMPOSE_PROFILES` (menyalakan egress-proxy), `KK_EDGE_SUBNET`, `KK_EDGE_IP_RANGE`, `KK_EDGE_CADDY_IP` (IP Caddy yang dipercaya api, temuan L1). Daftar image Trivy di SECURITY_MODEL §11 belum memuat `egress-proxy`. Kontrak perlu diperbarui oleh AG-00.
+49. **Risiko sisa egress belum tercatat di SECURITY_MODEL** (review AG-13 WP-1.5b, M2): allowlist CONNECT tidak mencegah eksfiltrasi lewat CDN multi-tenant (SNI) atau penulisan ke `registry.npmjs.org`. SECURITY_MODEL §4/§13 dan gate G4 perlu memuat syarat "dep-proxy read-only (ADR-064) atau SNI splice + install tanpa skrip sebelum profil `egress-allowed` pertama". Rinciannya di spec WP-1.5b bagian "Risiko sisa".
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
