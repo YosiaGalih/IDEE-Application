@@ -340,6 +340,17 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - `.claude/rules/infra.md` menulis "docker.sock hanya di-mount ke docker-socket-proxy". Scanner Trivy di CI (`infra/security/scan-images.sh`) juga memegang socket itu. Aturan tersebut dimaksudkan untuk stack runtime; skrip scan dibatasi ke CI dan mesin pengembang (RUNBOOK §12.1 langkah 8). Usul: perjelas bunyi aturannya. Alternatif yang lebih aman: `docker save` lalu `trivy image --input`.
     - Dua pin digest lebih muda dari aturan umur dua minggu: nginx-unprivileged 1.30-alpine (19 Okt) dan node 22-trixie-slim (28 Okt). Alasannya perbaikan keamanan mengalahkan umur, mengikuti preseden certifi dan uv 0.13.4. Perlu dicatat oleh PO/AG-00.
     - EX-02 berlaku sebagai kelas untuk semua image. Usul untuk konflik #56: baseline jumlah per image, dan kenaikan memblokir sampai diakui.
+60. **Toolchain frontend tidak ditentukan dokumen (WP-1.4a).** Keputusan Lead:
+    - Node 22 LTS, Prettier 3, TypeScript 6.0.3, ESLint 9, React Router 7.18. TS 7 dan ESLint 10 belum didukung `typescript-eslint` dan `eslint-plugin-react`.
+    - Lockfile ditulis npm 11.21.0, karena npm 10.9 crash pada graf peer vitest.
+    - msw tetap di 2.x agar `npm ci` npm 10 menerima lockfile.
+    - zod 4.6.7 dan vitest 4.1.12 melewati aturan umur sebagai perbaikan keamanan.
+61. **Nilai token desain tidak ada di dokumen (WP-1.4a).** PRD v2.2 §4 hanya menyebut grup `brand-*`/`sidebar-*`/`status-*` dan font Inter. Nilainya diturunkan dari mockup: sidebar `#1f2f49`, aksi utama `#c84712`, kanvas `#f3f5f9`, teks `#0f1428`. Mockup tampak memakai font selain Inter [Menebak]; Inter dipakai sesuai PRD.
+62. **SSE (WP-1.4a).** IMPLEMENTATION_DESIGN_V2 menyebut "EventSource + Last-Event-ID". `EventSource` tidak bisa mengirim header pada sambungan manual dan tidak memperlihatkan heartbeat `: ping`, jadi klien memakai `fetch` + `ReadableStream`, dengan `after_seq` dan `Last-Event-ID`. Penamaan diseragamkan menjadi `src/api/sse/eventStream.ts` + `src/api/hooks/useTaskEvents.ts`. Konflik lain dari ringkasan kontrak masih terbuka untuk WP berikutnya:
+    - path komponen Markdown;
+    - aturan link (`mailto`, `nofollow`);
+    - endpoint CSRF awal (dipenuhi oleh GET `/auth/me`);
+    - `compose.e2e.yml` belum ada.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

@@ -25,11 +25,12 @@ vulns = [
 ]
 pkgs = ["brotli-libs", "curl", "libcurl", "github.com/go-jose/go-jose/v4", "golang.org/x/net", "stdlib"]
 
-# web placeholder (until WP-1.4): the same brotli/curl, curl not run (healthcheck: busybox wget).
+# kodekantor/web (built on nginx-unprivileged 1.30-alpine): the base's brotli/curl; curl is not run
+# (healthcheck: busybox wget) and the nginx binary links neither.
 [[exception]]
 id = "EX-03"
 until = 2026-11-30
-image = "nginxinc/nginx-unprivileged:1.30-alpine"
+image = "kodekantor/web:dev"
 vulns = ["CVE-2026-111497", "CVE-2026-92392"]
 pkgs = ["brotli-libs", "curl", "libcurl"]
 

@@ -1,0 +1,38 @@
+name: frontend
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # TEST_STRATEGY §6: ESLint, tsc, Vitest + RTL, vite build; plus Prettier and the lint guards that prove the
+  # contract rules still reject their violations (spec WP-1.4a).
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: frontend/.nvmrc
+      # --ignore-scripts: no dependency runs code at install time (SECURITY_MODEL T8).
+      - run: npm ci --no-audit --ignore-scripts
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run lint:guards
+      - run: npm run typecheck
+      - run: npm test
+      - run: npx vite build

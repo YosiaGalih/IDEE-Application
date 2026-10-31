@@ -10,7 +10,7 @@ const API = `${window.location.origin}/api/v1`;
 const server = setupServer();
 const seen: Request[] = [];
 
-beforeAll(() => server.listen({ onUnhandledFrame: "error" }));
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => {
   server.resetHandlers();
   seen.length = 0;

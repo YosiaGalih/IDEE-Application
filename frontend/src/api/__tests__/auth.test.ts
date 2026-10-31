@@ -7,7 +7,7 @@ import { shouldRetry } from "@/api/queryClient";
 
 const API = `${window.location.origin}/api/v1`;
 const server = setupServer();
-beforeAll(() => server.listen({ onUnhandledFrame: "error" }));
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 

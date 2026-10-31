@@ -7,3 +7,4 @@
 /sandbox_manager/tests/
 /infra/tests/
 uv.lock
+package-lock.json

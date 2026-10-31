@@ -1,4 +1,4 @@
-# Build context of kodekantor/backend and kodekantor/sandbox-manager: the repository root (infra/compose.yml).
+# Build context of every kodekantor/* image: the repository root (infra/compose.yml).
 # Send the daemon only what the Dockerfiles copy, never .git, .env or local virtualenvs. A new COPY source
 # must be added here; the build fails loudly until it is.
 *
@@ -13,5 +13,16 @@
 !sandbox_manager/sandbox_manager/
 !infra/egress-proxy/tinyproxy.conf
 !infra/egress-proxy/allowlist
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/.npmrc
+!frontend/index.html
+!frontend/tsconfig.json
+!frontend/vite.config.ts
+!frontend/public/
+!frontend/src/
+!frontend/nginx/default.conf
+**/node_modules
+**/__tests__
 **/__pycache__
 **/*.pyc

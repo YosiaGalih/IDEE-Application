@@ -895,3 +895,30 @@ Review delta AG-13 @ 3977424: **SIGNED OFF**. M1 tertutup di kode. M2 menjadi sy
 LOW yang tetap terbuka, tidak memblokir:
 - cache Trivy di host persisten (didokumentasikan; runner GitHub sekali pakai);
 - semgrep dan ruleset registry tidak dipin hash.
+
+### WP-1.4a — fondasi frontend: scaffold, token, UI kit, klien API, SSE, i18n, image `web` (FR-149, PRD v2.2 §4/§8.1)
+
+Spec: `docs/superpowers/specs/2026-10-31-wp-1.4a-frontend-scaffold-design.md`. Plan: `docs/superpowers/plans/2026-10-31-wp-1.4a-frontend-scaffold.md`.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `npm ci --no-audit --ignore-scripts` dari nol | 473 paket |
+| `format:check`, `lint`, `typecheck` | bersih |
+| `lint:guards` | kelima fixture (impor lintas fitur via alias dan relatif, `new WebSocket`, teks literal, `dangerouslySetInnerHTML`) ditolak aturannya; mutan "aturan dimatikan" → skrip gagal |
+| `npm test` | 80 test: klien API 25, auth 5, parser SSE 7, stream + hook 12, i18n 2, UI 23, route 6 |
+| Mutan SSE | watchdog tanpa `reader.cancel()` → test "fetch yang tidak mengakhiri body saat abort" merah |
+| `npx vite build` | JS 440 kB (139 kB gzip), font Inter lokal |
+| `npm audit --omit=dev` | 0 setelah zod 4.6.7 (GHSA-mrhx-c7xc-m3w5, HIGH). Dev: 12 moderate, semuanya minimatch lewat ESLint; belum ada perbaikan non-breaking |
+| Image `kodekantor/web:dev` | build lokal; dijalankan read-only, `cap_drop ALL`, uid 101: `/healthz` 200, route SPA → app shell `no-cache`, `/assets/*` `immutable`, aset hilang → 404, header Server tanpa versi |
+| Stack lokal lewat Caddy + Chromium | `https://localhost/` 200 dengan CSP penuh; 0 pelanggaran CSP / error konsol; font dimuat dari origin sendiri; navigasi, ganti bahasa ke `en`, dan 404 bekerja |
+| `python3 -m unittest discover -s infra/tests` | OK (1 skip); compose `web` = image lokal `kodekantor/web` dengan `pull_policy: never` |
+
+Temuan saat menjalankan:
+- **npm 10.9.4 crash pada graf peer vitest.** Lockfile ditulis npm 11.21.0. msw 3 membuat `npm ci` npm 10 menolak lockfile, sehingga msw tetap 2.15.
+- **MSW 3 mengganti `onUnhandledRequest` menjadi `onUnhandledFrame`.** Typecheck menangkapnya. Sebelumnya opsi itu diam-diam diabaikan: test tidak gagal pada request yang tidak ditangani.
+- **Item terbuka untuk WP-1.6 (G1), bug dari WP-1.5a:** `scheduler` menjadi **unhealthy setelah 10 menit**.
+  - Penyebab: healthcheck memakai mtime `/tmp/celerybeat-schedule`, tetapi beat (celery 5.6.3, `dbm.gnu`) tidak memperbarui mtime file itu walau terus mengirim task.
+  - Terlihat di stack lokal: mtime 05:09, status unhealthy dengan 82 kegagalan beruntun.
+  - CI `clean-install` tidak menangkapnya karena selesai sebelum 10 menit.
+
+Konflik dokumen baru: #60–#62. CLAUDE.md bagian "Perintah": frontend.
