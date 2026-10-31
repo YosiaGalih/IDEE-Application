@@ -803,3 +803,33 @@ Bukti setelah perbaikan:
 - Drill lokal PASS: restore 34 dtk, DB lama tersimpan.
 
 Utang: scanner (gitleaks, semgrep, trivy) belum pernah dijalankan atas diff ini; gate security-scan sebelum G1.
+
+### WP-1.5d (🔒) — Semgrep dan Trivy di `security-scan` (SECURITY_MODEL §11, T8; prasyarat G1)
+
+Spec: `docs/superpowers/specs/2026-10-31-wp-1.5d-security-scan-design.md`. Plan: `docs/superpowers/plans/2026-10-31-wp-1.5d-security-scan.md`.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `python3 -m unittest discover -s infra/tests` | OK (1 skip). `test_scan_gate.py`: 30 test (gate Trivy/Semgrep dengan JSON sintetis, daftar image dari compose, kebijakan repo) |
+| Mutan gate (16) | merah semua: CRITICAL tanpa perbaikan lolos, EOSL diabaikan, laporan hilang, laporan tanpa OS, laporan liar, CVE exception tidak terpakai, `pkg_path` tidak terpakai, exception berlaku untuk image lain, tanggal DECISIONS tidak dicek, batas 92 hari, kedaluwarsa, file penanda Semgrep, ERROR Semgrep lolos, error Semgrep lolos, daftar image kosong |
+| Mutan kebijakan repo (2) | `postgres.user` bukan `70:70` selama EX-04 ada → merah; tanggal EX-03 di DECISIONS berbeda dari TOML → merah |
+| Trivy lokal (DB 31 Okt) | 9 dari 10 image; egress-proxy tidak bisa dibangun di container ini (mirror apk diblokir) dan gate memblokir laporan yang hilang itu |
+| Semgrep lokal | ruleset registry tidak bisa diunduh (semgrep.dev diblokir proxy); semantik `nosemgrep` diuji dengan rule lokal pada semgrep 1.180.0: ID lengkap dan bagian terakhirnya dikenali, prefix tidak; kontrol tanpa komentar → ditandai |
+| `sandbox-isolation` (CI) | hijau dengan base sandbox-node baru (node 22 trixie) |
+
+CI di runner GitHub, [job security-scan 124457098515](https://github.com/YosiaGalih/IDEE-Application/actions/runs/41173808138/job/124457098515) (86b85f8):
+- **Semgrep.** 199 rule, 186 file. Hasilnya 1 ERROR, yang dicatat sebagai false positive EX-05 (`sqlalchemy.text` pada GRANT/REVOKE dengan nama role tervalidasi), dan 6 WARNING `chmod` yang disengaja.
+- **Trivy.** `scan: 10 images`, semuanya punya laporan.
+  - Debian 13: 43–44 HIGH tanpa perbaikan per image, 175 baris "allowed EX-02".
+  - 55 baris "excepted" (EX-03, EX-04).
+  - egress-proxy: Alpine 3.24.3, 0 temuan.
+  - `gate: PASS (0 blocking)`.
+
+Temuan saat menjalankan:
+- Perintah literal SECURITY_MODEL §11 merah permanen pada setiap image Debian → konflik #56, exception EX-02.
+- Tag nginx-unprivileged `1.29-alpine` tidak lagi diperbarui upstream (47 temuan berperbaikan) → pin `1.30-alpine`.
+- Image Node bookworm membawa CRITICAL zlib `will_not_fix` → base `22-trixie-slim`.
+- `nosemgrep` dengan prefix ID rule registry tidak berlaku (ID registry mengulang bagian terakhirnya) → ID lengkap.
+- Image pihak ketiga terbaru (31 Okt) masih membawa temuan yang hanya bisa diperbaiki upstream → konflik #57, EX-03 (30 hari) dan EX-04.
+
+Konflik dokumen baru: #56, #57. DECISIONS: EX-02..EX-05 (menunggu persetujuan PO). RUNBOOK §12.1: prosedur exception bulanan dan saat merah.
