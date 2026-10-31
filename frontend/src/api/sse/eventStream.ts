@@ -23,6 +23,8 @@ export type StreamOptions = {
   maxBackoffMs?: number;
   /** Consecutive failures before the status turns from reconnecting to disconnected (retries go on). */
   disconnectedAfter?: number;
+  /** A connection that stayed open this long was healthy, even if it only carried heartbeats. */
+  healthyAfterMs?: number;
   jitter?: () => number;
   fetchImpl?: typeof fetch;
 };
@@ -75,6 +77,7 @@ export function openEventStream(options: StreamOptions): EventStream {
   const initialBackoff = options.initialBackoffMs ?? 1_000;
   const maxBackoff = options.maxBackoffMs ?? 30_000;
   const disconnectedAfter = options.disconnectedAfter ?? 3;
+  const healthyAfterMs = options.healthyAfterMs ?? 15_000;
   const jitter = options.jitter ?? Math.random;
   const fetchImpl = options.fetchImpl ?? fetch.bind(globalThis);
 
@@ -118,19 +121,19 @@ export function openEventStream(options: StreamOptions): EventStream {
     report("failed", error);
   };
 
-  /** Delivers one frame; returns false when the connection must be dropped (a gap in seq). */
-  const deliver = (frame: SseFrame): boolean => {
+  /** Delivers one frame: "new" when it reached onFrame, "skip" when it did not, "gap" to drop the connection. */
+  const deliver = (frame: SseFrame): "new" | "skip" | "gap" => {
     let seq: number | null = null;
     if (frame.id !== null) {
       if (!/^\d+$/.test(frame.id)) {
         protocolError(`event id is not a sequence number: ${frame.id.slice(0, 40)}`);
-        return true;
+        return "skip";
       }
       seq = Number(frame.id);
-      if (lastSeq !== null && seq <= lastSeq) return true; // replayed after a reconnect
+      if (lastSeq !== null && seq <= lastSeq) return "skip"; // replayed after a reconnect
       if (lastSeq !== null && seq > lastSeq + 1) {
         protocolError(`seq gap: expected ${lastSeq + 1}, got ${seq}; resuming from ${lastSeq}`);
-        return false;
+        return "gap";
       }
       lastSeq = seq;
     }
@@ -139,7 +142,7 @@ export function openEventStream(options: StreamOptions): EventStream {
     } catch (cause) {
       protocolError(`frame handler threw for seq ${seq ?? "-"}: ${String(cause)}`);
     }
-    return true;
+    return "new";
   };
 
   async function connect(): Promise<void> {
@@ -157,6 +160,9 @@ export function openEventStream(options: StreamOptions): EventStream {
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     let silent = false;
     let gap = false;
+    let openedAt: number | null = null;
+    /** A connection that stayed up a while was healthy even with heartbeats only (an idle wait). */
+    const wasHealthy = () => openedAt !== null && Date.now() - openedAt >= healthyAfterMs;
     const arm = () => {
       if (watchdog) clearTimeout(watchdog);
       watchdog = setTimeout(() => {
@@ -186,6 +192,7 @@ export function openEventStream(options: StreamOptions): EventStream {
         throw new ApiError({ kind: "bad_response", status: response.status, message: "not an event stream" });
       }
       report("open");
+      openedAt = Date.now();
       const parser = new SseParser();
       reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
       for (;;) {
@@ -193,11 +200,13 @@ export function openEventStream(options: StreamOptions): EventStream {
         if (done) break;
         arm(); // any bytes, heartbeat comments included, prove the connection is alive
         for (const frame of parser.push(value)) {
-          if (!deliver(frame)) {
+          const outcome = deliver(frame);
+          if (outcome === "gap") {
             gap = true;
             break;
           }
-          failures = 0; // only a delivered frame proves the stream works, not an accepted handshake
+          // A new frame proves the stream works; an accepted handshake or a replayed duplicate does not.
+          if (outcome === "new") failures = 0;
         }
         if (gap) {
           attempt.abort();
@@ -207,6 +216,7 @@ export function openEventStream(options: StreamOptions): EventStream {
       }
       if (watchdog) clearTimeout(watchdog);
       if (closed) return;
+      if (!gap && wasHealthy()) failures = 0;
       if (gap)
         scheduleRetry(new ApiError({ kind: "bad_response", message: "events missing from the stream" }));
       else if (silent)
@@ -215,6 +225,7 @@ export function openEventStream(options: StreamOptions): EventStream {
     } catch (cause) {
       if (watchdog) clearTimeout(watchdog);
       if (closed) return;
+      if (wasHealthy()) failures = 0;
       const error =
         cause instanceof ApiError
           ? cause

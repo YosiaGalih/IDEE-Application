@@ -61,7 +61,7 @@
     },
     "disconnected": {
       "title": "Disconnected",
-      "body": "No connection to the server. Reconnecting automatically.",
+      "body": "No connection to the server. Check your network, then try again.",
       "action": "Retry now"
     },
     "permission_denied": {

@@ -211,6 +211,30 @@ describe("openEventStream", () => {
     await waitFor(() => expect(statuses).toContain("disconnected"));
   });
 
+  it("does not escalate drops of healthy idle connections, nor reset on replayed duplicates", async () => {
+    const endpoint = fakeEndpoint();
+    const { statuses } = open(endpoint, { disconnectedAfter: 2, healthyAfterMs: 30 });
+    for (let i = 1; i <= 3; i++) {
+      await waitFor(() => expect(endpoint.connections()).toBe(i), { timeout: 1000 });
+      endpoint.send(": ping\n\n");
+      await new Promise((r) => setTimeout(r, 40)); // stayed up longer than healthyAfterMs
+      endpoint.end();
+    }
+    await waitFor(() => expect(endpoint.connections()).toBe(4), { timeout: 1000 });
+    expect(statuses).not.toContain("disconnected");
+  });
+
+  it("counts a connection that only replays duplicates as a failure", async () => {
+    const endpoint = fakeEndpoint();
+    const { statuses } = open(endpoint, { lastSeq: 5, disconnectedAfter: 2, healthyAfterMs: 10_000 });
+    for (let i = 1; i <= 2; i++) {
+      await waitFor(() => expect(endpoint.connections()).toBe(i), { timeout: 1000 });
+      endpoint.send(frame(4) + frame(5)); // nothing new
+      endpoint.end();
+    }
+    await waitFor(() => expect(statuses).toContain("disconnected"));
+  });
+
   it("refuses a path that leaves the API base and reports it as failed", async () => {
     const endpoint = fakeEndpoint();
     const statuses: StreamStatus[] = [];

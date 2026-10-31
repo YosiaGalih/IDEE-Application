@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { useRouteError } from "react-router";
+import { useNavigate, useRouteError } from "react-router";
 import { ApiError } from "@/api/errors";
 import { uxStateForError } from "@/api/uxState";
 import { StateView } from "@/components/ui/StateView";
@@ -14,13 +14,18 @@ export function RouteErrorPage() {
   const error = useRouteError();
   const state = uxStateForError(error);
   useDocumentTitle(t(`states.${state === "loading" ? "error" : state}.title`));
-  const handleReload = () => window.location.reload();
+  const navigate = useNavigate();
+  const handleAction = () => {
+    if (state === "unauthenticated") void navigate("/login");
+    else window.location.reload();
+  };
   return (
     <main className="mx-auto max-w-xl p-6">
       <StateView
         state={state}
         requestId={error instanceof ApiError ? error.requestId : null}
-        onAction={handleReload}
+        onAction={handleAction}
+        titleAs="h1"
       />
     </main>
   );

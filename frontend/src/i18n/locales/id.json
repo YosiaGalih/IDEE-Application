@@ -61,7 +61,7 @@
     },
     "disconnected": {
       "title": "Koneksi terputus",
-      "body": "Tidak ada koneksi ke server. Menyambung ulang secara otomatis.",
+      "body": "Tidak ada koneksi ke server. Periksa jaringan Anda, lalu coba lagi.",
       "action": "Coba sekarang"
     },
     "permission_denied": {

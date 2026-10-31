@@ -66,9 +66,13 @@ export function apiUrl(path: string): URL {
     path.startsWith("//") ||
     path.includes("\\") ||
     /%2e/i.test(path) ||
+    // eslint-disable-next-line no-control-regex -- the point is to refuse control characters
+    /[\u0000-\u001F\u007F]/.test(path) ||
     path.split(/[/?#]/).includes("..");
   const url = new URL(`${API_BASE}${path}`, window.location.origin);
-  if (unsafe || url.origin !== window.location.origin || !url.pathname.startsWith(`${API_BASE}/`)) {
+  // Whatever the parser rewrites (dropped tab/CR/LF, folded dots, escaped characters) is refused.
+  const rawPathname = `${API_BASE}${path.split(/[?#]/)[0] ?? ""}`;
+  if (unsafe || url.origin !== window.location.origin || url.pathname !== rawPathname) {
     throw new Error(`API path must be a plain absolute path under ${API_BASE}: ${path}`);
   }
   return url;
@@ -78,18 +82,23 @@ export function apiUrl(path: string): URL {
  * There is no CSRF endpoint: any API response sets the pre-session cookie (core/csrf.py), and logout
  * clears it. A mutation without the cookie first makes one GET to get it.
  */
+let csrfBootstrap: Promise<void> | null = null;
+
 async function csrfToken(signal: AbortSignal): Promise<string> {
   const existing = readCookie(CSRF_COOKIE);
   if (existing) return existing;
-  try {
-    await fetch(apiUrl("/auth/me"), {
-      credentials: "same-origin",
-      headers: { Accept: "application/json" },
-      signal,
+  // One GET for all mutations waiting at once: two would each set a different cookie.
+  csrfBootstrap ??= fetch(apiUrl("/auth/me"), {
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+    signal,
+  })
+    .then(() => undefined)
+    .catch(() => undefined) // reported below as csrf_missing
+    .finally(() => {
+      csrfBootstrap = null;
     });
-  } catch {
-    // reported below as csrf_missing
-  }
+  await csrfBootstrap;
   const issued = readCookie(CSRF_COOKIE);
   if (!issued)
     throw new ApiError({ kind: "csrf_missing", message: "The server did not issue a CSRF cookie" });

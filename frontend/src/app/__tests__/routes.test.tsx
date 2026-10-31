@@ -22,6 +22,7 @@ describe("route map (ARCHITECTURE §3.1b)", () => {
     render(<RouterProvider router={createMemoryRouter(withBoom, { initialEntries: ["/boom"] })} />);
     quiet.mockRestore();
     expect(screen.getByRole("alert")).toHaveTextContent(id.states.error.title);
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(id.states.error.title);
     expect(screen.getByRole("button", { name: id.states.error.action })).toBeInTheDocument();
     expect(document.body).not.toHaveTextContent("internal detail");
     expect(document.body).not.toHaveTextContent("Unexpected Application Error");

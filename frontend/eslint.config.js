@@ -49,6 +49,12 @@ const UI_TEXT = [
   },
 ];
 // Only src/api talks to the server, so envelope validation, CSRF and timeouts always apply.
+const NETWORK_MEMBERS = [
+  {
+    selector: "MemberExpression[property.name=/^(fetch|XMLHttpRequest)$/]",
+    message: "Call the API through src/api (apiRequest, openEventStream).",
+  },
+];
 const NETWORK_GLOBALS = [
   { name: "fetch", message: "Call the API through src/api (apiRequest, openEventStream)." },
   { name: "XMLHttpRequest", message: "Call the API through src/api." },
@@ -78,14 +84,17 @@ export default tseslint.config(
       "no-eval": "error",
       "no-implied-eval": "off",
       "@typescript-eslint/no-implied-eval": "error",
-      "no-restricted-syntax": ["error", ...RAW_HTML, ...SOCKETS, ...STORAGE, ...UI_TEXT],
+      "no-restricted-syntax": ["error", ...RAW_HTML, ...SOCKETS, ...STORAGE, ...UI_TEXT, ...NETWORK_MEMBERS],
       "no-restricted-globals": ["error", ...NETWORK_GLOBALS],
     },
   },
   {
     // The API layer is the one place that talks to the network (frontend.md).
     files: ["src/api/**"],
-    rules: { "no-restricted-globals": "off" },
+    rules: {
+      "no-restricted-globals": "off",
+      "no-restricted-syntax": ["error", ...RAW_HTML, ...SOCKETS, ...STORAGE, ...UI_TEXT],
+    },
   },
   {
     // The language preference is the one value kept in browser storage (no tokens: frontend.md).

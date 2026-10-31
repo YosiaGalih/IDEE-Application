@@ -964,3 +964,25 @@ Ditunda ke WP-1.4b:
 - stream berhenti pada status terminal task;
 - batas event di memori;
 - matriks browser.
+
+Review delta @ 31aff5b:
+- `kk-frontend-reviewer`: **BLOCK dicabut (APPROVE)**. Keempat HIGH diverifikasi tertutup langsung: ganti task, celah seq `[1,2,3,4]` lewat replay, 403 `capability_disabled` tanpa retry, error boundary. Badai backoff turun dari 37 ke 6 koneksi per 400 ms.
+- AG-13: **SIGNED OFF**, syarat 1 terpenuhi: CI `security-scan` @ 31aff5b menunjukkan `kodekantor/web:dev: alpine 3.24.2, 1 results, 0 HIGH/CRITICAL findings` dan `gate: PASS`. Perbaikan brotli/curl terbukti, dan EX-03 untuk `web` tidak diperlukan lagi.
+
+Temuan sisa dari kedua review delta, ditutup di commit berikutnya:
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| AG-13 MEDIUM sisa: tab/LF/CR pada path mentah dibuang parser, sehingga `.\t.` menjadi `..` | `apiUrl` menolak karakter kontrol **dan** setiap path yang ditulis ulang parser (`url.pathname` harus sama dengan `API_BASE + path`) | test `.\t.`, `\n`, `\r`, spasi; query string tetap jalan; `apiPath(".\t.")` → `.%09.` |
+| AG-13 LOW: `window.fetch`/`globalThis.fetch` lolos lint | selector `MemberExpression` fetch/XMLHttpRequest di luar `src/api` | fixture ke-14 `lint:guards` |
+| frontend M-low: stream idle yang sehat (hanya ping) menumpuk kegagalan; duplikat replay mereset hitungan | koneksi yang hidup ≥ `healthyAfterMs` (15 dtk) dianggap sehat; hanya frame **baru** yang mereset | 2 test; 2 mutan → merah |
+| frontend LOW: dua mutasi pra-sesi sekaligus → dua GET → dua cookie berbeda | satu GET bersama (promise in-flight) | test 3 mutasi → 1 GET; mutan → merah |
+| frontend LOW: aksi "Masuk" memuat ulang halaman; halaman error tanpa `<h1>`; teks disconnected menjanjikan sambung otomatis | aksi `unauthenticated` → `/login`; `StateView titleAs="h1"`; teks "Periksa jaringan Anda, lalu coba lagi" | test heading; mutan → merah |
+| LOW: komentar entri docker-socket-proxy ikut terhapus | dikembalikan | TOML |
+
+Tetap ditunda ke 1.4b:
+- `onUnauthenticated` yang sadar route publik dan `?next=`. Ini harus aman dari open redirect.
+- Stream berhenti pada status terminal, dan batas event di memori. Keduanya **sebelum layar task dirilis**.
+- Item 1.4b lain di tabel sebelumnya.
+
+Bukti setelah perbaikan: lint, `lint:guards` (14/14), typecheck, dan format bersih; **122 test**; 4 mutan baru merah.

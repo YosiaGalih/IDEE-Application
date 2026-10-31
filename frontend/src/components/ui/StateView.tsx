@@ -52,11 +52,13 @@ type Props = {
   detail?: string;
   requestId?: string | null;
   onAction?: () => void;
+  /** The title's element: h1 when the state is the whole page. */
+  titleAs?: "h1" | "h2" | "p";
   className?: string;
 };
 
 /** One view for every required screen state (PRD §4.1–§4.2): icon + text, never colour alone. */
-export function StateView({ state, title, detail, requestId, onAction, className }: Props) {
+export function StateView({ state, title, detail, requestId, onAction, titleAs = "p", className }: Props) {
   const { t } = useTranslation();
   const isProblem = state !== "loading" && state !== "empty" && state !== "partial_success";
   if (state === "loading") {
@@ -72,6 +74,7 @@ export function StateView({ state, title, detail, requestId, onAction, className
     );
   }
   const Icon = ICONS[state];
+  const TitleTag = titleAs;
   const action = ACTIONABLE.has(state) && onAction ? t(`states.${state}.action`) : null;
   return (
     <div
@@ -80,7 +83,7 @@ export function StateView({ state, title, detail, requestId, onAction, className
       className={cn("flex flex-col items-center gap-3 p-8 text-center", className)}
     >
       <Icon aria-hidden="true" className={cn("size-8", isProblem ? "text-status-danger" : "text-fg-muted")} />
-      <p className="text-base font-semibold text-fg">{title ?? t(`states.${state}.title`)}</p>
+      <TitleTag className="text-base font-semibold text-fg">{title ?? t(`states.${state}.title`)}</TitleTag>
       <p className="max-w-md text-sm text-fg-muted">{detail ?? t(`states.${state}.body`)}</p>
       {requestId ? (
         <p className="font-mono text-xs text-fg-muted">{t("common.requestId", { id: requestId })}</p>

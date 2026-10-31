@@ -117,6 +117,25 @@ describe("apiRequest", () => {
     expect(seen[0]?.headers.get("X-CSRF-Token")).toBe("issued");
   });
 
+  it("makes one CSRF bootstrap GET for mutations that start together", async () => {
+    let gets = 0;
+    server.use(
+      http.get(`${API}/auth/me`, async () => {
+        gets += 1;
+        await new Promise((r) => setTimeout(r, 10));
+        document.cookie = `kk_csrf=c${gets}; path=/`;
+        return failed(401, "UNAUTHENTICATED");
+      }),
+      http.post(
+        `${API}/things`,
+        record(() => ok({ id: "t" })),
+      ),
+    );
+    await Promise.all([1, 2, 3].map(() => apiRequest("/things", { method: "POST", schema: Thing })));
+    expect(gets).toBe(1);
+    expect(new Set(seen.map((r) => r.headers.get("X-CSRF-Token")))).toEqual(new Set(["c1"]));
+  });
+
   it("refuses a mutation when no CSRF cookie can be had, before the mutation is sent", async () => {
     server.use(http.get(`${API}/auth/me`, () => failed(401, "UNAUTHENTICATED")));
     server.use(
@@ -192,6 +211,10 @@ describe("apiRequest", () => {
     "/projects/%2E./x",
     "/projects/..\\admin\\users\\u1",
     "/projects/..",
+    "/projects/.\t./admin/users/u1",
+    "/projects/.\n./admin/users/u1",
+    "/projects/..\r/admin/users/u1",
+    "/projects/a b",
   ])("refuses %s, which would leave the API base", async (path) => {
     document.cookie = "kk_csrf=c; path=/";
     await expect(apiRequest(path, { method: "DELETE", schema: Thing })).rejects.toThrow(
@@ -200,9 +223,21 @@ describe("apiRequest", () => {
     expect(seen).toHaveLength(0);
   });
 
+  it("keeps a plain path with a query string", async () => {
+    server.use(
+      http.get(
+        `${API}/projects`,
+        record(() => ok({ id: "x" })),
+      ),
+    );
+    await apiRequest("/projects?page=2&page_size=50", { schema: Thing });
+    expect(new URL(seen[0]?.url ?? "").searchParams.get("page")).toBe("2");
+  });
+
   it("builds paths whose segments cannot add or remove a segment", () => {
     expect(apiPath("projects", "a/b", "imports")).toBe("/projects/a%2Fb/imports");
     expect(apiPath("tasks", 7)).toBe("/tasks/7");
+    expect(apiPath("projects", ".\t.", "x")).toBe("/projects/.%09./x");
   });
 });
 

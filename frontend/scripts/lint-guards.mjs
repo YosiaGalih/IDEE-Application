@@ -61,6 +61,11 @@ const cases = [
     rule: "no-restricted-globals",
   },
   {
+    file: path.join(dirA, "WindowFetch.ts"),
+    source: 'export const get = () => window.fetch("/api/v1/projects");\n',
+    rule: "no-restricted-syntax",
+  },
+  {
     file: path.join(dirA, "Eval.ts"),
     source: "export const run = (code: string): unknown => eval(code);\n",
     rule: "no-eval",
