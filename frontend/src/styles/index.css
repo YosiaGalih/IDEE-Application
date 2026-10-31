@@ -1,0 +1,80 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+
+/*
+ * KodeKantor design tokens (PRD v2.2 §4: groups brand-*, sidebar-*, status-*; light and dark).
+ * Values come from the hi-fi mockups (docs/mockups, conflict #61): navy sidebar, orange primary action,
+ * blue for status/interaction, green for success. Status is never colour alone: StatusPill adds icon + text.
+ */
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --color-brand-50: #fdf2ec;
+  --color-brand-100: #fbe3d6;
+  --color-brand-500: #e05a1b;
+  --color-brand-600: #c84712;
+  --color-brand-700: #a63a0e;
+
+  --color-sidebar: #1f2f49;
+  --color-sidebar-deep: #13233e;
+  --color-sidebar-active: #2c3e5c;
+  --color-sidebar-fg: #d5dce8;
+  --color-sidebar-muted: #93a1b8;
+
+  --color-canvas: #f3f5f9;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f8fafc;
+  --color-line: #e2e7ef;
+  --color-fg: #0f1428;
+  --color-fg-muted: #535d70;
+  --color-focus: #1d4ed8;
+
+  --color-status-success: #1f7a3f;
+  --color-status-success-bg: #e7f6ec;
+  --color-status-info: #1d4ed8;
+  --color-status-info-bg: #e8f0fe;
+  --color-status-warning: #8a5300;
+  --color-status-warning-bg: #fff4e0;
+  --color-status-danger: #b42318;
+  --color-status-danger-bg: #fdecec;
+  --color-status-neutral: #475467;
+  --color-status-neutral-bg: #eef1f5;
+
+  --radius-card: 0.75rem;
+  --radius-control: 0.5rem;
+}
+
+:root[data-theme="dark"] {
+  --color-canvas: #0b1220;
+  --color-surface: #121b2d;
+  --color-surface-muted: #172238;
+  --color-line: #26324a;
+  --color-fg: #e8edf6;
+  --color-fg-muted: #a3afc4;
+  --color-focus: #8ab4ff;
+  --color-sidebar: #0e1a2e;
+  --color-sidebar-deep: #08121f;
+  --color-sidebar-active: #1c2b45;
+  --color-status-success: #7ad59a;
+  --color-status-success-bg: #12301f;
+  --color-status-info: #9cc0ff;
+  --color-status-info-bg: #142640;
+  --color-status-warning: #f4c06a;
+  --color-status-warning-bg: #33260f;
+  --color-status-danger: #ff9a8f;
+  --color-status-danger-bg: #3a1714;
+  --color-status-neutral: #c3ccdb;
+  --color-status-neutral-bg: #1d2638;
+}
+
+html {
+  font-family: var(--font-sans);
+  color: var(--color-fg);
+  background: var(--color-canvas);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}

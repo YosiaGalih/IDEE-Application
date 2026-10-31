@@ -1,0 +1,119 @@
+{
+  "app": {
+    "name": "KodeKantor",
+    "tagline": "An AI team that builds your software",
+    "skipToContent": "Skip to content",
+    "mainNav": "Main navigation"
+  },
+  "nav": {
+    "sectionWork": "Work",
+    "sectionSettings": "Settings",
+    "dashboard": "Dashboard",
+    "projects": "Projects",
+    "agents": "AI agents",
+    "approvals": "Approvals",
+    "settings": "Settings"
+  },
+  "screens": {
+    "login": "Sign in",
+    "dashboard": "Dashboard",
+    "projects": "Projects",
+    "newProject": "New project",
+    "workspace": "Workspace",
+    "agents": "AI agents",
+    "tasks": "Tasks",
+    "taskDetail": "Task detail",
+    "preview": "Preview",
+    "testing": "Testing & debugging",
+    "review": "Review & diff",
+    "acceptance": "User Proxy validation",
+    "approvals": "Approvals",
+    "deployments": "Deployments",
+    "knowledge": "Knowledge",
+    "providers": "Providers & models",
+    "usage": "Usage & cost",
+    "users": "Users",
+    "policies": "Policies",
+    "audit": "Audit",
+    "notFound": "Page not found"
+  },
+  "placeholder": {
+    "body": "This screen is built in WP-1.4b. The foundation (API client, event stream, i18n, components) is ready."
+  },
+  "states": {
+    "loading": {
+      "title": "Loading…",
+      "body": "Fetching data."
+    },
+    "empty": {
+      "title": "Nothing here yet",
+      "body": "There is nothing to show here yet."
+    },
+    "error": {
+      "title": "Something went wrong",
+      "body": "The request failed. Try again; if it keeps failing, include the request ID when reporting.",
+      "action": "Try again"
+    },
+    "timeout": {
+      "title": "Timed out",
+      "body": "The server did not answer in time.",
+      "action": "Try again"
+    },
+    "disconnected": {
+      "title": "Disconnected",
+      "body": "No connection to the server. Reconnecting automatically.",
+      "action": "Retry now"
+    },
+    "permission_denied": {
+      "title": "Access denied",
+      "body": "Your account is not allowed to do this or see this data."
+    },
+    "partial_success": {
+      "title": "Partly done",
+      "body": "Some steps succeeded; check the details before going on."
+    },
+    "quota_exceeded": {
+      "title": "Quota used up",
+      "body": "The usage limit for this period has been reached."
+    },
+    "capability_disabled": {
+      "title": "Feature turned off",
+      "body": "This feature is turned off by an admin or a policy."
+    },
+    "provider_degraded": {
+      "title": "Service degraded",
+      "body": "A service this needs is unavailable. Try again in a moment.",
+      "action": "Try again"
+    },
+    "unauthenticated": {
+      "title": "Session ended",
+      "body": "Sign in again to continue.",
+      "action": "Sign in"
+    },
+    "rate_limited": {
+      "title": "Too many requests",
+      "body": "Wait a moment before trying again.",
+      "action": "Try again"
+    },
+    "not_found": {
+      "title": "Not found",
+      "body": "This does not exist or is outside your access."
+    }
+  },
+  "status": {
+    "queued": "Queued",
+    "running": "Running",
+    "waiting_approval": "Waiting for approval",
+    "validating": "Validating",
+    "completed": "Completed",
+    "failed": "Failed",
+    "cancelled": "Cancelled"
+  },
+  "common": {
+    "requestId": "Request ID: {{id}}",
+    "language": "Language",
+    "languageId": "Indonesia",
+    "languageEn": "English",
+    "backHome": "Back to the dashboard"
+  }
+}

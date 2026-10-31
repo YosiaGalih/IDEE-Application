@@ -1,0 +1,119 @@
+{
+  "app": {
+    "name": "KodeKantor",
+    "tagline": "Tim AI untuk membangun software Anda",
+    "skipToContent": "Lompat ke konten",
+    "mainNav": "Navigasi utama"
+  },
+  "nav": {
+    "sectionWork": "Kerja",
+    "sectionSettings": "Pengaturan",
+    "dashboard": "Dashboard",
+    "projects": "Project",
+    "agents": "AI Agents",
+    "approvals": "Persetujuan",
+    "settings": "Pengaturan"
+  },
+  "screens": {
+    "login": "Masuk",
+    "dashboard": "Dashboard",
+    "projects": "Project",
+    "newProject": "Project baru",
+    "workspace": "Workspace",
+    "agents": "AI Agents",
+    "tasks": "Task",
+    "taskDetail": "Detail task",
+    "preview": "Preview",
+    "testing": "Testing & debugging",
+    "review": "Review & diff",
+    "acceptance": "Validasi User Proxy",
+    "approvals": "Persetujuan",
+    "deployments": "Deployment",
+    "knowledge": "Knowledge",
+    "providers": "Provider & model",
+    "usage": "Pemakaian & biaya",
+    "users": "Pengguna",
+    "policies": "Kebijakan",
+    "audit": "Audit",
+    "notFound": "Halaman tidak ditemukan"
+  },
+  "placeholder": {
+    "body": "Layar ini dibangun di WP-1.4b. Fondasi (klien API, stream event, i18n, komponen) sudah siap."
+  },
+  "states": {
+    "loading": {
+      "title": "Memuat…",
+      "body": "Data sedang diambil."
+    },
+    "empty": {
+      "title": "Belum ada data",
+      "body": "Belum ada yang bisa ditampilkan di sini."
+    },
+    "error": {
+      "title": "Terjadi kesalahan",
+      "body": "Permintaan gagal. Coba lagi; bila berulang, sertakan ID permintaan saat melapor.",
+      "action": "Coba lagi"
+    },
+    "timeout": {
+      "title": "Waktu habis",
+      "body": "Server tidak menjawab tepat waktu.",
+      "action": "Coba lagi"
+    },
+    "disconnected": {
+      "title": "Koneksi terputus",
+      "body": "Tidak ada koneksi ke server. Menyambung ulang secara otomatis.",
+      "action": "Coba sekarang"
+    },
+    "permission_denied": {
+      "title": "Akses ditolak",
+      "body": "Akun Anda tidak punya izin untuk tindakan atau data ini."
+    },
+    "partial_success": {
+      "title": "Berhasil sebagian",
+      "body": "Sebagian langkah berhasil; lihat rincian sebelum melanjutkan."
+    },
+    "quota_exceeded": {
+      "title": "Kuota habis",
+      "body": "Batas pemakaian untuk periode ini sudah tercapai."
+    },
+    "capability_disabled": {
+      "title": "Fitur nonaktif",
+      "body": "Fitur ini dimatikan oleh admin atau kebijakan."
+    },
+    "provider_degraded": {
+      "title": "Layanan terganggu",
+      "body": "Layanan pendukung sedang tidak tersedia. Coba lagi beberapa saat lagi.",
+      "action": "Coba lagi"
+    },
+    "unauthenticated": {
+      "title": "Sesi berakhir",
+      "body": "Silakan masuk lagi untuk melanjutkan.",
+      "action": "Masuk"
+    },
+    "rate_limited": {
+      "title": "Terlalu banyak permintaan",
+      "body": "Tunggu sebentar sebelum mencoba lagi.",
+      "action": "Coba lagi"
+    },
+    "not_found": {
+      "title": "Tidak ditemukan",
+      "body": "Data ini tidak ada atau di luar akses Anda."
+    }
+  },
+  "status": {
+    "queued": "Dalam antrean",
+    "running": "Berjalan",
+    "waiting_approval": "Menunggu persetujuan",
+    "validating": "Divalidasi",
+    "completed": "Selesai",
+    "failed": "Gagal",
+    "cancelled": "Dibatalkan"
+  },
+  "common": {
+    "requestId": "ID permintaan: {{id}}",
+    "language": "Bahasa",
+    "languageId": "Indonesia",
+    "languageEn": "English",
+    "backHome": "Kembali ke dashboard"
+  }
+}
