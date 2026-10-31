@@ -163,6 +163,14 @@ class TrivyGate(Case):
         self.assertEqual(code, 0, out)
         self.assertIn("EX-04", out)
 
+    def test_package_path_exception_that_matches_nothing_blocks(self):
+        self.policy(POLICY + '[[exception]]\nid = "EX-04"\nuntil = 2027-01-31\nimage = "postgres:16"\n'
+                    'pkg_path = "usr/local/bin/gosu"\n')
+        self.add(report("postgres:16@sha256:abc"))
+        code, out = self.trivy()
+        self.assertEqual(code, 1, out)
+        self.assertIn("usr/local/bin/gosu", out)
+
     def test_expired_exception_blocks(self):
         self.policy(POLICY + '[[exception]]\nid = "EX-03"\nuntil = 2026-11-30\nimage = "caddy:2"\nvulns = ["CVE-5"]\n')
         self.add(report("caddy:2", [vuln("CVE-5", fixed="2")]))
@@ -307,7 +315,12 @@ class RepositoryPolicy(unittest.TestCase):
                     ids = re.findall(r"EX-\d{2}", line)
                     self.assertTrue(ids, f"{name}:{number}: nosemgrep without EX-nn")
                     for exc_id in ids:
-                        self.assertIn(f"| {exc_id} |", decisions, f"{name}:{number}: {exc_id} not in DECISIONS")
+                        row = next((r for r in decisions.splitlines() if r.startswith(f"| {exc_id} |")), "")
+                        self.assertTrue(row, f"{name}:{number}: {exc_id} not in DECISIONS")
+                        # The same expiry rule as the Trivy exceptions: in the future, at most 92 days ahead.
+                        until = date.fromisoformat(re.findall(r"\d{4}-\d{2}-\d{2}", row.rsplit("|", 2)[-2])[0])
+                        self.assertTrue(0 <= (until - date.today()).days <= gate.MAX_EXCEPTION_DAYS,
+                                        f"{name}:{number}: {exc_id} expires {until}")
 
 
 if __name__ == "__main__":
