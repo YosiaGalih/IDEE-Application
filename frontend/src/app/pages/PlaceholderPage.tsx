@@ -4,7 +4,6 @@ import { Card } from "@/components/ui/Card";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 
 export type ScreenKey =
-  | "login"
   | "dashboard"
   | "projects"
   | "newProject"
@@ -27,7 +26,7 @@ export type ScreenKey =
 
 type Props = { screen: ScreenKey };
 
-/** Stands in for a screen until WP-1.4b and later work packages build it. */
+/** Stands in for a screen until a later work package builds it. */
 export function PlaceholderPage({ screen }: Props) {
   const { t } = useTranslation();
   const title = t(`screens.${screen}`);

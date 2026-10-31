@@ -1,10 +1,15 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Outlet, useLocation } from "react-router";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 
-export function AppLayout() {
+type Props = {
+  /** Shown on the top bar: the signed-in user and the account actions (features/auth). */
+  userMenu?: ReactNode;
+};
+
+export function AppLayout({ userMenu }: Props) {
   const { t } = useTranslation();
   const { pathname } = useLocation();
   const mainRef = useRef<HTMLElement>(null);
@@ -27,7 +32,7 @@ export function AppLayout() {
       </a>
       <Sidebar />
       <div className="flex min-w-0 flex-1 flex-col">
-        <TopBar />
+        <TopBar userMenu={userMenu} />
         <main id="main" ref={mainRef} tabIndex={-1} className="flex-1 p-6 focus:outline-none">
           <Outlet />
         </main>

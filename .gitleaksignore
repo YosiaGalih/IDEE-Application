@@ -5,3 +5,5 @@
 6b7b588e842654f07f483d299ec6c07e8f0555cc:backend/tests/integration/test_core_audit.py:generic-api-key:108
 # False positive: "max_bytes=50 * 1024 * 1024" (a size literal) matched generic-api-key (WP-1.2a review tests).
 5cb94ead09c5dfaf7b1d43a694dfbc4d000d550b:backend/tests/security/test_workspace_hostile.py:generic-api-key:155
+# Synthetic reset token in a screen test (WP-1.4b), committed before it could carry an inline allow comment.
+f7f21facaceaadc9e585ab77009ac29b6146b208:frontend/src/features/auth/__tests__/PasswordReset.test.tsx:generic-api-key:72

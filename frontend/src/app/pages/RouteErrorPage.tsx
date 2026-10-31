@@ -1,8 +1,9 @@
 import { useTranslation } from "react-i18next";
-import { useNavigate, useRouteError } from "react-router";
+import { useLocation, useNavigate, useRouteError } from "react-router";
 import { ApiError } from "@/api/errors";
 import { uxStateForError } from "@/api/uxState";
 import { StateView } from "@/components/ui/StateView";
+import { loginPath } from "@/lib/safeNext";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 
 /**
@@ -15,8 +16,9 @@ export function RouteErrorPage() {
   const state = uxStateForError(error);
   useDocumentTitle(t(`states.${state === "loading" ? "error" : state}.title`));
   const navigate = useNavigate();
+  const location = useLocation();
   const handleAction = () => {
-    if (state === "unauthenticated") void navigate("/login");
+    if (state === "unauthenticated") void navigate(loginPath(location));
     else window.location.reload();
   };
   return (

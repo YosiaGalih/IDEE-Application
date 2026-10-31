@@ -1,5 +1,6 @@
 import js from "@eslint/js";
 import i18next from "eslint-plugin-i18next";
+import jsxA11y from "eslint-plugin-jsx-a11y";
 import react from "eslint-plugin-react";
 import reactHooks from "eslint-plugin-react-hooks";
 import globals from "globals";
@@ -69,12 +70,14 @@ export default tseslint.config(
       globals: globals.browser,
       parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
     },
-    plugins: { react, "react-hooks": reactHooks, local },
+    plugins: { react, "react-hooks": reactHooks, "jsx-a11y": jsxA11y, local },
     settings: { react: { version: "19.3" } },
     rules: {
       ...react.configs.flat.recommended.rules,
       ...react.configs.flat["jsx-runtime"].rules,
       ...reactHooks.configs.recommended.rules,
+      // Labels, roles and keyboard access are checked at lint time (WCAG 2.2 AA, PRD §4.1).
+      ...jsxA11y.flatConfigs.recommended.rules,
       // AI, web and repo content is never rendered as raw HTML (frontend.md, SECURITY_MODEL).
       "react/no-danger": "error",
       "react/jsx-no-target-blank": ["error", { allowReferrer: false, enforceDynamicLinks: "always" }],

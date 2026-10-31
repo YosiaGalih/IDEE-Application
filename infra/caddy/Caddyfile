@@ -12,7 +12,8 @@
 		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
-		Referrer-Policy "same-origin"
+		# A default: a route below may set a stricter one (the reset page, whose URL holds a token).
+		?Referrer-Policy "same-origin"
 		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
 		Cross-Origin-Opener-Policy "same-origin"
 		Cross-Origin-Resource-Policy "same-origin"
@@ -23,6 +24,11 @@
 {$APP_DOMAIN} {
 	import security_headers
 	encode zstd gzip
+
+	# The reset link holds its token in the path until the page replaces the URL: its assets must not
+	# send it on as Referer, not even to this origin (T5; DEPLOYMENT keeps same-origin everywhere else).
+	@reset_password path /reset-password /reset-password/*
+	header @reset_password Referrer-Policy "no-referrer"
 
 	# Archive import: the one route with a large body (ADR-005: archives up to 200 MB).
 	@import {

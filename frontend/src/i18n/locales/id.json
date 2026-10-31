@@ -15,7 +15,6 @@
     "settings": "Pengaturan"
   },
   "screens": {
-    "login": "Masuk",
     "dashboard": "Dashboard",
     "projects": "Project",
     "newProject": "Project baru",
@@ -115,5 +114,76 @@
     "languageId": "Indonesia",
     "languageEn": "English",
     "backHome": "Kembali ke dashboard"
+  },
+  "auth": {
+    "brandTitle": "KodeKantor — Tim AI untuk membangun software Anda",
+    "brandBody": "Setiap langkah agent tercatat sebagai bukti; perubahan hanya diterapkan setelah Anda menyetujuinya.",
+    "email": "Email",
+    "password": "Kata sandi",
+    "rememberMe": "Ingat saya",
+    "errorSummary": "Periksa kembali isian yang ditandai.",
+    "rateLimited_one": "Terlalu banyak percobaan. Coba lagi dalam {{count}} detik.",
+    "rateLimited_other": "Terlalu banyak percobaan. Coba lagi dalam {{count}} detik.",
+    "rateLimitedNoTime": "Terlalu banyak percobaan. Coba lagi sebentar lagi.",
+    "outcomeUnknown": "Jawaban server tidak sampai, jadi hasilnya belum pasti: kata sandi mungkin sudah berubah. Coba masuk dengan kata sandi baru sebelum mengulang.",
+    "errors": {
+      "emailRequired": "Isi email Anda.",
+      "emailInvalid": "Format email tidak valid.",
+      "passwordRequired": "Isi kata sandi.",
+      "passwordTooShort": "Kata sandi minimal 12 karakter.",
+      "passwordTooLong": "Kata sandi maksimal 1024 karakter.",
+      "passwordMismatch": "Konfirmasi tidak sama dengan kata sandi baru."
+    },
+    "login": {
+      "title": "Masuk ke KodeKantor",
+      "subtitle": "Gunakan akun yang dibuat oleh admin workspace Anda.",
+      "submit": "Masuk",
+      "submitting": "Memeriksa…",
+      "forgot": "Lupa kata sandi?",
+      "invalid": "Email atau kata sandi salah, atau akun sedang dikunci sementara.",
+      "resetDone": "Kata sandi sudah diganti. Masuk dengan kata sandi baru.",
+      "sessionNotStored": "Server menerima login, tetapi browser tidak menyimpan sesinya. Pastikan cookie diizinkan, dan alamatnya memakai HTTPS bila instalasi mewajibkannya.",
+      "sessionExpired": "Sesi Anda berakhir. Masuk lagi untuk melanjutkan."
+    },
+    "forgot": {
+      "title": "Lupa kata sandi",
+      "subtitle": "Masukkan email akun Anda untuk meminta tautan pembuatan kata sandi baru.",
+      "submit": "Minta tautan",
+      "submitting": "Mengirim permintaan…",
+      "sent": "Permintaan diterima. Versi KodeKantor ini belum mengirim email, jadi tautan tidak akan sampai ke kotak masuk Anda. Minta operator instalasi Anda mengatur ulang kata sandi.",
+      "backToLogin": "Kembali ke halaman masuk"
+    },
+    "reset": {
+      "title": "Buat kata sandi baru",
+      "subtitle": "Minimal 12 karakter. Setelah diganti, semua sesi lama keluar otomatis.",
+      "newPassword": "Kata sandi baru",
+      "confirmPassword": "Ulangi kata sandi baru",
+      "submit": "Simpan kata sandi",
+      "submitting": "Menyimpan…",
+      "invalidLink": "Tautan tidak valid atau sudah kedaluwarsa. Minta tautan baru.",
+      "noToken": "Buka lagi tautan reset kata sandi yang Anda terima. Setiap tautan hanya bisa dipakai sekali.",
+      "requestNew": "Minta tautan baru"
+    },
+    "change": {
+      "open": "Ganti kata sandi",
+      "title": "Ganti kata sandi",
+      "description": "Sesi di perangkat lain akan keluar setelah kata sandi diganti.",
+      "current": "Kata sandi sekarang",
+      "submit": "Ganti kata sandi",
+      "submitting": "Menyimpan…",
+      "cancel": "Batal",
+      "wrongCurrent": "Kata sandi sekarang salah, atau akun sedang dikunci sementara.",
+      "conflict": "Kata sandi baru saja berubah di tempat lain. Masuk lagi.",
+      "done": "Kata sandi sudah diganti.",
+      "close": "Tutup",
+      "signInAgain": "Masuk lagi"
+    },
+    "menu": {
+      "label": "Akun",
+      "signedInAs": "Masuk sebagai {{name}}",
+      "logout": "Keluar",
+      "loggingOut": "Sedang keluar…",
+      "logoutFailed": "Gagal keluar: sesi masih aktif. Coba lagi."
+    }
   }
 }

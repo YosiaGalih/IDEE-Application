@@ -15,7 +15,6 @@
     "settings": "Settings"
   },
   "screens": {
-    "login": "Sign in",
     "dashboard": "Dashboard",
     "projects": "Projects",
     "newProject": "New project",
@@ -115,5 +114,76 @@
     "languageId": "Indonesia",
     "languageEn": "English",
     "backHome": "Back to the dashboard"
+  },
+  "auth": {
+    "brandTitle": "KodeKantor — an AI team that builds your software",
+    "brandBody": "Every agent step is recorded as evidence; changes are applied only after you approve them.",
+    "email": "Email",
+    "password": "Password",
+    "rememberMe": "Remember me",
+    "errorSummary": "Check the marked fields.",
+    "rateLimited_one": "Too many attempts. Try again in {{count}} second.",
+    "rateLimited_other": "Too many attempts. Try again in {{count}} seconds.",
+    "rateLimitedNoTime": "Too many attempts. Try again shortly.",
+    "outcomeUnknown": "The server's answer did not arrive, so the outcome is unknown: the password may have changed. Try signing in with the new password before retrying.",
+    "errors": {
+      "emailRequired": "Enter your email.",
+      "emailInvalid": "This is not a valid email.",
+      "passwordRequired": "Enter your password.",
+      "passwordTooShort": "Use at least 12 characters.",
+      "passwordTooLong": "Use at most 1024 characters.",
+      "passwordMismatch": "The confirmation does not match the new password."
+    },
+    "login": {
+      "title": "Sign in to KodeKantor",
+      "subtitle": "Use the account your workspace admin created for you.",
+      "submit": "Sign in",
+      "submitting": "Checking…",
+      "forgot": "Forgot your password?",
+      "invalid": "Wrong email or password, or the account is temporarily locked.",
+      "resetDone": "Your password was changed. Sign in with the new one.",
+      "sessionNotStored": "The server accepted the sign-in, but the browser did not keep the session. Check that cookies are allowed, and that the address uses HTTPS if your installation requires it.",
+      "sessionExpired": "Your session ended. Sign in again to continue."
+    },
+    "forgot": {
+      "title": "Forgot password",
+      "subtitle": "Enter your account email to request a link for setting a new password.",
+      "submit": "Request link",
+      "submitting": "Sending request…",
+      "sent": "Request received. This version of KodeKantor does not send email yet, so no link will reach your inbox. Ask the operator of your installation to reset the password.",
+      "backToLogin": "Back to sign in"
+    },
+    "reset": {
+      "title": "Set a new password",
+      "subtitle": "At least 12 characters. Every old session is signed out once it changes.",
+      "newPassword": "New password",
+      "confirmPassword": "Repeat the new password",
+      "submit": "Save password",
+      "submitting": "Saving…",
+      "invalidLink": "This link is invalid or has expired. Ask for a new one.",
+      "noToken": "Open the password reset link you received again. Each link works only once.",
+      "requestNew": "Ask for a new link"
+    },
+    "change": {
+      "open": "Change password",
+      "title": "Change password",
+      "description": "Sessions on other devices are signed out once the password changes.",
+      "current": "Current password",
+      "submit": "Change password",
+      "submitting": "Saving…",
+      "cancel": "Cancel",
+      "wrongCurrent": "The current password is wrong, or the account is temporarily locked.",
+      "conflict": "The password just changed elsewhere. Sign in again.",
+      "done": "Your password was changed.",
+      "close": "Close",
+      "signInAgain": "Sign in again"
+    },
+    "menu": {
+      "label": "Account",
+      "signedInAs": "Signed in as {{name}}",
+      "logout": "Sign out",
+      "loggingOut": "Signing out…",
+      "logoutFailed": "Sign-out failed: the session is still active. Try again."
+    }
   }
 }

@@ -16,6 +16,8 @@ type ApiErrorInit = {
   requestId?: string | null;
   /** The key a mutation was sent with: pass it again to retry the same action without doing it twice. */
   idempotencyKey?: string | null;
+  /** Seconds from a 429/503 `Retry-After` header, when the server sent one. */
+  retryAfterSeconds?: number | null;
   cause?: unknown;
 };
 
@@ -26,6 +28,7 @@ export class ApiError extends Error {
   readonly details: unknown;
   readonly requestId: string | null;
   readonly idempotencyKey: string | null;
+  readonly retryAfterSeconds: number | null;
 
   constructor(init: ApiErrorInit) {
     super(init.message ?? init.code ?? init.kind, { cause: init.cause });
@@ -36,5 +39,6 @@ export class ApiError extends Error {
     this.details = init.details;
     this.requestId = init.requestId ?? null;
     this.idempotencyKey = init.idempotencyKey ?? null;
+    this.retryAfterSeconds = init.retryAfterSeconds ?? null;
   }
 }

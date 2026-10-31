@@ -1,19 +1,35 @@
 import type { RouteObject } from "react-router";
 import { AppLayout } from "@/components/layout/AppLayout";
+import { ForgotPasswordPage } from "@/features/auth/ForgotPasswordPage";
+import { LoginPage } from "@/features/auth/LoginPage";
+import { RequireSession } from "@/features/auth/RequireSession";
+import { ResetPasswordPage } from "@/features/auth/ResetPasswordPage";
+import { UserMenu } from "@/features/auth/UserMenu";
+import { AUTH_PATHS } from "@/lib/safeNext";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { RouteErrorPage } from "./pages/RouteErrorPage";
 import { PlaceholderPage, type ScreenKey } from "./pages/PlaceholderPage";
 
 const page = (screen: ScreenKey) => <PlaceholderPage screen={screen} />;
 
-/** The route map of ARCHITECTURE §3.1b. WP-1.4b and later replace each placeholder with its screen. */
+/**
+ * The route map of ARCHITECTURE §3.1b. The auth pages are public; everything in the app shell sits behind
+ * the session guard. Later work packages replace each placeholder with its screen.
+ */
 export const routes: RouteObject[] = [
   {
     errorElement: <RouteErrorPage />,
     children: [
-      { path: "/login", element: page("login") },
+      { path: AUTH_PATHS.login, element: <LoginPage /> },
+      { path: AUTH_PATHS.forgotPassword, element: <ForgotPasswordPage /> },
+      // One route for both: replacing the URL drops the token without remounting the page.
+      { path: `${AUTH_PATHS.resetPassword}/:token?`, element: <ResetPasswordPage /> },
       {
-        element: <AppLayout />,
+        element: (
+          <RequireSession>
+            <AppLayout userMenu={<UserMenu />} />
+          </RequireSession>
+        ),
         errorElement: <RouteErrorPage />,
         children: [
           { index: true, element: page("dashboard") },

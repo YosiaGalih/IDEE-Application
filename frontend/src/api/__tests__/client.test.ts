@@ -57,6 +57,32 @@ describe("apiRequest", () => {
     expect(error).toMatchObject({ kind: "http", status: 403, code: "FORBIDDEN", requestId: "req-12345678" });
   });
 
+  it.each([
+    ["37", 37],
+    ["0", 0],
+    ["Wed, 21 Oct 2026 07:28:00 GMT", null],
+    ["-5", null],
+    ["1e3", null],
+    ["9999999", null],
+    [null, null],
+  ])("reads Retry-After %j as %j seconds, nothing else", async (header, seconds) => {
+    server.use(
+      http.get(`${API}/limited`, () =>
+        HttpResponse.json(
+          {
+            request_id: "req-12345678",
+            status: "failed",
+            error: { code: "RATE_LIMITED", message: "slow down" },
+          },
+          { status: 429, ...(header === null ? {} : { headers: { "Retry-After": header } }) },
+        ),
+      ),
+    );
+    const error: unknown = await apiRequest("/limited", { schema: z.unknown() }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).retryAfterSeconds).toBe(seconds);
+  });
+
   it("rejects data that does not match the schema instead of passing it on", async () => {
     server.use(http.get(`${API}/things/1`, () => ok({ id: 42 })));
     await expect(apiRequest("/things/1", { schema: Thing })).rejects.toMatchObject({ kind: "bad_response" });
@@ -148,6 +174,32 @@ describe("apiRequest", () => {
       kind: "csrf_missing",
     });
     expect(seen).toHaveLength(0);
+  });
+
+  it("reports an unreachable API during the CSRF bootstrap as disconnected, not as a missing cookie", async () => {
+    server.use(http.get(`${API}/auth/me`, () => HttpResponse.error()));
+    const error: unknown = await apiRequest("/auth/password/forgot", {
+      method: "POST",
+      body: { email: "a@b.c" },
+      schema: Thing,
+    }).catch((e: unknown) => e);
+    expect(error).toMatchObject({ kind: "network" });
+    expect(uxStateForError(error)).toBe("disconnected");
+    expect(seen).toHaveLength(0);
+  });
+
+  it("keeps Retry-After from a gateway's own 429 page", async () => {
+    server.use(
+      http.get(
+        `${API}/gateway`,
+        () => new HttpResponse("<html>busy</html>", { status: 429, headers: { "Retry-After": "9" } }),
+      ),
+    );
+    await expect(apiRequest("/gateway", { schema: Thing })).rejects.toMatchObject({
+      kind: "bad_response",
+      status: 429,
+      retryAfterSeconds: 9,
+    });
   });
 
   it("returns the Idempotency-Key with a failed mutation so a retry can reuse it", async () => {

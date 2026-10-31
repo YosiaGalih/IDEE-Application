@@ -82,9 +82,10 @@ export function apiUrl(path: string): URL {
  * There is no CSRF endpoint: any API response sets the pre-session cookie (core/csrf.py), and logout
  * clears it. A mutation without the cookie first makes one GET to get it.
  */
-let csrfBootstrap: Promise<void> | null = null;
+/** The bootstrap GET in flight, resolving to its failure (null when it got an answer). */
+let csrfBootstrap: Promise<unknown> | null = null;
 
-async function csrfToken(signal: AbortSignal): Promise<string> {
+async function csrfToken(signal: AbortSignal, timeout: AbortSignal, caller?: AbortSignal): Promise<string> {
   const existing = readCookie(CSRF_COOKIE);
   if (existing) return existing;
   // One GET for all mutations waiting at once: two would each set a different cookie.
@@ -93,16 +94,23 @@ async function csrfToken(signal: AbortSignal): Promise<string> {
     headers: { Accept: "application/json" },
     signal,
   })
-    .then(() => undefined)
-    .catch(() => undefined) // reported below as csrf_missing
+    .then(() => null)
+    .catch((cause: unknown) => cause)
     .finally(() => {
       csrfBootstrap = null;
     });
-  await csrfBootstrap;
+  const failure = await csrfBootstrap;
   const issued = readCookie(CSRF_COOKIE);
-  if (!issued)
-    throw new ApiError({ kind: "csrf_missing", message: "The server did not issue a CSRF cookie" });
-  return issued;
+  if (issued) return issued;
+  // No answer at all is the network's state (disconnected/timeout), not a missing cookie.
+  if (failure !== null) {
+    throw new ApiError({
+      kind: abortKind(timeout, caller) ?? "network",
+      message: "Could not reach the API for a CSRF cookie",
+      cause: failure,
+    });
+  }
+  throw new ApiError({ kind: "csrf_missing", message: "The server did not issue a CSRF cookie" });
 }
 
 function abortKind(timeout: AbortSignal, caller?: AbortSignal): "timeout" | "aborted" | null {
@@ -126,7 +134,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
 
   let idempotencyKey: string | null = null;
   if (MUTATING.has(method)) {
-    if (path !== "/auth/login") headers.set("X-CSRF-Token", await csrfToken(signal));
+    if (path !== "/auth/login") headers.set("X-CSRF-Token", await csrfToken(signal, timeout, options.signal));
     if (!path.startsWith("/auth/")) {
       idempotencyKey = options.idempotencyKey ?? crypto.randomUUID();
       headers.set("Idempotency-Key", idempotencyKey);
@@ -146,6 +154,9 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
   }
 
   const headerRequestId = response.headers.get("X-Request-ID");
+  const retryAfter = /^\d{1,6}$/.test(response.headers.get("Retry-After") ?? "")
+    ? Number(response.headers.get("Retry-After"))
+    : null;
   let payload: unknown;
   try {
     payload = await response.json();
@@ -156,6 +167,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
       status: response.status,
       message: aborted ? `Request ${aborted} while reading the response` : "Response is not JSON",
       requestId: headerRequestId,
+      retryAfterSeconds: retryAfter,
       cause,
     });
   }
@@ -170,6 +182,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
       message: error.message,
       details: error.details,
       requestId: request_id ?? headerRequestId,
+      retryAfterSeconds: retryAfter,
     });
   }
   const success = successEnvelope.safeParse(payload);
@@ -179,6 +192,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
       status: response.status,
       message: "Response is not the API envelope",
       requestId: headerRequestId,
+      retryAfterSeconds: retryAfter, // a gateway's own 429/503 page may still say when to retry
     });
   }
   const data = options.schema.safeParse(success.data.data);
