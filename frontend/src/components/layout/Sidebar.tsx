@@ -1,9 +1,10 @@
 import { Bot, CheckSquare, FolderKanban, LayoutDashboard, Settings, type LucideIcon } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { NavLink } from "react-router";
+import type id from "@/i18n/locales/id.json";
 import { cn } from "@/lib/cn";
 
-type Item = { to: string; labelKey: string; icon: LucideIcon; end?: boolean };
+type Item = { to: string; labelKey: `nav.${keyof (typeof id)["nav"]}`; icon: LucideIcon; end?: boolean };
 
 const WORK: Item[] = [
   { to: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, end: true },

@@ -1,10 +1,10 @@
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { fetchMe, login, logout } from "@/api/auth";
 import { readCookie } from "@/api/cookies";
 import { ApiError } from "@/api/errors";
-import { shouldRetry } from "@/api/queryClient";
+import { createQueryClient, HANDLES_UNAUTHENTICATED, shouldRetry } from "@/api/queryClient";
 
 const API = `${window.location.origin}/api/v1`;
 const server = setupServer();
@@ -95,5 +95,49 @@ describe("shouldRetry", () => {
     expect(shouldRetry(0, new ApiError({ kind: "bad_response", status: 200 }))).toBe(false);
     expect(shouldRetry(2, new ApiError({ kind: "network" }))).toBe(false);
     expect(shouldRetry(0, new Error("x"))).toBe(false);
+  });
+});
+
+describe("createQueryClient 401 handling", () => {
+  const unauthenticated = new ApiError({ kind: "http", status: 401, code: "SESSION_EXPIRED" });
+
+  it("reports a 401 from a query or a mutation once each", async () => {
+    const onUnauthenticated = vi.fn();
+    const client = createQueryClient({ onUnauthenticated });
+    await client
+      .fetchQuery({ queryKey: ["x"], queryFn: () => Promise.reject(unauthenticated) })
+      .catch(() => {});
+    await client
+      .getMutationCache()
+      .build(client, { mutationFn: () => Promise.reject(unauthenticated) })
+      .execute(undefined)
+      .catch(() => {});
+    expect(onUnauthenticated).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves a 401 to queries and mutations marked HANDLES_UNAUTHENTICATED", async () => {
+    const onUnauthenticated = vi.fn();
+    const client = createQueryClient({ onUnauthenticated });
+    await client
+      .fetchQuery({
+        queryKey: ["me"],
+        queryFn: () => Promise.reject(unauthenticated),
+        meta: HANDLES_UNAUTHENTICATED,
+      })
+      .catch(() => {});
+    await client
+      .getMutationCache()
+      .build(client, { mutationFn: () => Promise.reject(unauthenticated), meta: HANDLES_UNAUTHENTICATED })
+      .execute(undefined)
+      .catch(() => {});
+    expect(onUnauthenticated).not.toHaveBeenCalled();
+  });
+
+  it("ignores other failures", async () => {
+    const onUnauthenticated = vi.fn();
+    const client = createQueryClient({ onUnauthenticated });
+    const forbidden = new ApiError({ kind: "http", status: 403, code: "FORBIDDEN" });
+    await client.fetchQuery({ queryKey: ["y"], queryFn: () => Promise.reject(forbidden) }).catch(() => {});
+    expect(onUnauthenticated).not.toHaveBeenCalled();
   });
 });

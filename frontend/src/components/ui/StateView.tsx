@@ -35,15 +35,18 @@ const ICONS: Record<Exclude<UxState, "loading">, LucideIcon> = {
   not_found: SearchX,
 };
 
-/** States that warrant an action button when the caller gives one. */
-const ACTIONABLE: ReadonlySet<UxState> = new Set([
+/** States that warrant an action button when the caller gives one (each has `states.<state>.action`). */
+const ACTIONABLE = [
   "error",
   "timeout",
   "disconnected",
   "provider_degraded",
   "unauthenticated",
   "rate_limited",
-]);
+] as const;
+type ActionableState = (typeof ACTIONABLE)[number];
+const isActionable = (state: UxState): state is ActionableState =>
+  (ACTIONABLE as readonly UxState[]).includes(state);
 
 type Props = {
   state: UxState;
@@ -75,7 +78,7 @@ export function StateView({ state, title, detail, requestId, onAction, titleAs =
   }
   const Icon = ICONS[state];
   const TitleTag = titleAs;
-  const action = ACTIONABLE.has(state) && onAction ? t(`states.${state}.action`) : null;
+  const action = isActionable(state) && onAction ? t(`states.${state}.action`) : null;
   return (
     <div
       role={isProblem ? "alert" : "status"}

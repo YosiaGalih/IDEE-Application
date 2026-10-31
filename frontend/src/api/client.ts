@@ -146,6 +146,9 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
   }
 
   const headerRequestId = response.headers.get("X-Request-ID");
+  const retryAfter = /^\d{1,6}$/.test(response.headers.get("Retry-After") ?? "")
+    ? Number(response.headers.get("Retry-After"))
+    : null;
   let payload: unknown;
   try {
     payload = await response.json();
@@ -170,6 +173,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
       message: error.message,
       details: error.details,
       requestId: request_id ?? headerRequestId,
+      retryAfterSeconds: retryAfter,
     });
   }
   const success = successEnvelope.safeParse(payload);

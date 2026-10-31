@@ -12,6 +12,10 @@ export function Card({ className, ...props }: Props) {
   );
 }
 
-export function CardTitle({ className, ...props }: ComponentProps<"h2">) {
-  return <h2 className={cn("text-base font-semibold text-fg", className)} {...props} />;
+export function CardTitle({ className, children, ...props }: ComponentProps<"h2">) {
+  return (
+    <h2 className={cn("text-base font-semibold text-fg", className)} {...props}>
+      {children}
+    </h2>
+  );
 }
