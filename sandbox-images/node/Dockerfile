@@ -1,9 +1,10 @@
 # kodekantor/sandbox-node: the image for node.* profiles (ARCHITECTURE §8, ADR-026 (2)).
 #
 # Runs as uid 10001 with a read-only rootfs and no network; the manager adds every runtime limit.
-# The base is pinned by digest (22-slim). BASE_REPO may name a mirror; the digest stays the same.
+# The base is pinned by digest (22-trixie-slim: Debian 13, like the Python images). BASE_REPO may name a mirror;
+# the digest stays the same.
 ARG BASE_REPO=docker.io/library/node
-FROM ${BASE_REPO}@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
+FROM ${BASE_REPO}@sha256:2117f713a417f3aff682ac8f5bc2ebbdf1beed51f36e67ab1e0fd3866b6d2d8f
 
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
     NPM_CONFIG_FUND=false \
