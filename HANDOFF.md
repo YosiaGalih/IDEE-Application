@@ -4,15 +4,15 @@ File ini ditulis untuk melanjutkan pembangunan KodeKantor setelah kredit cloud h
 
 Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-continuation-under-usage-limits.md`. File ini hanya memuat posisi terakhir dan langkah berikutnya.
 
-## Status (30 Okt 2026)
+## Status (31 Okt 2026)
 
 | | |
 |---|---|
-| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4, di-merge PO 25 Okt) |
+| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5, di-merge PO 31 Okt) |
 | Branch kerja | `claude/gracious-goodall-3hjh19` (dimulai ulang dari `main` setelah PR #3 di-merge) |
-| Sedang dikerjakan | PR #5 (uv 0.13.4, menutup EX-01; merge sebelum 2026-11-04). **WP-1.5b** (unit U7): egress-proxy, linter CI, L1. Lihat tracker bagian WP-1.5b |
+| Sedang dikerjakan | **WP-1.5c** (unit U8): backup/restore, drill restore otomatis di CI. Lihat tracker bagian WP-1.5c |
 | Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3. PR #3 di-merge tanpa itu; review putaran 2 menolak karena N1, lalu N1–N5 diperbaiki tetapi belum diverifikasi reviewer (U4, sesi terpisah). Dari WP-1.5a: L1 `--forwarded-allow-ips`, role owner non-superuser untuk migrate, Trivy/Semgrep sebelum G1 (tracker WP-1.5a) |
-| Menunggu PO | konflik dokumen #36–#48 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; konflik #45–#48 (WP-1.5b); merge PR #5; gate G0/G1 |
+| Menunggu PO | konflik dokumen #36–#54 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; konflik #45–#54 (WP-1.5b/1.5c); M2 egress sebelum G4; gate G0/G1 |
 
 ### WP-1.5a: yang sudah ada (di branch kerja)
 
@@ -50,9 +50,9 @@ Sudah selesai sejak HANDOFF pertama:
 Review AG-13 WP-1.5a (25 Okt): **SIGNED OFF**. M1 ditutup dengan pengecualian EX-01 yang kedaluwarsa sendiri di CI; M2, L2–L5 diperbaiki dengan test dan mutan; L1 menjadi utang. Rinciannya di tracker bagian WP-1.5a.
 
 Sisa:
-1. ~~PR #4~~ di-merge 25 Okt. ~~Naikkan uv ke ≥ 0.13.4 (EX-01)~~: PR [#5](https://github.com/YosiaGalih/IDEE-Application/pull/5), CI hijau, menunggu merge.
-2. WP-1.5b ada di PR #5 bersama uv 0.13.4. Review AG-13 signed off; M1, L1–L6 ditutup atau didokumentasikan. M2 (eksfiltrasi lewat CONNECT) terbuka sebagai syarat G4. Pastikan CI hijau di head, lalu keluarkan PR dari draft; tutup temuan review AG-13.
-3. Berikutnya: WP-1.5c (backup/restore), WP-1.4 (frontend), WP-1.6 (G1: Trivy dan Semgrep wajib berjalan di security-scan).
+1. ~~PR #4, #5~~ di-merge. EX-01 ditutup (uv 0.13.4).
+2. WP-1.5c: pastikan CI hijau (drill di runner), tutup temuan review AG-13, lalu keluarkan PR dari draft.
+3. Berikutnya: WP-1.4 (frontend), WP-1.6 (G1: Trivy dan Semgrep wajib berjalan di security-scan). M2 egress (dep-proxy read-only atau SNI splice) adalah syarat sebelum G4.
 
 Catatan build lokal di balik proxy TLS (container cloud): `docker compose ... up --build` tidak bisa membaca CA di luar folder proyek. Build image langsung lalu `up --no-build`:
 
