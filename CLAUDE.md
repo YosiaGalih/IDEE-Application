@@ -79,7 +79,20 @@ uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml
 - PostgreSQL dan Redis lokal di container cloud: `pg_ctlcluster 16 main start` dan `redis-server --daemonize yes`.
 - DB uji default: `kodekantor:kodekantor@localhost:5432/kodekantor_test`.
 - Library baru hanya yang dirilis sebelum tanggal `exclude-newer` di `backend/pyproject.toml`. Majukan tanggal itu lewat PR.
-- Frontend dan e2e belum di-scaffold; perintahnya menyusul di WP-nya.
+- e2e (Playwright) belum di-scaffold; perintahnya menyusul di WP-E2E-01.
+
+Frontend (`cd frontend`, Node 22 sesuai `.nvmrc`, npm):
+
+```bash
+npm ci --no-audit --ignore-scripts   # pasang persis dari package-lock.json
+npm run format:check && npm run lint && npm run lint:guards && npm run typecheck
+npm test                             # Vitest + RTL + MSW
+npx vite build                       # image web: frontend/Dockerfile (konteks: root repo)
+npm audit --omit=dev --audit-level=high
+```
+
+- Paket baru di-resolve dengan `npx npm@11.21.0 install --before=<tanggal exclude-newer backend> --save-exact <paket>`. npm 10.9 bawaan Node 22 crash pada graf peer vitest; `npm ci` npm 10 tetap membaca lockfile-nya.
+- Teks UI hanya lewat kunci i18n (`src/i18n/locales/{id,en}.json`, kunci keduanya harus sama). `lint:guards` membuktikan aturan kontrak (isolasi fitur, `react/no-danger`, WebSocket, teks literal) masih menolak pelanggarannya.
 
 Sandbox manager (`cd sandbox_manager`, pyproject dan uv.lock sendiri):
 

@@ -895,3 +895,94 @@ Review delta AG-13 @ 3977424: **SIGNED OFF**. M1 tertutup di kode. M2 menjadi sy
 LOW yang tetap terbuka, tidak memblokir:
 - cache Trivy di host persisten (didokumentasikan; runner GitHub sekali pakai);
 - semgrep dan ruleset registry tidak dipin hash.
+
+### WP-1.4a — fondasi frontend: scaffold, token, UI kit, klien API, SSE, i18n, image `web` (FR-149, PRD v2.2 §4/§8.1)
+
+Spec: `docs/superpowers/specs/2026-10-31-wp-1.4a-frontend-scaffold-design.md`. Plan: `docs/superpowers/plans/2026-10-31-wp-1.4a-frontend-scaffold.md`.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `npm ci --no-audit --ignore-scripts` dari nol | 473 paket |
+| `format:check`, `lint`, `typecheck` | bersih |
+| `lint:guards` | kelima fixture (impor lintas fitur via alias dan relatif, `new WebSocket`, teks literal, `dangerouslySetInnerHTML`) ditolak aturannya; mutan "aturan dimatikan" → skrip gagal |
+| `npm test` | 80 test: klien API 25, auth 5, parser SSE 7, stream + hook 12, i18n 2, UI 23, route 6 |
+| Mutan SSE | watchdog tanpa `reader.cancel()` → test "fetch yang tidak mengakhiri body saat abort" merah |
+| `npx vite build` | JS 440 kB (139 kB gzip), font Inter lokal |
+| `npm audit --omit=dev` | 0 setelah zod 4.6.7 (GHSA-mrhx-c7xc-m3w5, HIGH). Dev: 12 moderate, semuanya minimatch lewat ESLint; belum ada perbaikan non-breaking |
+| Image `kodekantor/web:dev` | build lokal; dijalankan read-only, `cap_drop ALL`, uid 101: `/healthz` 200, route SPA → app shell `no-cache`, `/assets/*` `immutable`, aset hilang → 404, header Server tanpa versi |
+| Stack lokal lewat Caddy + Chromium | `https://localhost/` 200 dengan CSP penuh; 0 pelanggaran CSP / error konsol; font dimuat dari origin sendiri; navigasi, ganti bahasa ke `en`, dan 404 bekerja |
+| `python3 -m unittest discover -s infra/tests` | OK (1 skip); compose `web` = image lokal `kodekantor/web` dengan `pull_policy: never` |
+
+Temuan saat menjalankan:
+- **npm 10.9.4 crash pada graf peer vitest.** Lockfile ditulis npm 11.21.0. msw 3 membuat `npm ci` npm 10 menolak lockfile, sehingga msw tetap 2.15.
+- **MSW 3 mengganti `onUnhandledRequest` menjadi `onUnhandledFrame`.** Typecheck menangkapnya. Sebelumnya opsi itu diam-diam diabaikan: test tidak gagal pada request yang tidak ditangani.
+- **Item terbuka untuk WP-1.6 (G1), bug dari WP-1.5a:** `scheduler` menjadi **unhealthy setelah 10 menit**.
+  - Penyebab: healthcheck memakai mtime `/tmp/celerybeat-schedule`, tetapi beat (celery 5.6.3, `dbm.gnu`) tidak memperbarui mtime file itu walau terus mengirim task.
+  - Terlihat di stack lokal: mtime 05:09, status unhealthy dengan 82 kegagalan beruntun.
+  - CI `clean-install` tidak menangkapnya karena selesai sebelum 10 menit.
+
+Konflik dokumen baru: #60–#62. CLAUDE.md bagian "Perintah": frontend.
+
+#### Review WP-1.4a @ 87d3aba: `kk-frontend-reviewer` (BLOCK, 4 HIGH), `kk-silent-failure-hunter` (2 HIGH, 7 MEDIUM, 9 LOW), AG-13 `kk-security-reviewer` (**SIGNED OFF** dengan syarat 1 MEDIUM, 4 LOW)
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| H (dua review) `useTaskEvents` menyimpan event task lama saat `taskId` berganti | state dikunci per `taskId` (adjust-during-render) + `lastSeqRef` direset | test A→B; mutan → merah |
+| H (dua review) celah `seq` diterima dan resume melompatinya | frame di atas `lastSeq + 1` tidak dikirim; putus lalu sambung dari `lastSeq` (replay DB). Backend: `seq = tasks.event_seq + 1` dalam transaksi, jadi tanpa lubang | test 1, 3 → `after_seq=1`, hasil `[1,2,3]`; mutan → merah |
+| H error stream dibuang; "disconnected" menyesatkan setelah 401/403/404 | status `failed` + `error` (kode dari envelope) + `uxState` + `reconnect()`; fatal 400/401/403/404/410/422 | test 6 status fatal, kode `CAPABILITY_DISABLED`, `retry()` |
+| H tanpa `errorElement`: stack trace React Router tampil | `RouteErrorPage` (StateView + muat ulang, `requestId`) di root dan layout | test komponen melempar; mutan → merah |
+| M backoff tidak naik (handshake mereset hitungan) | reset hanya setelah frame pertama | test jarak waktu membesar; test 200-lalu-tutup → `disconnected`; mutan → merah |
+| M `onEvent` atau handler frame melempar → event hilang / dianggap error jaringan | event disimpan dulu; error handler dicatat sebagai frame invalid; stream berjalan terus | 2 test; 2 mutan → merah |
+| M offline → query berhenti diam (`paused`) | `networkMode: "always"` | konfigurasi |
+| M `uxStateForError` hanya per kode | fallback status 401/403/404/429/502/503/504 (juga untuk `bad_response`) | 9 baris test; mutan → merah |
+| M (dua review) + AG-13 MEDIUM: penjaga path tembus `%2e%2e`, `.%2E`, `\`; SSE tanpa penjaga | `apiUrl` menolak `..`/`%2e`/`\`, memeriksa origin dan prefiks, dipakai juga oleh SSE; `apiPath` meng-encode segmen | 8 varian ditolak; path SSE → `failed` tanpa request; 2 mutan → merah |
+| M timeout/abort saat baca body jadi `bad_response` | diklasifikasikan `timeout`/`aborted` | kode |
+| M `Idempotency-Key` hilang saat retry | `ApiError.idempotencyKey` | test |
+| M `FormData` di-JSON-kan | dikirim multipart | test; mutan → merah |
+| M mutasi publik setelah logout gagal `csrf_missing` | satu GET `/auth/me` mengambil cookie pra-sesi | test bootstrap; mutan → merah |
+| M cache tidak dibersihkan saat logout; tanpa 401 global | `useLogout` (`queryClient.clear()`); `onUnauthenticated` → `/login` | kode |
+| M kontras fokus sidebar 2.0:1; danger gelap 2.0:1 | `--color-focus-on-dark` di `.on-dark`; `--color-on-danger` | token |
+| M `Alert`/`Badge` hanya warna; tanpa `<h1>`/judul/fokus | ikon per tone; `<h1>` + `useDocumentTitle`; fokus ke `main` saat navigasi | test heading + judul |
+| M fixture auth menyimpang (`project.read`) | `project:read`; nama test diperbaiki | test |
+| M template literal lolos lint i18n | `no-restricted-syntax` untuk template literal anak JSX | fixture `lint:guards` |
+| L (AG-13 + silent-failure) varian lint (eval, `createElement`, `innerHTML`, `insertAdjacentHTML`, `globalThis.WebSocket`, `EventSource`, `localStorage`, `fetch`) | aturan ditambah; 13 fixture `lint:guards` | `lint:guards` 13/13 |
+| L (AG-13) EX-03 untuk image yang kita bangun sendiri | `apk del curl` + `brotli-libs>=1.2.1-r0` di Dockerfile; entri EX-03 `kodekantor/web` dihapus (gate memblokir entri yang tak terpakai, jadi CI membuktikannya) | CI `security-scan` |
+| L (AG-13) undici 7.30.1 tidak tercatat | dicatat di tabel pengecualian umur spec | spec |
+| L `immutable` pada 404 `/assets/` | `always` dihapus untuk lokasi itu | config |
+| L test di luar `__tests__` tidak dijalankan | include `src/**/*.{test,spec}.{ts,tsx}` | vite.config |
+| L direktori fixture tertinggal | `.gitignore` + `rmdir` di skrip | skrip |
+| L `z.uuid()` menolak id non-RFC; `EmptySchema.strict()` | `z.guid()`; `z.object({})` | test id non-RFC |
+
+Bukti setelah perbaikan: format, lint, `lint:guards` (13/13), dan typecheck bersih; **114 test**; 15 mutan baru semuanya merah; `infra/tests` OK.
+
+Ditunda ke WP-1.4b:
+- primitif `CostLabel`/`AiBadge`/`ApprovalDialog`;
+- kunci i18n bertipe dan `jsx-a11y`;
+- `lazy()` per route;
+- respons blob/text;
+- skema payload per tipe;
+- stream berhenti pada status terminal task;
+- batas event di memori;
+- matriks browser.
+
+Review delta @ 31aff5b:
+- `kk-frontend-reviewer`: **BLOCK dicabut (APPROVE)**. Keempat HIGH diverifikasi tertutup langsung: ganti task, celah seq `[1,2,3,4]` lewat replay, 403 `capability_disabled` tanpa retry, error boundary. Badai backoff turun dari 37 ke 6 koneksi per 400 ms.
+- AG-13: **SIGNED OFF**, syarat 1 terpenuhi: CI `security-scan` @ 31aff5b menunjukkan `kodekantor/web:dev: alpine 3.24.2, 1 results, 0 HIGH/CRITICAL findings` dan `gate: PASS`. Perbaikan brotli/curl terbukti, dan EX-03 untuk `web` tidak diperlukan lagi.
+
+Temuan sisa dari kedua review delta, ditutup di commit berikutnya:
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| AG-13 MEDIUM sisa: tab/LF/CR pada path mentah dibuang parser, sehingga `.\t.` menjadi `..` | `apiUrl` menolak karakter kontrol **dan** setiap path yang ditulis ulang parser (`url.pathname` harus sama dengan `API_BASE + path`) | test `.\t.`, `\n`, `\r`, spasi; query string tetap jalan; `apiPath(".\t.")` → `.%09.` |
+| AG-13 LOW: `window.fetch`/`globalThis.fetch` lolos lint | selector `MemberExpression` fetch/XMLHttpRequest di luar `src/api` | fixture ke-14 `lint:guards` |
+| frontend M-low: stream idle yang sehat (hanya ping) menumpuk kegagalan; duplikat replay mereset hitungan | koneksi yang hidup ≥ `healthyAfterMs` (15 dtk) dianggap sehat; hanya frame **baru** yang mereset | 2 test; 2 mutan → merah |
+| frontend LOW: dua mutasi pra-sesi sekaligus → dua GET → dua cookie berbeda | satu GET bersama (promise in-flight) | test 3 mutasi → 1 GET; mutan → merah |
+| frontend LOW: aksi "Masuk" memuat ulang halaman; halaman error tanpa `<h1>`; teks disconnected menjanjikan sambung otomatis | aksi `unauthenticated` → `/login`; `StateView titleAs="h1"`; teks "Periksa jaringan Anda, lalu coba lagi" | test heading; mutan → merah |
+| LOW: komentar entri docker-socket-proxy ikut terhapus | dikembalikan | TOML |
+
+Tetap ditunda ke 1.4b:
+- `onUnauthenticated` yang sadar route publik dan `?next=`. Ini harus aman dari open redirect.
+- Stream berhenti pada status terminal, dan batas event di memori. Keduanya **sebelum layar task dirilis**.
+- Item 1.4b lain di tabel sebelumnya.
+
+Bukti setelah perbaikan: lint, `lint:guards` (14/14), typecheck, dan format bersih; **122 test**; 4 mutan baru merah.

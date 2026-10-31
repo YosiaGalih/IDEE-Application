@@ -129,11 +129,13 @@ services:
   # Placeholder until WP-1.4 builds kodekantor/web from frontend/ (spec WP-1.5a, decision #3).
   web:
     <<: *hardened
-    image: nginxinc/nginx-unprivileged:1.30-alpine@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03
+    image: kodekantor/web:${KK_IMAGE_TAG:-dev}
+    build:
+      context: ..
+      dockerfile: frontend/Dockerfile
+      secrets: [build_ca]
+    pull_policy: never
     user: "101:101"
-    volumes:
-      - ./web/placeholder.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./web/placeholder:/usr/share/nginx/html:ro
     tmpfs: [/tmp]
     networks: [edge]
     healthcheck:

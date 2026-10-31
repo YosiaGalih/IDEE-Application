@@ -8,9 +8,9 @@ Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-
 
 | | |
 |---|---|
-| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c backup/restore (PR #6, di-merge PO 31 Okt) |
-| Branch kerja | `claude/gracious-goodall-3hjh19` (dimulai ulang dari `main` setelah PR #6 di-merge) |
-| Sedang dikerjakan | **WP-1.5d** (PR #7): Semgrep + Trivy di `security-scan` dengan gate `infra/security/scan_gate.py` dan exception EX-02..EX-05 berkedaluwarsa. Lihat tracker bagian WP-1.5d |
+| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c backup/restore (PR #6), WP-1.5d Semgrep + Trivy (PR #7, di-merge PO 31 Okt) |
+| Branch kerja | `claude/gracious-goodall-3hjh19` (dimulai ulang dari `main` setelah PR #7 di-merge) |
+| Sedang dikerjakan | **WP-1.4a** (unit U9): fondasi frontend `frontend/` + image `kodekantor/web` + job CI `frontend`. Lihat tracker bagian WP-1.4a |
 | Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3. PR #3 di-merge tanpa itu; review putaran 2 menolak karena N1, lalu N1–N5 diperbaiki tetapi belum diverifikasi reviewer (U4, sesi terpisah). Dari WP-1.5a: L1 `--forwarded-allow-ips`, role owner non-superuser untuk migrate, Trivy/Semgrep sebelum G1 (tracker WP-1.5a) |
 | Menunggu PO | konflik dokumen #36–#59 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8 (#56/#57 aturan dan cakupan Trivy, #58 Redis 8 atau Valkey, #59 catatan review); persetujuan EX-02..EX-06 di DECISIONS; M2 egress sebelum G4; gate G0/G1 |
 
@@ -51,8 +51,8 @@ Review AG-13 WP-1.5a (25 Okt): **SIGNED OFF**. M1 ditutup dengan pengecualian EX
 
 Sisa:
 1. ~~PR #4, #5~~ di-merge. EX-01 ditutup (uv 0.13.4).
-2. ~~WP-1.5c~~ di-merge (PR #6). WP-1.5d (PR #7): tutup temuan review AG-13 dan silent-failure, lalu keluarkan PR dari draft.
-3. Berikutnya: WP-1.4a/b (frontend; tambahkan `npm audit` dan Semgrep `p/typescript`/`p/react` ke `security-scan`), lalu WP-1.6 (bukti G1, berhenti di gate). M2 egress (dep-proxy read-only atau SNI splice) adalah syarat sebelum G4.
+2. ~~WP-1.5c, WP-1.5d~~ di-merge (PR #6, #7). WP-1.4a: fondasi frontend (PR berikutnya).
+3. Berikutnya: WP-1.4b (layar login, dashboard, projects, agents, approvals; mulai dari daftar "Ditunda ke WP-1.4b" di tracker WP-1.4a, dan selalu pakai `apiPath` untuk parameter route, syarat AG-13), lalu WP-1.6 (bukti G1, berhenti di gate). WP-1.6 harus lebih dulu memperbaiki healthcheck `scheduler`, yang unhealthy setelah 10 menit karena beat dengan `dbm.gnu` tidak memperbarui mtime file jadwal (tracker WP-1.4a). M2 egress (dep-proxy read-only atau SNI splice) adalah syarat sebelum G4.
 4. Exception EX-03 kedaluwarsa 2026-11-30: `security-scan` akan merah pada tanggal itu sampai digest dinaikkan atau exception diperpanjang (RUNBOOK §12.1).
 5. Sebelum deploy publik (WP-7.1/G7): tutup CVE-2026-78669 (HTTP/2 DoS) di caddy, dengan caddy hasil build ulang (Go ≥ 1.26.10, x/net 0.60.0) atau `protocols h1 h3` sementara (DECISIONS EX-03, review AG-13 WP-1.5d).
 

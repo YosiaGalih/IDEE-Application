@@ -414,7 +414,7 @@ class RepositoryPolicy(unittest.TestCase):
         lines = [line for line in (ROOT / ".semgrepignore").read_text().splitlines()
                  if line.strip() and not line.startswith("#")]
         self.assertEqual(lines, [".git/", "/docs/", "/backend/tests/",
-                                 "/sandbox_manager/tests/", "/infra/tests/", "uv.lock"])
+                                 "/sandbox_manager/tests/", "/infra/tests/", "uv.lock", "package-lock.json"])
 
     def test_every_nosemgrep_names_its_rule_and_an_open_exception_for_that_file(self):
         files = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout

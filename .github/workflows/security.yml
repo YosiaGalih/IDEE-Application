@@ -42,18 +42,27 @@ jobs:
         run: |
           uv export --locked --no-hashes --no-emit-project --format requirements-txt > "$RUNNER_TEMP/requirements.txt"
           uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict -r "$RUNNER_TEMP/requirements.txt"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: frontend/.nvmrc
+      # SECURITY_MODEL §11: runtime dependencies of the SPA, 0 high/critical without an exception.
+      - name: Dependency audit (npm audit, runtime)
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high
       # Exceptions EX-nn: the TOML and every inline Semgrep suppression match an open DECISIONS row in the window.
       - name: Exception policy
         run: python3 -m unittest -v infra.tests.test_scan_gate.RepositoryPolicy
       # Findings other than WARNING/INFO and every scan error block; the expected files and the file floor prove
-      # the scan covered the code (186 files on 31 Oct 2026).
+      # the scan covered the code (186 files on 31 Oct 2026; about 240 with frontend/).
       - name: SAST (Semgrep)
         run: |
           uvx --exclude-newer 2026-10-10T00:00:00Z semgrep==1.180.0 scan --metrics=off --disable-version-check \
             --timeout 30 --config p/python --config p/secrets --config p/docker-compose \
+            --config p/typescript --config p/react \
             --json-output="$RUNNER_TEMP/semgrep.json"
-          python3 infra/security/scan_gate.py semgrep --report "$RUNNER_TEMP/semgrep.json" --min-files 180 \
-            --expect backend/app/main.py --expect sandbox_manager/sandbox_manager/app.py --expect infra/compose.yml
+          python3 infra/security/scan_gate.py semgrep --report "$RUNNER_TEMP/semgrep.json" --min-files 225 \
+            --expect backend/app/main.py --expect sandbox_manager/sandbox_manager/app.py --expect infra/compose.yml \
+            --expect frontend/src/main.tsx --expect frontend/src/api/client.ts
       - name: Build and pull every image the stack runs
         run: |
           make sandbox-images
