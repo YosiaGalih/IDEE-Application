@@ -97,7 +97,7 @@ describe("LoginPage", () => {
     backend(() => fail(429, "RATE_LIMITED", "Too many attempts", { "Retry-After": "37" }));
     renderApp("/login");
     await fillAndSubmit();
-    expect(await screen.findByText(id.auth.rateLimited.replace("{{seconds}}", "37"))).toBeInTheDocument();
+    expect(await screen.findByText(id.auth.rateLimited_other.replace("{{count}}", "37"))).toBeInTheDocument();
   });
 
   it("says try again later on 429 without Retry-After", async () => {
@@ -186,10 +186,46 @@ describe("LoginPage", () => {
     expect(queryClient.getQueryData(["projects"])).toBeUndefined();
   });
 
-  it("tells the user the password was reset when they arrive from the reset page", () => {
+  it("tells the user the password was reset, once: the notice leaves the history entry", async () => {
     backend();
-    renderApp({ pathname: "/login", state: { notice: "passwordReset" } });
+    const { router } = renderApp({
+      pathname: "/login",
+      search: "?next=/x",
+      state: { notice: "passwordReset" },
+    });
     expect(screen.getByText(id.auth.login.resetDone)).toBeInTheDocument();
+    await waitFor(() => expect(router.state.location.state).toBeNull());
+    expect(router.state.location.search).toBe("?next=/x");
+    expect(screen.getByText(id.auth.login.resetDone)).toBeInTheDocument();
+  });
+
+  it("ignores a notice it does not know", () => {
+    backend();
+    renderApp({ pathname: "/login", state: { notice: "<b>hi</b>" } });
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("says so when the server accepted the login but the browser kept no session", async () => {
+    const state = backend();
+    server.use(
+      http.post(`${API}/auth/login`, () => {
+        state.logins += 1;
+        return ok({ user }); // 200, yet /auth/me stays 401: the cookie was not stored
+      }),
+    );
+    const { router } = renderApp("/login?next=/projects");
+    await fillAndSubmit();
+    expect(await screen.findByText(id.auth.login.sessionNotStored)).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/login");
+    expect(screen.getByRole("alert")).toHaveFocus();
+  });
+
+  it("keeps no password in the mutation cache once the page is gone", async () => {
+    backend();
+    const { router, queryClient } = renderApp("/login");
+    await fillAndSubmit();
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    await waitFor(() => expect(queryClient.getMutationCache().getAll()).toEqual([]));
   });
 
   it("links to the forgot password page", async () => {

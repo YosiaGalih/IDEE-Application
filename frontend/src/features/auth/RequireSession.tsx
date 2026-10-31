@@ -6,7 +6,7 @@ import { useMe } from "@/api/hooks/useMe";
 import { uxStateForError, type UxState } from "@/api/uxState";
 import { StateView } from "@/components/ui/StateView";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
-import { loginPath } from "@/lib/safeNext";
+import { loginNoticeState, loginPath } from "@/lib/safeNext";
 
 type Props = { children: ReactNode };
 
@@ -19,7 +19,17 @@ export function RequireSession({ children }: Props) {
   const me = useMe();
   const location = useLocation();
   const state = me.isError ? uxStateForError(me.error) : null;
-  if (state === "unauthenticated") return <Navigate to={loginPath(location)} replace />;
+  if (state === "unauthenticated") {
+    // SESSION_EXPIRED: there was a session and it ended; a first visit (UNAUTHENTICATED) gets no notice.
+    const expired = me.error instanceof ApiError && me.error.code === "SESSION_EXPIRED";
+    return (
+      <Navigate
+        to={loginPath(location)}
+        replace
+        {...(expired ? { state: loginNoticeState("sessionExpired") } : {})}
+      />
+    );
+  }
   if (me.data !== undefined) return children;
   // A retry after an error is pending again (no data yet), so it shows loading, not the stale error.
   if (me.isPending) return <SessionState state="loading" />;

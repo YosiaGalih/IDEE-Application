@@ -45,11 +45,20 @@ describe("RequireSession (the session guard)", () => {
     expect(screen.queryByRole("navigation")).toBeNull();
   });
 
-  it("also redirects on an expired session (SESSION_EXPIRED)", async () => {
+  it("says the session ended when it expired (SESSION_EXPIRED), not on a first visit", async () => {
     server.use(http.get(`${API}/auth/me`, () => fail(401, "SESSION_EXPIRED", "Session expired")));
     const { router } = renderApp("/approvals");
     await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
     expect(router.state.location.search).toBe(`?next=${encodeURIComponent("/approvals")}`);
+    expect(await screen.findByText(id.auth.login.sessionExpired)).toBeInTheDocument();
+  });
+
+  it("gives a first visit no session notice", async () => {
+    server.use(signedOut());
+    const { router } = renderApp("/approvals");
+    await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
+    await screen.findByRole("button", { name: id.auth.login.submit });
+    expect(screen.queryByText(id.auth.login.sessionExpired)).toBeNull();
   });
 
   it("shows the error with a retry on 500, never the app or a redirect, then recovers", async () => {
@@ -122,5 +131,6 @@ describe("the global 401 handler", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
     expect(router.state.location.search).toBe(`?next=${encodeURIComponent("/probe?x=1")}`);
     expect(queryClient.getQueryData(["auth", "me"])).toBeUndefined();
+    expect(await screen.findByText(id.auth.login.sessionExpired)).toBeInTheDocument();
   });
 });

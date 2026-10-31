@@ -5,11 +5,35 @@ export const AUTH_PATHS = {
   resetPassword: "/reset-password",
 } as const;
 
+/** Why the login page was opened, carried in the navigation state (never in the URL). */
+export type LoginNotice = "passwordReset" | "sessionExpired";
+const NOTICES: ReadonlySet<string> = new Set<LoginNotice>(["passwordReset", "sessionExpired"]);
+
+export function loginNoticeState(notice: LoginNotice): { notice: LoginNotice } {
+  return { notice };
+}
+
+export function readLoginNotice(state: unknown): LoginNotice | null {
+  if (typeof state !== "object" || state === null || !("notice" in state)) return null;
+  const { notice } = state;
+  return typeof notice === "string" && NOTICES.has(notice) ? (notice as LoginNotice) : null;
+}
+
 /** Pages a sign-in must never return to (they would loop or reuse a spent token). */
 const PUBLIC_PREFIXES: readonly string[] = Object.values(AUTH_PATHS);
 
+/**
+ * Whether a path shows a public auth page. The router matches case-insensitively and on the decoded path,
+ * so `/LOGIN` and `/%6Cogin` count too; a path that does not decode counts as public (never a target).
+ */
 export function isPublicPath(pathname: string): boolean {
-  return PUBLIC_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname).toLowerCase();
+  } catch {
+    return true;
+  }
+  return PUBLIC_PREFIXES.some((prefix) => decoded === prefix || decoded.startsWith(`${prefix}/`));
 }
 
 /**

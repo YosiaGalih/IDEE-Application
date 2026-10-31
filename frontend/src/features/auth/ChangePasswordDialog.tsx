@@ -52,6 +52,7 @@ function ChangePasswordForm({ onSignOut }: Props) {
   });
   const mutation = useMutation({
     mutationFn: (values: ChangeValues) => changePassword(values.currentPassword, values.newPassword),
+    gcTime: 0, // the variables hold both passwords
   });
 
   if (mutation.isSuccess) {
@@ -67,14 +68,18 @@ function ChangePasswordForm({ onSignOut }: Props) {
     );
   }
 
-  const isConflict = mutation.error instanceof ApiError && mutation.error.status === 409;
+  const isConflict = mutation.error instanceof ApiError && mutation.error.code === "CONFLICT";
   const handleFormSubmit = (event: React.FormEvent<HTMLFormElement>) =>
     void handleSubmit(
       (values) => mutation.mutate(values),
       () => mutation.reset(),
     )(event);
   const summary = mutation.isError
-    ? describeError(mutation.error, t, { 403: t("auth.change.wrongCurrent"), 409: t("auth.change.conflict") })
+    ? describeError(mutation.error, t, {
+        // FORBIDDEN: wrong or locked; CSRF_FAILED (also 403) is not the user's password and stays generic.
+        byCode: { FORBIDDEN: t("auth.change.wrongCurrent"), CONFLICT: t("auth.change.conflict") },
+        isChange: true,
+      })
     : Object.keys(errors).length > 0
       ? { title: t("auth.errorSummary"), body: null, requestId: null }
       : null;

@@ -176,6 +176,32 @@ describe("apiRequest", () => {
     expect(seen).toHaveLength(0);
   });
 
+  it("reports an unreachable API during the CSRF bootstrap as disconnected, not as a missing cookie", async () => {
+    server.use(http.get(`${API}/auth/me`, () => HttpResponse.error()));
+    const error: unknown = await apiRequest("/auth/password/forgot", {
+      method: "POST",
+      body: { email: "a@b.c" },
+      schema: Thing,
+    }).catch((e: unknown) => e);
+    expect(error).toMatchObject({ kind: "network" });
+    expect(uxStateForError(error)).toBe("disconnected");
+    expect(seen).toHaveLength(0);
+  });
+
+  it("keeps Retry-After from a gateway's own 429 page", async () => {
+    server.use(
+      http.get(
+        `${API}/gateway`,
+        () => new HttpResponse("<html>busy</html>", { status: 429, headers: { "Retry-After": "9" } }),
+      ),
+    );
+    await expect(apiRequest("/gateway", { schema: Thing })).rejects.toMatchObject({
+      kind: "bad_response",
+      status: 429,
+      retryAfterSeconds: 9,
+    });
+  });
+
   it("returns the Idempotency-Key with a failed mutation so a retry can reuse it", async () => {
     server.use(http.post(`${API}/things`, () => failed(503, "DEPENDENCY_UNAVAILABLE")));
     document.cookie = "kk_csrf=c; path=/";

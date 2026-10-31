@@ -1,4 +1,5 @@
 import { useMutation } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -18,8 +19,9 @@ import { useFieldError } from "./useFieldError";
 const LINK_CLASS = "text-sm font-medium text-brand-600 hover:underline";
 
 /**
- * The answer is the same whether or not the email is registered (the API always says 200). A 429 is
- * shown as it is: the limit is per IP, so it reveals nothing, and claiming "sent" would be false.
+ * The answer is the same whether or not the email is registered (the API always says 200), and it claims
+ * no delivery: email is P1, so no link is sent yet (conflict #64). A 429 is shown as it is: the limit is
+ * per IP, so it reveals nothing.
  */
 export function ForgotPasswordPage() {
   const { t } = useTranslation();
@@ -34,11 +36,18 @@ export function ForgotPasswordPage() {
     shouldFocusError: false,
   });
   const mutation = useMutation({ mutationFn: (values: ForgotValues) => requestPasswordReset(values.email) });
+  // The submit button disappears with the form: focus the answer instead of dropping to <body>.
+  const answerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (mutation.isSuccess) answerRef.current?.focus();
+  }, [mutation.isSuccess]);
 
   if (mutation.isSuccess) {
     return (
       <AuthLayout title={t("auth.forgot.title")}>
-        <Alert tone="success">{t("auth.forgot.sent")}</Alert>
+        <Alert ref={answerRef} tabIndex={-1} tone="info">
+          {t("auth.forgot.sent")}
+        </Alert>
         <Link to={AUTH_PATHS.login} className={LINK_CLASS}>
           {t("auth.forgot.backToLogin")}
         </Link>

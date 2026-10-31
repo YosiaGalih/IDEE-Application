@@ -35,6 +35,13 @@ describe("safeNext (no open redirect, SECURITY_MODEL)", () => {
     ["/forgot-password"],
     ["/reset-password/token123"],
     ["/reset-password"],
+    ["/LOGIN"],
+    ["/Login?next=/x"],
+    ["/%6Cogin"],
+    ["/forgot-Password"],
+    ["/reset-PASSWORD/x"],
+    ["/%72eset-password"],
+    ["/%E0%A4%A"],
   ])("refuses %j and falls back to /", (next) => {
     expect(safeNext(next)).toBe("/");
   });

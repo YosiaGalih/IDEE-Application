@@ -9,7 +9,7 @@ import { Alert } from "@/components/ui/Alert";
 import { Button } from "@/components/ui/Button";
 import { FormField } from "@/components/ui/FormField";
 import { Spinner } from "@/components/ui/Spinner";
-import { AUTH_PATHS } from "@/lib/safeNext";
+import { AUTH_PATHS, loginNoticeState } from "@/lib/safeNext";
 import { zodResolver } from "@/lib/zodResolver";
 import { AuthLayout } from "./AuthLayout";
 import { describeError } from "./describeError";
@@ -47,13 +47,15 @@ export function ResetPasswordPage() {
   });
   const mutation = useMutation({
     mutationFn: (values: ResetValues) => resetPassword(token ?? "", values.newPassword),
+    gcTime: 0, // the variables hold the new password
     onSuccess: () => {
       queryClient.removeQueries(); // the server signed every session out
-      void navigate(AUTH_PATHS.login, { replace: true, state: { notice: "passwordReset" } });
+      void navigate(AUTH_PATHS.login, { replace: true, state: loginNoticeState("passwordReset") });
     },
   });
 
-  const isRefused = mutation.error instanceof ApiError && mutation.error.status === 400;
+  // backend: 400 BAD_REQUEST only for a token that is unknown, used, or expired.
+  const isRefused = mutation.error instanceof ApiError && mutation.error.code === "BAD_REQUEST";
   if (token === null || token.length > MAX_TOKEN_LENGTH || isRefused) {
     return (
       <AuthLayout title={t("auth.reset.title")}>
@@ -73,7 +75,7 @@ export function ResetPasswordPage() {
       () => mutation.reset(),
     )(event);
   const summary = mutation.isError
-    ? describeError(mutation.error, t)
+    ? describeError(mutation.error, t, { isChange: true })
     : Object.keys(errors).length > 0
       ? { title: t("auth.errorSummary"), body: null, requestId: null }
       : null;

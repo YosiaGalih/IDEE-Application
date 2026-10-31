@@ -986,3 +986,58 @@ Tetap ditunda ke 1.4b:
 - Item 1.4b lain di tabel sebelumnya.
 
 Bukti setelah perbaikan: lint, `lint:guards` (14/14), typecheck, dan format bersih; **122 test**; 4 mutan baru merah.
+
+### WP-1.4b (🔒 sesi) — layar auth, penjaga sesi, menu pengguna (FR-001–006, AC-01 bagian UI, PRD v2.2 §4 layar 1)
+
+Spec: `docs/superpowers/specs/2026-10-31-wp-1.4b-auth-screens-design.md`. Plan: `docs/superpowers/plans/2026-10-31-wp-1.4b-auth-screens.md`. Cakupan: konflik #63 (layar dashboard/projects/agents/approvals ikut WP backend-nya).
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `format:check`, `lint` (+ `jsx-a11y` recommended), `typecheck` (kunci i18n bertipe) | bersih |
+| `lint:guards` | 14/14 aturan kontrak menolak pelanggarannya |
+| `npm test` | **243 test** di 16 file (sebelumnya 122): `safeNext` 36, `zodResolver` 3, login 25, penjaga sesi + 401 global 11, menu + ganti password 13, lupa/reset 13, `useLogout` 3, sesi 4, klien API (+`Retry-After`, bootstrap CSRF) |
+| Mutan | putaran 1: 29 mutan, 5 selamat → 3 test ditambah, 2 kode tak berguna dihapus (penjaga `isPending`, `isFetching`); putaran 2 (perbaikan review): 20 mutan + 3 mutan konfigurasi nginx/Caddy; semuanya merah |
+| `npx vite build` | JS 635 kB (200 kB gzip), naik dari 441 kB (138 kB gzip): zod 85 kB pertama kali masuk bundle (layar pertama yang memanggil API; zod diwajibkan `frontend.md`), react-hook-form 31 kB, Radix Dialog ±25 kB. Peringatan Vite >500 kB dibiarkan terlihat; pemecahan per route di WP yang membawa Monaco |
+| `npm audit --omit=dev --audit-level=high` | 0. Dev: 13 moderate (minimatch lewat ESLint; `jsx-a11y` menambah satu dependen) |
+| `python3 -m unittest discover -s infra/tests` | 111 OK (1 skip), termasuk `test_reset_token_hygiene.py` (5) |
+| Backend nyata + Vite + Chromium (Playwright), DB `kodekantor_live`, owner `admin@localhost` lewat `create-owner` | `/projects?tab=tasks` tanpa sesi → `/login?next=…`; password salah → pesan generik, fokus ke ringkasan; validasi tanpa request; login → kembali ke `next`; cookie `kk_session` HttpOnly + `kk_csrf`, SameSite=Lax; ganti password 403 lalu sukses; keluar → cookie habis; Back setelah keluar → login lagi; lupa → pesan generik; tautan reset dari log dev → URL menjadi `/reset-password` (REPLACE), 11 karakter ditolak lokal, reset → `/login` dengan pesan → login dengan password baru; tautan bekas → "tidak valid"; **API dimatikan → Keluar: tetap di app dengan "Gagal keluar: sesi masih aktif", cookie sesi masih ada; API hidup → coba lagi → `/login`, cookie habis** |
+| nginx `web` (digest dipin) + Caddyfile asli di container | konfigurasi lama: token muncul 2× di access log (request line + Referer aset) → baru: 0×, juga untuk `/RESET-PASSWORD/…`; `Referrer-Policy: no-referrer` di `/reset-password*`, `same-origin` di path lain, header keamanan lain tetap; `caddy validate` → Valid |
+
+Temuan saat menjalankan:
+- **Open redirect di draf `safeNext`:** `"/..//evil.test"` lolos pemeriksaan awal dan menjadi `//evil.test` setelah diurai. Tertangkap test merah sebelum commit.
+- **Email reset tidak ada di produksi** (konflik #64): teks tidak lagi menjanjikan pengiriman.
+- **Validasi lokal lebih ketat dari server akan mengunci owner:** `z.email()` menolak `admin@localhost`; aturan disamakan dengan backend (`@`, ≤ 320). Panjang password dihitung per code point seperti Python.
+- **Bug backend di luar cakupan [Pasti]:** `RedactingFilter` (`backend/app/core/logging.py:41`) mengosongkan `record.args`, sedangkan `AccessFormatter` uvicorn membongkarnya, sehingga setiap baris access log menjadi traceback "--- Logging error ---" (terlihat di uvicorn lokal dengan CMD yang sama dengan image). Test `tests/unit/test_errors.py:192` tidak menangkapnya karena memakai pesan tanpa args. Dicatat di HANDOFF untuk WP-1.6.
+
+#### Review WP-1.4b @ f7f21fa/250b716: `kk-frontend-reviewer` (WARN, 4 SHOULD, 5 NIT), `kk-silent-failure-hunter` (2 HIGH, 3 MEDIUM, 8 LOW), AG-13 `kk-security-reviewer` (**SIGNED OFF dengan syarat**: 3 MEDIUM, 3 LOW)
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| AG-13 M + frontend S + silent L1: password tertinggal di MutationCache 5 menit | `gcTime: 0` pada mutasi login, reset, ganti password | test cache mutasi kosong setelah login dan setelah dialog ditutup; 2 mutan → merah |
+| AG-13 M + frontend S + silent H2: logout gagal diam-diam berakhir di `/login` saat sesi masih hidup | tetap di app dengan pesan dan coba lagi; cache tetap; 401 → `/login` polos; `useLogout` membersihkan hanya bila sesi berakhir | 3 kasus (500, `CSRF_FAILED`, jaringan) + 401 + 3 test hook; Chromium dengan API mati; 3 mutan → merah |
+| AG-13 M: token reset di access log nginx dan Referer aset same-origin | nginx: `log_format kk_redacted` tanpa Referer, path reset disamarkan (tanpa beda huruf); Caddy: `no-referrer` untuk `/reset-password*`, header global menjadi default `?Referrer-Policy` | container: 2× → 0×; `infra/tests/test_reset_token_hygiene.py`; 3 mutan konfigurasi → merah. **Syarat AG-13 yang masih terbuka:** token pindah ke fragment (`#token`) sebelum jalur pengiriman tautan mana pun (email atau admin/CLI, konflik #64) di-merge |
+| frontend S + silent H1: teks masih menjanjikan email | subjudul, tombol, pesan (nada info), `noToken` ditulis ulang | test teks; Chromium |
+| frontend S + silent M1: setiap 403 ganti password = "kata sandi salah" (juga `CSRF_FAILED`) | `describeError` memilih teks dari `code`; `FORBIDDEN` → "salah atau dikunci"; reset 400 hanya `BAD_REQUEST`; 409 hanya `CONFLICT` | test `CSRF_FAILED`, `PATH_VIOLATION`; 3 mutan → merah |
+| silent M2: tanpa jawaban pada reset/ganti → ulangan menyesatkan | badan pesan "hasil belum pasti: kata sandi mungkin sudah berubah" | 2 test; mutan → merah |
+| silent M3: login 200 tanpa cookie tersimpan → kembali ke form kosong tanpa kata | `/auth/me` sesudah login; 401 → "browser tidak menyimpan sesi"; sukses mengisi cache | test; mutan → merah |
+| AG-13 L + frontend NIT + silent L7: `/LOGIN`, `/%6Cogin`, `/RESET-PASSWORD/x` lolos `isPublicPath` | decode + huruf kecil; gagal decode = publik | 7 kasus baru; 2 mutan → merah |
+| silent L2: kunci error tak dikenal tersembunyi | `KEYS: Record<AuthErrorKey, true>` (kunci baru tanpa entri = typecheck error); `console.error` untuk pesan bukan kunci | test unit; mutan → merah |
+| silent L3: bootstrap CSRF menelan error jaringan | kegagalan GET bootstrap → `network`/`timeout` (layar "terputus"), bukan `csrf_missing` | test; mutan → merah |
+| silent L4: 429 dari gateway kehilangan `Retry-After` | `retryAfterSeconds` juga pada `bad_response`; teks 429 dari status | test halaman 429 HTML |
+| silent L5: sesi habis tanpa penjelasan | pemberitahuan `sessionExpired` (handler 401 global; `/auth/me` `SESSION_EXPIRED`), tidak untuk kunjungan pertama | 3 test; 2 mutan → merah |
+| silent L8: pemberitahuan muncul lagi saat muat ulang/Back | dibaca sekali, lalu state entri riwayat dihapus | test; mutan → merah |
+| frontend NIT: `zodResolver` membuat kunci datar | `set`/`get` React Hook Form; isu objek → `root` | test bersarang; mutan → merah |
+| frontend NIT: fokus hilang setelah sukses lupa password | fokus ke pesan | test; mutan → merah |
+| frontend NIT: "1 seconds"; header meluap | kunci plural `rateLimited_one/_other`; nama `truncate` | typecheck; screenshot |
+| AG-13 L: "tidak tersimpan di riwayat" | spec: hanya riwayat sesi tab; riwayat global = risiko sisa yang diterima | spec |
+| AG-13 L (info): 13 moderate dev | dipantau | — |
+
+Tidak ditutup (alasan):
+- **silent L4 sebagian:** halaman 401 HTML dari proxy pada login tampil sebagai "sesi berakhir". Hanya terjadi pada gateway yang salah konfigurasi.
+- **silent L6:** 403/404 dari `/auth/me` tanpa tombol aksi, karena `StateView` hanya memberi aksi untuk state yang bisa dipulihkan. Juga hanya pada salah konfigurasi.
+- Hitung mundur `Retry-After` dan "ganti email" setelah sukses lupa password: kosmetik.
+
+Syarat AG-13 yang terbawa:
+- token reset ke fragment sebelum jalur pengiriman tautan;
+- stream berhenti pada status terminal task dan batas event di memori (dari WP-1.4a), sebelum layar task dirilis.
+

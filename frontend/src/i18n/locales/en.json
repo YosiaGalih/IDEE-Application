@@ -122,8 +122,10 @@
     "password": "Password",
     "rememberMe": "Remember me",
     "errorSummary": "Check the marked fields.",
-    "rateLimited": "Too many attempts. Try again in {{seconds}} seconds.",
+    "rateLimited_one": "Too many attempts. Try again in {{count}} second.",
+    "rateLimited_other": "Too many attempts. Try again in {{count}} seconds.",
     "rateLimitedNoTime": "Too many attempts. Try again shortly.",
+    "outcomeUnknown": "The server's answer did not arrive, so the outcome is unknown: the password may have changed. Try signing in with the new password before retrying.",
     "errors": {
       "emailRequired": "Enter your email.",
       "emailInvalid": "This is not a valid email.",
@@ -139,14 +141,16 @@
       "submitting": "Checking…",
       "forgot": "Forgot your password?",
       "invalid": "Wrong email or password, or the account is temporarily locked.",
-      "resetDone": "Your password was changed. Sign in with the new one."
+      "resetDone": "Your password was changed. Sign in with the new one.",
+      "sessionNotStored": "The server accepted the sign-in, but the browser did not keep the session. Check that cookies are allowed, and that the address uses HTTPS if your installation requires it.",
+      "sessionExpired": "Your session ended. Sign in again to continue."
     },
     "forgot": {
       "title": "Forgot password",
-      "subtitle": "Enter your account email. We will send a link to set a new password.",
-      "submit": "Send link",
-      "submitting": "Sending…",
-      "sent": "Request received. If that email is registered, a link to change the password has been created. If it does not reach you, contact your workspace admin.",
+      "subtitle": "Enter your account email to request a link for setting a new password.",
+      "submit": "Request link",
+      "submitting": "Sending request…",
+      "sent": "Request received. This version of KodeKantor does not send email yet, so no link will reach your inbox. Ask the operator of your installation to reset the password.",
       "backToLogin": "Back to sign in"
     },
     "reset": {
@@ -157,7 +161,7 @@
       "submit": "Save password",
       "submitting": "Saving…",
       "invalidLink": "This link is invalid or has expired. Ask for a new one.",
-      "noToken": "Open the link from your email again to change the password.",
+      "noToken": "Open the password reset link you received again. Each link works only once.",
       "requestNew": "Ask for a new link"
     },
     "change": {
@@ -168,7 +172,7 @@
       "submit": "Change password",
       "submitting": "Saving…",
       "cancel": "Cancel",
-      "wrongCurrent": "The current password is wrong.",
+      "wrongCurrent": "The current password is wrong, or the account is temporarily locked.",
       "conflict": "The password just changed elsewhere. Sign in again.",
       "done": "Your password was changed.",
       "close": "Close",
@@ -178,7 +182,8 @@
       "label": "Account",
       "signedInAs": "Signed in as {{name}}",
       "logout": "Sign out",
-      "loggingOut": "Signing out…"
+      "loggingOut": "Signing out…",
+      "logoutFailed": "Sign-out failed: the session is still active. Try again."
     }
   }
 }

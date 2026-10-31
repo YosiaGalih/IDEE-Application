@@ -49,15 +49,16 @@ export const changeSchema = z
   .refine(confirmed, mismatch);
 export type ChangeValues = z.infer<typeof changeSchema>;
 
-const KEYS: ReadonlySet<string> = new Set<AuthErrorKey>([
-  "auth.errors.emailRequired",
-  "auth.errors.emailInvalid",
-  "auth.errors.passwordRequired",
-  "auth.errors.passwordTooShort",
-  "auth.errors.passwordTooLong",
-  "auth.errors.passwordMismatch",
-]);
+/** Every key of `auth.errors`: a key added to id.json and not here is a typecheck error. */
+const KEYS: Record<AuthErrorKey, true> = {
+  "auth.errors.emailRequired": true,
+  "auth.errors.emailInvalid": true,
+  "auth.errors.passwordRequired": true,
+  "auth.errors.passwordTooShort": true,
+  "auth.errors.passwordTooLong": true,
+  "auth.errors.passwordMismatch": true,
+};
 
-/** Narrows a resolver message to a translation key; anything else is a bug and shows as a plain error. */
+/** Narrows a resolver message to a translation key; anything else is a bug (see useFieldError). */
 export const isAuthErrorKey = (value: string | undefined): value is AuthErrorKey =>
-  value !== undefined && KEYS.has(value);
+  value !== undefined && Object.hasOwn(KEYS, value);

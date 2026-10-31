@@ -4,27 +4,43 @@ import { uxStateForError } from "@/api/uxState";
 
 export type ErrorText = { title: string; body: string | null; requestId: string | null };
 
+type Options = {
+  /** This screen's own wording by error code (API_CONTRACTS §1), e.g. FORBIDDEN on change password. */
+  byCode?: Partial<Record<string, string>>;
+  /** The call changes something: without an answer its outcome is unknown, and the text says so. */
+  isChange?: boolean;
+};
+
+/** No answer from the server, or an answer that is not the error envelope on a 2xx: it may have worked. */
+const isUnanswered = (error: ApiError) =>
+  error.kind === "network" ||
+  error.kind === "timeout" ||
+  (error.kind === "bad_response" && (error.status ?? 0) < 400);
+
 /**
- * The text for a failed auth call. `byStatus` gives this screen's own wording (e.g. 401 on login), 429
- * says how long to wait (Retry-After), and anything else is the screen state of the failure.
+ * The text for a failed auth call: the screen's wording for a known code, how long to wait on 429
+ * (Retry-After), and otherwise the screen state of the failure. The code decides, never the status alone:
+ * 403 is both FORBIDDEN and CSRF_FAILED.
  */
 export function describeError(
   error: unknown,
   t: TFunction,
-  byStatus: Partial<Record<number, string>> = {},
+  { byCode = {}, isChange = false }: Options = {},
 ): ErrorText {
-  const requestId = error instanceof ApiError ? error.requestId : null;
-  const status = error instanceof ApiError && error.kind === "http" ? error.status : null;
-  const own = status !== null ? byStatus[status] : undefined;
+  const api = error instanceof ApiError ? error : null;
+  const requestId = api?.requestId ?? null;
+  const own = api?.kind === "http" && api.code !== null ? byCode[api.code] : undefined;
   if (own) return { title: own, body: null, requestId };
-  if (status === 429 && error instanceof ApiError) {
-    const seconds = error.retryAfterSeconds;
+  if (api?.status === 429) {
+    const count = api.retryAfterSeconds;
     return {
-      title: seconds !== null ? t("auth.rateLimited", { seconds }) : t("auth.rateLimitedNoTime"),
+      title: count !== null ? t("auth.rateLimited", { count }) : t("auth.rateLimitedNoTime"),
       body: null,
       requestId,
     };
   }
   const state = uxStateForError(error);
-  return { title: t(`states.${state}.title`), body: t(`states.${state}.body`), requestId };
+  const body =
+    isChange && api !== null && isUnanswered(api) ? t("auth.outcomeUnknown") : t(`states.${state}.body`);
+  return { title: t(`states.${state}.title`), body, requestId };
 }

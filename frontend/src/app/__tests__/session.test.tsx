@@ -13,6 +13,7 @@ describe("redirectToLogin (the global 401 handler)", () => {
     expect(r.state.location.pathname).toBe("/login");
     expect(r.state.location.search).toBe(`?next=${encodeURIComponent("/projects/p1/tasks?status=open#t3")}`);
     expect(r.state.historyAction).toBe("REPLACE");
+    expect(r.state.location.state).toEqual({ notice: "sessionExpired" });
   });
 
   it.each(["/login?next=%2Fprojects", "/forgot-password", "/reset-password"])(

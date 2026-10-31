@@ -122,8 +122,10 @@
     "password": "Kata sandi",
     "rememberMe": "Ingat saya",
     "errorSummary": "Periksa kembali isian yang ditandai.",
-    "rateLimited": "Terlalu banyak percobaan. Coba lagi dalam {{seconds}} detik.",
+    "rateLimited_one": "Terlalu banyak percobaan. Coba lagi dalam {{count}} detik.",
+    "rateLimited_other": "Terlalu banyak percobaan. Coba lagi dalam {{count}} detik.",
     "rateLimitedNoTime": "Terlalu banyak percobaan. Coba lagi sebentar lagi.",
+    "outcomeUnknown": "Jawaban server tidak sampai, jadi hasilnya belum pasti: kata sandi mungkin sudah berubah. Coba masuk dengan kata sandi baru sebelum mengulang.",
     "errors": {
       "emailRequired": "Isi email Anda.",
       "emailInvalid": "Format email tidak valid.",
@@ -139,14 +141,16 @@
       "submitting": "Memeriksa…",
       "forgot": "Lupa kata sandi?",
       "invalid": "Email atau kata sandi salah, atau akun sedang dikunci sementara.",
-      "resetDone": "Kata sandi sudah diganti. Masuk dengan kata sandi baru."
+      "resetDone": "Kata sandi sudah diganti. Masuk dengan kata sandi baru.",
+      "sessionNotStored": "Server menerima login, tetapi browser tidak menyimpan sesinya. Pastikan cookie diizinkan, dan alamatnya memakai HTTPS bila instalasi mewajibkannya.",
+      "sessionExpired": "Sesi Anda berakhir. Masuk lagi untuk melanjutkan."
     },
     "forgot": {
       "title": "Lupa kata sandi",
-      "subtitle": "Masukkan email akun Anda. Kami akan mengirim tautan untuk membuat kata sandi baru.",
-      "submit": "Kirim tautan",
-      "submitting": "Mengirim…",
-      "sent": "Permintaan diterima. Bila email itu terdaftar, tautan untuk mengganti kata sandi sudah dibuat. Bila tautan tidak sampai, hubungi admin workspace Anda.",
+      "subtitle": "Masukkan email akun Anda untuk meminta tautan pembuatan kata sandi baru.",
+      "submit": "Minta tautan",
+      "submitting": "Mengirim permintaan…",
+      "sent": "Permintaan diterima. Versi KodeKantor ini belum mengirim email, jadi tautan tidak akan sampai ke kotak masuk Anda. Minta operator instalasi Anda mengatur ulang kata sandi.",
       "backToLogin": "Kembali ke halaman masuk"
     },
     "reset": {
@@ -157,7 +161,7 @@
       "submit": "Simpan kata sandi",
       "submitting": "Menyimpan…",
       "invalidLink": "Tautan tidak valid atau sudah kedaluwarsa. Minta tautan baru.",
-      "noToken": "Buka lagi tautan dari email Anda untuk mengganti kata sandi.",
+      "noToken": "Buka lagi tautan reset kata sandi yang Anda terima. Setiap tautan hanya bisa dipakai sekali.",
       "requestNew": "Minta tautan baru"
     },
     "change": {
@@ -168,7 +172,7 @@
       "submit": "Ganti kata sandi",
       "submitting": "Menyimpan…",
       "cancel": "Batal",
-      "wrongCurrent": "Kata sandi sekarang salah.",
+      "wrongCurrent": "Kata sandi sekarang salah, atau akun sedang dikunci sementara.",
       "conflict": "Kata sandi baru saja berubah di tempat lain. Masuk lagi.",
       "done": "Kata sandi sudah diganti.",
       "close": "Tutup",
@@ -178,7 +182,8 @@
       "label": "Akun",
       "signedInAs": "Masuk sebagai {{name}}",
       "logout": "Keluar",
-      "loggingOut": "Sedang keluar…"
+      "loggingOut": "Sedang keluar…",
+      "logoutFailed": "Gagal keluar: sesi masih aktif. Coba lagi."
     }
   }
 }

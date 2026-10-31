@@ -2,6 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http } from "msw";
 import { setupServer } from "msw/node";
+import { HttpResponse } from "msw";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { API, fail, me, ok, renderApp, user } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
@@ -55,13 +56,32 @@ describe("UserMenu", () => {
     expect(queryClient.getQueryData(["projects"])).toBeUndefined();
   });
 
-  it("still leaves for /login with an empty cache when the server fails the logout", async () => {
-    backend({ logout: () => fail(500, "INTERNAL_ERROR") });
+  it.each([
+    ["a server error", () => fail(500, "INTERNAL_ERROR")],
+    ["a refused CSRF token", () => fail(403, "CSRF_FAILED")],
+    ["a dropped connection", () => HttpResponse.error()],
+  ])("stays signed in and says so when logout fails with %s, then retries", async (_case, reply) => {
+    let failing = true;
+    const state = backend({ logout: () => (failing ? reply() : ok({})) });
+    const { router } = renderApp("/projects");
+    await screen.findByText(signedInAs);
+    await userEvent.click(screen.getByRole("button", { name: id.auth.menu.logout }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(id.auth.menu.logoutFailed);
+    expect(router.state.location.pathname).toBe("/projects");
+    expect(state.session).toBe(true);
+    failing = false;
+    await userEvent.click(screen.getByRole("button", { name: id.auth.menu.logout }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
+  });
+
+  it("goes to plain /login when the session was already gone (401 on logout)", async () => {
+    backend({ logout: () => fail(401, "SESSION_EXPIRED") });
     const { router, queryClient } = renderApp("/projects");
     await screen.findByText(signedInAs);
     queryClient.setQueryData(["projects"], [{ id: "p1" }]);
     await userEvent.click(screen.getByRole("button", { name: id.auth.menu.logout }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
+    expect(router.state.location.search).toBe("");
     expect(queryClient.getQueryData(["projects"])).toBeUndefined();
   });
 });
@@ -104,6 +124,39 @@ describe("ChangePasswordDialog", () => {
     });
     await userEvent.click(within(dialog).getByRole("button", { name: id.auth.change.close }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("does not call a CSRF refusal a wrong password", async () => {
+    backend({ change: () => fail(403, "CSRF_FAILED", "CSRF token missing or invalid") });
+    renderApp("/");
+    const dialog = await openAndFill();
+    expect(await within(dialog).findByText(id.states.error.title)).toBeInTheDocument();
+    expect(within(dialog).queryByText(id.auth.change.wrongCurrent)).toBeNull();
+  });
+
+  it("says the outcome is unknown when the answer never arrives", async () => {
+    backend({ change: () => HttpResponse.error() });
+    renderApp("/");
+    const dialog = await openAndFill();
+    expect(await within(dialog).findByText(id.auth.outcomeUnknown)).toBeInTheDocument();
+  });
+
+  it("keeps no password in the mutation cache after the dialog closes", async () => {
+    backend();
+    const { queryClient } = renderApp("/");
+    const dialog = await openAndFill();
+    await within(dialog).findByText(id.auth.change.done);
+    await userEvent.click(within(dialog).getByRole("button", { name: id.auth.change.close }));
+    await waitFor(() =>
+      expect(
+        JSON.stringify(
+          queryClient
+            .getMutationCache()
+            .getAll()
+            .map((m) => m.state.variables),
+        ),
+      ).not.toContain("kata-sandi"),
+    );
   });
 
   it("says the current password is wrong on 403, and stays signed in", async () => {

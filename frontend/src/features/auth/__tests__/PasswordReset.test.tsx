@@ -32,11 +32,12 @@ describe("ForgotPasswordPage", () => {
     await userEvent.click(screen.getByRole("button", { name: id.auth.forgot.submit }));
   }
 
-  it("shows the same message whether or not the email is registered", async () => {
+  it("shows the same message whether or not the email is registered, and focuses it", async () => {
     const state = backend();
     renderApp("/forgot-password");
     await submit("siapa@kodekantor.test");
     expect(await screen.findByText(id.auth.forgot.sent)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("status")).toHaveFocus());
     expect(state.bodies).toEqual([{ email: "siapa@kodekantor.test" }]);
     expect(screen.queryByLabelText(id.auth.email)).toBeNull();
     expect(screen.getByRole("link", { name: id.auth.forgot.backToLogin })).toHaveAttribute("href", "/login");
@@ -54,7 +55,7 @@ describe("ForgotPasswordPage", () => {
     backend(() => fail(429, "RATE_LIMITED", "Too many", { "Retry-After": "12" }));
     renderApp("/forgot-password");
     await submit("siapa@kodekantor.test");
-    expect(await screen.findByText(id.auth.rateLimited.replace("{{seconds}}", "12"))).toBeInTheDocument();
+    expect(await screen.findByText(id.auth.rateLimited_other.replace("{{count}}", "12"))).toBeInTheDocument();
     expect(screen.queryByText(id.auth.forgot.sent)).toBeNull();
   });
 
@@ -126,6 +127,23 @@ describe("ResetPasswordPage", () => {
       id.auth.errors.passwordMismatch,
     );
     expect(state.bodies).toEqual([]);
+  });
+
+  it("says the outcome is unknown when the answer never arrives (the password may have changed)", async () => {
+    backend(() => HttpResponse.error());
+    renderApp(`/reset-password/${TOKEN}`);
+    await submit("kata-sandi-baru-123");
+    expect(await screen.findByText(id.auth.outcomeUnknown)).toBeInTheDocument();
+    expect(screen.getByText(id.states.disconnected.title)).toBeInTheDocument();
+  });
+
+  it("keeps the form for a 400 that is not about the token", async () => {
+    backend(() => fail(400, "PATH_VIOLATION"));
+    renderApp(`/reset-password/${TOKEN}`);
+    await submit("kata-sandi-baru-123");
+    expect(await screen.findByText(id.states.error.title)).toBeInTheDocument();
+    expect(screen.queryByText(id.auth.reset.invalidLink)).toBeNull();
+    expect(screen.getByLabelText(id.auth.reset.newPassword)).toBeInTheDocument();
   });
 
   it("says the link is invalid or expired on 400, and offers a new one", async () => {

@@ -6,6 +6,9 @@ export function useFieldError() {
   const { t } = useTranslation();
   return (message: string | undefined): string | undefined => {
     if (message === undefined) return undefined;
-    return isAuthErrorKey(message) ? t(message) : t("states.error.title");
+    if (isAuthErrorKey(message)) return t(message);
+    // A schema message that is not a key is a bug: show a plain error, and say it where a developer looks.
+    console.error(`auth form: validation message is not an auth.errors key: ${message}`);
+    return t("states.error.title");
   };
 }
