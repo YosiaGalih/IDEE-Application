@@ -319,6 +319,17 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
 55. **Risiko sisa restore (review AG-13 WP-1.5c, M1):** `pg_restore` berjalan sebagai `kodekantor`, superuser bootstrap. `SHA256SUMS` hanya membuktikan integritas, bukan keaslian, sehingga dump yang dimanipulasi bisa menjalankan SQL sebagai superuser. WP-1.5c memitigasi dengan dua hal: menolak role baru atau superuser setelah load, dan menulis di RUNBOOK bahwa keaslian bergantung pada alat off-site yang terautentikasi. Yang masih terbuka dan perlu ditulis AG-00 di SECURITY_MODEL §13:
     - restore lewat role owner non-superuser (terkait utang "migrate non-superuser" WP-1.5a);
     - tanda tangan `SHA256SUMS`.
+56. **Perintah Trivy literal vs CVE tanpa perbaikan (WP-1.5d):** SECURITY_MODEL §11 menulis `trivy image --severity HIGH,CRITICAL --exit-code 1` dengan kriteria "0 critical/high tanpa exception". Pada 31 Okt 2026, setiap image Debian 13 membawa 43–44 HIGH yang belum punya perbaikan dari Debian, sehingga perintah itu merah permanen. WP-1.5d memakai gate `infra/security/scan_gate.py`:
+    - CRITICAL selalu memblokir;
+    - HIGH yang punya perbaikan memblokir;
+    - HIGH tanpa perbaikan dicetak dan dibolehkan oleh EX-02 (kedaluwarsa 2027-01-31).
+
+    Usul: §11 merujuk aturan gate itu, bukan perintah literal. Keputusan PO: setujui atau tolak EX-02..EX-05.
+57. **Cakupan Trivy (WP-1.5d):** §11 hanya menyebut image api/worker/web/sandbox-manager/sandbox-python/sandbox-node. WP-1.5d men-scan semua image yang dijalankan compose, termasuk caddy (publik), postgres, redis, docker-socket-proxy, dan egress-proxy. Temuan yang hanya bisa diperbaiki upstream dicatat sebagai EX-03 per CVE, kedaluwarsa 30 hari. Biayanya:
+    - pengecekan ulang bulanan (RUNBOOK §12.1);
+    - CVE baru di image upstream membuat PR merah sampai digest dinaikkan atau exception ditulis.
+
+    Keputusan PO: pertahankan cakupan ini, atau batasi ke daftar §11.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

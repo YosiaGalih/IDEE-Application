@@ -8,7 +8,7 @@ id = "EX-02"
 until = 2027-01-31
 
 # Fixed upstream, but only upstream can rebuild these images (EX-03): the newest digests (31 Oct 2026) still carry
-# them. Checked again monthly (RUNBOOK §8): bump the digest when a fixed image appears, then drop the CVE here.
+# them. Checked again monthly (RUNBOOK §12.1): bump the digest when a fixed image appears, then drop the CVE here.
 
 # caddy: brotli/curl only serve the curl binary, which nothing runs (the healthcheck uses busybox wget);
 # the Go findings wait for a Caddy release.

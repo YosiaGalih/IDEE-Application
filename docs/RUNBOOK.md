@@ -415,7 +415,25 @@ Aplikasi & operasional
 - [ ] Header keamanan aktif: `curl -sI https://$APP_DOMAIN | grep -Ei 'strict-transport|content-security|x-frame'`
 - [ ] Backup harian + off-site terenkripsi; restore drill bulan ini tercatat
 - [ ] Alert disk > 80% terpasang
-- [ ] CI hijau untuk rilis: gitleaks, pip-audit, npm audit, semgrep, trivy (fs + image), SBOM terlampir pada tag
+- [ ] CI hijau untuk rilis: gitleaks, pip-audit, npm audit, semgrep, trivy image (gate `infra/security/scan_gate.py`, §12.1), SBOM terlampir pada tag
+
+### 12.1 Pengecualian scan keamanan (bulanan, dan setiap kali `security-scan` merah)
+
+`security-scan` (`.github/workflows/security.yml`) berjalan di setiap PR, push ke `main`, dan nightly. Job ini merah bila:
+- ada temuan baru (CRITICAL, atau HIGH yang punya perbaikan);
+- ada exception yang kedaluwarsa;
+- ada exception yang tidak lagi cocok dengan temuan apa pun.
+
+Exception ada di `infra/security/scan-exceptions.toml` (Trivy) atau di komentar `# nosemgrep` (Semgrep), masing-masing dengan baris `EX-nn` di `docs/DECISIONS.md` bagian "Pengecualian keamanan".
+
+1. Baca log langkah "Image scan (Trivy) and gate" atau "SAST (Semgrep)". Setiap baris `BLOCKING:` menyebut image, CVE, paket, dan versi perbaikan.
+2. **Temuan punya perbaikan dan image dibangun sendiri** (`kodekantor/*`): naikkan digest base di Dockerfile, atau kunci ulang dependensinya. Lalu build dan scan ulang (`make sandbox-images`, `docker compose ... build`, `infra/security/scan-images.sh <folder>`).
+3. **Image pihak ketiga** (caddy, nginx-unprivileged, postgres, redis, docker-socket-proxy):
+   - cek apakah upstream sudah merilis digest dengan perbaikan, lalu naikkan pin di `infra/compose.yml`;
+   - bila belum, tambahkan CVE-nya ke entri EX-03 image itu, dengan alasan mengapa tidak tereksploitasi di stack ini.
+4. **Exception tidak lagi cocok**: hapus CVE atau entrinya. Ini tanda upstream sudah memperbaiki.
+5. **Memperpanjang exception**: perbarui tanggal di TOML **dan** di DECISIONS (maksimal 92 hari ke depan), dengan persetujuan PO. Gate menolak tanggal yang berbeda di dua tempat itu.
+6. **HIGH tanpa perbaikan** tidak memblokir selama EX-02 berlaku. Daftarnya tercetak di setiap run. Begitu distro merilis perbaikan, temuan itu memblokir sehingga langkah 2 berlaku.
 
 ---
 

@@ -55,5 +55,5 @@ async def grant_runtime_role(conn: AsyncConnection, role: str) -> None:
         "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
     ):
         # DDL cannot bind identifiers; the role passed _ROLE and exists, the rest is constant (EX-05).
-        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text (EX-05)
+        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text (EX-05)
         await conn.execute(text(statement))
