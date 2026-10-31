@@ -22,9 +22,10 @@ mkdir -p "$out"
 out=$(cd "$out" && pwd)
 rm -f -- "$out"/report-*.json "$out/images.txt" "$out/trivy-version.json"
 # Every profile, so a service added under a new profile is scanned too (or blocks when its image is missing).
+# A plain assignment, so a failing `config --profiles` stops the script under set -e (process substitution would not).
+profile_list=$(docker compose -f infra/compose.yml --env-file "$env_file" config --profiles)
 profiles=()
-while IFS= read -r profile; do profiles+=(--profile "$profile"); done \
-  < <(docker compose -f infra/compose.yml --env-file "$env_file" config --profiles)
+while IFS= read -r profile; do [[ -n "$profile" ]] && profiles+=(--profile "$profile"); done <<< "$profile_list"
 docker compose -f infra/compose.yml --env-file "$env_file" "${profiles[@]}" config --format json \
   | python3 infra/security/scan_gate.py images > "$out/images.txt"
 echo "scan: $(wc -l < "$out/images.txt") images"

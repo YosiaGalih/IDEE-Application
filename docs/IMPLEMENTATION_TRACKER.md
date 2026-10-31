@@ -884,3 +884,14 @@ Item terbuka sebelum G1/G7:
 - PO memutuskan EX-02..EX-06 dan konflik #56–#59.
 - CVE-2026-78669 caddy ditutup sebelum deploy publik.
 - EX-03 kedaluwarsa 2026-11-30.
+
+Review delta AG-13 @ 3977424: **SIGNED OFF**. M1 tertutup di kode. M2 menjadi syarat tertulis sebelum deploy publik. Dua LOW baru dari delta itu ditutup di commit berikutnya, persis seperti usul reviewer:
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| `config --profiles` lewat process substitution: kegagalannya tertelan, egress-proxy bisa tidak di-scan (regresi commit 3977424) | assignment biasa (`profile_list=$(…)`), sehingga `set -e` menghentikan skrip | stub `docker` yang menggagalkan `config --profiles` → skrip berhenti dengan exit 3 |
+| `:include .gitignore` mengeluarkan file ter-track dari SAST | dihapus; Semgrep hanya men-scan file yang di-track git; daftar terkunci test diperbarui | test `.semgrepignore` |
+
+LOW yang tetap terbuka, tidak memblokir:
+- cache Trivy di host persisten (didokumentasikan; runner GitHub sekali pakai);
+- semgrep dan ruleset registry tidak dipin hash.

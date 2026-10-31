@@ -413,7 +413,7 @@ class RepositoryPolicy(unittest.TestCase):
         # Adding a path here removes code from SAST without any other signal; change it only with a review.
         lines = [line for line in (ROOT / ".semgrepignore").read_text().splitlines()
                  if line.strip() and not line.startswith("#")]
-        self.assertEqual(lines, [":include .gitignore", ".git/", "/docs/", "/backend/tests/",
+        self.assertEqual(lines, [".git/", "/docs/", "/backend/tests/",
                                  "/sandbox_manager/tests/", "/infra/tests/", "uv.lock"])
 
     def test_every_nosemgrep_names_its_rule_and_an_open_exception_for_that_file(self):
