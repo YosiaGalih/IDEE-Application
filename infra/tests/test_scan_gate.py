@@ -404,9 +404,17 @@ class RepositoryPolicy(unittest.TestCase):
     def test_gosu_exception_requires_postgres_to_run_as_70(self):
         data = tomllib.loads((ROOT / "infra/security/scan-exceptions.toml").read_text())
         if any(e.get("pkg_path") == "usr/local/bin/gosu" for e in data.get("exception", [])):
-            compose = (ROOT / "infra/compose.yml").read_text()
-            postgres = compose.split("\n  postgres:\n", 1)[1].split("\n  redis:\n", 1)[0]
-            self.assertIn('user: "70:70"', postgres)
+            config = subprocess.run(
+                ["docker", "compose", "-f", "infra/compose.yml", "--env-file", "infra/tests/ci.env", "config",
+                 "--format", "json"], cwd=ROOT, check=True, capture_output=True, text=True).stdout
+            self.assertEqual(json.loads(config)["services"]["postgres"].get("user"), "70:70")
+
+    def test_semgrepignore_is_the_reviewed_list(self):
+        # Adding a path here removes code from SAST without any other signal; change it only with a review.
+        lines = [line for line in (ROOT / ".semgrepignore").read_text().splitlines()
+                 if line.strip() and not line.startswith("#")]
+        self.assertEqual(lines, [":include .gitignore", ".git/", "/docs/", "/backend/tests/",
+                                 "/sandbox_manager/tests/", "/infra/tests/", "uv.lock"])
 
     def test_every_nosemgrep_names_its_rule_and_an_open_exception_for_that_file(self):
         files = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
@@ -420,11 +428,11 @@ class RepositoryPolicy(unittest.TestCase):
             except UnicodeDecodeError:
                 continue
             for number, line in enumerate(lines, 1):
-                if "nosemgrep" not in line:
+                if not re.search(r"(?i)nosem", line):  # Semgrep also honours "nosem" and upper case
                     continue
                 found += 1
                 where = f"{name}:{number}"
-                self.assertRegex(line, r"nosemgrep: [\w.-]+\.[\w.-]+", f"{where}: name the full rule id")
+                self.assertRegex(line, r"# nosemgrep: [\w.-]+\.[\w.-]+", f"{where}: '# nosemgrep: <full rule id>'")
                 ids = re.findall(r"EX-\d{2}", line)
                 self.assertTrue(ids, f"{where}: nosemgrep without EX-nn")
                 for exc_id in ids:

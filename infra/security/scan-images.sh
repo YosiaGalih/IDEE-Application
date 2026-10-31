@@ -4,6 +4,9 @@
 #
 #   KK_ENV_FILE=infra/tests/ci.env infra/security/scan-images.sh <report-dir>
 #
+# For CI and development machines only, never the production host: the Trivy container gets the Docker socket
+# (root-equivalent) and a persistent cache volume (kk-trivy-cache) that a local user could tamper with.
+#
 # TRIVY_DOCKER_ARGS adds `docker run` arguments, e.g. a CA bundle behind a TLS proxy. One DB download, then every
 # image is scanned against that same DB, whose date the gate checks. Earlier reports in the folder are removed first,
 # so a failed scan leaves no report, and the gate blocks on a missing report.
@@ -18,7 +21,11 @@ read -ra extra <<< "${TRIVY_DOCKER_ARGS:-}"
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 rm -f -- "$out"/report-*.json "$out/images.txt" "$out/trivy-version.json"
-docker compose -f infra/compose.yml --env-file "$env_file" --profile egress config --format json \
+# Every profile, so a service added under a new profile is scanned too (or blocks when its image is missing).
+profiles=()
+while IFS= read -r profile; do profiles+=(--profile "$profile"); done \
+  < <(docker compose -f infra/compose.yml --env-file "$env_file" config --profiles)
+docker compose -f infra/compose.yml --env-file "$env_file" "${profiles[@]}" config --format json \
   | python3 infra/security/scan_gate.py images > "$out/images.txt"
 echo "scan: $(wc -l < "$out/images.txt") images"
 

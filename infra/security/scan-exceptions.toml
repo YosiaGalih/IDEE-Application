@@ -11,8 +11,10 @@ until = 2027-01-31
 # them. Checked again monthly (RUNBOOK §12.1): bump the digest when a fixed image appears, then drop the CVE here.
 # An entry covers a listed CVE only in a listed package of that one image (same CVE elsewhere still blocks).
 
-# caddy: brotli/curl only serve the curl binary, which nothing runs (the healthcheck uses busybox wget);
-# the Go findings wait for a Caddy release.
+# caddy: brotli/curl only serve the curl binary, which nothing runs (the healthcheck uses busybox wget).
+# Go: CVE-2026-78669 (HTTP/2 SETTINGS DoS) IS reachable on public :443 while h2 is on, so it must be closed before
+# any public deployment (caddy rebuilt with Go >= 1.26.10 and x/net 0.60.0, or `protocols h1 h3` for a while);
+# 78667 needs file_server, 97031 needs ECH, 111943/116587 are ACME client side (DECISIONS EX-03, review AG-13).
 [[exception]]
 id = "EX-03"
 until = 2026-11-30

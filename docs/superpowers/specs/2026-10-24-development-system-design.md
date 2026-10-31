@@ -336,6 +336,10 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - perpanjang exception selama upstream 7.4 masih memakai Alpine 3.21.
 
     Keputusan PO; ADR-001/stack menyebut Redis 7.
+59. **Catatan review AG-13 WP-1.5d:**
+    - `.claude/rules/infra.md` menulis "docker.sock hanya di-mount ke docker-socket-proxy". Scanner Trivy di CI (`infra/security/scan-images.sh`) juga memegang socket itu. Aturan tersebut dimaksudkan untuk stack runtime; skrip scan dibatasi ke CI dan mesin pengembang (RUNBOOK §12.1 langkah 8). Usul: perjelas bunyi aturannya. Alternatif yang lebih aman: `docker save` lalu `trivy image --input`.
+    - Dua pin digest lebih muda dari aturan umur dua minggu: nginx-unprivileged 1.30-alpine (19 Okt) dan node 22-trixie-slim (28 Okt). Alasannya perbaikan keamanan mengalahkan umur, mengikuti preseden certifi dan uv 0.13.4. Perlu dicatat oleh PO/AG-00.
+    - EX-02 berlaku sebagai kelas untuk semua image. Usul untuk konflik #56: baseline jumlah per image, dan kenaikan memblokir sampai diakui.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

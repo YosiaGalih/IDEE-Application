@@ -434,6 +434,10 @@ Exception ada di `infra/security/scan-exceptions.toml` (Trivy) atau di komentar 
 4. **Exception tidak lagi cocok**: hapus CVE atau entrinya. Ini tanda upstream sudah memperbaiki.
 5. **Memperpanjang exception**: perbarui tanggal di TOML **dan** di DECISIONS (maksimal 92 hari ke depan), dengan persetujuan PO. Gate menolak tanggal yang berbeda di dua tempat itu.
 6. **HIGH tanpa perbaikan** tidak memblokir selama EX-02 berlaku. Daftarnya tercetak di setiap run. Begitu distro merilis perbaikan, temuan itu memblokir sehingga langkah 2 berlaku.
+7. **Evaluasi ulang EX-03** bila:
+   - profil sandbox node dengan network (deps_install, ADR-007) ditambahkan. Entri npm (`ip-address`, SSRF) tidak lagi "tanpa network";
+   - stack akan dideploy publik. CVE-2026-78669 di caddy (HTTP/2) harus ditutup lebih dulu, dengan caddy hasil build ulang atau `protocols h1 h3` sementara.
+8. `infra/security/scan-images.sh` hanya untuk CI dan mesin pengembang, **tidak pernah di host produksi**: container Trivy memegang socket Docker (setara root) dan cache yang persisten.
 
 ---
 

@@ -30,6 +30,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -51,7 +52,7 @@ jobs:
           uvx --exclude-newer 2026-10-10T00:00:00Z semgrep==1.180.0 scan --metrics=off --disable-version-check \
             --timeout 30 --config p/python --config p/secrets --config p/docker-compose \
             --json-output="$RUNNER_TEMP/semgrep.json"
-          python3 infra/security/scan_gate.py semgrep --report "$RUNNER_TEMP/semgrep.json" --min-files 150 \
+          python3 infra/security/scan_gate.py semgrep --report "$RUNNER_TEMP/semgrep.json" --min-files 180 \
             --expect backend/app/main.py --expect sandbox_manager/sandbox_manager/app.py --expect infra/compose.yml
       - name: Build and pull every image the stack runs
         run: |
