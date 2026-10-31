@@ -101,12 +101,13 @@ describe("ResetPasswordPage", () => {
     );
   });
 
-  it("goes to /login with a notice after the reset", async () => {
+  it("goes to /login with a notice after the reset, keeping no password in the mutation cache", async () => {
     backend();
-    const { router } = renderApp(`/reset-password/${TOKEN}`);
+    const { router, queryClient } = renderApp(`/reset-password/${TOKEN}`);
     await submit("kata-sandi-baru-123");
     await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
     expect(await screen.findByText(id.auth.login.resetDone)).toBeInTheDocument();
+    await waitFor(() => expect(queryClient.getMutationCache().getAll()).toEqual([]));
   });
 
   it("counts characters as the backend does: 11 emoji are too short even though they are 22 UTF-16 units", async () => {

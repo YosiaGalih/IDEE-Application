@@ -3,6 +3,11 @@
 The link is `/reset-password/<token>`. The page replaces its URL at once, but the first request and the
 assets it loads before that carry the token: in the request line, and in Referer. Stdlib only; the live
 check (nginx and Caddy in containers) is in the tracker, WP-1.4b.
+
+Known limit (AG-13 delta review, LOW): the mask matches the raw `$request_uri`, so a link someone rewrote
+(`/%72eset-password/<token>`, `//reset-password/<token>`) is logged as sent. `$uri` cannot be used instead:
+`try_files` turns it into `/index.html` before the line is written. The server only issues the canonical
+form; the full fix is the token in the URL fragment, an AG-13 condition before any link delivery merges.
 """
 
 from __future__ import annotations

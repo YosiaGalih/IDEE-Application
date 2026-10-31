@@ -1037,7 +1037,25 @@ Tidak ditutup (alasan):
 - **silent L6:** 403/404 dari `/auth/me` tanpa tombol aksi, karena `StateView` hanya memberi aksi untuk state yang bisa dipulihkan. Juga hanya pada salah konfigurasi.
 - Hitung mundur `Retry-After` dan "ganti email" setelah sukses lupa password: kosmetik.
 
+Review delta AG-13 @ db1872a (`frontend/` dan `infra/` identik dengan 2c0e7b5): **SIGNED OFF** 🔒. Syarat merge dari review pertama terpenuhi.
+- **Diverifikasi dengan probe sendiri:**
+  - MutationCache kosong begitu app shell terpasang.
+  - Logout:
+    - 503, `CSRF_FAILED`, atau jaringan putus → tetap di app, alert tampil, cache dipertahankan;
+    - 401 atau 200 → `/login`, cache dikosongkan.
+  - nginx dan Caddy dengan digest dipin:
+    - `/reset-password/<t>`, `/RESET-PASSWORD/<t>`, slash di akhir, dan query → `[redacted]`;
+    - `no-referrer` hanya di path reset;
+    - CSP dan XFO tetap terpasang.
+  - Fuzz diferensial `isPublicPath` terhadap `matchRoutes`: 132.240 varian, 0 bypass.
+- **CI @ db1872a:** 9/9 hijau.
+  - gitleaks: no leaks found. Fingerprint fixture token sintetis ditambahkan ke `.gitleaksignore`.
+  - Semgrep: 272 file, 6 WARNING. Semuanya kode backend/sandbox lama.
+  - Trivy: `kodekantor/web:dev` 0 HIGH/CRITICAL; `gate: PASS`.
+- **LOW baru:** masking memakai `$request_uri` mentah, jadi tautan yang ditulis ulang (`/%72eset-password/<t>`, `//reset-password/<t>`) tercatat apa adanya. `$uri` tidak bisa dipakai karena `try_files` mengubahnya menjadi `/index.html` sebelum log ditulis. Batas ini kini didokumentasikan di `test_reset_token_hygiene.py`. Server hanya menerbitkan bentuk kanonik. Penutup tuntasnya adalah syarat fragment di bawah.
+- **INFO:** mutation reset kini juga punya test cache kosong; mutan `gcTime` reset → merah.
+
 Syarat AG-13 yang terbawa:
-- token reset ke fragment sebelum jalur pengiriman tautan;
+- token reset dipindah ke fragment (`/reset-password#<token>`) sebelum jalur pengiriman tautan mana pun (email atau admin/CLI, konflik #64). Ini juga menutup LOW masking nginx dan kebocoran lewat perantara milik operator (CDN/WAF/proxy);
 - stream berhenti pada status terminal task dan batas event di memori (dari WP-1.4a), sebelum layar task dirilis.
 
