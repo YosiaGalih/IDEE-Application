@@ -754,3 +754,23 @@ Utang terbuka:
 - M2: syarat G4, lihat di atas.
 - Keputusan produk proxy: #45.
 - Trivy/Semgrep di security-scan sebelum G1.
+
+### WP-1.5c (🔒) — backup, restore, drill restore (NFR-10, PRD §7.5/§8.1, AC-20; T9)
+
+Spec: `docs/superpowers/specs/2026-10-31-wp-1.5c-backup-restore-design.md`. Plan: `docs/superpowers/plans/2026-10-31-wp-1.5c-backup-restore.md`.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `python3 -m unittest discover -s infra/tests` | OK, 1 skip sebagai root (pesan non-root). `test_backup_restore.py` 16 test; sebagai non-root 2 test workspace di-skip (butuh root) |
+| Mutan unit (5) | merah semua: backup gagal tertinggal, retensi tanpa jangkar akhir, pengecualian project menjangkau lebih dalam, restore tanpa cek checksum, konfirmasi setelah service berhenti |
+| `infra/tests/restore_drill.sh` di stack `ci.env` | PASS: backup (berkas, mode 0700/0600, `SHA256SUMS`, counts = DB, pengecualian); setelah dirusak lalu di-restore, DB dan setiap file sama dengan saat backup (mode, owner, mtime, sha256), `git fsck` bersih, `ops.restore` tercatat, `pre-restore` berisi keadaan rusak; backup yang diubah satu byte ditolak dan api tetap berjalan. Restore 36 dtk |
+| Mutan drill (3) | tanpa ACL database → api unhealthy, restore gagal; ekstrak di atas workspace lama → jumlah entri tidak cocok; tanpa cek checksum → backup palsu di-restore, drill FAIL |
+
+Temuan saat menjalankan:
+- `--exclude='./*/uploads'` di tar juga mencocokkan `repo/uploads` milik pengguna, karena `*` mencocokkan `/` → diperbaiki dengan `--no-wildcards-match-slash`.
+- Format tar GNU hanya menyimpan mtime per detik → diganti format pax.
+- Ekstraksi sebagai uid 10001 gagal bila folder induk tidak bisa dijangkau 10001, padahal workspace lama sudah dipindah → sekarang dicek sebelum apa pun disentuh.
+
+Konflik dokumen baru: #50–#54. RUNBOOK §7 diselaraskan.
+
+Belum: run CI pertama (drill di runner), review AG-13.
