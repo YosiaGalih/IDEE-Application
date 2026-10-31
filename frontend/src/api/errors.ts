@@ -14,6 +14,8 @@ type ApiErrorInit = {
   message?: string;
   details?: unknown;
   requestId?: string | null;
+  /** The key a mutation was sent with: pass it again to retry the same action without doing it twice. */
+  idempotencyKey?: string | null;
   cause?: unknown;
 };
 
@@ -23,6 +25,7 @@ export class ApiError extends Error {
   readonly code: string | null;
   readonly details: unknown;
   readonly requestId: string | null;
+  readonly idempotencyKey: string | null;
 
   constructor(init: ApiErrorInit) {
     super(init.message ?? init.code ?? init.kind, { cause: init.cause });
@@ -32,5 +35,6 @@ export class ApiError extends Error {
     this.code = init.code ?? null;
     this.details = init.details;
     this.requestId = init.requestId ?? null;
+    this.idempotencyKey = init.idempotencyKey ?? null;
   }
 }

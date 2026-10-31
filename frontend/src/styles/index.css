@@ -29,6 +29,8 @@
   --color-fg: #0f1428;
   --color-fg-muted: #535d70;
   --color-focus: #1d4ed8;
+  --color-focus-on-dark: #8ab4ff;
+  --color-on-danger: #ffffff;
 
   --color-status-success: #1f7a3f;
   --color-status-success-bg: #e7f6ec;
@@ -53,6 +55,7 @@
   --color-fg: #e8edf6;
   --color-fg-muted: #a3afc4;
   --color-focus: #8ab4ff;
+  --color-on-danger: #1a0b0a;
   --color-sidebar: #0e1a2e;
   --color-sidebar-deep: #08121f;
   --color-sidebar-active: #1c2b45;
@@ -77,4 +80,16 @@ html {
 :focus-visible {
   outline: 2px solid var(--color-focus);
   outline-offset: 2px;
+}
+
+/* On the navy sidebar the light-theme focus blue is below 3:1 (WCAG 1.4.11). */
+.on-dark :focus-visible {
+  outline-color: var(--color-focus-on-dark);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin,
+  .animate-pulse {
+    animation: none;
+  }
 }

@@ -1,10 +1,22 @@
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { Outlet } from "react-router";
+import { Outlet, useLocation } from "react-router";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 
 export function AppLayout() {
   const { t } = useTranslation();
+  const { pathname } = useLocation();
+  const mainRef = useRef<HTMLElement>(null);
+  const firstRender = useRef(true);
+  // After client-side navigation, move focus to the new content so screen readers announce it.
+  useEffect(() => {
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
+    }
+    mainRef.current?.focus();
+  }, [pathname]);
   return (
     <div className="flex min-h-screen bg-canvas text-fg">
       <a
@@ -16,7 +28,7 @@ export function AppLayout() {
       <Sidebar />
       <div className="flex min-w-0 flex-1 flex-col">
         <TopBar />
-        <main id="main" className="flex-1 p-6">
+        <main id="main" ref={mainRef} tabIndex={-1} className="flex-1 p-6 focus:outline-none">
           <Outlet />
         </main>
       </div>

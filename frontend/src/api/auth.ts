@@ -3,7 +3,7 @@ import { apiRequest } from "./client";
 
 /** The public User (API_CONTRACTS §2, backend `UserOut`): never a hash, counter or token. */
 export const UserSchema = z.object({
-  id: z.uuid(),
+  id: z.guid(),
   email: z.string(),
   display_name: z.string(),
   status: z.string(),
@@ -20,7 +20,7 @@ export const MeSchema = z.object({
 export type Me = z.infer<typeof MeSchema>;
 
 const LoginResultSchema = z.object({ user: UserSchema });
-const EmptySchema = z.object({}).strict();
+const EmptySchema = z.object({});
 
 export type LoginInput = { email: string; password: string; rememberMe: boolean };
 

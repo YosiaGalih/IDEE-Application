@@ -2,6 +2,7 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { fetchMe, login, logout } from "@/api/auth";
+import { readCookie } from "@/api/cookies";
 import { ApiError } from "@/api/errors";
 import { shouldRetry } from "@/api/queryClient";
 
@@ -26,12 +27,12 @@ describe("auth API", () => {
   it("reads /auth/me with roles and permissions", async () => {
     server.use(
       http.get(`${API}/auth/me`, () =>
-        envelope({ user, roles: [{ role: "owner", scope: "global" }], permissions: ["project.read"] }),
+        envelope({ user, roles: [{ role: "owner", scope: "global" }], permissions: ["project:read"] }),
       ),
     );
     const me = await fetchMe();
     expect(me.user.display_name).toBe("Tira");
-    expect(me.permissions).toEqual(["project.read"]);
+    expect(me.permissions).toEqual(["project:read"]);
   });
 
   it("sends remember_me in the backend's field name and returns the user", async () => {
@@ -48,7 +49,7 @@ describe("auth API", () => {
     expect(body).toEqual({ email: "tira@kodekantor.test", password: "pw", remember_me: true });
   });
 
-  it("refuses a user object that carries more than the public fields' types allow", async () => {
+  it("refuses a user whose fields do not have the contract's types", async () => {
     server.use(
       http.get(`${API}/auth/me`, () =>
         envelope({ user: { ...user, id: "not-a-uuid" }, roles: [], permissions: [] }),
@@ -71,7 +72,20 @@ describe("auth API", () => {
   });
 });
 
+describe("readCookie", () => {
+  it("decodes the value and does not match a cookie that only ends with the name", () => {
+    document.cookie = "xkk_csrf=wrong; path=/";
+    document.cookie = "kk_csrf=a%20b; path=/";
+    expect(readCookie("kk_csrf")).toBe("a b");
+    expect(readCookie("missing")).toBeNull();
+  });
+});
+
 describe("shouldRetry", () => {
+  it("retries a gateway error page as well", () => {
+    expect(shouldRetry(0, new ApiError({ kind: "bad_response", status: 502 }))).toBe(true);
+  });
+
   it("retries no answer and server errors, never client errors, at most twice", () => {
     expect(shouldRetry(0, new ApiError({ kind: "network" }))).toBe(true);
     expect(shouldRetry(0, new ApiError({ kind: "http", status: 503, code: "DEPENDENCY_UNAVAILABLE" }))).toBe(

@@ -2,3 +2,5 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+# lint-guards fixtures, removed after each run
+src/features/lintguard-*/

@@ -1,8 +1,12 @@
-import { API_BASE } from "../client";
+import { apiUrl } from "../client";
 import { ApiError } from "../errors";
 import { SseParser, type SseFrame } from "./parser";
 
-export type StreamStatus = "connecting" | "open" | "reconnecting" | "disconnected" | "closed";
+/**
+ * connecting → open; on a drop reconnecting, then disconnected after `disconnectedAfter` failures (retries go
+ * on); failed = stopped for good (a status reconnecting cannot fix: call retry()); closed = closed by the caller.
+ */
+export type StreamStatus = "connecting" | "open" | "reconnecting" | "disconnected" | "failed" | "closed";
 export type StreamFrame = SseFrame & { seq: number | null };
 
 export type StreamOptions = {
@@ -11,7 +15,7 @@ export type StreamOptions = {
   /** Resume after this sequence number (`?after_seq=` and `Last-Event-ID`). */
   lastSeq?: number | null;
   onFrame: (frame: StreamFrame) => void;
-  onStatus?: (status: StreamStatus, error?: ApiError) => void;
+  onStatus?: (status: StreamStatus, error: ApiError | null) => void;
   onProtocolError?: (message: string) => void;
   /** Silence longer than this means a dead connection: the server sends `: ping` every 15 s. */
   heartbeatTimeoutMs?: number;
@@ -23,15 +27,48 @@ export type StreamOptions = {
   fetchImpl?: typeof fetch;
 };
 
-export type EventStream = { close(): void; lastSeq(): number | null };
+export type EventStream = {
+  close(): void;
+  /** Starts again after `failed` (e.g. after signing in again); no effect otherwise. */
+  retry(): void;
+  lastSeq(): number | null;
+};
 
-const FATAL = new Set([401, 403, 404]);
+/** Answers no reconnect can change: stop and say why. */
+const FATAL = new Set([400, 401, 403, 404, 410, 422]);
+
+async function fatalError(response: Response): Promise<ApiError> {
+  let code: string | null = null;
+  let requestId = response.headers.get("X-Request-ID");
+  try {
+    const body: unknown = await response.json();
+    if (typeof body === "object" && body !== null) {
+      const { error, request_id } = body as { error?: { code?: unknown }; request_id?: unknown };
+      if (typeof error?.code === "string") code = error.code;
+      if (typeof request_id === "string") requestId = request_id;
+    }
+  } catch {
+    // not the envelope: the status alone decides
+  }
+  return new ApiError({
+    kind: "http",
+    status: response.status,
+    code,
+    requestId,
+    message: "event stream refused",
+  });
+}
 
 /**
  * A resumable server-sent event stream over fetch. Not EventSource: a manual reconnect needs the
  * Last-Event-ID header, and the `: ping` heartbeat is only visible to a reader of the raw stream
- * (spec WP-1.4a, conflict #62). Frames with an id are delivered once, in seq order; frames without
- * one (ephemeral, e.g. agent.delta) are always delivered.
+ * (spec WP-1.4a, conflict #62).
+ *
+ * Persistent frames (with an id) are delivered once and strictly in order: the server numbers them
+ * `tasks.event_seq + 1` inside one transaction, so seq has no holes. A frame below the resume point is a
+ * replayed duplicate and is skipped; a frame above `lastSeq + 1` means a lost or reordered live message, so
+ * nothing past the gap is delivered and the stream reconnects from `lastSeq` (the server replays from the
+ * database). Frames without an id (ephemeral, e.g. agent.delta) are always delivered.
  */
 export function openEventStream(options: StreamOptions): EventStream {
   const heartbeatMs = options.heartbeatTimeoutMs ?? 45_000;
@@ -44,46 +81,73 @@ export function openEventStream(options: StreamOptions): EventStream {
   let lastSeq = options.lastSeq ?? null;
   let failures = 0;
   let closed = false;
+  let stopped = false;
   let status: StreamStatus | null = null;
   let controller: AbortController | null = null;
   let reader: ReadableStreamDefaultReader<string> | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const report = (next: StreamStatus, error?: ApiError) => {
+  const report = (next: StreamStatus, error: ApiError | null = null) => {
     if (closed && next !== "closed") return;
     status = next;
-    options.onStatus?.(next, error);
+    try {
+      options.onStatus?.(next, error);
+    } catch (cause) {
+      options.onProtocolError?.(`status handler threw: ${String(cause)}`);
+    }
+  };
+
+  const protocolError = (message: string) => {
+    try {
+      options.onProtocolError?.(message);
+    } catch {
+      // a broken handler must not break the stream
+    }
   };
 
   const scheduleRetry = (error: ApiError) => {
-    if (closed) return;
+    if (closed || stopped) return;
     failures += 1;
     report(failures >= disconnectedAfter ? "disconnected" : "reconnecting", error);
     const base = Math.min(maxBackoff, initialBackoff * 2 ** (failures - 1));
-    retryTimer = setTimeout(() => void connect(), base + base * 0.2 * jitter());
+    retryTimer = setTimeout(() => void run(), base + base * 0.2 * jitter());
   };
 
-  const deliver = (frame: SseFrame) => {
-    if (frame.id === null) {
-      options.onFrame({ ...frame, seq: null });
-      return;
+  const stop = (error: ApiError) => {
+    stopped = true;
+    report("failed", error);
+  };
+
+  /** Delivers one frame; returns false when the connection must be dropped (a gap in seq). */
+  const deliver = (frame: SseFrame): boolean => {
+    let seq: number | null = null;
+    if (frame.id !== null) {
+      if (!/^\d+$/.test(frame.id)) {
+        protocolError(`event id is not a sequence number: ${frame.id.slice(0, 40)}`);
+        return true;
+      }
+      seq = Number(frame.id);
+      if (lastSeq !== null && seq <= lastSeq) return true; // replayed after a reconnect
+      if (lastSeq !== null && seq > lastSeq + 1) {
+        protocolError(`seq gap: expected ${lastSeq + 1}, got ${seq}; resuming from ${lastSeq}`);
+        return false;
+      }
+      lastSeq = seq;
     }
-    if (!/^\d+$/.test(frame.id)) {
-      options.onProtocolError?.(`event id is not a sequence number: ${frame.id.slice(0, 40)}`);
-      return;
+    try {
+      options.onFrame({ ...frame, seq });
+    } catch (cause) {
+      protocolError(`frame handler threw for seq ${seq ?? "-"}: ${String(cause)}`);
     }
-    const seq = Number(frame.id);
-    if (lastSeq !== null && seq <= lastSeq) return; // already delivered (replay after a reconnect)
-    lastSeq = seq;
-    options.onFrame({ ...frame, seq });
+    return true;
   };
 
   async function connect(): Promise<void> {
-    if (closed) return;
+    if (closed || stopped) return;
     report(status === null ? "connecting" : status === "disconnected" ? "disconnected" : "reconnecting");
     const attempt = new AbortController();
     controller = attempt;
-    const url = new URL(`${API_BASE}${options.path}`, window.location.origin);
+    const url = apiUrl(options.path);
     const headers = new Headers({ Accept: "text/event-stream" });
     if (lastSeq !== null) {
       url.searchParams.set("after_seq", String(lastSeq));
@@ -92,6 +156,7 @@ export function openEventStream(options: StreamOptions): EventStream {
 
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     let silent = false;
+    let gap = false;
     const arm = () => {
       if (watchdog) clearTimeout(watchdog);
       watchdog = setTimeout(() => {
@@ -112,18 +177,14 @@ export function openEventStream(options: StreamOptions): EventStream {
       });
       if (FATAL.has(response.status)) {
         if (watchdog) clearTimeout(watchdog);
-        report(
-          "disconnected",
-          new ApiError({ kind: "http", status: response.status, message: "event stream refused" }),
-        );
-        closed = true;
+        stop(await fatalError(response));
         return;
       }
       const type = response.headers.get("Content-Type") ?? "";
       if (!response.ok || !type.startsWith("text/event-stream") || !response.body) {
+        response.body?.cancel().catch(() => {});
         throw new ApiError({ kind: "bad_response", status: response.status, message: "not an event stream" });
       }
-      failures = 0;
       report("open");
       const parser = new SseParser();
       reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -131,16 +192,26 @@ export function openEventStream(options: StreamOptions): EventStream {
         const { value, done } = await reader.read();
         if (done) break;
         arm(); // any bytes, heartbeat comments included, prove the connection is alive
-        for (const frame of parser.push(value)) deliver(frame);
+        for (const frame of parser.push(value)) {
+          if (!deliver(frame)) {
+            gap = true;
+            break;
+          }
+          failures = 0; // only a delivered frame proves the stream works, not an accepted handshake
+        }
+        if (gap) {
+          attempt.abort();
+          reader.cancel().catch(() => {});
+          break;
+        }
       }
       if (watchdog) clearTimeout(watchdog);
-      if (!closed) {
-        scheduleRetry(
-          silent
-            ? new ApiError({ kind: "timeout", message: "no heartbeat from the event stream" })
-            : new ApiError({ kind: "network", message: "event stream ended" }),
-        );
-      }
+      if (closed) return;
+      if (gap)
+        scheduleRetry(new ApiError({ kind: "bad_response", message: "events missing from the stream" }));
+      else if (silent)
+        scheduleRetry(new ApiError({ kind: "timeout", message: "no heartbeat from the event stream" }));
+      else scheduleRetry(new ApiError({ kind: "network", message: "event stream ended" }));
     } catch (cause) {
       if (watchdog) clearTimeout(watchdog);
       if (closed) return;
@@ -156,7 +227,13 @@ export function openEventStream(options: StreamOptions): EventStream {
     }
   }
 
-  void connect();
+  const run = () =>
+    connect().catch((cause: unknown) => {
+      // a bug, not the network: say so instead of leaving a stale status
+      stop(new ApiError({ kind: "bad_response", message: `event stream failed: ${String(cause)}`, cause }));
+    });
+
+  void run();
   return {
     close() {
       if (closed) return;
@@ -165,6 +242,12 @@ export function openEventStream(options: StreamOptions): EventStream {
       controller?.abort();
       reader?.cancel().catch(() => {});
       report("closed");
+    },
+    retry() {
+      if (closed || !stopped) return;
+      stopped = false;
+      failures = 0;
+      void run();
     },
     lastSeq: () => lastSeq,
   };

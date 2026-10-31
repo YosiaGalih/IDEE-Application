@@ -1,6 +1,6 @@
 // Proves each contract lint rule still rejects a violation (frontend.md, IMPLEMENTATION_DESIGN_V2 §4.4):
 // the fixtures are written into src/features for the run, linted, then removed.
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { ESLint } from "eslint";
 
@@ -30,6 +30,47 @@ const cases = [
     rule: "i18next/no-literal-string",
   },
   {
+    file: path.join(dirA, "SocketMember.ts"),
+    source: 'export const s = new globalThis.WebSocket("wss://example.test");\n',
+    rule: "no-restricted-syntax",
+  },
+  {
+    file: path.join(dirA, "Events.ts"),
+    source: 'export const e = new EventSource("/api/v1/x");\n',
+    rule: "no-restricted-syntax",
+  },
+  {
+    file: path.join(dirA, "InnerHtml.ts"),
+    source: "export function put(el: HTMLElement, html: string) {\n  el.innerHTML = html;\n}\n",
+    rule: "no-restricted-syntax",
+  },
+  {
+    file: path.join(dirA, "CreateElement.ts"),
+    source:
+      'import { createElement } from "react";\nexport const d = (html: string) => createElement("div", { dangerouslySetInnerHTML: { __html: html } });\n',
+    rule: "no-restricted-syntax",
+  },
+  {
+    file: path.join(dirA, "Storage.ts"),
+    source: 'export const save = (t: string) => window.localStorage.setItem("token", t);\n',
+    rule: "no-restricted-syntax",
+  },
+  {
+    file: path.join(dirA, "Fetch.ts"),
+    source: 'export const get = () => fetch("/api/v1/projects");\n',
+    rule: "no-restricted-globals",
+  },
+  {
+    file: path.join(dirA, "Eval.ts"),
+    source: "export const run = (code: string): unknown => eval(code);\n",
+    rule: "no-eval",
+  },
+  {
+    file: path.join(dirA, "TemplateText.tsx"),
+    source: "export function T({ n }: { n: number }) {\n  return <p>{`Halo ${n}`}</p>;\n}\n",
+    rule: "no-restricted-syntax",
+  },
+  {
     file: path.join(dirA, "Danger.tsx"),
     source:
       "export function Danger({ html }: { html: string }) {\n  return <div dangerouslySetInnerHTML={{ __html: html }} />;\n}\n",
@@ -57,6 +98,11 @@ try {
 } finally {
   rmSync(dirA, { recursive: true, force: true });
   rmSync(dirB, { recursive: true, force: true });
+  try {
+    rmdirSync(path.join(root, "src/features")); // only when the run created it and it is empty
+  } catch {
+    // features of the app live there
+  }
 }
 if (failed) {
   console.error("lint guards: a contract rule no longer rejects its violation");

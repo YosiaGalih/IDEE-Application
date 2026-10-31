@@ -2,7 +2,7 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { apiRequest } from "@/api/client";
+import { apiPath, apiRequest } from "@/api/client";
 import { ApiError } from "@/api/errors";
 import { uxStateForError } from "@/api/uxState";
 
@@ -102,7 +102,23 @@ describe("apiRequest", () => {
     expect(seen[0]?.headers.get("Idempotency-Key")).toBe("retry-1");
   });
 
-  it("refuses a mutation without a CSRF cookie before any request is sent", async () => {
+  it("fetches the CSRF cookie with one GET when it is missing (after logout), then sends the mutation", async () => {
+    server.use(
+      http.get(`${API}/auth/me`, () => {
+        document.cookie = "kk_csrf=issued; path=/"; // what the browser does with the middleware's Set-Cookie
+        return failed(401, "UNAUTHENTICATED");
+      }),
+      http.post(
+        `${API}/auth/password/forgot`,
+        record(() => ok({ id: "x" })),
+      ),
+    );
+    await apiRequest("/auth/password/forgot", { method: "POST", body: { email: "a@b.c" }, schema: Thing });
+    expect(seen[0]?.headers.get("X-CSRF-Token")).toBe("issued");
+  });
+
+  it("refuses a mutation when no CSRF cookie can be had, before the mutation is sent", async () => {
+    server.use(http.get(`${API}/auth/me`, () => failed(401, "UNAUTHENTICATED")));
     server.use(
       http.delete(
         `${API}/things/1`,
@@ -115,6 +131,28 @@ describe("apiRequest", () => {
     expect(seen).toHaveLength(0);
   });
 
+  it("returns the Idempotency-Key with a failed mutation so a retry can reuse it", async () => {
+    server.use(http.post(`${API}/things`, () => failed(503, "DEPENDENCY_UNAVAILABLE")));
+    document.cookie = "kk_csrf=c; path=/";
+    const error = await apiRequest("/things", { method: "POST", schema: Thing, idempotencyKey: "k-1" }).catch(
+      (e: unknown) => e,
+    );
+    expect(error).toMatchObject({ kind: "http", idempotencyKey: "k-1" });
+  });
+
+  it("sends FormData as multipart, never as JSON", async () => {
+    server.use(
+      http.post(
+        `${API}/projects/p1/imports`,
+        record(() => ok({ id: "i1" })),
+      ),
+    );
+    document.cookie = "kk_csrf=c; path=/";
+    const form = new FormData();
+    form.append("archive", new Blob(["zip"]), "a.zip");
+    await apiRequest("/projects/p1/imports", { method: "POST", body: form, schema: Thing });
+    expect(seen[0]?.headers.get("Content-Type")).toMatch(/^multipart\/form-data/);
+  });
   it("logs in without CSRF or Idempotency-Key, and auth mutations carry no Idempotency-Key", async () => {
     server.use(
       http.post(
@@ -145,9 +183,26 @@ describe("apiRequest", () => {
     });
   });
 
-  it("refuses paths that leave the API base", async () => {
-    await expect(apiRequest("https://evil.example/x", { schema: Thing })).rejects.toThrow();
-    await expect(apiRequest("/a/../../x", { schema: Thing })).rejects.toThrow();
+  it.each([
+    "https://evil.example/x",
+    "//evil.example/x",
+    "/a/../../x",
+    "/projects/%2e%2e/admin/users/u1",
+    "/projects/.%2E/settings/policies",
+    "/projects/%2E./x",
+    "/projects/..\\admin\\users\\u1",
+    "/projects/..",
+  ])("refuses %s, which would leave the API base", async (path) => {
+    document.cookie = "kk_csrf=c; path=/";
+    await expect(apiRequest(path, { method: "DELETE", schema: Thing })).rejects.toThrow(
+      /plain absolute path/,
+    );
+    expect(seen).toHaveLength(0);
+  });
+
+  it("builds paths whose segments cannot add or remove a segment", () => {
+    expect(apiPath("projects", "a/b", "imports")).toBe("/projects/a%2Fb/imports");
+    expect(apiPath("tasks", 7)).toBe("/tasks/7");
   });
 });
 
@@ -167,6 +222,16 @@ describe("uxStateForError", () => {
     [new ApiError({ kind: "timeout" }), "timeout"],
     [new ApiError({ kind: "network" }), "disconnected"],
     [new ApiError({ kind: "bad_response", status: 200 }), "error"],
+    // unknown codes and gateway pages fall back on the status
+    [new ApiError({ kind: "http", status: 403, code: "TERMINAL_DISABLED" }), "permission_denied"],
+    [new ApiError({ kind: "http", status: 404, code: "SOMETHING_ELSE" }), "not_found"],
+    [new ApiError({ kind: "http", status: 429, code: "ENV_QUOTA" }), "rate_limited"],
+    [new ApiError({ kind: "http", status: 503, code: "NODE_UNAVAILABLE" }), "provider_degraded"],
+    [new ApiError({ kind: "bad_response", status: 502 }), "provider_degraded"],
+    [new ApiError({ kind: "bad_response", status: 504 }), "provider_degraded"],
+    [new ApiError({ kind: "bad_response", status: 401 }), "unauthenticated"],
+    [new ApiError({ kind: "aborted" }), "error"],
+    [new ApiError({ kind: "csrf_missing" }), "error"],
   ];
   it.each(cases)("%#: maps to %s", (error, state) => {
     expect(uxStateForError(error)).toBe(state);

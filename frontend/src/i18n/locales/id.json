@@ -38,7 +38,7 @@
     "notFound": "Halaman tidak ditemukan"
   },
   "placeholder": {
-    "body": "Layar ini dibangun di WP-1.4b. Fondasi (klien API, stream event, i18n, komponen) sudah siap."
+    "body": "Layar ini sedang dibangun. Fondasi (klien API, stream event, i18n, komponen) sudah siap."
   },
   "states": {
     "loading": {

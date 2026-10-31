@@ -11,7 +11,7 @@ const buttonVariants = cva(
         primary: "bg-brand-600 text-white hover:bg-brand-700",
         secondary: "border border-line bg-surface text-fg hover:bg-surface-muted",
         ghost: "text-fg hover:bg-surface-muted",
-        danger: "bg-status-danger text-white hover:opacity-90",
+        danger: "bg-status-danger text-[var(--color-on-danger)] hover:opacity-90",
       },
       size: { sm: "h-8 px-3 text-sm", md: "h-10 px-4 text-sm", lg: "h-11 px-5 text-base" },
     },

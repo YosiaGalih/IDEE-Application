@@ -41,7 +41,7 @@ function NavItems({ items }: { items: Item[] }) {
 export function Sidebar() {
   const { t } = useTranslation();
   return (
-    <aside className="flex w-60 shrink-0 flex-col bg-sidebar text-sidebar-fg">
+    <aside className="on-dark flex w-60 shrink-0 flex-col bg-sidebar text-sidebar-fg">
       <div className="flex items-center gap-2 bg-sidebar-deep px-4 py-4">
         <img src="/favicon.svg" alt="" className="size-7" />
         <span className="font-semibold text-white">{t("app.name")}</span>

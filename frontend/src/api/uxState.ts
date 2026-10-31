@@ -16,37 +16,37 @@ export type UxState =
   | "rate_limited"
   | "not_found";
 
+const BY_CODE: Record<string, UxState> = {
+  UNAUTHENTICATED: "unauthenticated",
+  SESSION_EXPIRED: "unauthenticated",
+  FORBIDDEN: "permission_denied",
+  POLICY_DENIED: "permission_denied",
+  CAPABILITY_DISABLED: "capability_disabled",
+  NOT_FOUND: "not_found",
+  QUOTA_EXCEEDED: "quota_exceeded",
+  RATE_LIMITED: "rate_limited",
+  DEPENDENCY_UNAVAILABLE: "provider_degraded",
+};
+
+/** Codes we do not know yet (or a gateway page without the envelope) still get the state of their status. */
+const BY_STATUS: Record<number, UxState> = {
+  401: "unauthenticated",
+  403: "permission_denied",
+  404: "not_found",
+  429: "rate_limited",
+  502: "provider_degraded",
+  503: "provider_degraded",
+  504: "provider_degraded",
+};
+
 /** The state a failed call puts a view in. Unknown failures are a plain error, never silently "empty". */
 export function uxStateForError(error: unknown): UxState {
   if (!(error instanceof ApiError)) return "error";
-  switch (error.kind) {
-    case "timeout":
-      return "timeout";
-    case "network":
-      return "disconnected";
-    case "http":
-      break;
-    default:
-      return "error";
-  }
-  switch (error.code) {
-    case "UNAUTHENTICATED":
-    case "SESSION_EXPIRED":
-      return "unauthenticated";
-    case "FORBIDDEN":
-    case "POLICY_DENIED":
-      return "permission_denied";
-    case "CAPABILITY_DISABLED":
-      return "capability_disabled";
-    case "NOT_FOUND":
-      return "not_found";
-    case "QUOTA_EXCEEDED":
-      return "quota_exceeded";
-    case "RATE_LIMITED":
-      return "rate_limited";
-    case "DEPENDENCY_UNAVAILABLE":
-      return "provider_degraded";
-    default:
-      return error.status === 401 ? "unauthenticated" : "error";
-  }
+  if (error.kind === "timeout") return "timeout";
+  if (error.kind === "network") return "disconnected";
+  if (error.kind !== "http" && error.kind !== "bad_response") return "error";
+  const byCode = error.code ? BY_CODE[error.code] : undefined;
+  if (byCode) return byCode;
+  if (error.code === "CSRF_FAILED") return "error"; // a client bug, not missing rights
+  return (error.status !== null ? BY_STATUS[error.status] : undefined) ?? "error";
 }

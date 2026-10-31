@@ -38,7 +38,7 @@
     "notFound": "Page not found"
   },
   "placeholder": {
-    "body": "This screen is built in WP-1.4b. The foundation (API client, event stream, i18n, components) is ready."
+    "body": "This screen is under construction. The foundation (API client, event stream, i18n, components) is ready."
   },
   "states": {
     "loading": {
