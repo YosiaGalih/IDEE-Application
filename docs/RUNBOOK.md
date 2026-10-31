@@ -176,17 +176,24 @@ Setelah mengubah `.env`: `make up` (compose me-*recreate* hanya service yang env
 
 ### 7.1 Backup harian
 
-`scripts/backup.sh` (via `make backup`) menghasilkan `$BACKUP_DIR/kodekantor-<UTC>/`:
+`scripts/backup.sh [--quiesce]` (via `make backup`, sebagai root) menghasilkan `$BACKUP_DIR/kodekantor-<UTC>/`:
 
 | File | Isi |
 |---|---|
-| `postgres.dump` | `pg_dump --format=custom` (diverifikasi `pg_restore --list`) |
-| `workspaces.tar.gz` | isi `WORKSPACE_HOST_PATH` + owner/mode/mtime (repo git, worktree task, artefak); tanpa `node_modules`, `.venv`, `__pycache__`, `uploads/` |
-| `workspaces.manifest` | metadata per file: mode, uid:gid, size, mtime, path |
-| `manifest.json` | waktu, git commit, image tag, revisi alembic, ukuran |
-| `SHA256SUMS` | checksum semua file di atas |
+| `postgres.dump` | `pg_dump --format=custom` di container postgres; harus memuat data `alembic_version` menurut `pg_restore --list` |
+| `workspaces.tar.gz` | isi `WORKSPACE_HOST_PATH` (format pax: owner numerik, mode, mtime presisi penuh) berisi repo git, worktree task, dan artefak. Tanpa `node_modules`, `.venv`, `__pycache__`, serta `uploads/` dan `.kk-runs/` di level project |
+| `workspaces.manifest` | daftar isi arsip itu sendiri: mode, uid/gid, ukuran, mtime, path |
+| `manifest.json` | `created_at`, `git_commit`, `image_tag`, `alembic_revision`, `postgres_version`, `counts` (users, projects, tasks, audit_events), ukuran, `quiesced` |
+| `SHA256SUMS` | checksum keempat file di atas |
 
-Retensi: `BACKUP_RETENTION_DAYS` (default 14). Direktori backup mode 0700. `.env` **tidak** ikut — simpan salinannya di password manager / secret store.
+Aturan backup:
+- **Folder dan file:** folder backup 0700, file 0600, milik root.
+- **Atomik:** backup disusun di `kodekantor-<UTC>.partial/` dan di-rename hanya bila semua langkah lulus. Backup yang gagal dihapus.
+- **Kunci:** `$BACKUP_DIR/.lock` mencegah backup dan restore berjalan bersamaan.
+- **Retensi:** `BACKUP_RETENTION_DAYS` (default 14). Retensi hanya menghapus folder bernama persis `kodekantor-YYYYMMDDTHHMMSSZ` yang lebih tua dari batas itu; folder lain di `BACKUP_DIR` tidak disentuh.
+- **Konsistensi:** tanpa `--quiesce`, dump DB konsisten tetapi tar workspace diambil saat stack berjalan. `--quiesce` menghentikan api/worker/scheduler selama penyalinan; pakai saat upgrade (§6).
+- **Secret:** `.env` **tidak** ikut. Simpan salinannya di password manager / secret store.
+- **Yang tidak di-backup:** Redis (dapat dibuang) dan sertifikat Caddy (diterbitkan ulang, perhatikan rate limit Let's Encrypt saat pindah VM).
 
 Jadwal (systemd timer atau cron root), mis. `/etc/cron.d/kodekantor-backup`:
 
@@ -199,16 +206,44 @@ Off-site (wajib untuk DR): salin `$BACKUP_DIR` ke storage lain **terenkripsi**, 
 ### 7.2 Restore
 
 ```bash
-scripts/restore.sh /var/backups/kodekantor/kodekantor-20261021T023000Z          # minta konfirmasi "RESTORE"
+make restore BACKUP=/var/backups/kodekantor/kodekantor-20261021T023000Z           # minta konfirmasi "RESTORE"
 scripts/restore.sh --yes --db-only  <dir>                                         # non-interaktif, DB saja
 scripts/restore.sh --workspace-only <dir>
 ```
 
-Langkah skrip: verifikasi `SHA256SUMS` → stop caddy/api/worker/scheduler/sandbox-manager → `dropdb --force` + `createdb` + `pg_restore --exit-on-error` → workspace lama dipindah ke `<path>.pre-restore-<TS>` lalu arsip diekstrak (owner numerik dipertahankan) → `make up` (migrate ke head) → `healthcheck.sh --wait 180`. Redis **tidak** di-restore (hanya broker/pub-sub); task yang terputus menjadi `interrupted` dan bisa di-resume. Hapus `<path>.pre-restore-*` setelah verifikasi.
+Langkah skrip (sebagai root):
+1. **Validasi, sebelum apa pun disentuh.**
+   - Nama folder `kodekantor-<UTC>`.
+   - `SHA256SUMS` memuat tepat keempat file dan harus lulus `sha256sum --check --strict`.
+   - Untuk restore workspace, uid 10001 harus bisa menjangkau folder induk `WORKSPACE_HOST_PATH` (0755).
+   - Konfirmasi `RESTORE`.
+2. **Hentikan semua penulis:** caddy, web, api, worker, scheduler, sandbox-manager, egress-proxy, dan container task sandbox (`kk.managed=1`). postgres tetap jalan.
+3. **DB.**
+   - Role `kodekantor_app` harus ada; bila belum, jalankan `make up` sekali agar postgres menginisialisasinya.
+   - `DROP DATABASE … WITH (FORCE)` → `CREATE DATABASE … OWNER kodekantor` → ACL database dipasang ulang: `REVOKE ALL … FROM PUBLIC`, `GRANT CONNECT … TO kodekantor_app`. ACL ini hilang bersama `DROP`.
+   - `pg_restore --exit-on-error --single-transaction`.
+   - Event audit `ops.restore` (actor `restore.sh`, metadata `backup`, `backup_time`, `restored_at`) dicatat di DB hasil restore, karena restore memutar balik jejak audit.
+4. **Workspace.**
+   - Folder lama dipindah ke `<path>.pre-restore-<UTC>`, lalu folder baru dibuat 10001:10001 0750.
+   - Arsip diekstrak **sebagai uid 10001**, jadi arsip yang diubah tidak bisa menulis di luar wilayah 10001.
+   - Jumlah entri harus sama dengan `workspaces.manifest`.
+5. **Nyalakan:** `docker compose up -d --wait` (migrate ke head + `grant-runtime-role`) → `healthcheck.sh --wait 180`. Skrip lalu menampilkan RTO dan waktu backup (RPO).
+
+Redis **tidak** di-restore (hanya broker/pub-sub); task yang terputus menjadi `interrupted` dan bisa di-resume. Hapus `<path>.pre-restore-*` setelah verifikasi.
 
 ### 7.3 Restore drill (bulanan, wajib PRD §7.5)
 
-Di VM staging (bukan produksi):
+**Drill otomatis Fase 1** (`infra/tests/restore_drill.sh`, job CI `clean-install` pada setiap PR dan nightly; stack uji saja). Urutannya:
+1. seed penanda audit dan project git milik 10001;
+2. `backup.sh`;
+3. rusak DB dan workspace;
+4. `restore.sh --yes`;
+5. DB dan setiap file yang di-backup harus sama dengan saat backup: mode, owner, mtime, sha256, `git fsck`, `ops.restore` tercatat;
+6. backup yang diubah satu byte harus ditolak sebelum service mana pun berhenti.
+
+Drill otomatis ini **tidak** menggantikan drill operasional di bawah.
+
+**Drill operasional** di VM staging (bukan produksi):
 
 1. Provision VM sesuai §1, clone repo pada tag yang sama dengan produksi, salin `.env` produksi lalu ganti `APP_DOMAIN`/`APP_URL` ke domain staging.
 2. Salin backup terbaru dari off-site, jalankan `scripts/restore.sh --yes <dir>`.

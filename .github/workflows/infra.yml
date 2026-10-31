@@ -89,6 +89,10 @@ jobs:
           test "$refused" -ge 5
       - name: Client IP only from Caddy
         run: infra/tests/xff_probe.sh
+      # WP-1.5 "drill restore lulus" (spec WP-1.5c): backup, damage, restore; database and workspace must equal
+      # the backup and a tampered backup must be refused. Root: extraction runs as uid 10001 via setpriv.
+      - name: Restore drill
+        run: sudo --preserve-env=KK_ENV_FILE,COMPOSE_PROFILES infra/tests/restore_drill.sh
       - name: Diagnostics
         if: failure()
         run: |
