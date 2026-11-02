@@ -29,7 +29,7 @@ from app.core.logging import get_logger
 from app.gitops.adapter import Branch, GitStatus, GitTarget, LogEntry
 from app.gitops.diffparse import Diff
 from app.models.projects import Project, Repository
-from app.services.projects import Actor, ProjectEnv, authorize, repo_path
+from app.services.projects import Actor, ProjectEnv, authorize, commit_author, repo_path
 from app.workspace.fs import FileChange, TreeResult, Workspace
 from app.workspace.policy import Access
 
@@ -308,3 +308,49 @@ async def git_branches(env: ProjectEnv, actor: Actor, project_id: uuid.UUID) -> 
 async def git_log(env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, limit: int) -> list[LogEntry]:
     repo = await open_repo(env, actor, project_id, "git:read", write=False)
     return await env.git.log(repo.target, limit=limit)
+
+
+# --- git writes ---------------------------------------------------------------------------------------------
+
+RESERVED_BRANCH_PREFIX = "kk/"  # task and user branches belong to the platform (FR-114, §13.3)
+
+
+async def create_branch(
+    env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, name: str, from_ref: str | None
+) -> Branch:
+    """A new branch at ``from_ref`` (default HEAD). Only the ref is created: no checkout, the working tree
+    and its uncommitted edits stay as they are. Deleting or moving branches is not offered (FR-118)."""
+    if name.startswith(RESERVED_BRANCH_PREFIX):
+        raise AppError(
+            "VALIDATION_ERROR",
+            "Input did not pass validation",
+            http_status=422,
+            details=[{"loc": ["body", "name"], "msg": f"names under {RESERVED_BRANCH_PREFIX} are reserved"}],
+        )
+    repo = await open_repo(env, actor, project_id, "git:branch", write=True)
+    if any(branch.name == name for branch in await env.git.branches(repo.target)):
+        raise _conflict("branch_exists")
+    head = await env.git.create_branch(repo.target, name, from_ref or "HEAD")
+    await _audit(env, actor, project_id, "git.branch_created", {"name": name, "head": head})
+    return Branch(name=name, head=head, is_task_branch=False)
+
+
+async def commit(
+    env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, message: str, paths: list[str] | None
+) -> str:
+    """Commit the working tree of ``repo/`` (or only ``paths``) on its current branch, as the user. Holds the
+    workspace lock, so a concurrent save is either in this commit or left for the next one, never half in.
+    ``.kk`` is never staged (SECURITY_MODEL §4). Nothing staged → 409 ``nothing_to_commit``."""
+    repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
+    async with repo.workspace.exclusive():
+        sha = await env.git.commit(repo.target, message, commit_author(actor), paths=paths)
+    if sha is None:
+        raise _conflict("nothing_to_commit")
+    await _audit(
+        env,
+        actor,
+        project_id,
+        "git.commit",
+        {"commit": sha, "paths": len(paths) if paths is not None else None},
+    )
+    return sha

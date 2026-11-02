@@ -45,6 +45,8 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("GET", "/api/v1/projects/{id}/git/diff", None),
     ("GET", "/api/v1/projects/{id}/git/branches", None),
     ("GET", "/api/v1/projects/{id}/git/log", None),
+    ("POST", "/api/v1/projects/{id}/git/branch", {"name": "matrix"}),
+    ("POST", "/api/v1/projects/{id}/git/commit", {"message": "matrix"}),
 ]
 FILE = "README.md"  # exists in every blank project
 WRITES = {
@@ -56,6 +58,8 @@ WRITES = {
     ("POST", "/api/v1/projects/{id}/files"),
     ("DELETE", "/api/v1/projects/{id}/files/{path}"),
     ("POST", "/api/v1/projects/{id}/patches"),
+    ("POST", "/api/v1/projects/{id}/git/branch"),
+    ("POST", "/api/v1/projects/{id}/git/commit"),
 }
 
 
