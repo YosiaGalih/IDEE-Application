@@ -64,7 +64,7 @@ CREATE_CONCURRENCY = 4
 CREATE_RATE_LIMIT = 20
 CREATE_RATE_WINDOW_S = 600
 # Cleanups of failed creates run as tasks so a second cancel cannot stop them halfway; held here until done.
-_settling: set[asyncio.Task[None]] = set()
+_settling: set[asyncio.Task[bool]] = set()
 PAGE_SIZE_DEFAULT = 50
 PAGE_SIZE_MAX = 200
 _NAME_CHARACTER = re.compile(r"\w", re.UNICODE)
@@ -319,26 +319,17 @@ async def _populate(
     return commit
 
 
-async def _discard_folder(
-    env: ProjectEnv, root: Path, project_id: uuid.UUID, *, commit_attempted: bool
-) -> None:
-    """Remove the folder of a create that failed, unless its row exists after all (ambiguous commit)."""
-    if commit_attempted:
-        # A COMMIT can reach the server and still raise here (connection lost on the reply, cancel): only
-        # the database knows whether the project exists.
-        try:
-            async with env.sessions() as session:
-                exists = await session.scalar(select(Project.id).where(Project.id == project_id))
-        except Exception:
-            # Unknown whether the row exists: keeping the folder is the safe side; say so loudly.
-            logger.exception(
-                "project_create_cleanup_skipped", project_id=str(project_id), reason="row_state_unknown"
-            )
-            return
-        if exists is not None:
-            logger.error("project_create_cleanup_skipped", project_id=str(project_id), reason="row_exists")
-            return
+async def _row_exists(env: ProjectEnv, project_id: uuid.UUID) -> bool | None:
+    """Whether the project row exists, from a fresh session; None when the database cannot say."""
+    try:
+        async with env.sessions() as session:
+            return await session.scalar(select(Project.id).where(Project.id == project_id)) is not None
+    except Exception:
+        logger.exception("project_create_row_check_failed", project_id=str(project_id))
+        return None
 
+
+async def _remove_folder(env: ProjectEnv, root: Path, project_id: uuid.UUID) -> None:
     def report(_function: object, path: str, exc: BaseException) -> None:
         logger.error(
             "project_create_cleanup_failed",
@@ -382,19 +373,62 @@ async def _settle_failed_create(
     stage: str,
     exc: BaseException,
     folder_may_exist: bool,
-) -> None:
+) -> bool:
+    """Leave no half project behind. True when the project exists after all (a lost COMMIT reply)."""
+    if stage == "commit":
+        # A COMMIT can reach the server and still raise here (connection lost on the reply, cancel): only
+        # the database knows whether the project exists.
+        exists = await _row_exists(env, project_id)
+        if exists:
+            # Complete: its rows, folder and success audit are all in place. Not a failure.
+            logger.warning(
+                "project_create_commit_reply_lost", project_id=str(project_id), error_type=type(exc).__name__
+            )
+            return True
+        if exists is None:
+            # Unknown: keeping the folder is the safe side (a row without its folder is the worse half).
+            await _create_failed(env, actor, project_id, stage, exc)
+            logger.error(
+                "project_create_cleanup_skipped", project_id=str(project_id), reason="row_state_unknown"
+            )
+            return False
     if not (isinstance(exc, AppError) and exc.code == "RATE_LIMITED"):
         await _create_failed(env, actor, project_id, stage, exc)
     if folder_may_exist:
-        await _discard_folder(env, root, project_id, commit_attempted=stage == "commit")
+        await _remove_folder(env, root, project_id)
+    return False
 
 
-async def _settle(coroutine: Coroutine[Any, Any, None]) -> None:
-    """Run a cleanup to its end even if the request is cancelled again while it runs."""
+def _settled(task: asyncio.Task[bool]) -> None:
+    _settling.discard(task)
+    error = None if task.cancelled() else task.exception()
+    if error is not None:
+        logger.error("project_create_cleanup_crashed", error_type=type(error).__name__, exc_info=error)
+
+
+async def _settle(coroutine: Coroutine[Any, Any, bool]) -> bool:
+    """Run a cleanup to its end even if the request is cancelled again while it runs.
+
+    A cancel while waiting leaves the task running (it still finishes the cleanup). A cleanup that crashes
+    is logged and counts as "the project does not exist": it never replaces the create's own error.
+    """
     task = asyncio.create_task(coroutine)
     _settling.add(task)
-    task.add_done_callback(_settling.discard)
-    await asyncio.shield(task)  # a cancel here leaves the task running; it still finishes the cleanup
+    task.add_done_callback(_settled)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False  # logged by _settled
+
+
+async def drain_cleanups(grace_s: float = 30) -> None:
+    """At shutdown: let the cleanups of failed creates finish before the loop goes (no orphan folders)."""
+    if _settling:
+        _, pending = await asyncio.wait(set(_settling), timeout=grace_s)
+        if pending:
+            logger.error("project_create_cleanup_unfinished_at_shutdown", count=len(pending))
 
 
 async def create_project(
@@ -480,6 +514,7 @@ async def _create_project(
     stage = "database"
     # Set before mkdir: a cancelled await can still create the folder in its thread.
     folder_may_exist = False
+    created: ProjectView | None = None  # the answer, built before the COMMIT
     try:
         async with env.sessions() as session:
             try:
@@ -540,19 +575,28 @@ async def _create_project(
             stage = "commit"
             await _audit(env, session, actor, project, "project.create", metadata)
             await _load_updated_at(session, project)
+            created = _created_view(actor, project, repository, first_commit)
             await session.commit()
     except BaseException as exc:
         # Also when the session's own rollback raised: this block runs whatever left the `async with`.
-        await _settle(
+        exists = await _settle(
             _settle_failed_create(
                 env, actor, project_id, root, stage=stage, exc=exc, folder_may_exist=folder_may_exist
             )
         )
+        if exists and created is not None and isinstance(exc, Exception):
+            # The COMMIT landed and only its reply was lost: answer with the project, or a retry (a 5xx is
+            # not kept by the idempotency store) would create a second one.
+            return created
         if isinstance(exc, GitError):
             # Infrastructure, not the request: a 5xx, which the idempotency store never keeps (a 409 would
             # be replayed for 24 h to a retry with the same key).
             raise AppError("GIT_ERROR", "Git operation failed", http_status=500, details=exc.details) from exc
         raise
+    return created
+
+
+def _created_view(actor: Actor, project: Project, repository: Repository, first_commit: str) -> ProjectView:
     # Built from what was just written: a read after the commit could fail and report an error for a project
     # that exists (the client would then retry and create a second one).
     return ProjectView(

@@ -440,10 +440,11 @@ async def counts(engine: AsyncEngine) -> tuple[int, int]:
         )
 
 
-async def test_a_commit_that_applied_but_raised_keeps_the_folder(
+async def test_a_commit_whose_reply_was_lost_answers_with_the_project(
     owner: httpx.AsyncClient, workspace_root: Path, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The COMMIT reached the server and the reply was lost: the row exists, so the folder must stay."""
+    """The COMMIT reached the server and its reply was lost: the project exists, complete. Answering 500
+    would make a retry (5xx is not kept by the idempotency store) create a second one."""
     armed = False
     audit = projects._audit  # pyright: ignore[reportPrivateUsage]
     commit = AsyncSession.commit
@@ -462,12 +463,22 @@ async def test_a_commit_that_applied_but_raised_keeps_the_folder(
 
     monkeypatch.setattr(projects, "_audit", arming_audit)
     monkeypatch.setattr(AsyncSession, "commit", lost_reply)
-    # An unhandled error: the test transport raises it where a server would answer 500.
-    with pytest.raises(ConnectionResetError):
-        await create(owner)
+    response = await create(owner)
+    assert response.status_code == 201, response.text
+    data = response.json()["data"]
     assert await counts(engine) == (1, 1)
     [folder] = entries(workspace_root)
-    assert (folder / "repo" / ".git").is_dir()
+    assert folder.name == data["id"]
+    assert data["stats"]["last_commit"] == git(folder / "repo", "rev-parse", "HEAD")
+    async with make_sessionmaker(engine)() as session:
+        results = (
+            await session.scalars(
+                select(AuditEvent.result).where(
+                    AuditEvent.action == "project.create", AuditEvent.resource_id == data["id"]
+                )
+            )
+        ).all()
+    assert results == ["success"]  # no "error" for a project that exists
 
 
 async def test_a_failing_session_close_still_removes_the_folder(
@@ -530,6 +541,71 @@ async def test_a_cancelled_create_leaves_no_row_and_no_folder(
     await asyncio.gather(*projects._settling)  # pyright: ignore[reportPrivateUsage]
     assert entries(workspace_root) == []
     assert await counts(engine) == (0, 0)
+
+
+async def test_a_second_cancel_does_not_stop_the_cleanup(
+    app: FastAPI,
+    owner_id: uuid.UUID,
+    workspace_root: Path,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request is cancelled again while its cleanup runs (shutdown, a client gone twice): the cleanup
+    still finishes, in its own task."""
+    started, in_cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    create_failed = projects._create_failed  # pyright: ignore[reportPrivateUsage]
+
+    async def hangs(*_: object, **__: object) -> str | None:
+        started.set()
+        await asyncio.Event().wait()
+        return None
+
+    async def slow_create_failed(*args: object, **kwargs: object) -> None:
+        in_cleanup.set()
+        await release.wait()
+        await create_failed(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "commit_all", hangs)
+    monkeypatch.setattr(projects, "_create_failed", slow_create_failed)
+    task = asyncio.create_task(
+        projects.create_project(
+            service_env(app, workspace_root),
+            owner_actor(owner_id),
+            name="Cancelled twice",
+            description=None,
+            source=projects.BlankSource(),
+            default_branch="main",
+        )
+    )
+    await asyncio.wait_for(started.wait(), 10)
+    task.cancel()
+    await asyncio.wait_for(in_cleanup.wait(), 10)
+    task.cancel()  # again, while the cleanup waits
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(entries(workspace_root)) == 1  # the cleanup has not reached the folder yet
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*projects._settling), 10)  # pyright: ignore[reportPrivateUsage]
+    assert entries(workspace_root) == []
+    assert await counts(engine) == (0, 0)
+
+
+async def test_startup_reads_the_templates_and_shutdown_waits_for_cleanups(workspace_root: Path) -> None:
+    projects._template_catalog.cache_clear()  # pyright: ignore[reportPrivateUsage]
+    app = create_app(load_settings(make_test_env(COOKIE_SECURE="false", WORKSPACE_ROOT=str(workspace_root))))
+    finished: list[bool] = []
+
+    async def cleanup() -> bool:
+        await asyncio.sleep(0.2)
+        finished.append(True)
+        return False
+
+    async with app.router.lifespan_context(app):
+        assert projects._template_catalog.cache_info().currsize == 1  # pyright: ignore[reportPrivateUsage]
+        request = asyncio.create_task(projects._settle(cleanup()))  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0)
+        request.cancel()  # the request is gone; its cleanup is not
+    assert finished == [True]  # shutdown waited for it
 
 
 # --- review gaps: reads, lists, limits ---------------------------------------------------------------------

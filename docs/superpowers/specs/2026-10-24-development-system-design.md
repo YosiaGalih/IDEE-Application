@@ -357,6 +357,13 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - hapus project (FR-018, R3) menunggu tabel dan handler approval (WP-3.1);
     - import `git_https` (FR-016, P1) menunggu egress internet dan gate G4; `api` tidak berada di network `outbound`, jadi clone dilakukan worker;
     - knowledge (M16) dan admin user/policy serta audit viewer (M20) berprioritas P1, dikerjakan setelah jalur P0.
+66. **Versi Python di CI.**
+    - `.claude/rules/backend.md` menulis "Python 3.12 (CI juga 3.13)", tetapi semua job CI memin `UV_PYTHON: "3.12"`, dan `backend/` tidak punya `.python-version`.
+    - AG-13 (review WP-2.1a) menemukan `tests/unit/test_paths.py::test_deep_symlink_chain_is_a_violation` gagal di 3.13 ("DID NOT RAISE PathViolation"). Ini bukti T2 dari WP-1.2.
+    - Menunggu keputusan Lead/PO:
+      - tambah job 3.13 dan perbaiki perilakunya, atau
+      - hapus "CI juga 3.13" dari aturan dan pin `.python-version` 3.12.
+    - Sampai diputuskan, `uv sync` tanpa pin dapat memilih 3.13 dan memberi hasil T2 yang berbeda.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

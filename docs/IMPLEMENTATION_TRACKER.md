@@ -1112,6 +1112,27 @@ Tidak ditutup (alasan):
 - **silent L3 sebagian, L8, L9:** "Belum terdeteksi" pada stack kosong, arsip tanpa peringatan task berjalan, slug generik untuk nama non-Latin. Bersifat kosmetik atau informasional; arsip vs task berjalan diatur WP-3.1.
 - **AG-13 [Menebak]:** cancel saat `to_thread(materialize)` dapat membiarkan thread salin masih menulis ketika `rmtree` berjalan. Kegagalan hapus di-log per path; penyapu folder yatim menyusul (catatan di bawah).
 
+#### Delta review WP-2.1a: `kk-backend-reviewer` @ 37c34f1 (**WARN**: B1, B2, S1–S8, N1, N2, N6 CLOSED; 1 SHOULD, 6 NIT), AG-13 @ cd34fbc (**SIGNED OFF 🔒**, 2 LOW terbuka)
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| backend SHOULD: sifat `_settle` (cancel kedua) dan `CreateGate` tidak dites; test cancel sekali juga lolos tanpa shield | `test_a_second_cancel_does_not_stop_the_cleanup`, `tests/unit/test_create_gate.py` (batas proses, satu per owner, cancel acak 100 putaran, holder dibatalkan), test lifespan | mutan `_settle` tanpa task/shield → merah; mutan tanpa drain → merah |
+| backend NIT: cleanup yang crash mengganti error asli (juga `CancelledError`) | `_settle` menangkap `Exception`, mencatat `project_create_cleanup_crashed` lewat done-callback, dan mengembalikan False (error asli tetap) | `test_a_crashing_cleanup_never_replaces_the_create_error` |
+| backend NIT: cleanup tidak ditunggu saat shutdown | `drain_cleanups()` di lifespan sebelum `aclose` (30 s; sisa di-log) | test lifespan: shutdown menunggu cleanup |
+| backend NIT: COMMIT yang ternyata berhasil tetap 500 → retry membuat project kedua, audit success + error | baris dicek dulu. Bila ada → log warning `project_create_commit_reply_lost`, jawab 201 dengan project yang sudah dibangun sebelum COMMIT, tanpa audit error | `test_a_commit_whose_reply_was_lost_answers_with_the_project` (201, `last_commit` = HEAD, audit hanya `success`) |
+| backend NIT: f-string di `text()` | sudah ditutup di cd34fbc (Semgrep) | CI |
+| backend NIT: dua definisi status "selesai" | `workflow.states.FINISHED` (publik) dipakai `task_stats` | suite |
+| backend NIT kecil (`total` bisa selisih satu di READ COMMITTED; `limiter=None` mematikan batas untuk pemanggil non-HTTP; test memakai nama privat) | dibiarkan: perilaku pagination offset yang biasa; `None` disengaja dan dikomentari | — |
+| AG-13 LOW: CVE dari git di image backend bergantung pada EX-02 yang teksnya tidak menyebut curl/perl | baris EX-02 di DECISIONS ditambah analisis keterjangkauan untuk libcurl dan perl (tanpa operasi remote, `api` tanpa egress, tanpa perl). Dievaluasi ulang saat `git_https` | DECISIONS EX-02. **Bila PO menolak EX-02, bagian T8 sign-off gugur** |
+| AG-13 LOW: role global di project yang diberi grant | keputusan PO (lihat "Tidak ditutup") | test mengunci |
+
+- **Hasil lokal setelah putaran ini:** backend `pytest -q -p no:randomly` → **1325 passed, 1 skipped**; urutan terbalik (security → integration → unit gate) → 78 passed; ruff, pyright, dan lint-imports bersih.
+- **Sign-off AG-13** berlaku untuk cd34fbc. Commit putaran ini mengubah `services/projects.py` dan `main.py`, jadi delta review AG-13 diminta lagi.
+
+AG-13, catatan di luar WP ini:
+- Di Python 3.13, `tests/unit/test_paths.py::test_deep_symlink_chain_is_a_violation` gagal (DID NOT RAISE `PathViolation`). CI memin `UV_PYTHON=3.12`, sedangkan `.claude/rules/backend.md` menyebut "CI juga 3.13" (konflik #66). `backend/` tidak punya `.python-version`.
+- `_audit_unsafe` menulis audit di setiap GET untuk repo yang dirusak, dan setiap `GET /projects/{id}` menjalankan git tanpa rate limit. Keduanya belum terjangkau, karena belum ada yang menulis `.git`. Ditinjau ulang saat sandbox mendapat akses repo.
+
 Catatan untuk WP berikutnya (dari review, belum diubah):
 - 2.1b/`git_https`: ekstrak `reserve_slug` dari create. Sanitasi `RepositoryOut.error` bila berasal dari remote.
 - 2.1c: kunci per repo untuk commit/PUT. Kebijakan status untuk project `archived` dan `deleting_pending_approval` (PATCH masih jalan saat menunggu approval hapus; WP-3.1 harus membuat rename menggantikan approval `project_delete`). Simpan `sync_state=error` secara persisten. Siapkan penyapu folder yatim.

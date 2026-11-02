@@ -19,7 +19,7 @@ from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
 from app.services.auth import resolve_session
 from app.services.health import Dependencies
-from app.services.projects import load_templates
+from app.services.projects import drain_cleanups, load_templates
 
 
 class RequestIdMiddleware:
@@ -69,6 +69,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         await load_templates()  # read once, off the event loop; requests then use the cached catalog
         yield
+        await drain_cleanups()  # cleanups of failed creates still running: no orphan folders
         await dependencies.aclose()
 
     app = FastAPI(
