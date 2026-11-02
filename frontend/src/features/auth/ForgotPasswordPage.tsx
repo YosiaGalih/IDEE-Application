@@ -11,8 +11,8 @@ import { Spinner } from "@/components/ui/Spinner";
 import { AUTH_PATHS } from "@/lib/safeNext";
 import { zodResolver } from "@/lib/zodResolver";
 import { AuthLayout } from "./AuthLayout";
-import { describeError } from "./describeError";
-import { ErrorSummary } from "./ErrorSummary";
+import { describeError } from "@/lib/describeError";
+import { ErrorSummary } from "@/components/ui/ErrorSummary";
 import { forgotSchema, type ForgotValues } from "./schemas";
 import { useFieldError } from "./useFieldError";
 

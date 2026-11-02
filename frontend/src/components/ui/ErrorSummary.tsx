@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Alert } from "@/components/ui/Alert";
-import type { ErrorText } from "./describeError";
+import type { ErrorText } from "@/lib/describeError";
 
 type Props = {
   text: ErrorText;

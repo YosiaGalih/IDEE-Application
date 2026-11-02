@@ -30,7 +30,7 @@ describe("RequireSession (the session guard)", () => {
         return ok(me);
       }),
     );
-    renderApp("/projects");
+    renderApp("/approvals");
     expect(await screen.findByRole("status")).toHaveTextContent(id.states.loading.title);
     expect(screen.queryByRole("navigation")).toBeNull();
     release();
@@ -39,9 +39,9 @@ describe("RequireSession (the session guard)", () => {
 
   it("sends a signed-out visitor to /login with the page to come back to", async () => {
     server.use(signedOut());
-    const { router } = renderApp("/projects?tab=tasks");
+    const { router } = renderApp("/approvals?tab=tasks");
     await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
-    expect(router.state.location.search).toBe(`?next=${encodeURIComponent("/projects?tab=tasks")}`);
+    expect(router.state.location.search).toBe(`?next=${encodeURIComponent("/approvals?tab=tasks")}`);
     expect(screen.queryByRole("navigation")).toBeNull();
   });
 
@@ -71,11 +71,11 @@ describe("RequireSession (the session guard)", () => {
         return ok(me);
       }),
     );
-    const { router } = renderApp("/projects");
+    const { router } = renderApp("/approvals");
     expect(await screen.findByRole("alert")).toHaveTextContent(id.states.error.title);
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(id.states.error.title);
     expect(screen.getByText(id.common.requestId.replace("{{id}}", "r-err-0001"))).toBeInTheDocument();
-    expect(router.state.location.pathname).toBe("/projects");
+    expect(router.state.location.pathname).toBe("/approvals");
     expect(screen.queryByRole("navigation")).toBeNull();
     fail500 = false;
     await userEvent.click(screen.getByRole("button", { name: id.states.error.action }));

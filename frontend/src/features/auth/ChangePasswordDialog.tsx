@@ -10,8 +10,8 @@ import { Dialog, DialogClose, DialogContent, DialogTrigger } from "@/components/
 import { FormField } from "@/components/ui/FormField";
 import { Spinner } from "@/components/ui/Spinner";
 import { zodResolver } from "@/lib/zodResolver";
-import { describeError } from "./describeError";
-import { ErrorSummary } from "./ErrorSummary";
+import { describeError } from "@/lib/describeError";
+import { ErrorSummary } from "@/components/ui/ErrorSummary";
 import { changeSchema, type ChangeValues } from "./schemas";
 import { useFieldError } from "./useFieldError";
 
@@ -78,7 +78,7 @@ function ChangePasswordForm({ onSignOut }: Props) {
     ? describeError(mutation.error, t, {
         // FORBIDDEN: wrong or locked; CSRF_FAILED (also 403) is not the user's password and stays generic.
         byCode: { FORBIDDEN: t("auth.change.wrongCurrent"), CONFLICT: t("auth.change.conflict") },
-        isChange: true,
+        unknownOutcome: t("auth.outcomeUnknown"),
       })
     : Object.keys(errors).length > 0
       ? { title: t("auth.errorSummary"), body: null, requestId: null }

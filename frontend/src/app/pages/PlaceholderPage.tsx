@@ -5,8 +5,6 @@ import { useDocumentTitle } from "@/lib/useDocumentTitle";
 
 export type ScreenKey =
   | "dashboard"
-  | "projects"
-  | "newProject"
   | "workspace"
   | "agents"
   | "tasks"

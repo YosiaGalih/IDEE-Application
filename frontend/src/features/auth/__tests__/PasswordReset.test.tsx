@@ -55,7 +55,9 @@ describe("ForgotPasswordPage", () => {
     backend(() => fail(429, "RATE_LIMITED", "Too many", { "Retry-After": "12" }));
     renderApp("/forgot-password");
     await submit("siapa@kodekantor.test");
-    expect(await screen.findByText(id.auth.rateLimited_other.replace("{{count}}", "12"))).toBeInTheDocument();
+    expect(
+      await screen.findByText(id.errors.rateLimited_other.replace("{{count}}", "12")),
+    ).toBeInTheDocument();
     expect(screen.queryByText(id.auth.forgot.sent)).toBeNull();
   });
 

@@ -73,7 +73,7 @@ describe("route map (ARCHITECTURE §3.1b)", () => {
 
   it.each([
     ["/", id.screens.dashboard],
-    ["/projects/new", id.screens.newProject],
+    ["/projects/p1/tasks", id.screens.tasks],
     ["/projects/p1/workspace", id.screens.workspace],
     ["/tasks/t1/acceptance", id.screens.acceptance],
     ["/settings/audit", id.screens.audit],

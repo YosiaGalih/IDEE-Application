@@ -115,6 +115,11 @@
     "languageEn": "English",
     "backHome": "Back to the dashboard"
   },
+  "errors": {
+    "rateLimited_one": "Too many attempts. Try again in {{count}} second.",
+    "rateLimited_other": "Too many attempts. Try again in {{count}} seconds.",
+    "rateLimitedNoTime": "Too many attempts. Try again shortly."
+  },
   "auth": {
     "brandTitle": "KodeKantor — an AI team that builds your software",
     "brandBody": "Every agent step is recorded as evidence; changes are applied only after you approve them.",
@@ -122,9 +127,6 @@
     "password": "Password",
     "rememberMe": "Remember me",
     "errorSummary": "Check the marked fields.",
-    "rateLimited_one": "Too many attempts. Try again in {{count}} second.",
-    "rateLimited_other": "Too many attempts. Try again in {{count}} seconds.",
-    "rateLimitedNoTime": "Too many attempts. Try again shortly.",
     "outcomeUnknown": "The server's answer did not arrive, so the outcome is unknown: the password may have changed. Try signing in with the new password before retrying.",
     "errors": {
       "emailRequired": "Enter your email.",
@@ -184,6 +186,71 @@
       "logout": "Sign out",
       "loggingOut": "Signing out…",
       "logoutFailed": "Sign-out failed: the session is still active. Try again."
+    }
+  },
+  "projects": {
+    "newProject": "New project",
+    "search": {
+      "label": "Search projects",
+      "placeholder": "Name or slug",
+      "submit": "Search"
+    },
+    "statusFilter": {
+      "label": "Status",
+      "active": "Active",
+      "archived": "Archived",
+      "all": "All"
+    },
+    "status": {
+      "active": "Active",
+      "archived": "Archived",
+      "deleting_pending_approval": "Awaiting delete approval",
+      "deleted": "Deleted"
+    },
+    "table": {
+      "caption": "Projects",
+      "name": "Name",
+      "stack": "Stack",
+      "status": "Status",
+      "updated": "Updated",
+      "actions": "Actions"
+    },
+    "noStack": "Not detected yet",
+    "empty": {
+      "title": "No projects yet",
+      "body": "Create an empty project or start from a template that runs as is.",
+      "filteredTitle": "No matching projects",
+      "filteredBody": "Change the search words or the status filter."
+    },
+    "archive": "Archive",
+    "unarchive": "Restore",
+    "archiveOf": "Archive {{name}}",
+    "unarchiveOf": "Restore {{name}}",
+    "new": {
+      "title": "New project",
+      "subtitle": "Every project has its own git repository. Start empty or from a template.",
+      "name": "Project name",
+      "description": "Description (optional)",
+      "source": "Start from",
+      "blank": "Empty project",
+      "blankHint": "A git repository with a README and one first commit.",
+      "template": "Template",
+      "templateHint": "A skeleton that runs as is, tests included.",
+      "templates": "Choose a template",
+      "templatesFailed": "The templates could not be loaded.",
+      "retryTemplates": "Load templates again",
+      "submit": "Create project",
+      "submitting": "Creating…",
+      "cancel": "Cancel",
+      "outcomeUnknown": "The server's answer did not arrive, so the outcome is unknown: the project may have been created. Check the project list before retrying.",
+      "errorSummary": "Check the marked fields."
+    },
+    "errors": {
+      "nameRequired": "Enter a project name.",
+      "nameTooLong": "Use at most 120 characters.",
+      "nameInvalid": "The name cannot contain control characters.",
+      "descriptionTooLong": "Use at most 2000 characters.",
+      "templateRequired": "Choose a template."
     }
   }
 }

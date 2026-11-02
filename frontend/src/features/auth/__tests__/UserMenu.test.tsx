@@ -46,7 +46,7 @@ describe("UserMenu", () => {
 
   it("signs out with the CSRF token, empties the cache, and goes to /login", async () => {
     const state = backend();
-    const { router, queryClient } = renderApp("/projects");
+    const { router, queryClient } = renderApp("/approvals");
     await screen.findByText(signedInAs);
     queryClient.setQueryData(["projects"], [{ id: "p1" }]);
     await userEvent.click(screen.getByRole("button", { name: id.auth.menu.logout }));
@@ -63,11 +63,11 @@ describe("UserMenu", () => {
   ])("stays signed in and says so when logout fails with %s, then retries", async (_case, reply) => {
     let failing = true;
     const state = backend({ logout: () => (failing ? reply() : ok({})) });
-    const { router } = renderApp("/projects");
+    const { router } = renderApp("/approvals");
     await screen.findByText(signedInAs);
     await userEvent.click(screen.getByRole("button", { name: id.auth.menu.logout }));
     expect(await screen.findByRole("alert")).toHaveTextContent(id.auth.menu.logoutFailed);
-    expect(router.state.location.pathname).toBe("/projects");
+    expect(router.state.location.pathname).toBe("/approvals");
     expect(state.session).toBe(true);
     failing = false;
     await userEvent.click(screen.getByRole("button", { name: id.auth.menu.logout }));
@@ -76,7 +76,7 @@ describe("UserMenu", () => {
 
   it("goes to plain /login when the session was already gone (401 on logout)", async () => {
     backend({ logout: () => fail(401, "SESSION_EXPIRED") });
-    const { router, queryClient } = renderApp("/projects");
+    const { router, queryClient } = renderApp("/approvals");
     await screen.findByText(signedInAs);
     queryClient.setQueryData(["projects"], [{ id: "p1" }]);
     await userEvent.click(screen.getByRole("button", { name: id.auth.menu.logout }));
@@ -161,15 +161,15 @@ describe("ChangePasswordDialog", () => {
 
   it("says the current password is wrong on 403, and stays signed in", async () => {
     backend({ change: () => fail(403, "FORBIDDEN", "Current password is incorrect") });
-    const { router } = renderApp("/projects");
+    const { router } = renderApp("/approvals");
     const dialog = await openAndFill();
     expect(await within(dialog).findByText(id.auth.change.wrongCurrent)).toBeInTheDocument();
-    expect(router.state.location.pathname).toBe("/projects");
+    expect(router.state.location.pathname).toBe("/approvals");
   });
 
   it("asks to sign in again on 409, and does it from the dialog", async () => {
     const state = backend({ change: () => fail(409, "CONFLICT") });
-    const { router } = renderApp("/projects");
+    const { router } = renderApp("/approvals");
     const dialog = await openAndFill();
     expect(await within(dialog).findByText(id.auth.change.conflict)).toBeInTheDocument();
     await userEvent.click(within(dialog).getByRole("button", { name: id.auth.change.signInAgain }));
