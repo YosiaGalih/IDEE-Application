@@ -1128,6 +1128,11 @@ Tidak ditutup (alasan):
 
 - **Hasil lokal setelah putaran ini:** backend `pytest -q -p no:randomly` → **1325 passed, 1 skipped**; urutan terbalik (security → integration → unit gate) → 78 passed; ruff, pyright, dan lint-imports bersih.
 - **Sign-off AG-13** berlaku untuk cd34fbc. Commit putaran ini mengubah `services/projects.py` dan `main.py`, jadi delta review AG-13 diminta lagi.
+- **Delta AG-13 @ acdd4b6: SIGNED OFF 🔒.**
+  - CI acdd4b6 9/9 hijau. Backend CI "1326 passed"; smoke "created 906e7ca4-… from python-basic"; Trivy `gate: PASS`, backend 50 HIGH tanpa fix (EX-02), 0 CRITICAL.
+  - Ekspor bersih dengan DB sendiri: 1325 passed, 1 skipped; urutan terbalik 90 passed.
+  - LOW baru: teks EX-02 keliru menyebut `worker` tanpa egress (`worker` ada di `outbound`) dan hanya menyebut `protocol.allow=never` (adapter juga memasang `protocol.https.allow=always`). Teks sudah dikoreksi. Mitigasinya tetap berlaku, karena tidak ada perintah remote dan allowlist config menolak kunci promisor/partial clone/submodule/insteadOf (diuji AG-13). Perbaikan khusus dokumen tidak butuh delta review.
+  - Sign-off ini hanya untuk acdd4b6. Commit berikutnya ke `services/projects.py`, `api/deps.py`, `routes/projects.py`, `main.py`, atau `backend/Dockerfile` butuh delta review lagi.
 
 AG-13, catatan di luar WP ini:
 - Di Python 3.13, `tests/unit/test_paths.py::test_deep_symlink_chain_is_a_violation` gagal (DID NOT RAISE `PathViolation`). CI memin `UV_PYTHON=3.12`, sedangkan `.claude/rules/backend.md` menyebut "CI juga 3.13" (konflik #66). `backend/` tidak punya `.python-version`.
