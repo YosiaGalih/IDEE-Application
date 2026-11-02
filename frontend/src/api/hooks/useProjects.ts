@@ -13,6 +13,7 @@ import {
 
 export const projectsKey = ["projects"] as const;
 const projectListsKey = [...projectsKey, "list"] as const;
+const detailKey = (projectId: string) => [...projectsKey, "detail", projectId] as const;
 
 /** Projects in the user's scope (the server decides what that is). */
 export function useProjects(filter: ProjectListFilter) {
@@ -20,6 +21,11 @@ export function useProjects(filter: ProjectListFilter) {
     queryKey: [...projectListsKey, filter],
     queryFn: ({ signal }) => listProjects(filter, signal),
     placeholderData: keepPreviousData, // a new filter keeps the old rows on screen while it loads
+    // A row that says "Importing…" must not keep saying it after the import ended.
+    refetchInterval: (query) =>
+      query.state.data?.items.some((row) => row.repository?.sync_state === "importing")
+        ? IMPORT_POLL_MS
+        : false,
   });
 }
 
@@ -62,7 +68,7 @@ export function useProject(
   { pollWhileImporting = false, enabled = true }: { pollWhileImporting?: boolean; enabled?: boolean } = {},
 ) {
   return useQuery({
-    queryKey: [...projectsKey, "detail", projectId],
+    queryKey: detailKey(projectId),
     queryFn: ({ signal }) => getProject(projectId, signal),
     enabled,
     refetchInterval: (query) =>
@@ -70,7 +76,11 @@ export function useProject(
   });
 }
 
-export const isImporting = (project: Project | undefined) => project?.repository?.sync_state === "importing";
+/** Not settled yet (importing, or any state other than ready/error): keep reading until it settles. */
+export const isImporting = (project: Project | undefined) =>
+  project !== undefined &&
+  project.repository?.sync_state !== "ready" &&
+  project.repository?.sync_state !== "error";
 
 export function useUploadArchive() {
   const queryClient = useQueryClient();
@@ -87,8 +97,14 @@ export function useUploadArchive() {
       onProgress: (sent: number, total: number) => void;
     }) => uploadArchive(projectId, file, { idempotencyKey, onProgress }),
     gcTime: 0, // holds a File: nothing to keep once settled
+    onSuccess: (accepted, { projectId }) => {
+      // The 202 says "importing": the screen follows that, never the previous (failed) read still cached.
+      queryClient.setQueryData<Project>(detailKey(projectId), (old) =>
+        old ? { ...old, repository: accepted.repository } : old,
+      );
+    },
     onSettled: (_data, _error, { projectId }) => {
-      void queryClient.invalidateQueries({ queryKey: [...projectsKey, "detail", projectId] });
+      void queryClient.invalidateQueries({ queryKey: detailKey(projectId) });
       void queryClient.invalidateQueries({ queryKey: projectListsKey });
     },
   });

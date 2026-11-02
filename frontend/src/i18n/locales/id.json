@@ -250,7 +250,7 @@
       "archive": "Arsip",
       "archiveHint": "Unggah .zip, .tar, atau .tar.gz berisi kode Anda.",
       "archiveFile": "File arsip",
-      "archiveLimit": "Maksimal 200 MB, 1 GB setelah diekstrak, 50.000 file. Folder .git tidak diterima: buat arsip tanpa riwayat (git archive)."
+      "archiveLimit": "Maksimal 200 MiB, 1 GiB setelah diekstrak, 50.000 file. Folder .git tidak diterima: buat arsip tanpa riwayat (git archive)."
     },
     "errors": {
       "nameRequired": "Isi nama project.",
@@ -260,7 +260,7 @@
       "templateRequired": "Pilih salah satu template.",
       "fieldRejected": "Server menolak isian ini. Periksa lalu coba lagi.",
       "archiveRequired": "Pilih file arsip.",
-      "archiveTooLarge": "Arsip lebih besar dari 200 MB.",
+      "archiveTooLarge": "Arsip lebih besar dari 200 MiB.",
       "archiveType": "Hanya .zip, .tar, .tar.gz, atau .tgz."
     },
     "archived": "{{name}} diarsipkan.",
@@ -281,7 +281,6 @@
       "importing": "Mengekstrak dan memeriksa arsip…",
       "progressLabel": "Kemajuan unggah",
       "failedTitle": "Impor gagal",
-      "chooseAnother": "Pilih file lain",
       "retry": "Coba lagi",
       "upload": "Unggah",
       "running": "Mengimpor…",
@@ -293,7 +292,7 @@
       "outcomeUnknown": "Jawaban unggahan tidak sampai. Arsip mungkin sudah diterima; coba lagi untuk memastikan (tidak akan diimpor dua kali).",
       "reason": {
         "format": "Bukan arsip zip/tar yang bisa dibaca, atau rusak, terenkripsi, atau memakai kompresi yang tidak didukung.",
-        "oversize": "Arsip atau isinya melebihi batas ukuran (200 MB arsip, 1 GB setelah diekstrak).",
+        "oversize": "Arsip atau isinya melebihi batas ukuran (200 MiB arsip, 1 GiB setelah diekstrak).",
         "ratio": "Rasio kompresi terlalu tinggi (mencurigakan sebagai bom arsip).",
         "too_many_files": "Arsip berisi lebih dari 50.000 entri.",
         "link": "Arsip berisi symlink atau hardlink.",
@@ -317,7 +316,12 @@
         "repository_not_empty": "Project ini sudah punya repository.",
         "not_an_upload_project": "Project ini tidak dibuat dari arsip.",
         "project_archived": "Project ini diarsipkan. Aktifkan dulu."
-      }
+      },
+      "uploadingTitle": "Mengunggah arsip…",
+      "heldFile": "File terakhir: {{name}} ({{size}}). Kirim ulang file yang sama, atau pilih file lain.",
+      "slow": "Impor masih berjalan. Anda boleh meninggalkan halaman ini; statusnya terlihat di daftar project.",
+      "runningHere": "Impor arsip untuk project ini sedang berjalan.",
+      "openList": "Buka daftar project"
     }
   }
 }

@@ -250,7 +250,7 @@
       "archive": "Archive",
       "archiveHint": "Upload a .zip, .tar or .tar.gz with your code.",
       "archiveFile": "Archive file",
-      "archiveLimit": "Up to 200 MB, 1 GB extracted, 50,000 files. A .git folder is not accepted: make the archive without history (git archive)."
+      "archiveLimit": "Up to 200 MiB, 1 GiB extracted, 50,000 files. A .git folder is not accepted: make the archive without history (git archive)."
     },
     "errors": {
       "nameRequired": "Enter a project name.",
@@ -260,7 +260,7 @@
       "templateRequired": "Choose a template.",
       "fieldRejected": "The server refused this value. Check it and try again.",
       "archiveRequired": "Choose an archive file.",
-      "archiveTooLarge": "The archive is larger than 200 MB.",
+      "archiveTooLarge": "The archive is larger than 200 MiB.",
       "archiveType": "Only .zip, .tar, .tar.gz or .tgz."
     },
     "archived": "{{name}} archived.",
@@ -281,7 +281,6 @@
       "importing": "Extracting and checking the archive…",
       "progressLabel": "Upload progress",
       "failedTitle": "Import failed",
-      "chooseAnother": "Choose another file",
       "retry": "Try again",
       "upload": "Upload",
       "running": "Importing…",
@@ -293,7 +292,7 @@
       "outcomeUnknown": "The upload's answer was lost. The archive may have been accepted; try again to be sure (it will not be imported twice).",
       "reason": {
         "format": "Not a readable zip/tar archive, or damaged, encrypted, or using an unsupported compression.",
-        "oversize": "The archive or its contents exceed the size limit (200 MB archive, 1 GB extracted).",
+        "oversize": "The archive or its contents exceed the size limit (200 MiB archive, 1 GiB extracted).",
         "ratio": "The compression ratio is too high (looks like an archive bomb).",
         "too_many_files": "The archive has more than 50,000 entries.",
         "link": "The archive contains a symlink or hardlink.",
@@ -317,7 +316,12 @@
         "repository_not_empty": "This project already has a repository.",
         "not_an_upload_project": "This project was not created from an archive.",
         "project_archived": "This project is archived. Restore it first."
-      }
+      },
+      "uploadingTitle": "Uploading the archive…",
+      "heldFile": "Last file: {{name}} ({{size}}). Send the same file again, or choose another.",
+      "slow": "The import is still running. You can leave this page; the project list shows its status.",
+      "runningHere": "An archive import for this project is running.",
+      "openList": "Open the project list"
     }
   }
 }

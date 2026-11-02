@@ -1,6 +1,6 @@
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { ApiError } from "../errors";
 import { apiUpload } from "../upload";
@@ -90,5 +90,84 @@ describe("apiUpload", () => {
     await expect(
       apiUpload("/projects/p1/imports", { file: file(), schema, idempotencyKey: "k", signal: stop.signal }),
     ).rejects.toMatchObject({ kind: "aborted" });
+  });
+});
+
+describe("apiUpload without MSW (a stand-in XMLHttpRequest)", () => {
+  /** MSW's interceptor ignores xhr.abort(); these paths need a request that waits until told. */
+  class HangingXhr {
+    static last: HangingXhr | null = null;
+    upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
+    status = 0;
+    responseText = "";
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    onabort: (() => void) | null = null;
+    aborted = false;
+    open() {}
+    setRequestHeader() {}
+    getResponseHeader() {
+      return null;
+    }
+    send() {
+      HangingXhr.last = this;
+    }
+    abort() {
+      this.aborted = true;
+      this.onabort?.();
+    }
+  }
+
+  it("stops a running upload on abort and reports it as aborted", async () => {
+    vi.stubGlobal("XMLHttpRequest", HangingXhr);
+    try {
+      const stop = new AbortController();
+      const pending = apiUpload("/projects/p1/imports", {
+        file: file(),
+        schema,
+        idempotencyKey: "k",
+        signal: stop.signal,
+      });
+      await vi.waitFor(() => expect(HangingXhr.last).not.toBeNull());
+      stop.abort();
+      await expect(pending).rejects.toMatchObject({ kind: "aborted", idempotencyKey: "k" });
+      expect(HangingXhr.last?.aborted).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      HangingXhr.last = null;
+    }
+  });
+
+  it("reports an upload past its time limit as a timeout", async () => {
+    vi.stubGlobal("XMLHttpRequest", HangingXhr);
+    try {
+      await expect(
+        apiUpload("/projects/p1/imports", { file: file(), schema, idempotencyKey: "k", timeoutMs: 20 }),
+      ).rejects.toMatchObject({ kind: "timeout" });
+    } finally {
+      vi.unstubAllGlobals();
+      HangingXhr.last = null;
+    }
+  });
+
+  it("reports a gateway's HTML 502 as bad_response with its status (outcome unknown)", async () => {
+    class GatewayXhr extends HangingXhr {
+      override send() {
+        this.status = 502;
+        this.responseText = "<html>502 Bad Gateway</html>";
+        queueMicrotask(() => this.onload?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", GatewayXhr);
+    try {
+      await expect(
+        apiUpload("/projects/p1/imports", { file: file(), schema, idempotencyKey: "k" }),
+      ).rejects.toMatchObject({
+        kind: "bad_response",
+        status: 502,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

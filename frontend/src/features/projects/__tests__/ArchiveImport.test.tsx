@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { API, fail, ok, okPage, renderApp, signedIn } from "@/__tests__/harness";
+import { API, deferred, fail, ok, okPage, renderApp, signedIn } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
 
 const server = setupServer();
@@ -186,19 +186,115 @@ describe("project from an archive", () => {
     expect(state.keys[0]).not.toBe(state.keys[1]);
   });
 
-  it("keeps the key when the upload's answer is lost, and says the outcome is unknown", async () => {
+  it("keeps the key when the upload's answer is lost: Try again resends the same file", async () => {
     let lost = true;
     const state = backend({ upload: () => (lost ? HttpResponse.error() : accepted()) });
     renderApp("/projects/new");
-    const file = zip();
-    await chooseArchive(file);
+    await chooseArchive(zip());
     await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
     expect(await screen.findByText(id.projects.import.outcomeUnknown)).toBeInTheDocument();
+    expect(screen.getByText(/kode\.zip/)).toBeInTheDocument(); // the held file is named
     lost = false;
-    await userEvent.upload(screen.getByLabelText(id.projects.new.archiveFile), file);
     await userEvent.click(screen.getByRole("button", { name: id.projects.import.retry }));
     await waitFor(() => expect(state.uploads).toHaveLength(2));
     expect(state.keys[0]).toBe(state.keys[1]);
+  });
+
+  it("keeps the key for the same file picked again (a new File object), and changes it for another file", async () => {
+    const lost = true;
+    const state = backend({ upload: () => (lost ? HttpResponse.error() : accepted()) });
+    renderApp("/projects/new");
+    const original = new File([new Uint8Array([0x50, 0x4b, 0x03])], "kode.zip", {
+      lastModified: 1_700_000_000_000,
+    });
+    await chooseArchive(original);
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    await screen.findByText(id.projects.import.outcomeUnknown);
+    // The picker hands back a new object for the same file.
+    const again = new File([new Uint8Array([0x50, 0x4b, 0x03])], "kode.zip", {
+      lastModified: 1_700_000_000_000,
+    });
+    await userEvent.upload(screen.getByLabelText(id.projects.new.archiveFile), again);
+    await userEvent.click(screen.getByRole("button", { name: id.projects.import.upload }));
+    await waitFor(() => expect(state.uploads).toHaveLength(2));
+    expect(state.keys[1]).toBe(state.keys[0]);
+    await screen.findByText(id.projects.import.outcomeUnknown);
+    const other = new File([new Uint8Array([0x50, 0x4b, 0x03, 0x04])], "lain.zip", { lastModified: 1 });
+    await userEvent.upload(screen.getByLabelText(id.projects.new.archiveFile), other);
+    await userEvent.click(screen.getByRole("button", { name: id.projects.import.upload }));
+    await waitFor(() => expect(state.uploads).toHaveLength(3));
+    expect(state.keys[2]).not.toBe(state.keys[0]);
+  });
+
+  it("after a refused archive the form is empty and Upload waits for a new file", async () => {
+    backend({ read: () => ok(project({ repository: repo("error", "archive_rejected:link") })) });
+    renderApp("/projects/new");
+    await chooseArchive(zip());
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    expect(await screen.findByText(id.projects.import.reason.link)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: id.projects.import.upload })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: id.projects.import.retry })).toBeNull(); // answered: no resend
+  });
+
+  it("forgets a chosen archive when the user switches to another source and back", async () => {
+    const state = backend();
+    renderApp("/projects/new");
+    await chooseArchive(zip());
+    await userEvent.click(screen.getByRole("radio", { name: new RegExp(`^${id.projects.new.blank}`) }));
+    await userEvent.click(screen.getByRole("radio", { name: new RegExp(`^${id.projects.new.archive}`) }));
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    expect(await screen.findByText(id.projects.errors.archiveRequired)).toBeInTheDocument();
+    expect(state.created).toEqual([]);
+  });
+
+  it("shows the upload's progress while it is sent", async () => {
+    const { gate, release } = deferred();
+    backend({ upload: () => accepted() });
+    server.use(
+      http.post(`${API}/projects/:projectId/imports`, async () => {
+        await gate;
+        return accepted();
+      }),
+    );
+    renderApp("/projects/new");
+    await chooseArchive(zip());
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    expect(await screen.findByText(id.projects.import.uploadingTitle)).toBeInTheDocument();
+    // MSW in jsdom emits the XHR's upload progress only with the answer, so the percent itself is proven in
+    // api/__tests__/upload.test.ts; here: the bar, its value for assistive tech, and its text.
+    const bar = screen.getByRole("progressbar", { name: id.projects.import.progressLabel });
+    expect(bar).toHaveAttribute("aria-valuenow", "0");
+    expect(bar).toHaveAttribute("aria-valuetext", id.projects.import.uploading.replace("{{percent}}", "0"));
+    release();
+  });
+
+  it("never shows the previous failure after a new upload is accepted", async () => {
+    const { gate, release } = deferred();
+    let reads = 0;
+    backend();
+    server.use(
+      http.get(`${API}/projects/:projectId`, async () => {
+        reads += 1;
+        if (reads === 1) return ok(project({ repository: repo("error", "archive_rejected:git_dir") }));
+        await gate; // the read after the 202 is slow
+        return ok(project({ repository: repo("importing") }));
+      }),
+    );
+    renderApp(`/projects/${PROJECT_ID}/import`);
+    expect(await screen.findByText(id.projects.import.reason.git_dir)).toBeInTheDocument();
+    await userEvent.upload(screen.getByLabelText(id.projects.new.archiveFile), zip("tanpa-git.zip"));
+    await userEvent.click(screen.getByRole("button", { name: id.projects.import.upload }));
+    expect(await screen.findByText(id.projects.import.importing)).toBeInTheDocument();
+    expect(screen.queryByText(id.projects.import.reason.git_dir)).toBeNull();
+    release();
+  });
+
+  it("says the archive is too large on the gateway's own 413 page", async () => {
+    backend({ upload: () => new HttpResponse("<html>413 Request Entity Too Large</html>", { status: 413 }) });
+    renderApp("/projects/new");
+    await chooseArchive(zip());
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    expect(await screen.findByText(id.projects.errors.archiveTooLarge)).toBeInTheDocument();
   });
 });
 
@@ -218,6 +314,38 @@ describe("ImportArchivePage", () => {
     backend();
     renderApp(`/projects/${PROJECT_ID}/import`);
     expect(await screen.findByText(id.projects.import.notWaiting)).toBeInTheDocument();
+    expect(screen.queryByLabelText(id.projects.new.archiveFile)).toBeNull();
+  });
+
+  it("says why the last import failed when the page opens", async () => {
+    backend({ read: () => ok(project({ repository: repo("error", "archive_rejected:git_dir") })) });
+    renderApp(`/projects/${PROJECT_ID}/import`);
+    expect(await screen.findByText(id.projects.import.reason.git_dir)).toBeInTheDocument();
+    expect(screen.getByLabelText(id.projects.new.archiveFile)).toBeInTheDocument();
+  });
+
+  it("follows an import that is already running, without a form, until it is ready", async () => {
+    let reads = 0;
+    backend({
+      read: () => {
+        reads += 1;
+        return ok(project({ repository: repo(reads === 1 ? "importing" : "ready") }));
+      },
+    });
+    renderApp(`/projects/${PROJECT_ID}/import`);
+    expect(await screen.findByText(id.projects.import.runningHere)).toBeInTheDocument();
+    expect(screen.queryByLabelText(id.projects.new.archiveFile)).toBeNull();
+    expect(
+      await screen.findByText(id.projects.import.notWaiting, undefined, { timeout: 4000 }),
+    ).toBeInTheDocument();
+  });
+
+  it("says an archived project must be restored first", async () => {
+    backend({
+      read: () => ok(project({ status: "archived", repository: repo("error", "import_incomplete") })),
+    });
+    renderApp(`/projects/${PROJECT_ID}/import`);
+    expect(await screen.findByText(id.projects.import.conflict.project_archived)).toBeInTheDocument();
     expect(screen.queryByLabelText(id.projects.new.archiveFile)).toBeNull();
   });
 
@@ -272,6 +400,15 @@ describe("ProjectsPage with upload projects", () => {
       screen.getByRole("link", { name: id.projects.import.actionOf.replace("{{name}}", "Arsipku") }),
     );
     expect(router.state.location.pathname).toBe(`/projects/${PROJECT_ID}/import`);
+  });
+
+  it("offers no upload to an archived project", async () => {
+    list([project({ status: "archived", repository: repo("error", "import_incomplete") })]);
+    renderApp("/projects?status=archived");
+    expect(await screen.findByText(id.projects.import.incomplete)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: id.projects.import.actionOf.replace("{{name}}", "Arsipku") }),
+    ).toBeNull();
   });
 
   it("refuses an upload that the server answers 413", async () => {

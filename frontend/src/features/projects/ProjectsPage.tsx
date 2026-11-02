@@ -345,6 +345,7 @@ export function ProjectsPage() {
 
 /** An upload project whose import failed or stopped: the user can send an archive again. */
 const needsArchive = (project: Project) =>
+  project.status === "active" &&
   project.repository?.provider === "upload" &&
   project.repository.sync_state === "error" &&
   isImportError(project.repository.error);

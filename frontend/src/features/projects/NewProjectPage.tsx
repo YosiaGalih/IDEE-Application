@@ -17,7 +17,7 @@ import { cn } from "@/lib/cn";
 import { PROJECTS_PATH, workspacePath } from "@/lib/paths";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { zodResolver } from "@/lib/zodResolver";
-import { ArchiveImport } from "./ArchiveImport";
+import { ArchiveImport, ArchiveInput } from "./ArchiveImport";
 import { isProjectErrorKey, newProjectSchema, SERVER_FIELD_ERRORS, type NewProjectValues } from "./schemas";
 import { useArchiveImport } from "./useArchiveImport";
 
@@ -42,13 +42,15 @@ function serverFieldErrors(error: unknown) {
 /** `/projects/new`: a blank project or one from a template (FR-013, FR-014). */
 export function NewProjectPage() {
   const { t } = useTranslation();
-  useDocumentTitle(t("screens.newProject"));
   const navigate = useNavigate();
   const templates = useTemplates();
   const create = useCreateProject();
   // An archive project: created first, then its archive is uploaded into it (WP-2.1b).
   const [created, setCreated] = useState<Project | null>(null);
-  const importer = useArchiveImport({ onReady: (project) => void navigate(workspacePath(project.id)) });
+  useDocumentTitle(t(created ? "screens.importArchive" : "screens.newProject"));
+  // Replace: Back from the workspace must not land on a form that would create a second project.
+  const openWorkspace = (project: Project) => void navigate(workspacePath(project.id), { replace: true });
+  const importer = useArchiveImport({ onReady: openWorkspace });
   // One key per request body: kept only while the answer is unknown, so a retry is answered once.
   const attempt = useRef<{ key: string; body: string } | null>(null);
   const {
@@ -91,7 +93,7 @@ export function NewProjectPage() {
       {
         onSuccess: (project) => {
           if (archive === null) {
-            void navigate(workspacePath(project.id));
+            openWorkspace(project);
             return;
           }
           setCreated(project);
@@ -241,7 +243,12 @@ export function NewProjectPage() {
                   type="radio"
                   value={kind}
                   className="mt-1 size-4"
-                  {...register("source")}
+                  {...register("source", {
+                    // A file chosen earlier must not be sent after the user left the archive option.
+                    onChange: (event: React.ChangeEvent<HTMLInputElement>) => {
+                      if (event.target.value !== "archive") setValue("archive", null);
+                    },
+                  })}
                 />
                 <SourceText kind={kind} />
               </label>
@@ -250,28 +257,11 @@ export function NewProjectPage() {
         </fieldset>
         {templateChoices}
         {source === "archive" ? (
-          <div className="space-y-1.5">
-            <Label htmlFor="new-project-archive">{t("projects.new.archiveFile")}</Label>
-            <input
-              id="new-project-archive"
-              type="file"
-              accept=".zip,.tar,.tar.gz,.tgz"
-              aria-invalid={errors.archive ? true : undefined}
-              aria-describedby={`new-project-archive-hint${errors.archive ? " new-project-archive-error" : ""}`}
-              onChange={(event) =>
-                setValue("archive", event.target.files?.[0] ?? null, { shouldValidate: submitCount > 0 })
-              }
-              className="block w-full text-sm text-fg file:mr-3 file:rounded-[var(--radius-control)] file:border file:border-line file:bg-surface file:px-3 file:py-1.5"
-            />
-            <p id="new-project-archive-hint" className="text-xs text-fg-muted">
-              {t("projects.new.archiveLimit")}
-            </p>
-            {errors.archive ? (
-              <p id="new-project-archive-error" className="text-sm text-status-danger">
-                {fieldError(errors.archive.message)}
-              </p>
-            ) : null}
-          </div>
+          <ArchiveInput
+            id="new-project-archive"
+            error={fieldError(errors.archive?.message) ?? null}
+            onChoose={(file) => setValue("archive", file, { shouldValidate: submitCount > 0 })}
+          />
         ) : null}
         <div className="flex justify-end gap-2">
           <Button asChild variant="secondary">
