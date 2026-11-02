@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from alembic.config import Config
@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.core.config import Settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.logging import get_logger
+from app.gitops.adapter import GitAdapter
 from app.sandbox.client import HttpSandboxClient
 
 ReadinessCheck = Callable[[], Awaitable[bool]]
@@ -46,6 +47,7 @@ class Dependencies:
     sandbox: HttpSandboxClient
     migration_heads: frozenset[str]
     sessions: async_sessionmaker[AsyncSession]
+    git: GitAdapter = field(default_factory=GitAdapter)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Dependencies:

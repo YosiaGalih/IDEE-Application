@@ -26,7 +26,15 @@ FROM ${BASE_REPO}@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e1
 ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
-RUN groupadd --gid 10001 app \
+# git: GitAdapter (app/gitops, the only process the backend starts) creates and reads project repositories
+# (WP-2.1a). Debian trixie's git, without recommends; set-uid bits are stripped after it is installed.
+# Not pinned to a revision (DL3008): the Debian archive serves only the latest one, so a pin breaks the build at
+# the next security update. The base is pinned by digest and security-scan (Trivy) checks what this installs.
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app \
     && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 COPY --from=build /opt/venv /opt/venv
