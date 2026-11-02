@@ -57,10 +57,16 @@ class GitHttpsIn(_Strict):
     branch: str | None = None
 
 
+class UploadIn(_Strict):
+    """The files come later, as an archive (``POST /projects/{id}/imports``; conflict #67)."""
+
+    type: Literal["upload"]
+
+
 class CreateProjectIn(_Strict):
     name: Annotated[str, StringConstraints(max_length=projects.NAME_MAX * 2)]
     description: Annotated[str, StringConstraints(max_length=projects.DESCRIPTION_MAX)] | None = None
-    source: Annotated[BlankIn | TemplateIn | GitHttpsIn, Field(discriminator="type")]
+    source: Annotated[BlankIn | TemplateIn | GitHttpsIn | UploadIn, Field(discriminator="type")]
     default_branch: str = "main"
 
     @field_validator("name")
@@ -205,6 +211,7 @@ def project_env(request: Request, audit: AuditDep, limiter: LimiterDep) -> Proje
         workspace_root=Path(request.app.state.settings.workspace_root),
         creates=deps.project_creates,
         limiter=limiter,
+        redis=deps.redis,
     )
 
 
@@ -257,6 +264,8 @@ async def create_project(
         source = projects.TemplateSource(body.source.template_id)
     elif isinstance(body.source, GitHttpsIn):
         source = projects.RemoteSource(body.source.url)
+    elif isinstance(body.source, UploadIn):
+        source = projects.UploadSource()
     else:
         source = projects.BlankSource()
     view = await projects.create_project(
