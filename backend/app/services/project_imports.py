@@ -20,9 +20,10 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import shutil
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from redis.asyncio import Redis
@@ -31,10 +32,17 @@ from sqlalchemy import select
 
 from app.core.errors import AppError
 from app.core.logging import get_logger
+from app.gitops.adapter import GitTarget
+from app.gitops.errors import GitError
+from app.models.identity import User
 from app.models.projects import Project, Repository
 from app.services import import_lock
 from app.services.job_queue import JobQueue
-from app.services.projects import Actor, ProjectEnv, authorize, enforce_rate, repo_path
+from app.services.projects import Actor, ProjectEnv, authorize, commit_author, enforce_rate, repo_path
+from app.workspace.archive import ArchiveLimits, ImportReport, import_archive
+from app.workspace.errors import ArchiveRejected
+from app.workspace.fs import Workspace
+from app.workspace.stack import detect_stack
 
 logger = get_logger(__name__)
 
@@ -45,6 +53,7 @@ FILENAME_MAX = 255
 _WRITE_BATCH = 1024 * 1024
 _SNIFF_BYTES = 512
 _HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+DEFAULT_LIMITS = ArchiveLimits()  # ADR-005
 _OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
@@ -52,7 +61,7 @@ _OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(o
 class ImportEnv:
     projects: ProjectEnv
     redis: Redis
-    jobs: JobQueue
+    jobs: JobQueue | None = None  # None in the worker, which runs imports and never enqueues them
 
 
 @dataclass(frozen=True)
@@ -279,7 +288,11 @@ async def finish_import(env: ImportEnv, actor: Actor, slot: ImportSlot, upload: 
         )
         await session.commit()
     try:
-        await env.jobs.enqueue_import(project_id=slot.project_id, job_id=slot.job_id, user_id=actor.user_id)
+        if env.jobs is None:
+            raise RuntimeError("no job queue")
+        await env.jobs.enqueue_import(
+            project_id=slot.project_id, job_id=slot.job_id, user_id=actor.user_id, filename=upload.filename
+        )
     except Exception as exc:
         logger.error(
             "project_import_enqueue_failed",
@@ -341,3 +354,203 @@ async def _abort(env: ImportEnv, slot: ImportSlot) -> None:
             project_id=str(slot.project_id),
             error_type=type(exc).__name__,
         )
+
+
+# --- running it (worker) ------------------------------------------------------------------------------------
+
+
+@dataclass
+class _Job:
+    project_id: uuid.UUID
+    job_id: uuid.UUID
+    archive: Path
+    repo: Path
+    repo_created: bool = False  # set the moment extraction made ``repo``: only then may this job remove it
+
+
+class _Gone(Exception):
+    """The project stopped being this job's to finish (deleted, or no longer waiting for this import)."""
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    report: ImportReport
+    commit: str
+    stack: dict[str, object]
+
+
+async def run_import(
+    env: ImportEnv,
+    *,
+    project_id: uuid.UUID,
+    job_id: uuid.UUID,
+    user_id: uuid.UUID,
+    filename: str,
+    limits: ArchiveLimits = DEFAULT_LIMITS,
+) -> str:
+    """Turn the accepted archive into the project's repository: ``ready``, ``error`` or ``skipped``.
+
+    ``skipped`` changes nothing: the job is stale (its lock expired or belongs to a newer upload) or was
+    delivered again after it finished. Whatever happens, this job's archive is deleted and its lock released,
+    and a repository this job extracted but did not finish is removed.
+    """
+    root = env.projects.workspace_root / str(project_id)
+    job = _Job(project_id, job_id, root / "uploads" / f"{job_id}.archive", root / "repo")
+    finished = False
+    try:
+        if not await _still_ours(env, job):
+            return "skipped"
+        try:
+            outcome = await _import(env, job, user_id, clean_filename(filename), limits)
+            await _complete(env, job, outcome)
+            finished = True
+            return "ready"
+        except _Gone:
+            logger.warning("project_import_gone", project_id=str(project_id), job_id=str(job_id))
+            return "skipped"
+        except ArchiveRejected as exc:
+            code = f"archive_rejected:{exc.reason}"
+        except GitError as exc:
+            logger.error("project_import_git_failed", project_id=str(project_id), reason=exc.reason)
+            code = "import_git_failed"
+        except Exception:
+            logger.exception("project_import_failed", project_id=str(project_id), job_id=str(job_id))
+            code = "import_failed"
+        await _remove_repo(env, job)
+        await _fail(env, job, user_id, code)
+        return "error"
+    finally:
+        if job.repo_created and not finished:
+            await _remove_repo(env, job)  # cancelled or gone mid-way: no half repository stays
+        await _abort(env, ImportSlot(project_id, job_id, job.archive.parent))
+
+
+async def _still_ours(env: ImportEnv, job: _Job) -> bool:
+    try:
+        holder = await import_lock.holder(env.redis, job.project_id)
+    except RedisError as exc:
+        # Unknown whether this job still owns the import: do nothing. The lock expires and the project then
+        # reads as import_incomplete, which the user can retry.
+        logger.error(
+            "project_import_lock_unknown", project_id=str(job.project_id), error_type=type(exc).__name__
+        )
+        return False
+    if holder != str(job.job_id):
+        logger.warning("project_import_stale_job", project_id=str(job.project_id), job_id=str(job.job_id))
+        return False
+    async with env.projects.sessions() as session:
+        repository = await session.scalar(select(Repository).where(Repository.project_id == job.project_id))
+    waiting = (
+        repository is not None and repository.provider == "upload" and repository.sync_state == "importing"
+    )
+    if not waiting or not await asyncio.to_thread(job.archive.is_file):
+        logger.warning("project_import_not_waiting", project_id=str(job.project_id), job_id=str(job.job_id))
+        return False
+    if await asyncio.to_thread(os.path.lexists, job.repo):
+        # Only this job's own earlier attempt (it holds the lock) can have left a repository here mid-way.
+        logger.warning("project_import_leftover_removed", project_id=str(job.project_id))
+        job.repo_created = True
+        await _remove_repo(env, job)
+    return True
+
+
+async def _import(
+    env: ImportEnv, job: _Job, user_id: uuid.UUID, filename: str, limits: ArchiveLimits
+) -> _Outcome:
+    async with env.projects.sessions() as session:
+        user = await session.get(User, user_id)
+        project = await session.get(Project, job.project_id)
+    if user is None or project is None or project.status == "deleted":
+        raise _Gone()
+    report = await asyncio.to_thread(
+        import_archive, job.archive, job.repo, limits=limits, strip_single_root=True
+    )
+    job.repo_created = True
+    await env.projects.git.init(job.repo, project.default_branch)
+    author = commit_author(Actor(user.id, user.email, user.display_name, ()))
+    commit = await env.projects.git.commit_all(GitTarget(job.repo), f"Import from archive {filename}", author)
+    if commit is None:  # an empty archive: nothing to commit, so no base for task worktrees
+        raise ArchiveRejected("empty")
+    stack = asdict(await detect_stack(Workspace(job.repo)))
+    return _Outcome(report, commit, stack)
+
+
+async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> None:
+    async with env.projects.sessions() as session:
+        project = await session.scalar(
+            select(Project).where(Project.id == job.project_id).with_for_update(key_share=True)
+        )
+        repository = await session.scalar(select(Repository).where(Repository.project_id == job.project_id))
+        if (
+            project is None
+            or project.status == "deleted"
+            or repository is None
+            or repository.sync_state != "importing"
+        ):
+            raise _Gone()
+        project.stack = outcome.stack
+        repository.sync_state = "ready"
+        repository.error = None
+        await env.projects.audit.write(
+            session,
+            actor_type="system",
+            actor_id="project-import",
+            action="project.import",
+            result="success",
+            resource_type="project",
+            resource_id=str(job.project_id),
+            project_id=job.project_id,
+            metadata={
+                "job_id": str(job.job_id),
+                "files": outcome.report.files,
+                "dirs": outcome.report.dirs,
+                "bytes": outcome.report.bytes,
+                "stripped_prefix": outcome.report.stripped_prefix,
+                "commit": outcome.commit,
+            },
+        )
+        await session.commit()
+    logger.info("project_import_ready", project_id=str(job.project_id), files=outcome.report.files)
+
+
+async def _fail(env: ImportEnv, job: _Job, user_id: uuid.UUID, code: str) -> None:
+    logger.error("project_import_rejected", project_id=str(job.project_id), job_id=str(job.job_id), code=code)
+    await mark_failed(env, job.project_id, code)
+    try:
+        await env.projects.audit.write_detached(
+            env.projects.sessions,
+            actor_type="system",
+            actor_id="project-import",
+            action="project.import",
+            result="error",
+            resource_type="project",
+            resource_id=str(job.project_id),
+            project_id=job.project_id,
+            metadata={"job_id": str(job.job_id), "reason": code, "user_id": str(user_id)},
+        )
+    except Exception:
+        logger.exception("project_import_audit_failed", project_id=str(job.project_id))
+
+
+async def _remove_repo(env: ImportEnv, job: _Job) -> None:
+    """Remove the repository this job extracted (never one it did not make)."""
+    if not job.repo_created:
+        return
+
+    def report(_function: object, path: str, exc: BaseException) -> None:
+        logger.error(
+            "project_import_cleanup_failed",
+            project_id=str(job.project_id),
+            path=os.path.relpath(path, env.projects.workspace_root),
+            error_type=type(exc).__name__,
+        )
+
+    def remove() -> None:
+        if os.path.lexists(job.repo):
+            shutil.rmtree(job.repo, onexc=report)
+
+    try:
+        await asyncio.to_thread(remove)
+    except OSError:
+        logger.exception("project_import_cleanup_failed", project_id=str(job.project_id))
+    job.repo_created = False

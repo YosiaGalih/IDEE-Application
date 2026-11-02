@@ -11,6 +11,7 @@ import hashlib
 import uuid
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -24,9 +25,12 @@ from app.core.db import make_sessionmaker
 from app.core.errors import AppError
 from app.core.rbac import RoleGrant
 from app.core.redaction import Redactor
+from app.gitops.adapter import GitAdapter
+from app.gitops.errors import GitError
 from app.models.audit import AuditEvent
 from app.services import project_imports, projects
 from app.services.import_lock import lock_key
+from app.workspace.archive import ArchiveLimits
 from tests.conftest import make_test_env
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     OWNER,
@@ -35,6 +39,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     clean_state,
     create,
     entries,
+    git,
     headers,
     owner,
     owner_id,
@@ -42,7 +47,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
 )
 
 
-async def create_upload(client: httpx.AsyncClient, name: str = "Arsip") -> dict[str, object]:
+async def create_upload(client: httpx.AsyncClient, name: str = "Arsip") -> dict[str, Any]:
     response = await create(client, name, source={"type": "upload"})
     assert response.status_code == 201, response.text
     return response.json()["data"]
@@ -54,7 +59,7 @@ async def held(project_id: object) -> str | None:
         value = await redis.get(lock_key(uuid.UUID(str(project_id))))
     finally:
         await redis.aclose()
-    return value.decode() if value is not None else None
+    return value.decode() if isinstance(value, bytes) else value
 
 
 async def hold_lock(project_id: object, value: str = "job") -> None:
@@ -114,12 +119,16 @@ class RecordingQueue:
 
     def __init__(self, fail: bool = False) -> None:
         self.calls: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = []
+        self.filenames: list[str] = []
         self.fail = fail
 
-    async def enqueue_import(self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    async def enqueue_import(
+        self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID, filename: str
+    ) -> None:
         if self.fail:
             raise ConnectionError("broker unreachable")
         self.calls.append((project_id, job_id, user_id))
+        self.filenames.append(filename)
 
 
 def import_env(api: FastAPI, root: Path, queue: RecordingQueue) -> project_imports.ImportEnv:
@@ -427,3 +436,142 @@ async def test_two_uploads_at_once_one_wins(
     refused = next(r for r in responses if r.status_code == 409)
     assert refused.json()["error"]["details"] == [{"reason": "import_running"}]
     assert len(queue.calls) == 1
+
+
+# --- the worker job (Task 4) --------------------------------------------------------------------------------
+
+
+async def accepted_upload(
+    client: httpx.AsyncClient, data: bytes, name: str = "proj.zip"
+) -> tuple[uuid.UUID, uuid.UUID]:
+    project = await create_upload(client)
+    response = await upload(client, project["id"], data, name=name)
+    assert response.status_code == 202, response.text
+    return uuid.UUID(str(project["id"])), uuid.UUID(response.json()["data"]["job_id"])
+
+
+async def run_job(
+    api: FastAPI,
+    root: Path,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    job_id: uuid.UUID,
+    filename: str = "proj.zip",
+    limits: ArchiveLimits | None = None,
+) -> str:
+    env = import_env(api, root, RecordingQueue())
+    extra = {"limits": limits} if limits is not None else {}
+    return await project_imports.run_import(
+        env, project_id=project_id, job_id=job_id, user_id=user_id, filename=filename, **extra
+    )
+
+
+async def test_run_import_makes_a_repository_with_one_commit(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "ready"
+    repo = workspace_root / str(project_id) / "repo"
+    assert (repo / "README.md").read_text() == "# Proj\n"  # the proj-main/ wrapper is stripped
+    assert git(repo, "log", "--format=%s|%an|%ae") == "Import from archive proj.zip|Tira|owner@example.test"
+    data = (await owner.get(f"{PROJECTS}/{project_id}")).json()["data"]
+    assert (data["repository"]["sync_state"], data["repository"]["error"]) == ("ready", None)
+    assert data["stats"]["last_commit"] == git(repo, "rev-parse", "HEAD")
+    assert "python" in data["stack"]["languages"]
+    assert list((workspace_root / str(project_id) / "uploads").iterdir()) == []
+    assert await held(project_id) is None
+    async with make_sessionmaker(engine)() as session:
+        events = (
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "project.import", AuditEvent.resource_id == str(project_id)
+                )
+            )
+        ).all()
+    assert [(e.result, e.metadata_["files"], e.metadata_["stripped_prefix"]) for e in events] == [
+        ("success", 2, "proj-main")
+    ]
+
+
+async def test_a_job_delivered_again_changes_nothing(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "ready"
+    repo = workspace_root / str(project_id) / "repo"
+    head = git(repo, "rev-parse", "HEAD")
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "skipped"
+    assert git(repo, "rev-parse", "HEAD") == head
+    data = (await owner.get(f"{PROJECTS}/{project_id}")).json()["data"]
+    assert data["repository"]["sync_state"] == "ready"
+
+
+async def test_a_git_failure_removes_the_repository_and_allows_a_new_upload(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+
+    async def broken(*_: object, **__: object) -> str | None:
+        raise GitError("commit_failed")
+
+    monkeypatch.setattr(GitAdapter, "commit_all", broken)
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "error"
+    data = (await owner.get(f"{PROJECTS}/{project_id}")).json()["data"]
+    assert (data["repository"]["sync_state"], data["repository"]["error"]) == ("error", "import_git_failed")
+    assert not (workspace_root / str(project_id) / "repo").exists()
+    assert list((workspace_root / str(project_id) / "uploads").iterdir()) == []
+    assert await held(project_id) is None
+    monkeypatch.undo()
+    assert (await upload(owner, project_id, small_zip(tmp_path))).status_code == 202
+
+
+async def test_a_stale_job_changes_nothing(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    await hold_lock(project_id, "a-newer-upload")  # this job's lock expired and someone else took it
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "skipped"
+    assert not (workspace_root / str(project_id) / "repo").exists()
+    assert await held(project_id) == "a-newer-upload"  # never freed by a job that does not own it
+    data = (await owner.get(f"{PROJECTS}/{project_id}")).json()["data"]
+    assert data["repository"]["sync_state"] == "importing"
+
+
+async def test_an_archive_with_nothing_in_it_is_rejected_as_empty(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "empty.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("only-a-folder/", "")
+    project_id, job_id = await accepted_upload(owner, path.read_bytes(), name="empty.zip")
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id, "empty.zip") == "error"
+    data = (await owner.get(f"{PROJECTS}/{project_id}")).json()["data"]
+    assert data["repository"]["error"] == "archive_rejected:empty"
+    assert not (workspace_root / str(project_id) / "repo").exists()

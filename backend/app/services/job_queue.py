@@ -19,7 +19,9 @@ SEND_TIMEOUT_S = 10.0
 
 
 class JobQueue(Protocol):
-    async def enqueue_import(self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    async def enqueue_import(
+        self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID, filename: str
+    ) -> None:
         """Hand the import to a worker; raise if it was not handed over."""
         ...
 
@@ -40,7 +42,14 @@ class CeleryJobQueue:
             },
         )
 
-    async def enqueue_import(self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID) -> None:
-        kwargs = {"project_id": str(project_id), "job_id": str(job_id), "user_id": str(user_id)}
+    async def enqueue_import(
+        self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID, filename: str
+    ) -> None:
+        kwargs = {
+            "project_id": str(project_id),
+            "job_id": str(job_id),
+            "user_id": str(user_id),
+            "filename": filename,  # already cleaned (clean_filename): data for the commit message only
+        }
         async with asyncio.timeout(SEND_TIMEOUT_S):
             await asyncio.to_thread(self._celery.send_task, IMPORT_TASK, kwargs=kwargs, queue=QUEUE)
