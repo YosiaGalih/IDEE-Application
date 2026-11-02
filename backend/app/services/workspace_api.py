@@ -25,11 +25,16 @@ from pathlib import PurePosixPath
 from sqlalchemy import select
 
 from app.core.errors import AppError
+from app.core.logging import get_logger
 from app.gitops.adapter import GitTarget
 from app.models.projects import Project, Repository
 from app.services.projects import Actor, ProjectEnv, authorize, repo_path
-from app.workspace.fs import TreeResult, Workspace
+from app.workspace.fs import FileChange, TreeResult, Workspace
 from app.workspace.policy import Access
+
+logger = get_logger(__name__)
+
+AUDIT_PATHS_MAX = 100  # paths listed in one patch event; the count is always exact
 
 _TASK_REF = re.compile(r"task:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -161,3 +166,115 @@ async def read_file(
         language=language_for(content.path),
         too_large=content.too_large,
     )
+
+
+# --- writes -------------------------------------------------------------------------------------------------
+
+
+async def _audit(
+    env: ProjectEnv, actor: Actor, project_id: uuid.UUID, action: str, metadata: dict[str, object]
+) -> None:
+    """One event per successful write (paths and shas, never content). The change already happened on disk:
+    a failed event is logged at error level, never turned into a failed request the client would retry."""
+    try:
+        await env.audit.write_detached(
+            env.sessions,
+            actor_type="user",
+            actor_id=str(actor.user_id),
+            action=action,
+            result="success",
+            resource_type="project",
+            resource_id=str(project_id),
+            project_id=project_id,
+            metadata=metadata,
+            ip=actor.ip,
+        )
+    except Exception:
+        logger.exception("workspace_audit_failed", project_id=str(project_id), action=action)
+
+
+async def write_file(
+    env: ProjectEnv,
+    actor: Actor,
+    project_id: uuid.UUID,
+    path: str,
+    content: str,
+    *,
+    expected_sha256: str | None,
+) -> FileChange:
+    """Save ``content`` if the file is still ``expected_sha256`` (``None``: it must not exist yet), else 409
+    ``VERSION_CONFLICT`` (FR-029): a concurrent edit is never overwritten."""
+    repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
+    change = await repo.workspace.write_file(
+        path, content, Access.USER_WRITE, expected_sha256=expected_sha256
+    )
+    await _audit(
+        env,
+        actor,
+        project_id,
+        "workspace.file_written",
+        {"path": change.path, "sha256": change.sha256, "old_sha256": change.old_sha256},
+    )
+    return change
+
+
+async def create(
+    env: ProjectEnv,
+    actor: Actor,
+    project_id: uuid.UUID,
+    path: str,
+    *,
+    kind: str,
+    content: str | None,
+) -> str:
+    """A new file (``content``, empty when ``None``) or folder; 409 ``CONFLICT`` when the path exists."""
+    repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
+    if kind == "dir":
+        created = await repo.workspace.make_dir(path, Access.USER_WRITE)
+        metadata: dict[str, object] = {"path": created, "type": "dir"}
+    else:
+        change = await repo.workspace.write_file(path, content or "", Access.USER_WRITE, expected_sha256=None)
+        created = change.path
+        metadata = {"path": created, "type": "file", "sha256": change.sha256}
+    await _audit(env, actor, project_id, "workspace.file_created", metadata)
+    return created
+
+
+async def delete_file(
+    env: ProjectEnv, actor: Actor, project_id: uuid.UUID, path: str, *, expected_sha256: str
+) -> None:
+    """Delete one file that is still ``expected_sha256``. Folders are refused by the workspace
+    (``PATH_VIOLATION`` ``not_regular``); deleting folders is a v2.1 feature (§13.3 ``recursive``)."""
+    repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
+    change = await repo.workspace.delete_file(path, Access.USER_WRITE, expected_sha256=expected_sha256)
+    await _audit(
+        env,
+        actor,
+        project_id,
+        "workspace.file_deleted",
+        {"path": change.path, "old_sha256": change.old_sha256},
+    )
+
+
+async def apply_patch(
+    env: ProjectEnv, actor: Actor, project_id: uuid.UUID, diff: str, *, target: str
+) -> list[FileChange]:
+    """Apply a unified diff all-or-nothing (FR-031): one hunk that does not apply → 409 ``CONFLICT`` with the
+    rejected hunks in ``details`` and no file changed."""
+    if target != "main":
+        raise AppError(
+            "VALIDATION_ERROR",
+            "Input did not pass validation",
+            http_status=422,
+            details=[{"loc": ["body", "target"], "msg": "only main until task worktrees exist"}],
+        )
+    repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
+    changes = await repo.workspace.apply_patch(diff, Access.USER_WRITE)
+    await _audit(
+        env,
+        actor,
+        project_id,
+        "workspace.patch_applied",
+        {"files": len(changes), "paths": [change.path for change in changes[:AUDIT_PATHS_MAX]]},
+    )
+    return changes

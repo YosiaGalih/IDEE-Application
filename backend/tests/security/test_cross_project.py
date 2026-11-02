@@ -37,6 +37,10 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("POST", "/api/v1/projects/{id}/imports", None),  # the door answers before the body is read
     ("GET", "/api/v1/projects/{id}/tree", None),
     ("GET", "/api/v1/projects/{id}/files/{path}", None),
+    ("PUT", "/api/v1/projects/{id}/files/{path}", {"content": "x\n", "expected_sha256": None}),
+    ("POST", "/api/v1/projects/{id}/files", {"path": "new.txt", "type": "file"}),
+    ("DELETE", "/api/v1/projects/{id}/files/{path}", None),  # the door answers before the query is checked
+    ("POST", "/api/v1/projects/{id}/patches", {"diff": "x"}),
 ]
 FILE = "README.md"  # exists in every blank project
 WRITES = {
@@ -44,6 +48,10 @@ WRITES = {
     ("POST", "/api/v1/projects/{id}/archive"),
     ("POST", "/api/v1/projects/{id}/unarchive"),
     ("POST", "/api/v1/projects/{id}/imports"),
+    ("PUT", "/api/v1/projects/{id}/files/{path}"),
+    ("POST", "/api/v1/projects/{id}/files"),
+    ("DELETE", "/api/v1/projects/{id}/files/{path}"),
+    ("POST", "/api/v1/projects/{id}/patches"),
 }
 
 
