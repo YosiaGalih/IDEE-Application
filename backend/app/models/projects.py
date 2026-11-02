@@ -1,16 +1,17 @@
-"""Projects and conversations (DATA_MODEL M03, M06). Repositories and messages land with their WPs."""
+"""Projects, repositories and conversations (DATA_MODEL M03, M04, M06). Messages land with their WP."""
 
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, Timestamps, UUIDPrimaryKey, in_values
-from app.models.enums import PROJECT_STATUSES
+from app.models.enums import PROJECT_STATUSES, REPOSITORY_PROVIDERS, REPOSITORY_SYNC_STATES
 
 
 class Project(UUIDPrimaryKey, Timestamps, Base):
@@ -33,6 +34,29 @@ class Project(UUIDPrimaryKey, Timestamps, Base):
     settings: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
+
+
+class Repository(UUIDPrimaryKey, Timestamps, Base):
+    """The project's git repository at ``WORKSPACE_ROOT/<project_id>/repo`` (one per project in v1)."""
+
+    __tablename__ = "repositories"
+    __table_args__ = (
+        CheckConstraint(in_values("provider", REPOSITORY_PROVIDERS), name="provider"),
+        CheckConstraint(in_values("sync_state", REPOSITORY_SYNC_STATES), name="sync_state"),
+    )
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Stored without userinfo; a credential is only ever a reference name (credential_ref), never a value.
+    remote_url: Mapped[str | None] = mapped_column(String(500))
+    branch: Mapped[str] = mapped_column(String(100), nullable=False)
+    credential_ref: Mapped[str | None] = mapped_column(String(200))
+    sync_state: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'ready'"))
+    index_commit: Mapped[str | None] = mapped_column(String(64))
+    last_indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
 
 
 class Conversation(UUIDPrimaryKey, Timestamps, Base):

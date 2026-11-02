@@ -126,6 +126,7 @@ export default tseslint.config(
               "width",
               "height",
               "data-testid",
+              "htmlFor", // references an id, like "id" itself
             ],
           },
         },

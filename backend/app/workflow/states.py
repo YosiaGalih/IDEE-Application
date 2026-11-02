@@ -59,8 +59,8 @@ ALLOWED: dict[TaskStatus, frozenset[TaskStatus]] = {
     S.REJECTED: frozenset(),
 }
 TERMINAL = frozenset(status for status, targets in ALLOWED.items() if not targets)
-# Statuses that end a run; completed_at is stamped on entry.
-_FINISHED = frozenset({S.COMPLETED, S.FAILED, S.CANCELLED, S.REJECTED})
+# Statuses that end a run; completed_at is stamped on entry. Also what a person calls "not open".
+FINISHED = frozenset({S.COMPLETED, S.FAILED, S.CANCELLED, S.REJECTED})
 # Remediation and reopen start a new iteration (DATA_MODEL tasks.iteration).
 _NEW_ITERATION_FROM = frozenset({S.COMPLETED, S.NEEDS_CHANGES})
 
@@ -123,10 +123,10 @@ async def transition(
     }
     if target is S.RUNNING:
         values["started_at"] = func.coalesce(Task.started_at, func.now())
-    if target in _FINISHED:
+    if target in FINISHED:
         # failed -> cancelled keeps the original finish time.
         values["completed_at"] = (
-            func.coalesce(Task.completed_at, func.now()) if source in _FINISHED else func.now()
+            func.coalesce(Task.completed_at, func.now()) if source in FINISHED else func.now()
         )
     if target is S.QUEUED:
         values["completed_at"] = None

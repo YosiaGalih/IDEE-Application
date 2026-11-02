@@ -14,8 +14,8 @@ import { Spinner } from "@/components/ui/Spinner";
 import { AUTH_PATHS, readLoginNotice, safeNext } from "@/lib/safeNext";
 import { zodResolver } from "@/lib/zodResolver";
 import { AuthLayout } from "./AuthLayout";
-import { describeError } from "./describeError";
-import { ErrorSummary } from "./ErrorSummary";
+import { describeError } from "@/lib/describeError";
+import { ErrorSummary } from "@/components/ui/ErrorSummary";
 import { loginSchema, type LoginValues } from "./schemas";
 import { useFieldError } from "./useFieldError";
 

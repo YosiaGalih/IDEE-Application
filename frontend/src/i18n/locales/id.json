@@ -115,6 +115,11 @@
     "languageEn": "English",
     "backHome": "Kembali ke dashboard"
   },
+  "errors": {
+    "rateLimited_one": "Terlalu banyak percobaan. Coba lagi dalam {{count}} detik.",
+    "rateLimited_other": "Terlalu banyak percobaan. Coba lagi dalam {{count}} detik.",
+    "rateLimitedNoTime": "Terlalu banyak percobaan. Coba lagi sebentar lagi."
+  },
   "auth": {
     "brandTitle": "KodeKantor — Tim AI untuk membangun software Anda",
     "brandBody": "Setiap langkah agent tercatat sebagai bukti; perubahan hanya diterapkan setelah Anda menyetujuinya.",
@@ -122,9 +127,6 @@
     "password": "Kata sandi",
     "rememberMe": "Ingat saya",
     "errorSummary": "Periksa kembali isian yang ditandai.",
-    "rateLimited_one": "Terlalu banyak percobaan. Coba lagi dalam {{count}} detik.",
-    "rateLimited_other": "Terlalu banyak percobaan. Coba lagi dalam {{count}} detik.",
-    "rateLimitedNoTime": "Terlalu banyak percobaan. Coba lagi sebentar lagi.",
     "outcomeUnknown": "Jawaban server tidak sampai, jadi hasilnya belum pasti: kata sandi mungkin sudah berubah. Coba masuk dengan kata sandi baru sebelum mengulang.",
     "errors": {
       "emailRequired": "Isi email Anda.",
@@ -184,6 +186,85 @@
       "logout": "Keluar",
       "loggingOut": "Sedang keluar…",
       "logoutFailed": "Gagal keluar: sesi masih aktif. Coba lagi."
+    }
+  },
+  "projects": {
+    "newProject": "Project baru",
+    "search": {
+      "label": "Cari project",
+      "placeholder": "Nama atau slug",
+      "submit": "Cari"
+    },
+    "statusFilter": {
+      "label": "Status",
+      "active": "Aktif",
+      "archived": "Diarsipkan",
+      "all": "Semua"
+    },
+    "status": {
+      "active": "Aktif",
+      "archived": "Diarsipkan",
+      "deleting_pending_approval": "Menunggu persetujuan hapus",
+      "deleted": "Dihapus"
+    },
+    "table": {
+      "caption": "Daftar project",
+      "name": "Nama",
+      "stack": "Stack",
+      "status": "Status",
+      "updated": "Diperbarui",
+      "actions": "Aksi"
+    },
+    "noStack": "Belum terdeteksi",
+    "empty": {
+      "title": "Belum ada project",
+      "body": "Buat project kosong atau mulai dari template yang siap dijalankan. Project yang diarsipkan tampil di filter Diarsipkan.",
+      "filteredTitle": "Tidak ada project yang cocok",
+      "filteredBody": "Ubah kata pencarian atau filter status."
+    },
+    "archive": "Arsipkan",
+    "unarchive": "Aktifkan lagi",
+    "archiveOf": "Arsipkan {{name}}",
+    "unarchiveOf": "Aktifkan lagi {{name}}",
+    "new": {
+      "title": "Project baru",
+      "subtitle": "Setiap project punya repository git sendiri. Mulai kosong atau dari template.",
+      "name": "Nama project",
+      "description": "Deskripsi (opsional)",
+      "source": "Mulai dari",
+      "blank": "Project kosong",
+      "blankHint": "Repository git dengan README dan satu commit awal.",
+      "template": "Template",
+      "templateHint": "Kerangka yang bisa langsung dijalankan, lengkap dengan test-nya.",
+      "templates": "Pilih template",
+      "templatesFailed": "Daftar template tidak dapat dimuat.",
+      "retryTemplates": "Muat ulang template",
+      "submit": "Buat project",
+      "submitting": "Membuat…",
+      "cancel": "Batal",
+      "outcomeUnknown": "Jawaban server tidak sampai, jadi hasilnya belum pasti: project mungkin sudah dibuat. Periksa daftar project sebelum mencoba lagi.",
+      "errorSummary": "Periksa kembali isian yang ditandai.",
+      "noTemplates": "Belum ada template yang tersedia. Pilih project kosong.",
+      "serverFieldSummary": "Server menolak isian yang ditandai."
+    },
+    "errors": {
+      "nameRequired": "Isi nama project.",
+      "nameTooLong": "Nama project maksimal 120 karakter.",
+      "nameInvalid": "Nama project tidak boleh berisi karakter kontrol atau karakter tak terlihat.",
+      "descriptionTooLong": "Deskripsi maksimal 2000 karakter.",
+      "templateRequired": "Pilih salah satu template.",
+      "fieldRejected": "Server menolak isian ini. Periksa lalu coba lagi."
+    },
+    "archived": "{{name}} diarsipkan.",
+    "unarchived": "{{name}} aktif lagi.",
+    "archiveConflict": "Status project sudah berubah di tempat lain. Daftar dimuat ulang.",
+    "archiveOutcomeUnknown": "Jawaban server tidak sampai, jadi hasilnya belum pasti. Daftar dimuat ulang untuk menunjukkan status terbaru.",
+    "repositoryProblem": "Repository bermasalah",
+    "pagination": {
+      "label": "Halaman daftar project",
+      "previous": "Sebelumnya",
+      "next": "Berikutnya",
+      "status": "Halaman {{page}} dari {{pages}} · {{total}} project"
     }
   }
 }

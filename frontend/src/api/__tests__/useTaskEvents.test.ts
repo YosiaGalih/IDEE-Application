@@ -181,11 +181,15 @@ describe("openEventStream", () => {
   });
 
   it("backs off with growing delays", async () => {
-    const times: number[] = [];
-    const fetchImpl = vi.fn(() => {
-      times.push(performance.now());
-      return Promise.reject(new TypeError("down"));
-    });
+    // The delays the stream asks for, not wall-clock gaps: those depend on how busy the machine is.
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const record = (handler: () => void, ms?: number) => {
+      if (ms !== undefined && ms < 45_000) delays.push(ms); // 45 s is the heartbeat watchdog
+      return realSetTimeout(handler, ms);
+    };
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(record);
+    const fetchImpl = vi.fn(() => Promise.reject(new TypeError("down")));
     const stream = openEventStream({
       path: `/tasks/${TASK}/events`,
       fetchImpl: fetchImpl,
@@ -195,10 +199,12 @@ describe("openEventStream", () => {
       jitter: () => 0,
     });
     streams.push(stream);
-    await waitFor(() => expect(times.length).toBeGreaterThanOrEqual(4), { timeout: 2000 });
-    const gaps = times.slice(1).map((t, i) => t - (times[i] ?? 0));
-    expect(gaps[1]).toBeGreaterThan((gaps[0] ?? 0) * 1.5);
-    expect(gaps[2]).toBeGreaterThan((gaps[1] ?? 0) * 1.5);
+    // Polls with the real timer, so the only setTimeout calls recorded are the stream's own.
+    for (let i = 0; i < 200 && fetchImpl.mock.calls.length < 4; i++) {
+      await new Promise((resolve) => realSetTimeout(resolve, 10));
+    }
+    spy.mockRestore();
+    expect(delays.slice(0, 3)).toEqual([20, 40, 80]);
   });
 
   it("does not count an accepted handshake that delivers nothing as a success", async () => {

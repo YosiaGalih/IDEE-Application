@@ -83,28 +83,30 @@ describe("LoginPage", () => {
   ])("shows one generic message for %s, never the server's text", async (_case, serverText) => {
     backend(() => fail(401, "UNAUTHENTICATED", serverText));
     const onUnauthenticated = vi.fn();
-    const { router } = renderApp("/login?next=/projects", routes, { onUnauthenticated });
+    const { router } = renderApp("/login?next=/approvals", routes, { onUnauthenticated });
     await fillAndSubmit();
     const alert = await screen.findByText(id.auth.login.invalid);
     expect(alert.closest("[role=alert]")).toHaveFocus();
     expect(document.body).not.toHaveTextContent(serverText);
     // A 401 here is not an expired session: the global handler never hears of it, next is kept.
     expect(onUnauthenticated).not.toHaveBeenCalled();
-    expect(router.state.location.search).toBe("?next=/projects");
+    expect(router.state.location.search).toBe("?next=/approvals");
   });
 
   it("shows the wait from Retry-After on 429", async () => {
     backend(() => fail(429, "RATE_LIMITED", "Too many attempts", { "Retry-After": "37" }));
     renderApp("/login");
     await fillAndSubmit();
-    expect(await screen.findByText(id.auth.rateLimited_other.replace("{{count}}", "37"))).toBeInTheDocument();
+    expect(
+      await screen.findByText(id.errors.rateLimited_other.replace("{{count}}", "37")),
+    ).toBeInTheDocument();
   });
 
   it("says try again later on 429 without Retry-After", async () => {
     backend(() => fail(429, "RATE_LIMITED"));
     renderApp("/login");
     await fillAndSubmit();
-    expect(await screen.findByText(id.auth.rateLimitedNoTime)).toBeInTheDocument();
+    expect(await screen.findByText(id.errors.rateLimitedNoTime)).toBeInTheDocument();
   });
 
   it("shows the degraded state with the request id on 503", async () => {
@@ -140,9 +142,9 @@ describe("LoginPage", () => {
 
   it("goes to a safe next after signing in, and shows the app with the signed-in user", async () => {
     backend();
-    const { router } = renderApp("/login?next=%2Fprojects%3Ftab%3Dtasks");
+    const { router } = renderApp("/login?next=%2Fapprovals%3Ftab%3Dtasks");
     await fillAndSubmit();
-    await waitFor(() => expect(router.state.location.pathname).toBe("/projects"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/approvals"));
     expect(router.state.location.search).toBe("?tab=tasks");
     expect(
       await screen.findByText(id.auth.menu.signedInAs.replace("{{name}}", user.display_name)),
@@ -166,7 +168,7 @@ describe("LoginPage", () => {
   it("drops the cached session when the login page opens, so Back cannot show the last user's data", async () => {
     const state = backend();
     state.session = true;
-    const { router, queryClient } = renderApp("/projects");
+    const { router, queryClient } = renderApp("/approvals");
     await screen.findByText(id.auth.menu.signedInAs.replace("{{name}}", user.display_name));
     queryClient.setQueryData(["projects"], [{ id: "p-old" }]);
     state.session = false;
@@ -213,7 +215,7 @@ describe("LoginPage", () => {
         return ok({ user }); // 200, yet /auth/me stays 401: the cookie was not stored
       }),
     );
-    const { router } = renderApp("/login?next=/projects");
+    const { router } = renderApp("/login?next=/approvals");
     await fillAndSubmit();
     expect(await screen.findByText(id.auth.login.sessionNotStored)).toBeInTheDocument();
     expect(router.state.location.pathname).toBe("/login");

@@ -12,8 +12,8 @@ import { Spinner } from "@/components/ui/Spinner";
 import { AUTH_PATHS, loginNoticeState } from "@/lib/safeNext";
 import { zodResolver } from "@/lib/zodResolver";
 import { AuthLayout } from "./AuthLayout";
-import { describeError } from "./describeError";
-import { ErrorSummary } from "./ErrorSummary";
+import { describeError } from "@/lib/describeError";
+import { ErrorSummary } from "@/components/ui/ErrorSummary";
 import { resetSchema, type ResetValues } from "./schemas";
 import { useFieldError } from "./useFieldError";
 
@@ -75,7 +75,7 @@ export function ResetPasswordPage() {
       () => mutation.reset(),
     )(event);
   const summary = mutation.isError
-    ? describeError(mutation.error, t, { isChange: true })
+    ? describeError(mutation.error, t, { unknownOutcome: t("auth.outcomeUnknown") })
     : Object.keys(errors).length > 0
       ? { title: t("auth.errorSummary"), body: null, requestId: null }
       : null;
