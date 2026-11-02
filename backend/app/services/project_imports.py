@@ -46,11 +46,13 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.gitops.adapter import GitTarget
 from app.gitops.errors import GitError
+from app.models.audit import AuditEvent
 from app.models.identity import User
 from app.models.projects import Project, Repository
 from app.services import import_lock
@@ -79,6 +81,7 @@ _PUBLISHED = ".published"  # .import-<job_id>.published: written just before the
 _WORKER = ("system", "project-import")
 # Failures that say nothing about the archive: the job is retried, never failed, on these.
 _TRANSIENT = (RedisError, SQLAlchemyError, ConnectionError, TimeoutError)
+_READ_BACK_S = 30.0  # how long a commit whose reply was lost may still be settling in the database
 
 
 @dataclass(frozen=True)
@@ -278,27 +281,48 @@ async def _claim_folder(env: ImportEnv, actor: Actor, slot: ImportSlot) -> None:
 
     A job holds that row lock from its last lock check, through the rename to ``repo/``, to its ``ready``
     commit. Taking it here means a job either finished (``ready``: refused) or will find its lock gone, even
-    if the Redis key vanished without expiring. Only a ``repo/`` with an import's publish marker is set aside;
-    any other ``repo/`` is not an import's to remove (409 ``repository_not_empty``).
+    if the Redis key vanished without expiring. Only a ``repo/`` with the publish marker of a job whose
+    ``ready`` commit never landed is set aside: a job with a ``project.import`` success event committed its
+    ``repo/`` (the event is written in the same transaction), so its marker, if one was left, proves nothing.
+    Any other ``repo/`` is not an import's to remove (409 ``repository_not_empty``).
     """
     async with env.projects.sessions() as session:
         project, _ = await authorize(session, actor, slot.project_id, "project:write", lock=True)
         repository = await session.scalar(select(Repository).where(Repository.project_id == project.id))
         reason = _refusal(project, repository)
-        if reason is None and not await asyncio.to_thread(_set_aside_repo, slot.uploads.parent):
-            reason = "repository_not_empty"
+        if reason is None:
+            committed = await _jobs_with_outcome(session, slot.project_id, result="success")
+            if not await asyncio.to_thread(_set_aside_repo, slot.uploads.parent, committed):
+                reason = "repository_not_empty"
         if reason:
             logger.info("project_import_refused", project_id=str(slot.project_id), reason=reason)
             raise _conflict(reason)
 
 
-def _set_aside_repo(root: Path) -> bool:
+async def _jobs_with_outcome(
+    session: AsyncSession, project_id: uuid.UUID, *, result: str | None = None
+) -> set[uuid.UUID]:
+    """The jobs of this project that have a ``project.import`` event (of ``result``, when given)."""
+    statement = select(AuditEvent.metadata_).where(
+        AuditEvent.project_id == project_id, AuditEvent.action == "project.import"
+    )
+    if result is not None:
+        statement = statement.where(AuditEvent.result == result)
+    jobs: set[uuid.UUID] = set()
+    for metadata in await session.scalars(statement):
+        with contextlib.suppress(TypeError, ValueError):
+            jobs.add(uuid.UUID(str(metadata.get("job_id"))))
+    return jobs
+
+
+def _set_aside_repo(root: Path, committed: set[uuid.UUID]) -> bool:
     """Move an unfinished import's ``repo/`` out of the way (the sweep removes it); False when ``repo/``
-    exists without a publish marker."""
+    exists without the marker of a job that never committed."""
     repo = root / "repo"
     if not os.path.lexists(repo):
         return True
-    if not any(root.glob(f".import-*{_PUBLISHED}")):
+    markers = _dead_jobs([path for path in root.glob(f".import-*{_PUBLISHED}")])
+    if not markers - committed:
         return False
     os.rename(repo, root / f".import-sweep-{uuid.uuid4().hex}")
     return True
@@ -342,6 +366,13 @@ async def _sweep(env: ImportEnv, slot: ImportSlot) -> None:
         raise _conflict("cleanup_failed")
     if count:
         logger.warning("project_import_leftovers_removed", project_id=str(slot.project_id), count=count)
+    if dead:
+        try:
+            async with env.projects.sessions() as session:
+                dead -= await _jobs_with_outcome(session, slot.project_id)  # those wrote their own
+        except Exception:
+            logger.exception("project_import_audit_failed", project_id=str(slot.project_id))
+            dead = set()
     for job_id in sorted(dead, key=str):
         await _write_audit_detached(
             env, slot.project_id, {"job_id": str(job_id), "reason": "import_incomplete"}
@@ -763,23 +794,31 @@ async def _run(env: ImportEnv, job: _Job, user_id: uuid.UUID, filename: str, lim
 
 
 async def _take_back(env: ImportEnv, job: _Job) -> None:
-    """An earlier run of this job published ``repo/`` but its ``ready`` commit did not land (the project still
-    waits, and this job holds the lock): its marker proves that ``repo/`` is this job's. Take it back and
-    start over."""
+    """An earlier run of this job published ``repo/`` and its ``ready`` commit's outcome was unknown: its
+    marker proves that ``repo/`` is this job's. Under the project row lock (so a commit still settling in the
+    database ends first) the project still waits and this job still holds the lock: the commit did not
+    land. Take ``repo/`` back and start over."""
+    if not await asyncio.to_thread(job.marker.exists):
+        return
 
-    def take_back() -> bool:
-        if not job.marker.exists():
-            return False
+    def take_back() -> None:
         if os.path.lexists(job.repo):
             os.rename(job.repo, job.work)
         job.marker.unlink()
-        return True
 
-    if await asyncio.to_thread(take_back):
-        logger.warning(
-            "project_import_publish_taken_back", project_id=str(job.project_id), job_id=str(job.job_id)
+    async with env.projects.sessions() as session:
+        project = await session.scalar(
+            select(Project).where(Project.id == job.project_id).with_for_update(key_share=True)
         )
-        await _remove(env, job, [job.work])
+        repository = await session.scalar(select(Repository).where(Repository.project_id == job.project_id))
+        if not _waiting(project, repository):
+            raise _NotWaiting()  # it landed after all
+        await _keep(env, job)
+        await asyncio.to_thread(take_back)
+    logger.warning(
+        "project_import_publish_taken_back", project_id=str(job.project_id), job_id=str(job.job_id)
+    )
+    await _remove(env, job, [job.work])
 
 
 async def _keep(env: ImportEnv, job: _Job) -> None:
@@ -827,7 +866,11 @@ async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> str:
             # Not this job's: it publishes only here, and takes back its own earlier publish first.
             raise RuntimeError("the project already has a repo folder")
         await asyncio.to_thread(job.marker.touch)
-        await asyncio.to_thread(os.rename, job.work, job.repo)
+        try:
+            await asyncio.to_thread(os.rename, job.work, job.repo)
+        except BaseException:
+            await _remove(env, job, [job.marker])  # nothing was published
+            raise
         try:
             project.stack = outcome.stack
             repository.sync_state = "ready"
@@ -852,6 +895,8 @@ async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> str:
             )
             await session.commit()
         except Exception:
+            with contextlib.suppress(Exception):
+                await session.rollback()  # the read-back below must not wait on this session's own locks
             ready = await _is_ready(env, job)
             if ready:
                 logger.warning("project_import_commit_reply_lost", project_id=str(job.project_id))
@@ -871,10 +916,14 @@ async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> str:
 
 
 async def _is_ready(env: ImportEnv, job: _Job) -> bool | None:
+    """Did the ``ready`` commit land? ``FOR SHARE`` waits for a commit still settling in the database; None
+    when the database does not answer in time."""
     try:
-        async with env.projects.sessions() as session:
+        async with asyncio.timeout(_READ_BACK_S), env.projects.sessions() as session:
             state = await session.scalar(
-                select(Repository.sync_state).where(Repository.project_id == job.project_id)
+                select(Repository.sync_state)
+                .where(Repository.project_id == job.project_id)
+                .with_for_update(read=True)
             )
     except Exception:
         logger.exception("project_import_state_unknown", project_id=str(job.project_id))
