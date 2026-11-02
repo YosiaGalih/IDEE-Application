@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -19,7 +20,11 @@ from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
 from app.services.auth import resolve_session
 from app.services.health import Dependencies
+from app.services.project_imports import IMPORT_MAX_BYTES
 from app.services.projects import drain_cleanups, load_templates
+
+IMPORT_PATH = re.compile(r"/api/v1/projects/[^/]+/imports")
+IMPORT_MAX_REQUEST_BYTES = IMPORT_MAX_BYTES + 1024 * 1024
 
 
 class RequestIdMiddleware:
@@ -101,6 +106,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redis=dependencies.redis,
         session_validator=session_identity,
         exempt_prefix="/api/v1/auth/",
+        # The archive import streams up to 200 MiB (+ multipart overhead): never buffered (WP-2.1b).
+        stream_paths=IMPORT_PATH,
+        stream_max_bytes=IMPORT_MAX_REQUEST_BYTES,
     )
     app.add_middleware(
         CsrfMiddleware,

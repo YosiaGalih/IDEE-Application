@@ -6,6 +6,7 @@ Malicious archives through the same path are in ``tests/security/test_archive_im
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 import zipfile
@@ -263,3 +264,166 @@ def test_clean_filename() -> None:
     assert clean("") == "archive"
     assert clean(None) == "archive"
     assert len(clean("x" * 1000 + ".zip")) == 255
+
+
+# --- the route (Task 3) -----------------------------------------------------------------------------------
+
+
+IMPORTS = PROJECTS + "/{id}/imports"
+
+
+async def upload(
+    client: httpx.AsyncClient,
+    project_id: object,
+    data: bytes,
+    *,
+    name: str = "proj.zip",
+    key: str | None = None,
+) -> httpx.Response:
+    sent = headers(client)
+    if key is not None:
+        sent["Idempotency-Key"] = key
+    return await client.post(
+        IMPORTS.format(id=project_id), files={"file": (name, data, "application/zip")}, headers=sent
+    )
+
+
+def multipart(parts: list[tuple[str, str | None, bytes]], boundary: str = "kkboundary") -> tuple[bytes, str]:
+    body = b""
+    for field_name, filename, data in parts:
+        disposition = f'form-data; name="{field_name}"' + (f'; filename="{filename}"' if filename else "")
+        body += f"--{boundary}\r\nContent-Disposition: {disposition}\r\n\r\n".encode() + data + b"\r\n"
+    return body + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
+@pytest.fixture
+def queue(app: FastAPI) -> RecordingQueue:  # noqa: F811
+    recording = RecordingQueue()
+    app.state.dependencies.jobs = recording
+    return recording
+
+
+async def test_an_upload_through_http_is_accepted(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+) -> None:
+    project = await create_upload(owner)
+    data = small_zip(tmp_path)
+    response = await upload(owner, project["id"], data)
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "accepted"
+    assert body["data"]["upload"] == {
+        "filename": "proj.zip",
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    assert body["data"]["repository"]["sync_state"] == "importing"
+    assert [str(call[1]) for call in queue.calls] == [body["data"]["job_id"]]
+
+
+async def test_a_project_that_cannot_take_an_archive_is_refused_before_the_body(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+) -> None:
+    blank = (await create(owner, "Blank")).json()["data"]
+    response = await upload(owner, blank["id"], small_zip(tmp_path))
+    assert response.status_code == 409
+    assert response.json()["error"]["details"] == [{"reason": "not_an_upload_project"}]
+    assert queue.calls == []
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        [("file", "a.zip", b"PK\x03\x04x"), ("file", "b.zip", b"PK\x03\x04y")],
+        [("note", None, b"hello"), ("file", "a.zip", b"PK\x03\x04x")],
+        [("archive", "a.zip", b"PK\x03\x04x")],
+        [("file", None, b"PK\x03\x04x")],
+    ],
+    ids=["two_files", "extra_field", "wrong_name", "no_filename"],
+)
+async def test_anything_but_one_file_field_is_422_and_leaves_nothing(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+    workspace_root: Path,  # noqa: F811
+    parts: list[tuple[str, str | None, bytes]],
+) -> None:
+    project = await create_upload(owner)
+    body, content_type = multipart(parts)
+    sent = headers(owner) | {"Content-Type": content_type}
+    response = await owner.post(IMPORTS.format(id=project["id"]), content=body, headers=sent)
+    assert response.status_code == 422, response.text
+    assert list((workspace_root / str(project["id"]) / "uploads").iterdir()) == []
+    assert await held(project["id"]) is None
+    assert queue.calls == []
+
+
+async def test_an_upload_without_content_length_is_400(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+) -> None:
+    project = await create_upload(owner)
+    body, content_type = multipart([("file", "a.zip", b"PK\x03\x04x")])
+
+    async def chunks():  # type: ignore[no-untyped-def]
+        yield body
+
+    sent = headers(owner) | {"Content-Type": content_type}
+    response = await owner.post(IMPORTS.format(id=project["id"]), content=chunks(), headers=sent)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "BAD_REQUEST"
+    assert queue.calls == []
+
+
+async def test_a_retry_with_the_same_key_replays_without_a_second_job(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+) -> None:
+    project = await create_upload(owner)
+    data = small_zip(tmp_path)
+    key = str(uuid.uuid4())
+    first = await upload(owner, project["id"], data, key=key)
+    again = await upload(owner, project["id"], data, key=key)
+    assert (first.status_code, again.status_code) == (202, 202)
+    assert again.json()["data"]["job_id"] == first.json()["data"]["job_id"]
+    assert len(queue.calls) == 1
+
+
+async def test_a_client_that_goes_away_mid_upload_leaves_nothing(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+    workspace_root: Path,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    project = await create_upload(owner)
+    body, content_type = multipart([("file", "a.zip", small_zip(tmp_path) + b"\0" * 300_000)])
+
+    async def broken():  # type: ignore[no-untyped-def]
+        yield body[: len(body) // 2]
+        raise ConnectionResetError("client went away")
+
+    sent = headers(owner) | {"Content-Type": content_type, "Content-Length": str(len(body))}
+    with pytest.raises(ConnectionResetError):
+        await owner.post(IMPORTS.format(id=project["id"]), content=broken(), headers=sent)
+    assert list((workspace_root / str(project["id"]) / "uploads").iterdir()) == []
+    assert await held(project["id"]) is None
+    assert queue.calls == []
+    assert (await upload(owner, project["id"], small_zip(tmp_path))).status_code == 202
+
+
+async def test_two_uploads_at_once_one_wins(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+) -> None:
+    project = await create_upload(owner)
+    data = small_zip(tmp_path)
+    responses = await asyncio.gather(upload(owner, project["id"], data), upload(owner, project["id"], data))
+    assert sorted(r.status_code for r in responses) == [202, 409]
+    refused = next(r for r in responses if r.status_code == 409)
+    assert refused.json()["error"]["details"] == [{"reason": "import_running"}]
+    assert len(queue.calls) == 1
