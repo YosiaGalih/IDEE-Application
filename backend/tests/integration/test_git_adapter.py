@@ -522,6 +522,47 @@ async def test_a_commit_that_landed_is_returned_though_git_was_stopped(
     assert await git.commit_files(repo, sha) == ["a.txt"]
 
 
+@pytest.mark.parametrize("foreign", ["another_author", "another_message", "same_identity_other_parent"])
+async def test_a_head_moved_by_another_writer_is_not_taken_as_this_commit(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch, foreign: str
+) -> None:
+    """AG-13 delta2 LOW: only a commit proven to be this one (parent, author, message) answers a failure."""
+    write(repo.repo / "mine.txt", "mine\n")
+    before = await git.current_commit(repo)
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+
+    def move_head() -> str:
+        # Each case breaks exactly one of the three proofs: author, message, parent.
+        if foreign == "another_author":
+            raw_git(repo, "-c", "user.name=Other", "-c", "user.email=other@example.test",
+                    "commit", "-q", "--allow-empty", "-m", "mine")  # fmt: skip
+        elif foreign == "another_message":
+            raw_git(repo, "-c", f"user.name={ME.name}", "-c", f"user.email={ME.email}",
+                    "commit", "-q", "--allow-empty", "-m", "foreign")  # fmt: skip
+        else:  # our author and message, but not on top of ``before``
+            tree = raw_git(repo, "write-tree")
+            orphan = raw_git(repo, "-c", f"user.name={ME.name}", "-c", f"user.email={ME.email}",
+                             "commit-tree", tree, "-m", "mine")  # fmt: skip
+            raw_git(repo, "update-ref", "HEAD", orphan)
+        return raw_git(repo, "rev-parse", "HEAD")
+
+    moved: list[str] = []
+
+    async def killed(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "add":
+            moved.append(move_head())  # another writer commits while our git is being killed
+            raise GitError("timeout")
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", killed)
+    with pytest.raises(GitError) as raised:
+        await git.commit(repo, "mine", ME)
+    monkeypatch.undo()
+    assert raised.value.reason == "timeout"  # the original error stands
+    assert moved and moved[0] != before
+    assert "mine.txt" not in raw_git(repo, "ls-tree", "-r", "--name-only", "HEAD").split()
+
+
 async def test_an_unborn_index_that_differs_from_the_file_is_reset(tmp_path: Path, git: GitAdapter) -> None:
     """AG-13 I-d: ``rm --cached`` refuses an entry that differs from both the file and HEAD."""
     root = tmp_path / "repo"

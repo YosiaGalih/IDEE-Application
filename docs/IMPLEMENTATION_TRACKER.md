@@ -1283,11 +1283,12 @@ Spec: `docs/superpowers/specs/2026-11-02-wp-2.1c-workspace-git-api-design.md`. P
 | Pemeriksaan | Hasil aktual |
 |---|---|
 | Backend `ruff check .`, `ruff format --check .`, `pyright`, `lint-imports` | bersih; 0 error; 3 kontrak dipertahankan |
-| Backend `pytest -q` (PostgreSQL 16 + Redis 7 lokal) | implementasi: **1540 passed, 1 skipped**; setelah putaran review: **1568 passed, 1 skipped**; setelah delta AG-13: **1580 passed, 1 skipped** |
-| Mutan | implementasi: 6 (Task 3) + 3 (Task 5; mutan "tanpa kunci" selamat dari test balapan, lalu dibunuh test baru `test_a_commit_waits_for_a_write_in_progress`). Putaran review: 13 mutan, semuanya merah. Delta AG-13: 13 mutan, semuanya merah |
+| Backend `pytest -q` (PostgreSQL 16 + Redis 7 lokal) | implementasi: **1540 passed, 1 skipped**; setelah putaran review: **1568 passed, 1 skipped**; setelah delta AG-13: **1580 passed, 1 skipped**; setelah delta AG-13 kedua: **1585 passed, 1 skipped** |
+| Mutan | implementasi: 6 (Task 3) + 3 (Task 5; mutan "tanpa kunci" selamat dari test balapan, lalu dibunuh test baru `test_a_commit_waits_for_a_write_in_progress`). Putaran review: 13 mutan, semuanya merah. Delta AG-13: 13 mutan, semuanya merah. Delta AG-13 kedua: 6 mutan, semuanya merah |
 | Syarat masuk AG-13 dari WP-2.1b | dipenuhi (konfirmasi AG-13 @ 6cabb4f): tidak ada penulis `sync_state` baru, tidak ada yang menghapus `repo/` |
 | CI @ 6cabb4f (implementasi) | 9/9 hijau |
 | CI @ 2bab00c (putaran review) | 9/9 hijau |
+| CI @ b733ecc (delta AG-13) | 9/9 hijau (`backend-lint`, `backend-types`, `backend-test`, `frontend`, `sandbox-test`, `sandbox-isolation`, `infra-config`, `security-scan`, `clean-install`) |
 
 #### Review WP-2.1c @ 6cabb4f: `kk-backend-reviewer` (**BLOCK**: 1 BLOCK, 6 SHOULD, 7 NIT), `kk-silent-failure-hunter` (1 HIGH, 6 MEDIUM, 8 LOW), AG-13 (**SIGNED OFF 🔒** @ 6cabb4f: 4 LOW, 8 INFO)
 
@@ -1329,5 +1330,18 @@ Tidak ditutup (alasan):
 | **L2 (LOW):** `exclusive()` membocorkan fd file kunci bila di-cancel saat file dibuka di thread | pembukaan di-shield; saat cancel, callback menutup fd yang dikembalikan thread | `test_exclusive_cancel_while_opening_the_lock_file_leaks_no_fd` (3 cancel, jumlah fd `/proc/self/fd` sama); mutan → merah |
 | **I-a:** task audit yang di-shield tanpa referensi kuat; exception-nya hilang setelah cancel | `_RUNNING` memegang task sampai selesai; kegagalan task yang tidak lagi ditunggu → log error `workspace_write_failed_after_cancel` | `test_a_write_that_fails_after_the_request_was_cancelled_is_logged`; mutan → merah |
 | **I-d:** reset index repo tanpa commit (`rm --cached -r`) ditolak bila isi ter-stage berbeda dari file dan HEAD | `read-tree --empty` | `test_an_unborn_index_that_differs_from_the_file_is_reset`; mutan → merah |
+
+#### Delta AG-13 @ b733ecc: **SIGNED OFF 🔒** (2 LOW, 5 INFO); kelima temuan delta sebelumnya dikonfirmasi tertutup (12 test baru merah terhadap kode 2bab00c), kedua LOW ditutup
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| **LOW: `_landed` menganggap setiap HEAD yang maju sebagai commit ini** (R-04, laten: belum ada pemanggil yang melanggar aturan satu penulis). Probe: merge penulis lain dikembalikan sebagai commit user, `mine.txt` tidak ter-commit di mana pun | HEAD baru hanya diterima bila parent = HEAD sebelumnya (tanpa parent untuk commit pertama), email author sama, dan pesan sama (whitespace dinormalisasi); selain itu error asli + log error `git_head_moved_by_another_writer` | `test_a_head_moved_by_another_writer_is_not_taken_as_this_commit[another_author / another_message / same_identity_other_parent]`, satu kasus per bukti; 4 mutan → merah |
+| **LOW: `_RUNNING` tidak dikuras saat shutdown; log tanpa konteks** (T10; nyata bila `--timeout-graceful-shutdown` dipasang) | `drain_writes(30 s)` dipanggil lifespan setelah `drain_cleanups`, sebelum `dependencies.aclose()`; task diberi nama `<aksi> <project_id>` dan nama itu ikut di setiap log task yang tidak lagi ditunggu | `test_shutdown_waits_for_writes_still_running`, `test_the_app_drains_writes_at_shutdown`; 2 mutan → merah |
+
+INFO delta kedua: I-2 (penumpukan tulis), I-3 (TOCTOU otorisasi), dan I-5 (aman menghapus `index.lock` saat cancel, untuk semua pemanggil sekarang) tidak membutuhkan perubahan. I-1 dan I-4 masuk "Tidak ditutup" di bawah.
+
+Tidak ditutup dari delta kedua (alasan):
+- **I-1:** idempotency membebaskan key saat request di-cancel walau tulisnya tetap berjalan; retry dengan key yang sama dijalankan lagi. Efek ganda tetap dicegah `expected_sha256`, `AlreadyExists`, `branch_exists`, `nothing_to_commit`; commit tanpa `paths` bisa membawa perubahan yang muncul belakangan. Jalur cancel ini tidak terpicu oleh disconnect di uvicorn [Kemungkinan Besar, AG-13].
+- **I-4:** bila `rev-parse`/`log` di `_landed` sendiri gagal tepat setelah `git commit` yang sudah menulis ref dihentikan, hasilnya 409 tanpa audit (dua kegagalan berurutan).
 
 Dibawa ke WP berikutnya (AG-13 I-b, syarat masuk): penghapusan `index.lock` dan reset index mengandaikan satu penulis per index. Pemanggil baru `GitAdapter.commit` di worktree task dan `merge_branch` di `repo/` (WP-3.x, merge queue) **wajib** memegang `Workspace(root).exclusive()`. I-e (I2, I5, I6) tetap di daftar "Tidak ditutup" di atas; I4 [Kemungkinan Besar] sudah dimitigasi desain sandbox (artefak di mount terpisah, `repo/` read-only), dikonfirmasi saat pembaca evidence dibuat.

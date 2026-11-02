@@ -598,7 +598,7 @@ class GitAdapter:
                 await asyncio.to_thread(_remove_index_lock, git_dir)
             if not isinstance(exc, Exception):
                 raise  # a cancel goes up at once; the next commit puts the index back first
-            landed = await self._landed(target, before, exc)
+            landed = await self._landed(target, git_dir, tree, before, exc, message=message, author=author)
             if landed is not None:
                 return landed
             await self._reset_after_failure(git_dir, tree, born=born)
@@ -618,18 +618,45 @@ class GitAdapter:
         )
         return [name for name in result.stdout.decode("utf-8", "replace").split("\0") if name]
 
-    async def _landed(self, target: GitTarget, before: str | None, error: Exception) -> str | None:
-        """The new HEAD when a failed commit step still moved it: git was stopped after it wrote the ref,
-        so the commit exists and is the answer (evidence over claims). Callers serialise commits on one index
-        (the workspace lock), so a moved HEAD is this commit."""
+    async def _landed(
+        self,
+        target: GitTarget,
+        git_dir: Path,
+        tree: Path,
+        before: str | None,
+        error: Exception,
+        *,
+        message: str,
+        author: Author,
+    ) -> str | None:
+        """The new HEAD when a failed commit step still wrote this commit (git stopped after the ref), else
+        ``None`` and the original error stands. Evidence over claims: a moved HEAD answers only when it is
+        provably this commit (parent ``before``, this author, this message), never another writer's."""
+        reason = getattr(error, "reason", None)
         try:
             after = await self.current_commit(target)
+            if after is None or after == before:
+                return None
+            shown = await self._run(
+                ["log", "-1", "--format=%P%x00%ae%x00%B", after, "--"],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+            )
         except Exception:
-            logger.exception("git_head_unknown_after_failure", reason=getattr(error, "reason", None))
-            return None  # cannot tell: the original error stands
-        if after is None or after == before:
+            logger.exception("git_head_unknown_after_failure", reason=reason)
             return None
-        logger.warning("git_commit_landed_despite_error", reason=getattr(error, "reason", None))
+        parents, email, body = [*shown.stdout.decode("utf-8", "replace").split("\0", 2), "", ""][:3]
+        mine = (
+            parents.split() == ([before] if before is not None else [])
+            and email == author.email
+            and body.split() == message.split()  # git trims and collapses the message's whitespace
+        )
+        if not mine:
+            # Another writer moved HEAD: callers must serialise writers of one index (the workspace lock).
+            logger.error("git_head_moved_by_another_writer", reason=reason)
+            return None
+        logger.warning("git_commit_landed_despite_error", reason=reason)
         return after
 
     async def _reset_index(self, git_dir: Path, tree: Path, *, born: bool) -> None:

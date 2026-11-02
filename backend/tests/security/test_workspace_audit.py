@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.gitops.adapter import GitAdapter
 from app.gitops.errors import GitError
+from app.services import workspace_api
 from app.workspace.fs import Workspace
 from tests.integration.test_git_api import post_json, raw
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
@@ -169,3 +170,54 @@ async def test_a_write_that_fails_after_the_request_was_cancelled_is_logged(
             assert "RuntimeError" in out
             return
     pytest.fail("the failure of a write nobody awaits was not logged")
+
+
+async def test_shutdown_waits_for_writes_still_running(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AG-13 delta2 LOW: the loop cancels every task at shutdown; a write between its effect and its event
+    must be waited for first, or the M1 window opens again."""
+    project = await blank(owner)
+    repo = repo_of(workspace_root, project)
+    current = sha((repo / "README.md").read_bytes())
+    written, release = asyncio.Event(), asyncio.Event()
+    write_file = Workspace.write_file
+
+    async def held(self: Workspace, *args: Any, **kwargs: Any) -> Any:
+        change = await write_file(self, *args, **kwargs)
+        written.set()
+        await release.wait()
+        return change
+
+    monkeypatch.setattr(Workspace, "write_file", held)
+    request = asyncio.create_task(put(owner, project, "README.md", "# saved\n", current))
+    await asyncio.wait_for(written.wait(), 10)
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    asyncio.get_running_loop().call_later(0.3, release.set)
+    await workspace_api.drain_writes(grace_s=10)
+    assert len(await workspace_events(engine, project, "workspace.file_written")) == 1
+
+
+async def test_the_app_drains_writes_at_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    from app import main
+    from app.core.config import load_settings
+    from tests.conftest import make_test_env
+
+    drained: list[float] = []
+
+    async def drain(grace_s: float = 30) -> None:
+        drained.append(grace_s)
+
+    monkeypatch.setattr(main, "drain_writes", drain)
+    application = main.create_app(load_settings(make_test_env(WORKSPACE_ROOT=str(workspace_root))))
+    async with application.router.lifespan_context(application):
+        assert drained == []
+    assert len(drained) == 1

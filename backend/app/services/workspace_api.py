@@ -210,11 +210,12 @@ async def read_file(
 _RUNNING: set[asyncio.Task[Any]] = set()  # writes that outlive their request: referenced until they end
 
 
-async def _to_the_end[T](work: Coroutine[Any, Any, T]) -> T:
+async def _to_the_end[T](work: Coroutine[Any, Any, T], *, project_id: uuid.UUID, action: str) -> T:
     """Run a write and its audit event to their end even if the request is cancelled (AG-13 M1): the change
     reaches the disk or git before its event, and must never be left without one. A cancel stops the request
-    from waiting, not the write; a failure nobody awaits any more is logged."""
-    task = asyncio.ensure_future(work)
+    from waiting, not the write; a failure nobody awaits any more is logged. Shutdown waits for these
+    (``drain_writes``)."""
+    task = asyncio.create_task(work, name=f"{action} {project_id}")
     _RUNNING.add(task)
     task.add_done_callback(_RUNNING.discard)
     try:
@@ -225,14 +226,30 @@ async def _to_the_end[T](work: Coroutine[Any, Any, T]) -> T:
 
 
 def _log_unawaited(task: asyncio.Task[Any]) -> None:
-    if task.cancelled():  # only at shutdown: the loop cancels every task
-        logger.error("workspace_write_cancelled_after_cancel")
+    write = task.get_name()  # "<action> <project_id>"
+    if task.cancelled():  # only at shutdown, past the drain's grace: the loop cancels every task
+        logger.error("workspace_write_cancelled_after_cancel", write=write)
         return
     error = task.exception()
     if isinstance(error, AppError):  # an answer (409, 400, ...) nobody reads any more
-        logger.warning("workspace_write_failed_after_cancel", error=error.code, reason=_reason(error))
+        logger.warning(
+            "workspace_write_failed_after_cancel", write=write, error=error.code, reason=_reason(error)
+        )
     elif error is not None:
-        logger.error("workspace_write_failed_after_cancel", error=type(error).__name__, exc_info=error)
+        logger.error(
+            "workspace_write_failed_after_cancel", write=write, error=type(error).__name__, exc_info=error
+        )
+
+
+async def drain_writes(grace_s: float = 30) -> None:
+    """At shutdown: let writes that outlived their request reach their audit event before the loop cancels
+    every task (AG-13 delta2). What is still running after ``grace_s`` is logged by name."""
+    if _RUNNING:
+        _, pending = await asyncio.wait(set(_RUNNING), timeout=grace_s)
+        if pending:
+            logger.error(
+                "workspace_writes_unfinished_at_shutdown", writes=sorted(task.get_name() for task in pending)
+            )
 
 
 async def _audit(
@@ -290,7 +307,7 @@ async def write_file(
         )
         return change
 
-    return await _to_the_end(write())
+    return await _to_the_end(write(), project_id=project_id, action="workspace.file_written")
 
 
 async def create(
@@ -325,7 +342,7 @@ async def create(
         await _audit(env, actor, project_id, "workspace.file_created", metadata)
         return created
 
-    return await _to_the_end(write())
+    return await _to_the_end(write(), project_id=project_id, action="workspace.file_created")
 
 
 async def delete_file(
@@ -345,7 +362,7 @@ async def delete_file(
             {"path": change.path, "old_sha256": change.old_sha256},
         )
 
-    await _to_the_end(write())
+    await _to_the_end(write(), project_id=project_id, action="workspace.file_deleted")
 
 
 async def apply_patch(
@@ -386,7 +403,7 @@ async def apply_patch(
         )
         return changes
 
-    return await _to_the_end(write())
+    return await _to_the_end(write(), project_id=project_id, action="workspace.patch_applied")
 
 
 # --- git reads ----------------------------------------------------------------------------------------------
@@ -462,7 +479,8 @@ async def create_branch(
         await _audit(env, actor, project_id, "git.branch_created", {"name": name, "head": head})
         return head
 
-    return Branch(name=name, head=await _to_the_end(write()), is_task_branch=False)
+    head = await _to_the_end(write(), project_id=project_id, action="git.branch_created")
+    return Branch(name=name, head=head, is_task_branch=False)
 
 
 async def commit(
@@ -488,7 +506,7 @@ async def commit(
             await _record_commit(env, actor, project_id, repo.target, sha, paths)
         return sha
 
-    sha = await _to_the_end(write())
+    sha = await _to_the_end(write(), project_id=project_id, action="git.commit")
     if sha is None:
         raise _conflict("nothing_to_commit")
     return sha
