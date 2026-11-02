@@ -7,15 +7,17 @@ Every endpoint with a project id is listed in ``ENDPOINTS``; a new one must be a
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable, Iterator
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from redis.asyncio import Redis
-from sqlalchemy import update
+from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.routing import BaseRoute
 
 from app.core.config import load_settings
 from app.core.db import make_sessionmaker
@@ -93,16 +95,41 @@ async def call(
     return await client.request(method, path, json=body, headers=headers(client))
 
 
-def test_every_project_route_is_in_the_matrix(app: FastAPI) -> None:
-    # From the OpenAPI schema: included routers are not flattened into app.routes in this FastAPI.
-    routes = {
-        (method.upper(), path)
-        for path, item in app.openapi()["paths"].items()
+def all_routes(routes: Iterable[BaseRoute], prefix: str = "") -> Iterator[tuple[str, APIRoute]]:
+    """(full path, route) for every route the app serves, hidden ones too (``include_in_schema=False``
+    is not in OpenAPI)."""
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield prefix + route.path, route
+        nested = getattr(route, "original_router", None)  # an included router in this FastAPI
+        if nested is not None:
+            context = getattr(route, "include_context", None)
+            yield from all_routes(nested.routes, prefix + getattr(context, "prefix", ""))
+
+
+def project_routes(app: FastAPI) -> dict[tuple[str, str], APIRoute]:
+    return {
+        (method, path): route
+        for path, route in all_routes(app.router.routes)
         if "{project_id}" in path
-        for method in item
+        for method in (route.methods or set()) - {"HEAD"}
     }
+
+
+def test_every_project_route_is_in_the_matrix(app: FastAPI) -> None:
     listed = {(method, path.replace("{id}", "{project_id}")) for method, path, _ in ENDPOINTS}
-    assert routes == listed
+    assert set(project_routes(app)) == listed
+
+
+def test_every_project_route_has_the_project_door(app: FastAPI) -> None:
+    """The first door (SECURITY_MODEL §8) is a dependency of the route, not a habit of its body."""
+    for key, route in project_routes(app).items():
+        guards = [
+            dependency.call
+            for dependency in route.dependant.dependencies
+            if getattr(dependency.call, "__qualname__", "").startswith("require_project_permission.")
+        ]
+        assert guards, f"{key} has no require_project_permission dependency"
 
 
 @pytest.mark.parametrize(("method", "path", "body"), ENDPOINTS)
@@ -159,3 +186,64 @@ async def test_a_malformed_id_is_a_plain_404_or_422(world: dict[str, object]) ->
     assert isinstance(owner, httpx.AsyncClient)
     response = await owner.get("/api/v1/projects/not-a-uuid")
     assert response.status_code in {404, 422}
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"), [*ENDPOINTS, ("POST", "/api/v1/projects", {"name": "x"})]
+)
+async def test_signed_out_is_401_on_every_route(
+    app: FastAPI, method: str, path: str, body: dict[str, object] | None
+) -> None:
+    transport = httpx.ASGITransport(app=app)
+    # A matching double-submit pair without a session: past the CSRF middleware, to the auth door.
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver", cookies={"kk_csrf": "t" * 43}
+    ) as anonymous:
+        sent = {"X-CSRF-Token": "t" * 43, "Idempotency-Key": str(uuid.uuid4())}
+        response = await anonymous.request(method, path.format(id=uuid.uuid4()), json=body, headers=sent)
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHENTICATED"
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        *[(m, p, b) for m, p, b in ENDPOINTS if (m, p) in WRITES],
+        ("POST", "/api/v1/projects", {"name": "x", "source": {"type": "blank"}}),
+    ],
+)
+async def test_a_write_without_the_csrf_token_is_refused(
+    world: dict[str, object], method: str, path: str, body: dict[str, object] | None
+) -> None:
+    project = world["project"]
+    owner = world["owner"]
+    assert isinstance(project, dict) and isinstance(owner, httpx.AsyncClient)
+    sent = {"Idempotency-Key": str(uuid.uuid4())}
+    response = await owner.request(method, path.format(id=project["id"]), json=body, headers=sent)
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "CSRF_FAILED"
+    after = (await owner.get(f"/api/v1/projects/{project['id']}")).json()["data"]
+    assert (after["name"], after["status"]) == ("Secret Plan", "active")
+
+
+async def test_a_global_role_counts_inside_a_project_it_was_granted(
+    world: dict[str, object], app: FastAPI, engine: AsyncEngine
+) -> None:
+    """Pins API_CONTRACTS §2 as written: a global role applies in every project the user holds a role in.
+
+    A global admin given ``readonly`` on a project can therefore write it. AG-13 flagged this as a surprise
+    for an owner who granted "readonly"; the PO decides (tracker, WP-2.1a). Until then this test pins it.
+    """
+    project = world["project"]
+    assert isinstance(project, dict)
+    admin = world["admin"]
+    assert isinstance(admin, httpx.AsyncClient)
+    async with make_sessionmaker(engine)() as session:
+        admin_id = (
+            await session.execute(text("SELECT id FROM users WHERE email = 'adi@example.test'"))
+        ).scalar_one()
+    await grant(engine, admin_id, "readonly", f"project:{project['id']}")
+    response = await admin.patch(
+        f"/api/v1/projects/{project['id']}", json={"description": "x"}, headers=headers(admin)
+    )
+    assert response.status_code == 200, response.text

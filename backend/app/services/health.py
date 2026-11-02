@@ -22,6 +22,7 @@ from app.core.db import make_engine, make_sessionmaker
 from app.core.logging import get_logger
 from app.gitops.adapter import GitAdapter
 from app.sandbox.client import HttpSandboxClient
+from app.services.projects import CreateGate
 
 ReadinessCheck = Callable[[], Awaitable[bool]]
 
@@ -48,6 +49,7 @@ class Dependencies:
     migration_heads: frozenset[str]
     sessions: async_sessionmaker[AsyncSession]
     git: GitAdapter = field(default_factory=GitAdapter)
+    project_creates: CreateGate = field(default_factory=CreateGate)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Dependencies:

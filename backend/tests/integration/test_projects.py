@@ -7,6 +7,7 @@ Workspaces live under a per-test ``WORKSPACE_ROOT``. The cross-project matrix is
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
 import sys
 import uuid
@@ -17,20 +18,24 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from redis.asyncio import Redis
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.audit import AuditWriter
 from app.core.config import load_settings
 from app.core.db import make_sessionmaker
+from app.core.errors import AppError
+from app.core.rbac import RoleGrant
 from app.core.redaction import Redactor
 from app.core.security import hash_password
 from app.gitops.adapter import GitAdapter
 from app.gitops.errors import GitError
 from app.main import create_app
 from app.models.audit import AuditEvent
+from app.models.enums import TASK_STATUSES
 from app.models.identity import User, UserRole
 from app.models.projects import Project, Repository
+from app.services import projects
 from app.services.users import create_owner
 from tests.conftest import make_test_env, reset_data
 
@@ -157,11 +162,16 @@ async def test_create_blank(owner: httpx.AsyncClient, workspace_root: Path, engi
     assert data["stats"]["last_commit"] == git(repo, "rev-parse", "HEAD")
 
     async with make_sessionmaker(engine)() as session:
+        # audit_events is append-only and never reset: always filter on this test's resource.
         events = (
-            await session.scalars(select(AuditEvent).where(AuditEvent.action == "project.create"))
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "project.create", AuditEvent.resource_id == data["id"]
+                )
+            )
         ).all()
-    assert [(e.resource_id, e.result, e.metadata_) for e in events] == [
-        (data["id"], "success", {"source": "blank"})
+    assert [(e.result, e.metadata_, e.ip) for e in events] == [
+        ("success", {"source": "blank"}, "203.0.113.10")
     ]
 
 
@@ -208,7 +218,8 @@ async def test_a_failed_git_step_leaves_no_row_and_no_folder(
 
     monkeypatch.setattr(GitAdapter, "commit_all", broken)
     response = await create(owner)
-    assert response.status_code == 409
+    # Infrastructure, not the request: a 5xx, which the idempotency store does not keep for a retry.
+    assert response.status_code == 500
     assert response.json()["error"]["code"] == "GIT_ERROR"
     assert entries(workspace_root) == []
     async with make_sessionmaker(engine)() as session:
@@ -222,6 +233,9 @@ async def test_a_failed_git_step_leaves_no_row_and_no_folder(
         {"name": "   ", "source": {"type": "blank"}},
         {"name": "a\nb", "source": {"type": "blank"}},
         {"name": "x" * 121, "source": {"type": "blank"}},
+        {"name": "Tira\u202eevil", "source": {"type": "blank"}},  # bidi override: displays as another name
+        {"name": "a\u200bb", "source": {"type": "blank"}},  # zero width space
+        {"name": "a\x85b", "source": {"type": "blank"}},  # C1 control
         {"name": "ok", "description": "d" * 2001, "source": {"type": "blank"}},
         {"name": "ok", "source": {"type": "template", "template_id": "no-such-template"}},
         {"name": "ok", "source": {"type": "template", "template_id": "../python-basic"}},
@@ -319,21 +333,33 @@ async def test_patch_updates_metadata_but_never_the_slug(
     assert data["settings"] == {"plan_approval_required": True}
     second = await owner.patch(url, json={"settings": {"auto_remediation": False}}, headers=headers(owner))
     assert second.json()["data"]["settings"] == {"plan_approval_required": True, "auto_remediation": False}
+    # The same value again changes nothing, so it is not audited as a change.
+    same = await owner.patch(url, json={"settings": {"auto_remediation": False}}, headers=headers(owner))
+    assert same.status_code == 200
     for bad in (
         {"settings": {"budget": 5}},
         {"name": ""},
         {"slug": "x"},
         {"settings": {"auto_remediation": "yes"}},
+        {"settings": None},
+        {"settings": {"auto_remediation": None}},
+        {"name": None},
     ):
         refused = await owner.patch(url, json=bad, headers=headers(owner))
         assert refused.status_code == 422, bad
     async with make_sessionmaker(engine)() as session:
         updates = (
-            await session.scalars(select(AuditEvent).where(AuditEvent.action == "project.update"))
+            await session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.action == "project.update", AuditEvent.resource_id == created["id"])
+                .order_by(AuditEvent.id)
+            )
         ).all()
-    assert [sorted(e.metadata_["fields"]) for e in updates] == [
-        ["description", "name", "settings"],
-        ["settings"],
+    # Settings are booleans, never secret: the audit records the new values (an approval control turned
+    # off must leave its value on record).
+    assert [e.metadata_ for e in updates] == [
+        {"fields": ["description", "name", "settings"], "settings": {"plan_approval_required": True}},
+        {"fields": ["settings"], "settings": {"auto_remediation": False}},
     ]
 
 
@@ -374,10 +400,6 @@ async def test_service_refuses_unknown_settings_even_without_the_route(
     app: FastAPI, owner: httpx.AsyncClient, owner_id: uuid.UUID, workspace_root: Path, engine: AsyncEngine
 ) -> None:
     """Workers and agents call the service directly: it checks settings itself, not only the route."""
-    from app.core.errors import AppError
-    from app.core.rbac import RoleGrant
-    from app.services import projects
-
     created = (await create(owner)).json()["data"]
     deps = app.state.dependencies
     env = projects.ProjectEnv(deps.sessions, AuditWriter(Redactor()), deps.git, workspace_root)
@@ -396,3 +418,240 @@ async def test_service_refuses_unknown_settings_even_without_the_route(
             env, actor, uuid.UUID(created["id"]), projects.ProjectChanges(fields=frozenset({"slug"}))
         )
     assert unknown_field.value.code == "VALIDATION_ERROR"
+
+
+# --- review gaps: the all-or-nothing invariant (spec anti-goal) -------------------------------------------
+
+
+def service_env(app: FastAPI, workspace_root: Path) -> projects.ProjectEnv:
+    deps = app.state.dependencies
+    return projects.ProjectEnv(deps.sessions, AuditWriter(Redactor()), deps.git, workspace_root)
+
+
+def owner_actor(owner_id: uuid.UUID) -> projects.Actor:
+    return projects.Actor(owner_id, OWNER[0], "Tira", (RoleGrant("owner", "global"),))
+
+
+async def counts(engine: AsyncEngine) -> tuple[int, int]:
+    async with make_sessionmaker(engine)() as session:
+        return (
+            await session.scalar(select(func.count()).select_from(Project)) or 0,
+            await session.scalar(select(func.count()).select_from(Repository)) or 0,
+        )
+
+
+async def test_a_commit_that_applied_but_raised_keeps_the_folder(
+    owner: httpx.AsyncClient, workspace_root: Path, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The COMMIT reached the server and the reply was lost: the row exists, so the folder must stay."""
+    armed = False
+    audit = projects._audit  # pyright: ignore[reportPrivateUsage]
+    commit = AsyncSession.commit
+
+    async def arming_audit(*args: object, **kwargs: object) -> None:
+        nonlocal armed
+        await audit(*args, **kwargs)  # type: ignore[arg-type]
+        armed = True  # the next commit is the create's own
+
+    async def lost_reply(self: AsyncSession) -> None:
+        nonlocal armed
+        await commit(self)
+        if armed:
+            armed = False
+            raise ConnectionResetError("reply lost")
+
+    monkeypatch.setattr(projects, "_audit", arming_audit)
+    monkeypatch.setattr(AsyncSession, "commit", lost_reply)
+    # An unhandled error: the test transport raises it where a server would answer 500.
+    with pytest.raises(ConnectionResetError):
+        await create(owner)
+    assert await counts(engine) == (1, 1)
+    [folder] = entries(workspace_root)
+    assert (folder / "repo" / ".git").is_dir()
+
+
+async def test_a_failing_session_close_still_removes_the_folder(
+    owner: httpx.AsyncClient, workspace_root: Path, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The connection dies with the create: the session's own cleanup raises, the folder still goes."""
+    armed = False
+    close = AsyncSession.close
+
+    async def broken(*_: object, **__: object) -> str | None:
+        nonlocal armed
+        armed = True
+        raise GitError("commit_failed")
+
+    async def failing_close(self: AsyncSession) -> None:
+        nonlocal armed
+        await close(self)
+        if armed:
+            armed = False
+            raise RuntimeError("connection is closed")
+
+    monkeypatch.setattr(GitAdapter, "commit_all", broken)
+    monkeypatch.setattr(AsyncSession, "close", failing_close)
+    with pytest.raises(RuntimeError):
+        await create(owner)
+    assert entries(workspace_root) == []
+    assert await counts(engine) == (0, 0)
+
+
+async def test_a_cancelled_create_leaves_no_row_and_no_folder(
+    app: FastAPI,
+    owner_id: uuid.UUID,
+    workspace_root: Path,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+
+    async def hangs(*_: object, **__: object) -> str | None:
+        started.set()
+        await asyncio.Event().wait()
+        return None
+
+    monkeypatch.setattr(GitAdapter, "commit_all", hangs)
+    task = asyncio.create_task(
+        projects.create_project(
+            service_env(app, workspace_root),
+            owner_actor(owner_id),
+            name="Cancelled",
+            description=None,
+            source=projects.BlankSource(),
+            default_branch="main",
+        )
+    )
+    await asyncio.wait_for(started.wait(), 10)
+    assert len(entries(workspace_root)) == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.gather(*projects._settling)  # pyright: ignore[reportPrivateUsage]
+    assert entries(workspace_root) == []
+    assert await counts(engine) == (0, 0)
+
+
+# --- review gaps: reads, lists, limits ---------------------------------------------------------------------
+
+
+async def test_open_tasks_counts_only_unfinished_tasks(
+    owner: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    created = (await create(owner)).json()["data"]
+    async with make_sessionmaker(engine)() as session:
+        for status in sorted(TASK_STATUSES):
+            task_id = uuid.uuid4()
+            await session.execute(
+                text(
+                    "INSERT INTO tasks (id, project_id, title, prompt, workflow_type, created_by) "
+                    "VALUES (:id, :project, 't', 'p', 'create', :user)"
+                ),
+                {"id": task_id, "project": created["id"], "user": owner_id},
+            )
+            # Test setup only: place the task in ``status`` past the writer backstop.
+            await session.execute(text("SELECT set_config('kk.status_writer', 'transition', true)"))
+            await session.execute(
+                text("UPDATE tasks SET status = :s WHERE id = :id"), {"s": status, "id": task_id}
+            )
+            await session.execute(text("SELECT set_config('kk.status_writer', '', true)"))
+        await session.commit()
+    data = (await owner.get(f"{PROJECTS}/{created['id']}")).json()["data"]
+    closed = {"completed", "failed", "cancelled", "rejected"}
+    assert data["stats"]["open_tasks"] == len(set(TASK_STATUSES) - closed) == 9
+
+
+async def test_a_missing_repository_is_reported_not_hidden(
+    owner: httpx.AsyncClient, workspace_root: Path
+) -> None:
+    created = (await create(owner)).json()["data"]
+    shutil.rmtree(workspace_root / created["id"])
+    data = (await owner.get(f"{PROJECTS}/{created['id']}")).json()["data"]
+    assert (data["repository"]["sync_state"], data["repository"]["error"]) == ("error", "repository_missing")
+    assert data["stats"]["last_commit"] is None
+    [listed] = (await owner.get(PROJECTS)).json()["data"]
+    assert (listed["repository"]["sync_state"], listed["repository"]["error"]) == (
+        "error",
+        "repository_missing",
+    )
+    # An update still answers for the change it made.
+    renamed = await owner.patch(
+        f"{PROJECTS}/{created['id']}", json={"name": "Renamed"}, headers=headers(owner)
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["data"]["repository"]["error"] == "repository_missing"
+
+
+async def test_list_is_paginated(owner: httpx.AsyncClient) -> None:
+    for name in ("One", "Two", "Three"):
+        assert (await create(owner, name)).status_code == 201
+    first = (await owner.get(PROJECTS, params={"page_size": 2})).json()
+    assert len(first["data"]) == 2
+    assert first["meta"] == {"page": 1, "page_size": 2, "total": 3}
+    second = (await owner.get(PROJECTS, params={"page_size": 2, "page": 2})).json()
+    assert [p["name"] for p in second["data"]] == ["One"]  # newest first
+    assert second["meta"] == {"page": 2, "page_size": 2, "total": 3}
+    assert (await owner.get(PROJECTS)).json()["meta"] == {"page": 1, "page_size": 50, "total": 3}
+    for bad in ({"page_size": 201}, {"page_size": 0}, {"page": 0}):
+        assert (await owner.get(PROJECTS, params=bad)).status_code == 422, bad
+
+
+async def test_search_refuses_control_characters(owner: httpx.AsyncClient) -> None:
+    response = await owner.get(PROJECTS, params={"q": "a\x00b"})
+    assert response.status_code == 422  # never reaches PostgreSQL (a NUL there is a 500)
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+async def test_an_idempotent_retry_creates_one_project(owner: httpx.AsyncClient, engine: AsyncEngine) -> None:
+    sent = headers(owner)
+    body = {"name": "Once", "source": {"type": "blank"}}
+    first = await owner.post(PROJECTS, json=body, headers=sent)
+    again = await owner.post(PROJECTS, json=body, headers=sent)
+    assert (first.status_code, again.status_code) == (201, 201)
+    assert again.json()["data"]["id"] == first.json()["data"]["id"]
+    assert await counts(engine) == (1, 1)
+
+
+async def test_creates_are_rate_limited_per_user(
+    owner: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(projects, "CREATE_RATE_LIMIT", 2)
+    assert [(await create(owner, f"P{i}")).status_code for i in range(2)] == [201, 201]
+    refused = await create(owner, "P3")
+    assert refused.status_code == 429
+    assert refused.json()["error"]["code"] == "RATE_LIMITED"
+    assert int(refused.headers["retry-after"]) > 0
+
+
+async def test_a_refused_remote_import_is_audited(
+    owner: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine
+) -> None:
+    response = await create(owner, source={"type": "git_https", "url": "https://github.com/a/b.git"})
+    assert response.status_code == 403
+    async with make_sessionmaker(engine)() as session:
+        events = (
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "project.create",
+                    AuditEvent.actor_id == str(owner_id),
+                    AuditEvent.result == "denied",
+                )
+            )
+        ).all()
+    assert [(e.metadata_, e.ip) for e in events] == [
+        ({"source": "git_https", "reason": "remote_import_disabled"}, "203.0.113.10")
+    ]
+
+
+def test_author_is_what_git_accepts_and_a_reader_sees() -> None:
+    user = uuid.uuid4()
+
+    def author(email: str, name: str) -> tuple[str, str]:
+        found = projects._author(projects.Actor(user, email, name, ()))  # pyright: ignore[reportPrivateUsage]
+        return found.name, found.email
+
+    assert author("tira@example.test", "Tira <x>") == ("Tira x", "tira@example.test")
+    # git refuses a name made only of punctuation: fall back to the address, then to a fixed name.
+    assert author("tira@example.test", "';") == ("tira", "tira@example.test")
+    assert author("..@example.test", "';") == ("KodeKantor user", "..@example.test")
+    assert author("tira@example.test", "Ti\u202era") == ("Tira", "tira@example.test")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated
@@ -16,6 +17,7 @@ from app.core.rbac import ALL_PERMISSIONS, GLOBAL_ONLY_PERMISSIONS, RoleGrant, h
 from app.models.identity import Session, User
 from app.services.auth import Sessions, resolve_session
 from app.services.health import Dependencies
+from app.services.projects import Actor, authorize
 
 
 @dataclass(frozen=True)
@@ -68,12 +70,39 @@ async def current_user(request: Request, sessions: SessionsDep) -> AuthContext:
 CurrentUser = Annotated[AuthContext, Depends(current_user)]
 
 
+def current_actor(ctx: CurrentUser, ip: ClientIp) -> Actor:
+    """The signed-in user as the services see them; the IP goes into every audit event."""
+    return Actor(ctx.user.id, ctx.user.email, ctx.user.display_name, tuple(ctx.grants), ip=ip)
+
+
+CurrentActor = Annotated[Actor, Depends(current_actor)]
+
+
+def require_project_permission(permission: str) -> Callable[..., Awaitable[Actor]]:
+    """First door of a ``/projects/{project_id}`` route (SECURITY_MODEL §8, T6).
+
+    404 when the project is outside the user's scope (its existence never leaks), 403 inside the scope
+    without the permission. The service decides again with the same ``authorize``.
+    """
+    if permission not in ALL_PERMISSIONS:
+        raise ValueError(f"unknown permission {permission!r}")
+    if permission in GLOBAL_ONLY_PERMISSIONS:
+        raise ValueError(f"{permission!r} is a global permission; use require_permission")
+
+    async def guard(project_id: uuid.UUID, actor: CurrentActor, sessions: SessionsDep) -> Actor:
+        async with sessions() as session:
+            await authorize(session, actor, project_id, permission)
+        return actor
+
+    return guard
+
+
 def require_permission(permission: str) -> Callable[..., Awaitable[AuthContext]]:
-    """Guard for global-only permissions. Project permissions need the project id (WP-2.1)."""
+    """Guard for global-only permissions. Project permissions: ``require_project_permission``."""
     if permission not in ALL_PERMISSIONS:
         raise ValueError(f"unknown permission {permission!r}")
     if permission not in GLOBAL_ONLY_PERMISSIONS:
-        raise ValueError(f"{permission!r} is a project permission; check it with the project id")
+        raise ValueError(f"{permission!r} is a project permission; use require_project_permission")
 
     async def guard(ctx: CurrentUser) -> AuthContext:
         if not has_permission(ctx.grants, permission, user_id=ctx.user.id):
