@@ -353,6 +353,10 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - `compose.e2e.yml` belum ada.
 63. **Cakupan WP-1.4 (WP-1.4b).** WBS WP-1.4 dan rencana lanjutan U10 memasukkan layar dashboard, projects, agents, dan approvals. Backend baru punya route `auth` dan `health`, jadi layar itu hanya bisa dibangun di atas mock. Keputusan Lead: WP-1.4b berisi login, logout, lupa/reset/ganti password, penjaga sesi, dan menu pengguna; layar lain dibangun bersama WP backend-nya (WP-2.1, WP-3.1, WP-INT-03) dalam satu PR.
 64. **Email reset password belum ada (WP-1.4b).** Alur lupa password mengandaikan email, tetapi pengiriman email dijadwalkan di P1. Backend hanya mencetak tautan ke log pada `APP_ENV=development`; produksi tidak mengirim apa pun. Layar tidak mengklaim "terkirim" dan menyuruh menghubungi admin. Perlu keputusan PO: majukan email ke P0, atau sediakan reset oleh admin/CLI.
+65. **Cakupan WP-2.1 (WP-2.1a).** WBS WP-2.1 mencakup projects, workspace/git, search/index, knowledge, dashboard, admin, dan audit sekaligus. Keputusan Lead: WP-2.1 dipecah menjadi 2.1a–2.1e (P0: projects inti, import arsip, workspace/git API, indeks/pencarian, dashboard). Yang ditunda:
+    - hapus project (FR-018, R3) menunggu tabel dan handler approval (WP-3.1);
+    - import `git_https` (FR-016, P1) menunggu egress internet dan gate G4; `api` tidak berada di network `outbound`, jadi clone dilakukan worker;
+    - knowledge (M16) dan admin user/policy serta audit viewer (M20) berprioritas P1, dikerjakan setelah jalur P0.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
