@@ -309,19 +309,23 @@
         "import_git_failed": "Repository tidak bisa dibuat dari arsip ini (git gagal).",
         "import_failed": "Impor gagal karena kesalahan server.",
         "import_not_started": "Arsip diterima, tetapi impor tidak bisa dimulai. Coba lagi.",
-        "import_incomplete": "Impor terhenti sebelum selesai. Unggah arsip lagi."
+        "import_incomplete": "Impor terhenti sebelum selesai. Unggah arsip lagi.",
+        "import_expired": "Impor menunggu terlalu lama dan dibatalkan. Unggah arsip lagi."
       },
       "conflict": {
         "import_running": "Impor lain untuk project ini sedang berjalan.",
         "repository_not_empty": "Project ini sudah punya repository.",
         "not_an_upload_project": "Project ini tidak dibuat dari arsip.",
-        "project_archived": "Project ini diarsipkan. Aktifkan dulu."
+        "project_archived": "Project ini diarsipkan. Aktifkan dulu.",
+        "import_expired": "Unggahan ini kehabisan waktu sebelum selesai. Unggah lagi.",
+        "cleanup_failed": "Sisa impor sebelumnya tidak bisa dibersihkan. Hubungi admin platform."
       },
       "uploadingTitle": "Mengunggah arsip…",
       "heldFile": "File terakhir: {{name}} ({{size}}). Kirim ulang file yang sama, atau pilih file lain.",
       "slow": "Impor masih berjalan. Anda boleh meninggalkan halaman ini; statusnya terlihat di daftar project.",
       "runningHere": "Impor arsip untuk project ini sedang berjalan.",
-      "openList": "Buka daftar project"
+      "openList": "Buka daftar project",
+      "stalled": "Unggahan terhenti sebelum selesai. Coba lagi."
     }
   }
 }

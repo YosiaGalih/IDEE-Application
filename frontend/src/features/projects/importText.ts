@@ -20,12 +20,15 @@ const ERRORS = {
   import_failed: "projects.import.error.import_failed",
   import_not_started: "projects.import.error.import_not_started",
   import_incomplete: "projects.import.error.import_incomplete",
+  import_expired: "projects.import.error.import_expired",
 } as const;
 export const CONFLICTS = {
   import_running: "projects.import.conflict.import_running",
   repository_not_empty: "projects.import.conflict.repository_not_empty",
   not_an_upload_project: "projects.import.conflict.not_an_upload_project",
   project_archived: "projects.import.conflict.project_archived",
+  import_expired: "projects.import.conflict.import_expired",
+  cleanup_failed: "projects.import.conflict.cleanup_failed",
 } as const;
 
 const has = <T extends object>(table: T, key: string): key is Extract<keyof T, string> =>

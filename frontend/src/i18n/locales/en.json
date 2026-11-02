@@ -309,19 +309,23 @@
         "import_git_failed": "A repository could not be made from this archive (git failed).",
         "import_failed": "The import failed because of a server error.",
         "import_not_started": "The archive was received, but the import could not start. Try again.",
-        "import_incomplete": "The import stopped before it finished. Upload the archive again."
+        "import_incomplete": "The import stopped before it finished. Upload the archive again.",
+        "import_expired": "The import waited too long and was dropped. Upload the archive again."
       },
       "conflict": {
         "import_running": "Another import of this project is running.",
         "repository_not_empty": "This project already has a repository.",
         "not_an_upload_project": "This project was not created from an archive.",
-        "project_archived": "This project is archived. Restore it first."
+        "project_archived": "This project is archived. Restore it first.",
+        "import_expired": "This upload ran out of time before it finished. Upload it again.",
+        "cleanup_failed": "What an earlier import left behind could not be cleared. Contact the platform admin."
       },
       "uploadingTitle": "Uploading the archive…",
       "heldFile": "Last file: {{name}} ({{size}}). Send the same file again, or choose another.",
       "slow": "The import is still running. You can leave this page; the project list shows its status.",
       "runningHere": "An archive import for this project is running.",
-      "openList": "Open the project list"
+      "openList": "Open the project list",
+      "stalled": "The upload stopped before it finished. Try again."
     }
   }
 }

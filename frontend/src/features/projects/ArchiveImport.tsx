@@ -193,6 +193,10 @@ function uploadErrorText(error: unknown, t: ReturnType<typeof useTranslation>["t
     const reason = conflictReason(error.details);
     if (reason) return { title: t(CONFLICTS[reason]), body: null, requestId: error.requestId };
   }
+  if (error instanceof ApiError && error.status === 408) {
+    // The server stopped waiting for the body (stalled or cut off); it kept nothing, so a new try is safe.
+    return { title: t("projects.import.stalled"), body: null, requestId: error.requestId };
+  }
   if (error instanceof ApiError && error.status === 413) {
     // Also the gateway's own 413 page (no envelope): the body limit in front of the API.
     return { title: t("projects.errors.archiveTooLarge"), body: null, requestId: error.requestId };

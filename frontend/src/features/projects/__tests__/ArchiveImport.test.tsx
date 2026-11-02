@@ -411,6 +411,52 @@ describe("ProjectsPage with upload projects", () => {
     ).toBeNull();
   });
 
+  it.each([
+    ["import_expired", id.projects.import.conflict.import_expired],
+    ["cleanup_failed", id.projects.import.conflict.cleanup_failed],
+  ])("says why the server refused the upload: %s", async (reason, text) => {
+    server.use(
+      signedIn(),
+      http.get(`${API}/projects/:projectId`, () =>
+        ok(project({ repository: repo("error", "import_incomplete") })),
+      ),
+      http.post(`${API}/projects/:projectId/imports`, () =>
+        HttpResponse.json(
+          {
+            request_id: "r-409",
+            status: "failed",
+            error: { code: "CONFLICT", message: "no", details: [{ reason }] },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderApp(`/projects/${PROJECT_ID}/import`);
+    await userEvent.upload(await screen.findByLabelText(id.projects.new.archiveFile), zip());
+    await userEvent.click(screen.getByRole("button", { name: id.projects.import.upload }));
+    expect(await screen.findByText(text)).toBeInTheDocument();
+  });
+
+  it("says the upload stopped when the server answers 408", async () => {
+    server.use(
+      signedIn(),
+      http.get(`${API}/projects/:projectId`, () =>
+        ok(project({ repository: repo("error", "import_incomplete") })),
+      ),
+      http.post(`${API}/projects/:projectId/imports`, () => fail(408, "BAD_REQUEST")),
+    );
+    renderApp(`/projects/${PROJECT_ID}/import`);
+    await userEvent.upload(await screen.findByLabelText(id.projects.new.archiveFile), zip());
+    await userEvent.click(screen.getByRole("button", { name: id.projects.import.upload }));
+    expect(await screen.findByText(id.projects.import.stalled)).toBeInTheDocument();
+  });
+
+  it("says an import that waited too long was dropped", async () => {
+    backend({ read: () => ok(project({ repository: repo("error", "import_expired") })) });
+    renderApp(`/projects/${PROJECT_ID}/import`);
+    expect(await screen.findByText(id.projects.import.error.import_expired)).toBeInTheDocument();
+  });
+
   it("refuses an upload that the server answers 413", async () => {
     server.use(
       signedIn(),
