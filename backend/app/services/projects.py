@@ -484,7 +484,11 @@ async def _create_project(
         async with env.sessions() as session:
             try:
                 # Bounded wait: one stuck create must not hold the owner's other creates forever.
-                await session.execute(text(f"SET LOCAL lock_timeout = '{SLUG_LOCK_TIMEOUT_S}s'"))
+                # set_config(..., true) is SET LOCAL with a bound value (no SQL built from strings).
+                await session.execute(
+                    text("SELECT set_config('lock_timeout', :timeout, true)"),
+                    {"timeout": f"{SLUG_LOCK_TIMEOUT_S}s"},
+                )
                 # Serialise creations by the same owner so two requests never pick the same slug.
                 await session.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),

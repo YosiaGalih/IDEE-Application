@@ -655,3 +655,26 @@ def test_author_is_what_git_accepts_and_a_reader_sees() -> None:
     assert author("tira@example.test", "';") == ("tira", "tira@example.test")
     assert author("..@example.test", "';") == ("KodeKantor user", "..@example.test")
     assert author("tira@example.test", "Ti\u202era") == ("Tira", "tira@example.test")
+
+
+async def test_a_stuck_create_of_the_same_owner_is_answered_429(
+    owner: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process holds this owner's slug lock: the wait is bounded, never forever."""
+    monkeypatch.setattr(projects, "SLUG_LOCK_TIMEOUT_S", 1)
+    async with engine.connect() as holder:
+        await holder.execute(
+            text("SELECT pg_advisory_lock(hashtextextended(:key, 0))"), {"key": f"project-slug:{owner_id}"}
+        )
+        try:
+            # Bounded here too: without the server's timeout this would wait forever, not fail.
+            response = await asyncio.wait_for(create(owner), 15)
+        finally:
+            await holder.execute(
+                text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+                {"key": f"project-slug:{owner_id}"},
+            )
+    assert response.status_code == 429, response.text
+    assert response.json()["error"]["code"] == "RATE_LIMITED"
+    assert response.headers["retry-after"] == "1"
+    assert await counts(engine) == (0, 0)
