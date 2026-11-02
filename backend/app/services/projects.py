@@ -249,6 +249,11 @@ def _author(actor: Actor) -> Author:
     return Author(name, email)
 
 
+def commit_author(actor: Actor) -> Author:
+    """The user as the author of a commit KodeKantor makes for them (create, import)."""
+    return _author(actor)
+
+
 def repo_path(root: Path, project_id: uuid.UUID) -> Path:
     return root / str(project_id) / "repo"
 
@@ -458,13 +463,25 @@ async def create_project(
 
 
 async def _enforce_create_rate(env: ProjectEnv, actor: Actor) -> None:
+    await enforce_rate(
+        env,
+        actor,
+        scope="project-create",
+        limit=CREATE_RATE_LIMIT,
+        window_s=CREATE_RATE_WINDOW_S,
+        message="Too many projects created; try again later",
+    )
+
+
+async def enforce_rate(
+    env: ProjectEnv, actor: Actor, *, scope: str, limit: int, window_s: int, message: str
+) -> None:
+    """Per-user fixed window in Redis; fails closed (503) when the limiter cannot answer."""
     if env.limiter is None:
         return
     try:
         decision = await env.limiter.hit(
-            f"kk:rl:project-create:{actor.user_id}",
-            limit=CREATE_RATE_LIMIT,
-            window_seconds=CREATE_RATE_WINDOW_S,
+            f"kk:rl:{scope}:{actor.user_id}", limit=limit, window_seconds=window_s
         )
     except RateLimiterUnavailable:
         # Fail closed, as login does: an unenforced limit is not a limit.
@@ -472,12 +489,9 @@ async def _enforce_create_rate(env: ProjectEnv, actor: Actor) -> None:
             "DEPENDENCY_UNAVAILABLE", "A required dependency is unavailable", http_status=503
         ) from None
     if not decision.allowed:
-        logger.warning("rate_limited", scope="project-create", user_id=str(actor.user_id))
+        logger.warning("rate_limited", scope=scope, user_id=str(actor.user_id))
         raise AppError(
-            "RATE_LIMITED",
-            "Too many projects created; try again later",
-            http_status=429,
-            headers={"Retry-After": str(decision.retry_after)},
+            "RATE_LIMITED", message, http_status=429, headers={"Retry-After": str(decision.retry_after)}
         )
 
 
