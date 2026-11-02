@@ -364,6 +364,11 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
       - tambah job 3.13 dan perbaiki perilakunya, atau
       - hapus "CI juga 3.13" dari aturan dan pin `.python-version` 3.12.
     - Sampai diputuskan, `uv sync` tanpa pin dapat memilih 3.13 dan memberi hasil T2 yang berbeda.
+67. **Sumber `upload` untuk project dari arsip (WP-2.1b).**
+    - API_CONTRACTS §3 `POST /projects` hanya mencantumkan sumber `blank`, `template`, `git_https`. Endpoint `POST /projects/{id}/imports` butuh project yang sudah ada, dan DATA_MODEL `repositories.provider` sudah punya nilai `upload`.
+    - Keputusan Lead: tambah `{type:"upload"}`. Project dibuat dengan `sync_state = importing` tanpa folder workspace, lalu arsip diunggah ke `/imports`.
+    - Import ke project blank/template ditolak (409 `repository_not_empty`, FR-015 "tanpa overwrite").
+    - Usulan perubahan kontrak: tambahkan sumber `upload` di §3, dan `error` repository berisi kode (`archive_rejected:<reason>`, `import_git_failed`, `import_failed`, `import_not_started`, `import_incomplete`).
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
