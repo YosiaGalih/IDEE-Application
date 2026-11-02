@@ -26,7 +26,8 @@ from app.models.projects import Project
 from tests.conftest import make_test_env, reset_data
 from tests.integration.test_projects import OWNER, create, grant, headers, make_user, signed_in
 
-# (method, path template, json body) for every route under /projects/{project_id}.
+# (method, path template, json body) for every route under /projects/{project_id}. ``{path}`` stands for a
+# file path inside the repository (the route's ``{path:path}``).
 ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("GET", "/api/v1/projects/{id}", None),
     ("PATCH", "/api/v1/projects/{id}", {"name": "Taken"}),
@@ -34,7 +35,10 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("POST", "/api/v1/projects/{id}/unarchive", None),
     ("GET", "/api/v1/projects/{id}/stack", None),
     ("POST", "/api/v1/projects/{id}/imports", None),  # the door answers before the body is read
+    ("GET", "/api/v1/projects/{id}/tree", None),
+    ("GET", "/api/v1/projects/{id}/files/{path}", None),
 ]
+FILE = "README.md"  # exists in every blank project
 WRITES = {
     ("PATCH", "/api/v1/projects/{id}"),
     ("POST", "/api/v1/projects/{id}/archive"),
@@ -119,7 +123,10 @@ def project_routes(app: FastAPI) -> dict[tuple[str, str], APIRoute]:
 
 
 def test_every_project_route_is_in_the_matrix(app: FastAPI) -> None:
-    listed = {(method, path.replace("{id}", "{project_id}")) for method, path, _ in ENDPOINTS}
+    listed = {
+        (method, path.replace("{id}", "{project_id}").replace("{path}", "{path:path}"))
+        for method, path, _ in ENDPOINTS
+    }
     assert set(project_routes(app)) == listed
 
 
@@ -143,12 +150,12 @@ async def test_endpoint_denies_other_users_project(
     assert isinstance(project, dict)
     client = world[who]
     assert isinstance(client, httpx.AsyncClient)
-    response = await call(client, method, path.format(id=project["id"]), body)
+    response = await call(client, method, path.format(id=project["id"], path=FILE), body)
     assert response.status_code == 404, response.text
     assert response.json()["error"]["code"] == "NOT_FOUND"
     assert "Secret Plan" not in response.text
     # Same answer as an id that does not exist at all: nothing tells them apart.
-    missing = await call(client, method, path.format(id=uuid.uuid4()), body)
+    missing = await call(client, method, path.format(id=uuid.uuid4(), path=FILE), body)
     assert (missing.status_code, missing.json()["error"]) == (404, response.json()["error"])
 
 
@@ -159,7 +166,7 @@ async def test_project_scoped_reader_reads_but_cannot_write(
     project = world["project"]
     reader = world["reader"]
     assert isinstance(project, dict) and isinstance(reader, httpx.AsyncClient)
-    response = await call(reader, method, path.format(id=project["id"]), body)
+    response = await call(reader, method, path.format(id=project["id"], path=FILE), body)
     if (method, path) in WRITES:
         assert response.status_code == 403, response.text
         assert response.json()["error"]["code"] == "FORBIDDEN"
@@ -177,7 +184,7 @@ async def test_deleted_project_is_gone_even_for_its_owner(
     async with make_sessionmaker(engine)() as session:
         await session.execute(update(Project).where(Project.id == project["id"]).values(status="deleted"))
         await session.commit()
-    response = await call(owner, method, path.format(id=project["id"]), body)
+    response = await call(owner, method, path.format(id=project["id"], path=FILE), body)
     assert response.status_code == 404
     listed = (await owner.get("/api/v1/projects", params={"status": "all"})).json()["data"]
     assert listed == []
@@ -202,7 +209,9 @@ async def test_signed_out_is_401_on_every_route(
         transport=transport, base_url="http://testserver", cookies={"kk_csrf": "t" * 43}
     ) as anonymous:
         sent = {"X-CSRF-Token": "t" * 43, "Idempotency-Key": str(uuid.uuid4())}
-        response = await anonymous.request(method, path.format(id=uuid.uuid4()), json=body, headers=sent)
+        response = await anonymous.request(
+            method, path.format(id=uuid.uuid4(), path=FILE), json=body, headers=sent
+        )
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "UNAUTHENTICATED"
 
@@ -221,7 +230,7 @@ async def test_a_write_without_the_csrf_token_is_refused(
     owner = world["owner"]
     assert isinstance(project, dict) and isinstance(owner, httpx.AsyncClient)
     sent = {"Idempotency-Key": str(uuid.uuid4())}
-    response = await owner.request(method, path.format(id=project["id"]), json=body, headers=sent)
+    response = await owner.request(method, path.format(id=project["id"], path=FILE), json=body, headers=sent)
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "CSRF_FAILED"
     after = (await owner.get(f"/api/v1/projects/{project['id']}")).json()["data"]
