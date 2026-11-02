@@ -449,6 +449,94 @@ async def test_a_timeout_leaves_no_index_lock(
     assert await git.commit(repo, "recovered", ME) is not None
 
 
+@pytest.mark.parametrize(("step", "reason"), [("restore", "timeout"), ("add", "output_too_large")])
+async def test_every_kill_leaves_no_index_lock(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch, step: str, reason: str
+) -> None:
+    """AG-13 L1: the first reset is a git run too, and an output cap kills git like a timeout does."""
+    write(repo.repo / "a.txt", "a\n")
+    raw_git(repo, "add", "a.txt")  # left staged by an earlier run: the first reset has work to do
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+    lock = repo.repo / ".git" / "index.lock"
+
+    async def killed(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == step:
+            lock.write_text("")
+            raise GitError(reason)
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", killed)
+    with pytest.raises(GitError):
+        await git.commit(repo, "killed", ME)
+    monkeypatch.undo()
+    assert not lock.exists()
+    assert await git.commit(repo, "recovered", ME) is not None
+
+
+async def test_a_cancelled_commit_leaves_no_index_lock(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AG-13 L1: ``_run`` kills git on a cancel too; the lock it held must not block every later commit."""
+    write(repo.repo / "a.txt", "a\n")
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+    lock = repo.repo / ".git" / "index.lock"
+    holding = asyncio.Event()
+
+    async def hangs(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "add":
+            lock.write_text("")  # git holds the index lock ...
+            holding.set()
+            await asyncio.sleep(30)  # ... until the cancel kills it
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", hangs)
+    committing = asyncio.create_task(git.commit(repo, "cancelled", ME))
+    await asyncio.wait_for(holding.wait(), 5)
+    committing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await committing
+    monkeypatch.undo()
+    assert not lock.exists()
+    assert await git.commit(repo, "recovered", ME) is not None
+
+
+async def test_a_commit_that_landed_is_returned_though_git_was_stopped(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AG-13 M1: git killed after it wrote the ref; HEAD moved, so the commit exists and is the answer."""
+    write(repo.repo / "a.txt", "a\n")
+    before = await git.current_commit(repo)
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+
+    async def stopped(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        result = await run(self, args, **kwargs)  # type: ignore[arg-type]
+        if args[0] == "commit":
+            raise GitError("timeout")
+        return result
+
+    monkeypatch.setattr(GitAdapter, "_run", stopped)
+    sha = await git.commit(repo, "landed", ME)
+    monkeypatch.undo()
+    assert sha is not None and sha != before
+    assert sha == await git.current_commit(repo)
+    assert await git.commit_files(repo, sha) == ["a.txt"]
+
+
+async def test_an_unborn_index_that_differs_from_the_file_is_reset(tmp_path: Path, git: GitAdapter) -> None:
+    """AG-13 I-d: ``rm --cached`` refuses an entry that differs from both the file and HEAD."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    await git.init(root, "main")
+    target = GitTarget(root)
+    write(root / "a.txt", "staged\n")
+    raw_git(target, "add", "a.txt")
+    write(root / "a.txt", "edited after staging\n")
+    write(root / "b.txt", "b\n")
+    sha = await git.commit(target, "first", ME, paths=["b.txt"])
+    assert sha is not None
+    assert await git.commit_files(target, sha) == ["b.txt"]
+
+
 async def test_commit_files_lists_what_the_commit_holds(git: GitAdapter, repo: GitTarget) -> None:
     write(repo.repo / "a.txt", "a\n")
     write(repo.repo / "d" / "b.txt", "b\n")

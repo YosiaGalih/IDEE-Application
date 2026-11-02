@@ -568,13 +568,15 @@ class GitAdapter:
         git_dir, tree = await self._adirs(target)
         if target.worktree is None:
             await asyncio.to_thread(_ensure_excludes, git_dir)
-        # The commit holds exactly what this call stages: whatever an earlier, failed run left in the index is
-        # put back to HEAD first, and again if this run fails.
-        await self._reset_index(target, git_dir, tree)
+        before = await self.current_commit(target)
+        born = before is not None
         try:
+            # The commit holds exactly what this call stages: whatever an earlier, failed run left in the
+            # index is put back to HEAD first.
+            await self._reset_index(git_dir, tree, born=born)
             await self._run(["add", "-A", "--", *selected], git_dir=git_dir, work_tree=tree, cwd=tree)
             for path in excluded:
-                await self._unstage(target, git_dir, tree, path)
+                await self._unstage(git_dir, tree, path, born=born)
             staged = await self._run(
                 ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
                 git_dir=git_dir,
@@ -592,12 +594,14 @@ class GitAdapter:
                 env=_identity_env(author, self.committer),
             )
         except BaseException as exc:
-            if isinstance(exc, GitError) and exc.reason == "timeout":
-                # This adapter killed git (SIGKILL): an index.lock it held is ours to remove, or every later
-                # commit fails. Callers serialise commits on one index (the workspace lock).
+            if _killed_git(exc):
                 await asyncio.to_thread(_remove_index_lock, git_dir)
-            with contextlib.suppress(Exception):
-                await self._reset_index(target, git_dir, tree)
+            if not isinstance(exc, Exception):
+                raise  # a cancel goes up at once; the next commit puts the index back first
+            landed = await self._landed(target, before, exc)
+            if landed is not None:
+                return landed
+            await self._reset_after_failure(git_dir, tree, born=born)
             raise
         return await self.current_commit(target)
 
@@ -614,7 +618,21 @@ class GitAdapter:
         )
         return [name for name in result.stdout.decode("utf-8", "replace").split("\0") if name]
 
-    async def _reset_index(self, target: GitTarget, git_dir: Path, tree: Path) -> None:
+    async def _landed(self, target: GitTarget, before: str | None, error: Exception) -> str | None:
+        """The new HEAD when a failed commit step still moved it: git was stopped after it wrote the ref,
+        so the commit exists and is the answer (evidence over claims). Callers serialise commits on one index
+        (the workspace lock), so a moved HEAD is this commit."""
+        try:
+            after = await self.current_commit(target)
+        except Exception:
+            logger.exception("git_head_unknown_after_failure", reason=getattr(error, "reason", None))
+            return None  # cannot tell: the original error stands
+        if after is None or after == before:
+            return None
+        logger.warning("git_commit_landed_despite_error", reason=getattr(error, "reason", None))
+        return after
+
+    async def _reset_index(self, git_dir: Path, tree: Path, *, born: bool) -> None:
         """Put the whole index back to HEAD (empty before the first commit); no-op when nothing is staged."""
         staged = await self._run(
             ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
@@ -625,22 +643,32 @@ class GitAdapter:
         )
         if staged.returncode == 0:
             return
-        if await self.current_commit(target) is None:
-            command = ["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", "."]
-        else:
-            command = ["restore", "--staged", "--", "."]
+        # ``rm --cached`` refuses an entry that differs from both the file and HEAD; ``read-tree`` does not.
+        command = ["restore", "--staged", "--", "."] if born else ["read-tree", "--empty"]
         await self._run(command, git_dir=git_dir, work_tree=tree, cwd=tree)
 
-    async def _unstage(self, target: GitTarget, git_dir: Path, tree: Path, path: str) -> None:
+    async def _reset_after_failure(self, git_dir: Path, tree: Path, *, born: bool) -> None:
+        """Leave nothing staged by a failed commit. A failure here is logged, not raised over the commit's own
+        error: the next commit resets the index before it stages anything."""
+        try:
+            await self._reset_index(git_dir, tree, born=born)
+        except BaseException as exc:
+            if _killed_git(exc):
+                await asyncio.to_thread(_remove_index_lock, git_dir)
+            if not isinstance(exc, Exception):
+                raise
+            logger.warning("git_index_reset_failed", reason=getattr(exc, "reason", type(exc).__name__))
+
+    async def _unstage(self, git_dir: Path, tree: Path, path: str, *, born: bool) -> None:
         """Put ``path``'s index entries back to HEAD (none at all before the first commit). Nothing to do
         when the index has none: ``restore`` would fail on a pathspec that matches nothing."""
         listed = await self._run(["ls-files", "-z", "--", path], git_dir=git_dir, work_tree=tree, cwd=tree)
         if not listed.stdout:
             return
-        if await self.current_commit(target) is None:
-            command = ["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", path]
-        else:
+        if born:
             command = ["restore", "--staged", "--", path]
+        else:
+            command = ["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", path]
         await self._run(command, git_dir=git_dir, work_tree=tree, cwd=tree)
 
     async def create_worktree(self, repo: Path, path: Path, branch: str, base: str) -> GitTarget:
@@ -759,6 +787,15 @@ def _ensure_excludes(git_dir: Path) -> None:
         separator = "" if current.endswith("\n") or not current else "\n"
         with exclude.open("a") as handle:
             handle.write(separator + "".join(f"{pattern}\n" for pattern in missing))
+
+
+def _killed_git(exc: BaseException) -> bool:
+    """``_run`` kills git (SIGKILL) on a timeout, past the output cap, and on a cancel: an ``index.lock`` git
+    held is left behind, and every later commit fails until it is gone. Callers serialise writers of one index
+    (the workspace lock), so that lock is ours to remove."""
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    return isinstance(exc, GitError) and exc.reason in ("timeout", "output_too_large")
 
 
 def _remove_index_lock(git_dir: Path) -> None:

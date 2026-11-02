@@ -20,8 +20,10 @@ import asyncio
 import os
 import re
 import uuid
+from collections.abc import Coroutine
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from sqlalchemy import select
 
@@ -205,6 +207,34 @@ async def read_file(
 # --- writes -------------------------------------------------------------------------------------------------
 
 
+_RUNNING: set[asyncio.Task[Any]] = set()  # writes that outlive their request: referenced until they end
+
+
+async def _to_the_end[T](work: Coroutine[Any, Any, T]) -> T:
+    """Run a write and its audit event to their end even if the request is cancelled (AG-13 M1): the change
+    reaches the disk or git before its event, and must never be left without one. A cancel stops the request
+    from waiting, not the write; a failure nobody awaits any more is logged."""
+    task = asyncio.ensure_future(work)
+    _RUNNING.add(task)
+    task.add_done_callback(_RUNNING.discard)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(_log_unawaited)
+        raise
+
+
+def _log_unawaited(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():  # only at shutdown: the loop cancels every task
+        logger.error("workspace_write_cancelled_after_cancel")
+        return
+    error = task.exception()
+    if isinstance(error, AppError):  # an answer (409, 400, ...) nobody reads any more
+        logger.warning("workspace_write_failed_after_cancel", error=error.code, reason=_reason(error))
+    elif error is not None:
+        logger.error("workspace_write_failed_after_cancel", error=type(error).__name__, exc_info=error)
+
+
 async def _audit(
     env: ProjectEnv,
     actor: Actor,
@@ -214,11 +244,10 @@ async def _audit(
     *,
     result: str = "success",
 ) -> None:
-    """One event per write (paths and shas, never content), written to its end even if the request is
-    cancelled: the change already happened on disk. A failed event is logged at error level, never turned into
-    a failed request the client would retry (and then get ``VERSION_CONFLICT``)."""
-
-    async def write() -> None:
+    """One event per write (paths and shas, never content). Callers run inside ``_to_the_end``, so a cancelled
+    request still gets its event. A failed event is logged at error level, never turned into a failed request
+    the client would retry (and then get ``VERSION_CONFLICT``)."""
+    try:
         await env.audit.write_detached(
             env.sessions,
             actor_type="user",
@@ -231,9 +260,6 @@ async def _audit(
             metadata=metadata,
             ip=actor.ip,
         )
-
-    try:
-        await asyncio.shield(asyncio.ensure_future(write()))
     except Exception:
         logger.exception("workspace_audit_failed", project_id=str(project_id), action=action)
 
@@ -250,17 +276,21 @@ async def write_file(
     """Save ``content`` if the file is still ``expected_sha256`` (``None``: it must not exist yet), else 409
     ``VERSION_CONFLICT`` (FR-029): a concurrent edit is never overwritten."""
     repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
-    change = await repo.workspace.write_file(
-        path, content, Access.USER_WRITE, expected_sha256=expected_sha256
-    )
-    await _audit(
-        env,
-        actor,
-        project_id,
-        "workspace.file_written",
-        {"path": change.path, "sha256": change.sha256, "old_sha256": change.old_sha256},
-    )
-    return change
+
+    async def write() -> FileChange:
+        change = await repo.workspace.write_file(
+            path, content, Access.USER_WRITE, expected_sha256=expected_sha256
+        )
+        await _audit(
+            env,
+            actor,
+            project_id,
+            "workspace.file_written",
+            {"path": change.path, "sha256": change.sha256, "old_sha256": change.old_sha256},
+        )
+        return change
+
+    return await _to_the_end(write())
 
 
 async def create(
@@ -274,24 +304,28 @@ async def create(
 ) -> str:
     """A new file (``content``, empty when ``None``) or folder; 409 ``CONFLICT`` when the path exists."""
     repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
-    if kind == "dir":
-        created = await repo.workspace.make_dir(path, Access.USER_WRITE)
-        metadata: dict[str, object] = {"path": created, "type": "dir"}
-    else:
-        try:
-            change = await repo.workspace.write_file(
-                path, content or "", Access.USER_WRITE, expected_sha256=None
-            )
-        except VersionConflict:
-            raise AlreadyExists() from None  # a file is there: the name is taken, nothing to reload
-        except PathViolation as exc:
-            if _reason(exc) == "not_regular":
-                raise AlreadyExists() from None  # a folder is there
-            raise
-        created = change.path
-        metadata = {"path": created, "type": "file", "sha256": change.sha256}
-    await _audit(env, actor, project_id, "workspace.file_created", metadata)
-    return created
+
+    async def write() -> str:
+        if kind == "dir":
+            created = await repo.workspace.make_dir(path, Access.USER_WRITE)
+            metadata: dict[str, object] = {"path": created, "type": "dir"}
+        else:
+            try:
+                change = await repo.workspace.write_file(
+                    path, content or "", Access.USER_WRITE, expected_sha256=None
+                )
+            except VersionConflict:
+                raise AlreadyExists() from None  # a file is there: the name is taken, nothing to reload
+            except PathViolation as exc:
+                if _reason(exc) == "not_regular":
+                    raise AlreadyExists() from None  # a folder is there
+                raise
+            created = change.path
+            metadata = {"path": created, "type": "file", "sha256": change.sha256}
+        await _audit(env, actor, project_id, "workspace.file_created", metadata)
+        return created
+
+    return await _to_the_end(write())
 
 
 async def delete_file(
@@ -300,14 +334,18 @@ async def delete_file(
     """Delete one file that is still ``expected_sha256``. Folders are refused by the workspace
     (``PATH_VIOLATION`` ``not_regular``); deleting folders is a v2.1 feature (§13.3 ``recursive``)."""
     repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
-    change = await repo.workspace.delete_file(path, Access.USER_WRITE, expected_sha256=expected_sha256)
-    await _audit(
-        env,
-        actor,
-        project_id,
-        "workspace.file_deleted",
-        {"path": change.path, "old_sha256": change.old_sha256},
-    )
+
+    async def write() -> None:
+        change = await repo.workspace.delete_file(path, Access.USER_WRITE, expected_sha256=expected_sha256)
+        await _audit(
+            env,
+            actor,
+            project_id,
+            "workspace.file_deleted",
+            {"path": change.path, "old_sha256": change.old_sha256},
+        )
+
+    await _to_the_end(write())
 
 
 async def apply_patch(
@@ -323,28 +361,32 @@ async def apply_patch(
             details=[{"loc": ["body", "target"], "msg": "only main until task worktrees exist"}],
         )
     repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
-    try:
-        changes = await repo.workspace.apply_patch(diff, Access.USER_WRITE)
-    except PatchRollbackFailed as exc:
-        # The tree is partly patched: that change must be on the record, not only in a log line.
-        paths = [str(detail.get("path")) for detail in exc.details or []]
+
+    async def write() -> list[FileChange]:
+        try:
+            changes = await repo.workspace.apply_patch(diff, Access.USER_WRITE)
+        except PatchRollbackFailed as exc:
+            # The tree is partly patched: that change must be on the record, not only in a log line.
+            paths = [str(detail.get("path")) for detail in exc.details or []]
+            await _audit(
+                env,
+                actor,
+                project_id,
+                "workspace.patch_applied",
+                {"reason": "rollback_failed", "paths": paths[:AUDIT_PATHS_MAX]},
+                result="error",
+            )
+            raise
         await _audit(
             env,
             actor,
             project_id,
             "workspace.patch_applied",
-            {"reason": "rollback_failed", "paths": paths[:AUDIT_PATHS_MAX]},
-            result="error",
+            {"files": len(changes), "paths": [change.path for change in changes[:AUDIT_PATHS_MAX]]},
         )
-        raise
-    await _audit(
-        env,
-        actor,
-        project_id,
-        "workspace.patch_applied",
-        {"files": len(changes), "paths": [change.path for change in changes[:AUDIT_PATHS_MAX]]},
-    )
-    return changes
+        return changes
+
+    return await _to_the_end(write())
 
 
 # --- git reads ----------------------------------------------------------------------------------------------
@@ -414,9 +456,13 @@ async def create_branch(
     repo = await open_repo(env, actor, project_id, "git:branch", write=True)
     if any(branch.name == name for branch in await env.git.branches(repo.target)):
         raise _conflict("branch_exists")
-    head = await env.git.create_branch(repo.target, name, from_ref or "HEAD")
-    await _audit(env, actor, project_id, "git.branch_created", {"name": name, "head": head})
-    return Branch(name=name, head=head, is_task_branch=False)
+
+    async def write() -> str:
+        head = await env.git.create_branch(repo.target, name, from_ref or "HEAD")
+        await _audit(env, actor, project_id, "git.branch_created", {"name": name, "head": head})
+        return head
+
+    return Branch(name=name, head=await _to_the_end(write()), is_task_branch=False)
 
 
 async def commit(
@@ -433,21 +479,48 @@ async def commit(
             details=[{"loc": ["body", "paths"], "msg": "path_excluded: .kk is never committed"}],
         )
     repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
-    async with repo.workspace.exclusive():
-        sha = await env.git.commit(repo.target, message, commit_author(actor), paths=paths)
+
+    async def write() -> str | None:
+        # The lock is taken inside: a cancelled request must not release it while git still runs.
+        async with repo.workspace.exclusive():
+            sha = await env.git.commit(repo.target, message, commit_author(actor), paths=paths)
+        if sha is not None:
+            await _record_commit(env, actor, project_id, repo.target, sha, paths)
+        return sha
+
+    sha = await _to_the_end(write())
     if sha is None:
         raise _conflict("nothing_to_commit")
-    files = await env.git.commit_files(repo.target, sha)
-    await _audit(
-        env,
-        actor,
-        project_id,
-        "git.commit",
-        {
-            "commit": sha,
-            "selected": len(paths) if paths is not None else None,  # None: the whole working tree
+    return sha
+
+
+async def _record_commit(
+    env: ProjectEnv,
+    actor: Actor,
+    project_id: uuid.UUID,
+    target: GitTarget,
+    sha: str,
+    paths: list[str] | None,
+) -> None:
+    """The commit is in git: its event is written whatever happens to the file list (AG-13 M1)."""
+    # selected None: the whole working tree was committed
+    metadata: dict[str, object] = {"commit": sha, "selected": len(paths) if paths is not None else None}
+    try:
+        files = await env.git.commit_files(target, sha)
+    except Exception as exc:
+        reason = _reason(exc) if isinstance(exc, AppError) else None
+        logger.error(
+            "git_commit_files_failed",
+            project_id=str(project_id),
+            commit=sha,
+            reason=reason,
+            error=type(exc).__name__,
+            exc_info=not isinstance(exc, AppError),
+        )
+        metadata |= {"files": None, "files_error": reason or type(exc).__name__, "paths": None}
+    else:
+        metadata |= {
             "files": len(files),
             "paths": files[:AUDIT_PATHS_MAX],  # what the commit holds, not what was asked for
-        },
-    )
-    return sha
+        }
+    await _audit(env, actor, project_id, "git.commit", metadata)

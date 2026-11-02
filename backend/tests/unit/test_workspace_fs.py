@@ -545,6 +545,35 @@ async def test_exclusive_cancel_is_prompt_and_leaks_nothing(ws: Workspace) -> No
             pass
 
 
+async def test_exclusive_cancel_while_opening_the_lock_file_leaks_no_fd(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AG-13 L2: the thread opening the lock file ends after the cancel; its fd must still be closed."""
+    import time
+
+    real = Workspace._lock_fd  # pyright: ignore[reportPrivateUsage]
+
+    def slow(self: Workspace) -> int:
+        time.sleep(0.2)
+        return real(self)
+
+    monkeypatch.setattr(Workspace, "_lock_fd", slow)
+
+    async def take() -> None:
+        async with ws.exclusive():
+            pass
+
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(3):
+        taking = asyncio.create_task(take())
+        await asyncio.sleep(0.05)  # inside the open
+        taking.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await taking
+    await asyncio.sleep(0.4)  # the threads finish their opens
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
 async def test_exclusive_releases_when_the_body_fails(ws: Workspace) -> None:
     with pytest.raises(RuntimeError):
         async with ws.exclusive():

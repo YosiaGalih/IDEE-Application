@@ -9,8 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.gitops.adapter import GitAdapter
+from app.workspace import fs
+from app.workspace.errors import WorkspaceBusy
 from app.workspace.fs import Workspace
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     app,
@@ -214,6 +218,39 @@ async def test_a_commit_waits_for_a_write_in_progress(
         await asyncio.sleep(0.5)
         assert not committing.done()
     assert (await committing).status_code == 201
+
+
+async def test_a_cancelled_commit_keeps_the_lock_until_git_ends(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The commit outlives a cancelled request (AG-13 M1), so its lock must too: no save lands mid-commit."""
+    project, repo = await project_with_repo(owner, workspace_root)
+    (repo / "a.txt").write_text("a\n")
+    inside, release = asyncio.Event(), asyncio.Event()
+    commit = GitAdapter.commit
+
+    async def held(self: GitAdapter, *args: Any, **kwargs: Any) -> str | None:
+        inside.set()
+        await release.wait()
+        return await commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(GitAdapter, "commit", held)
+    monkeypatch.setattr(fs, "LOCK_WAIT_S", 0.3)
+    request = asyncio.create_task(post_json(owner, project, "git/commit", {"message": "Cancelled"}))
+    await asyncio.wait_for(inside.wait(), 10)
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    with pytest.raises(WorkspaceBusy):
+        async with Workspace(repo).exclusive():
+            pass
+    release.set()
+    monkeypatch.setattr(fs, "LOCK_WAIT_S", 10.0)
+    async with Workspace(repo).exclusive():
+        pass
+    assert raw(repo, "log", "-1", "--format=%s") == "Cancelled"
 
 
 # --- review round -------------------------------------------------------------------------------------------

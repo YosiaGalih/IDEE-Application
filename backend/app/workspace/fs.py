@@ -147,6 +147,16 @@ class Current:
     size: int
 
 
+def _close_opened(opening: asyncio.Future[int]) -> None:
+    """Close the lock file that a cancelled ``exclusive()`` opened after it stopped waiting (no lock held)."""
+    if opening.cancelled():
+        return
+    if (error := opening.exception()) is not None:
+        logger.warning("workspace_lock_open_failed_after_cancel", error=type(error).__name__)
+        return
+    os.close(opening.result())
+
+
 def _bad_request(message: str) -> AppError:
     return AppError("BAD_REQUEST", message)
 
@@ -337,7 +347,12 @@ class Workspace:
         The wait polls a non-blocking ``flock`` from the event loop: a waiter holds no executor thread (the
         lock holder and every other project keep the pool), and a cancel takes effect at once.
         """
-        lock_fd = await asyncio.to_thread(self._lock_fd)
+        opening = asyncio.ensure_future(asyncio.to_thread(self._lock_fd))
+        try:
+            lock_fd = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            opening.add_done_callback(_close_opened)  # the thread still opens the file: close what it returns
+            raise
         try:
             deadline = time.monotonic() + LOCK_WAIT_S
             delay = 0.005
