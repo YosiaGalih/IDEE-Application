@@ -1288,6 +1288,7 @@ Spec: `docs/superpowers/specs/2026-11-02-wp-2.1c-workspace-git-api-design.md`. P
 | Syarat masuk AG-13 dari WP-2.1b | dipenuhi (konfirmasi AG-13 @ 6cabb4f): tidak ada penulis `sync_state` baru, tidak ada yang menghapus `repo/` |
 | CI @ 6cabb4f (implementasi) | 9/9 hijau |
 | CI @ 2bab00c (putaran review) | 9/9 hijau |
+| CI @ 3e5f1c7 (delta AG-13 kedua, head kode) | 9/9 hijau |
 | CI @ b733ecc (delta AG-13) | 9/9 hijau (`backend-lint`, `backend-types`, `backend-test`, `frontend`, `sandbox-test`, `sandbox-isolation`, `infra-config`, `security-scan`, `clean-install`) |
 
 #### Review WP-2.1c @ 6cabb4f: `kk-backend-reviewer` (**BLOCK**: 1 BLOCK, 6 SHOULD, 7 NIT), `kk-silent-failure-hunter` (1 HIGH, 6 MEDIUM, 8 LOW), AG-13 (**SIGNED OFF 🔒** @ 6cabb4f: 4 LOW, 8 INFO)
@@ -1343,5 +1344,22 @@ INFO delta kedua: I-2 (penumpukan tulis), I-3 (TOCTOU otorisasi), dan I-5 (aman 
 Tidak ditutup dari delta kedua (alasan):
 - **I-1:** idempotency membebaskan key saat request di-cancel walau tulisnya tetap berjalan; retry dengan key yang sama dijalankan lagi. Efek ganda tetap dicegah `expected_sha256`, `AlreadyExists`, `branch_exists`, `nothing_to_commit`; commit tanpa `paths` bisa membawa perubahan yang muncul belakangan. Jalur cancel ini tidak terpicu oleh disconnect di uvicorn [Kemungkinan Besar, AG-13].
 - **I-4:** bila `rev-parse`/`log` di `_landed` sendiri gagal tepat setelah `git commit` yang sudah menulis ref dihentikan, hasilnya 409 tanpa audit (dua kegagalan berurutan).
+
+#### Delta AG-13 @ 3e5f1c7: **SIGNED OFF 🔒** (0 CRITICAL/HIGH/MEDIUM/LOW, 4 INFO baru); kedua LOW @ b733ecc dikonfirmasi tertutup
+
+Bukti AG-13:
+- probe merge asing kini ditolak (`git_head_moved_by_another_writer`, error asli naik);
+- matriks HEAD asing ditolak semua: merge, orphan, root commit, `.mailmap`;
+- commit sendiri tetap diterima untuk spasi, CRLF, baris `#`, NBSP, dan pesan 5000 karakter;
+- urutan lifespan asli: `drain_writes` lalu `aclose`;
+- 5 test baru merah terhadap b733ecc;
+- suite penuh: 1585 passed, 1 skipped.
+
+| INFO | Keputusan |
+|---|---|
+| **I-8:** urutan `drain_writes` sebelum `aclose()` tidak dikunci test (mutan "drain setelah aclose" selamat) | **ditutup** (hanya test): `test_the_app_drains_writes_at_shutdown` mencatat urutan `["drain_writes", "aclose"]`; mutan itu kini merah |
+| **I-6:** `_landed` tidak bisa membedakan commit asing dengan email, pesan, dan parent yang sama | tidak ditutup: butuh dua pelanggaran sekaligus (aturan satu penulis dan identitas+pesan identik). **Syarat masuk** WP pemanggil `merge_branch`/commit worktree pertama: tambahkan bukti keempat "index sama dengan tree commit" (`diff --cached --quiet <sha>`) bersama pemanggil itu |
+| **I-7:** git membuang karakter "crud" di ujung email (`;`, `,`, `\`, kutip), sehingga commit sendiri yang mendarat ditolak → 409 tanpa audit | tidak ditutup: arahnya aman (bukan sukses palsu) dan butuh dua kondisi langka (email semacam itu dan git dihentikan tepat setelah ref ditulis). Usulan (Lead): perketat validasi email user (`services/users.py` hanya memeriksa `@`), atau bandingkan email lewat `git var GIT_AUTHOR_IDENT` |
+| **I-9:** grace drain (30 s + 30 s) lebih panjang dari `stop_grace_period` default Docker (10 s); sinyal kedua melewati lifespan | risiko sisa, tidak ditutup di WP ini (infra). Usulan (Lead): `stop_grace_period` service `api` ≥ grace drain di `infra/compose.yml`; penutupan penuh butuh outbox audit |
 
 Dibawa ke WP berikutnya (AG-13 I-b, syarat masuk): penghapusan `index.lock` dan reset index mengandaikan satu penulis per index. Pemanggil baru `GitAdapter.commit` di worktree task dan `merge_branch` di `repo/` (WP-3.x, merge queue) **wajib** memegang `Workspace(root).exclusive()`. I-e (I2, I5, I6) tetap di daftar "Tidak ditutup" di atas; I4 [Kemungkinan Besar] sudah dimitigasi desain sandbox (artefak di mount terpisah, `repo/` read-only), dikonfirmasi saat pembaca evidence dibuat.

@@ -211,13 +211,22 @@ async def test_the_app_drains_writes_at_shutdown(
     from app.core.config import load_settings
     from tests.conftest import make_test_env
 
-    drained: list[float] = []
+    steps: list[str] = []
 
     async def drain(grace_s: float = 30) -> None:
-        drained.append(grace_s)
+        steps.append("drain_writes")
 
     monkeypatch.setattr(main, "drain_writes", drain)
     application = main.create_app(load_settings(make_test_env(WORKSPACE_ROOT=str(workspace_root))))
+    dependencies = application.state.dependencies
+    aclose = dependencies.aclose
+
+    async def closing() -> None:
+        steps.append("aclose")
+        await aclose()
+
+    monkeypatch.setattr(dependencies, "aclose", closing)
     async with application.router.lifespan_context(application):
-        assert drained == []
-    assert len(drained) == 1
+        assert steps == []
+    # AG-13 I-8: the writes still need the database for their audit event, so they drain before it closes.
+    assert steps == ["drain_writes", "aclose"]
