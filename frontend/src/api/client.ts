@@ -85,7 +85,12 @@ export function apiUrl(path: string): URL {
 /** The bootstrap GET in flight, resolving to its failure (null when it got an answer). */
 let csrfBootstrap: Promise<unknown> | null = null;
 
-async function csrfToken(signal: AbortSignal, timeout: AbortSignal, caller?: AbortSignal): Promise<string> {
+/** Internal to `src/api` (also used by `apiUpload`). */
+export async function csrfToken(
+  signal: AbortSignal,
+  timeout: AbortSignal,
+  caller?: AbortSignal,
+): Promise<string> {
   const existing = readCookie(CSRF_COOKIE);
   if (existing) return existing;
   // One GET for all mutations waiting at once: two would each set a different cookie.
@@ -113,7 +118,7 @@ async function csrfToken(signal: AbortSignal, timeout: AbortSignal, caller?: Abo
   throw new ApiError({ kind: "csrf_missing", message: "The server did not issue a CSRF cookie" });
 }
 
-function abortKind(timeout: AbortSignal, caller?: AbortSignal): "timeout" | "aborted" | null {
+export function abortKind(timeout: AbortSignal, caller?: AbortSignal): "timeout" | "aborted" | null {
   if (timeout.aborted) return "timeout";
   if (caller?.aborted) return "aborted";
   return null;
@@ -153,19 +158,51 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
     throw fail({ kind: abortKind(timeout, options.signal) ?? "network", cause });
   }
 
-  const headerRequestId = response.headers.get("X-Request-ID");
-  const retryAfter = /^\d{1,6}$/.test(response.headers.get("Retry-After") ?? "")
-    ? Number(response.headers.get("Retry-After"))
+  return interpretResponse(
+    {
+      status: response.status,
+      ok: response.ok,
+      header: (name) => response.headers.get(name),
+      json: () => response.json(),
+    },
+    options.schema,
+    fail,
+    () => abortKind(timeout, options.signal),
+  );
+}
+
+/** What `interpretResponse` needs of an answer, from `fetch` or from an XHR upload. */
+export type RawResponse = {
+  status: number;
+  ok: boolean;
+  header: (name: string) => string | null;
+  json: () => Promise<unknown>;
+};
+
+/**
+ * The answer as the contract defines it (API_CONTRACTS §1): the failure envelope → `http` error with its
+ * code; anything else that is not the success envelope with data matching `schema` → `bad_response`.
+ * Internal to `src/api` (shared by `apiRequest` and `apiUpload`).
+ */
+export async function interpretResponse<T>(
+  response: RawResponse,
+  schema: z.ZodType<T>,
+  fail: (init: ConstructorParameters<typeof ApiError>[0]) => ApiError,
+  aborted: () => "timeout" | "aborted" | null,
+): Promise<ApiResult<T>> {
+  const headerRequestId = response.header("X-Request-ID");
+  const retryAfter = /^\d{1,6}$/.test(response.header("Retry-After") ?? "")
+    ? Number(response.header("Retry-After"))
     : null;
   let payload: unknown;
   try {
     payload = await response.json();
   } catch (cause) {
-    const aborted = abortKind(timeout, options.signal);
+    const kind = aborted();
     throw fail({
-      kind: aborted ?? "bad_response",
+      kind: kind ?? "bad_response",
       status: response.status,
-      message: aborted ? `Request ${aborted} while reading the response` : "Response is not JSON",
+      message: kind ? `Request ${kind} while reading the response` : "Response is not JSON",
       requestId: headerRequestId,
       retryAfterSeconds: retryAfter,
       cause,
@@ -195,7 +232,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions<T>): P
       retryAfterSeconds: retryAfter, // a gateway's own 429/503 page may still say when to retry
     });
   }
-  const data = options.schema.safeParse(success.data.data);
+  const data = schema.safeParse(success.data.data);
   if (!data.success) {
     throw fail({
       kind: "bad_response",

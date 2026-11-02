@@ -34,7 +34,8 @@
     "users": "Users",
     "policies": "Policies",
     "audit": "Audit",
-    "notFound": "Page not found"
+    "notFound": "Page not found",
+    "importArchive": "Import an archive"
   },
   "placeholder": {
     "body": "This screen is under construction. The foundation (API client, event stream, i18n, components) is ready."
@@ -245,7 +246,11 @@
       "outcomeUnknown": "The server's answer did not arrive, so the outcome is unknown: the project may have been created. Check the project list before retrying.",
       "errorSummary": "Check the marked fields.",
       "noTemplates": "No templates are available yet. Choose an empty project.",
-      "serverFieldSummary": "The server refused the marked fields."
+      "serverFieldSummary": "The server refused the marked fields.",
+      "archive": "Archive",
+      "archiveHint": "Upload a .zip, .tar or .tar.gz with your code.",
+      "archiveFile": "Archive file",
+      "archiveLimit": "Up to 200 MB, 1 GB extracted, 50,000 files. A .git folder is not accepted: make the archive without history (git archive)."
     },
     "errors": {
       "nameRequired": "Enter a project name.",
@@ -253,7 +258,10 @@
       "nameInvalid": "The name cannot contain control or invisible characters.",
       "descriptionTooLong": "Use at most 2000 characters.",
       "templateRequired": "Choose a template.",
-      "fieldRejected": "The server refused this value. Check it and try again."
+      "fieldRejected": "The server refused this value. Check it and try again.",
+      "archiveRequired": "Choose an archive file.",
+      "archiveTooLarge": "The archive is larger than 200 MB.",
+      "archiveType": "Only .zip, .tar, .tar.gz or .tgz."
     },
     "archived": "{{name}} archived.",
     "unarchived": "{{name}} is active again.",
@@ -265,6 +273,51 @@
       "previous": "Previous",
       "next": "Next",
       "status": "Page {{page}} of {{pages}} · {{total}} projects"
+    },
+    "import": {
+      "title": "Import an archive",
+      "subtitle": "The archive becomes this project's repository, with one initial commit.",
+      "uploading": "Uploading… {{percent}}%",
+      "importing": "Extracting and checking the archive…",
+      "progressLabel": "Upload progress",
+      "failedTitle": "Import failed",
+      "chooseAnother": "Choose another file",
+      "retry": "Try again",
+      "upload": "Upload",
+      "running": "Importing…",
+      "incomplete": "Import not finished",
+      "action": "Upload archive",
+      "actionOf": "Upload an archive for {{name}}",
+      "notWaiting": "This project is not waiting for an archive.",
+      "openWorkspace": "Open workspace",
+      "outcomeUnknown": "The upload's answer was lost. The archive may have been accepted; try again to be sure (it will not be imported twice).",
+      "reason": {
+        "format": "Not a readable zip/tar archive, or damaged, encrypted, or using an unsupported compression.",
+        "oversize": "The archive or its contents exceed the size limit (200 MB archive, 1 GB extracted).",
+        "ratio": "The compression ratio is too high (looks like an archive bomb).",
+        "too_many_files": "The archive has more than 50,000 entries.",
+        "link": "The archive contains a symlink or hardlink.",
+        "device": "The archive contains a special file (device or FIFO).",
+        "duplicate": "The archive has the same path twice, or a file where a folder is.",
+        "invalid_name": "The archive contains a file name that is not allowed.",
+        "traversal": "The archive contains a path that leaves the project folder (..).",
+        "absolute": "The archive contains an absolute path.",
+        "git_dir": "The archive contains a .git folder. Make it without history, e.g. with git archive.",
+        "empty": "The archive has no files.",
+        "unknown": "The archive was refused."
+      },
+      "error": {
+        "import_git_failed": "A repository could not be made from this archive (git failed).",
+        "import_failed": "The import failed because of a server error.",
+        "import_not_started": "The archive was received, but the import could not start. Try again.",
+        "import_incomplete": "The import stopped before it finished. Upload the archive again."
+      },
+      "conflict": {
+        "import_running": "Another import of this project is running.",
+        "repository_not_empty": "This project already has a repository.",
+        "not_an_upload_project": "This project was not created from an archive.",
+        "project_archived": "This project is archived. Restore it first."
+      }
     }
   }
 }

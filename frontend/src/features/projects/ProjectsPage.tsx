@@ -4,8 +4,10 @@ import {
   ArchiveRestore,
   ChevronLeft,
   ChevronRight,
+  Loader2,
   Plus,
   Search,
+  Upload,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -23,8 +25,9 @@ import { Label } from "@/components/ui/Label";
 import { StateView } from "@/components/ui/StateView";
 import { cn } from "@/lib/cn";
 import { describeError } from "@/lib/describeError";
-import { NEW_PROJECT_PATH, workspacePath } from "@/lib/paths";
+import { importPath, NEW_PROJECT_PATH, workspacePath } from "@/lib/paths";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
+import { importErrorText, isImportError } from "./importText";
 import { ProjectStatusBadge } from "./ProjectStatusBadge";
 
 const STATUS_FILTERS = ["active", "archived", "all"] as const;
@@ -197,12 +200,7 @@ export function ProjectsPage() {
                   <td className="px-4 py-3">
                     <div className="flex flex-wrap gap-1">
                       <ProjectStatusBadge status={project.status} />
-                      {project.repository?.sync_state === "error" ? (
-                        <Badge tone="warning" title={project.repository.error ?? undefined}>
-                          <AlertTriangle aria-hidden="true" className="size-3.5" />
-                          {t("projects.repositoryProblem")}
-                        </Badge>
-                      ) : null}
+                      <RepositoryBadge repository={project.repository} />
                     </div>
                   </td>
                   <td className="px-4 py-3 text-fg-muted">
@@ -210,7 +208,18 @@ export function ProjectsPage() {
                       {dateFormat.format(new Date(project.updated_at))}
                     </time>
                   </td>
-                  <td className="px-4 py-3 text-right">
+                  <td className="space-x-1 px-4 py-3 text-right">
+                    {canWrite && needsArchive(project) ? (
+                      <Button asChild variant="ghost" size="sm">
+                        <Link
+                          to={importPath(project.id)}
+                          aria-label={t("projects.import.actionOf", { name: project.name })}
+                        >
+                          <Upload aria-hidden="true" className="size-4" />
+                          {t("projects.import.action")}
+                        </Link>
+                      </Button>
+                    ) : null}
                     {canToggle ? (
                       <Button
                         variant="ghost"
@@ -331,5 +340,39 @@ export function ProjectsPage() {
       {announcement ? <Alert tone="success">{announcement}</Alert> : null}
       {body}
     </div>
+  );
+}
+
+/** An upload project whose import failed or stopped: the user can send an archive again. */
+const needsArchive = (project: Project) =>
+  project.repository?.provider === "upload" &&
+  project.repository.sync_state === "error" &&
+  isImportError(project.repository.error);
+
+function RepositoryBadge({ repository }: { repository: Project["repository"] }) {
+  const { t } = useTranslation();
+  if (repository?.sync_state === "importing") {
+    return (
+      <Badge tone="info">
+        <Loader2 aria-hidden="true" className="size-3.5" />
+        {t("projects.import.running")}
+      </Badge>
+    );
+  }
+  if (repository?.sync_state !== "error") return null;
+  if (isImportError(repository.error)) {
+    const incomplete = repository.error === "import_incomplete";
+    return (
+      <Badge tone="warning" title={importErrorText(repository.error, t)}>
+        <AlertTriangle aria-hidden="true" className="size-3.5" />
+        {t(incomplete ? "projects.import.incomplete" : "projects.import.failedTitle")}
+      </Badge>
+    );
+  }
+  return (
+    <Badge tone="warning" title={repository.error ?? undefined}>
+      <AlertTriangle aria-hidden="true" className="size-3.5" />
+      {t("projects.repositoryProblem")}
+    </Badge>
   );
 }

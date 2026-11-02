@@ -34,7 +34,8 @@
     "users": "Pengguna",
     "policies": "Kebijakan",
     "audit": "Audit",
-    "notFound": "Halaman tidak ditemukan"
+    "notFound": "Halaman tidak ditemukan",
+    "importArchive": "Impor arsip"
   },
   "placeholder": {
     "body": "Layar ini sedang dibangun. Fondasi (klien API, stream event, i18n, komponen) sudah siap."
@@ -245,7 +246,11 @@
       "outcomeUnknown": "Jawaban server tidak sampai, jadi hasilnya belum pasti: project mungkin sudah dibuat. Periksa daftar project sebelum mencoba lagi.",
       "errorSummary": "Periksa kembali isian yang ditandai.",
       "noTemplates": "Belum ada template yang tersedia. Pilih project kosong.",
-      "serverFieldSummary": "Server menolak isian yang ditandai."
+      "serverFieldSummary": "Server menolak isian yang ditandai.",
+      "archive": "Arsip",
+      "archiveHint": "Unggah .zip, .tar, atau .tar.gz berisi kode Anda.",
+      "archiveFile": "File arsip",
+      "archiveLimit": "Maksimal 200 MB, 1 GB setelah diekstrak, 50.000 file. Folder .git tidak diterima: buat arsip tanpa riwayat (git archive)."
     },
     "errors": {
       "nameRequired": "Isi nama project.",
@@ -253,7 +258,10 @@
       "nameInvalid": "Nama project tidak boleh berisi karakter kontrol atau karakter tak terlihat.",
       "descriptionTooLong": "Deskripsi maksimal 2000 karakter.",
       "templateRequired": "Pilih salah satu template.",
-      "fieldRejected": "Server menolak isian ini. Periksa lalu coba lagi."
+      "fieldRejected": "Server menolak isian ini. Periksa lalu coba lagi.",
+      "archiveRequired": "Pilih file arsip.",
+      "archiveTooLarge": "Arsip lebih besar dari 200 MB.",
+      "archiveType": "Hanya .zip, .tar, .tar.gz, atau .tgz."
     },
     "archived": "{{name}} diarsipkan.",
     "unarchived": "{{name}} aktif lagi.",
@@ -265,6 +273,51 @@
       "previous": "Sebelumnya",
       "next": "Berikutnya",
       "status": "Halaman {{page}} dari {{pages}} · {{total}} project"
+    },
+    "import": {
+      "title": "Impor arsip",
+      "subtitle": "Isi arsip menjadi repository project ini, dengan satu commit awal.",
+      "uploading": "Mengunggah… {{percent}}%",
+      "importing": "Mengekstrak dan memeriksa arsip…",
+      "progressLabel": "Kemajuan unggah",
+      "failedTitle": "Impor gagal",
+      "chooseAnother": "Pilih file lain",
+      "retry": "Coba lagi",
+      "upload": "Unggah",
+      "running": "Mengimpor…",
+      "incomplete": "Impor belum selesai",
+      "action": "Unggah arsip",
+      "actionOf": "Unggah arsip untuk {{name}}",
+      "notWaiting": "Project ini tidak menunggu arsip.",
+      "openWorkspace": "Buka workspace",
+      "outcomeUnknown": "Jawaban unggahan tidak sampai. Arsip mungkin sudah diterima; coba lagi untuk memastikan (tidak akan diimpor dua kali).",
+      "reason": {
+        "format": "Bukan arsip zip/tar yang bisa dibaca, atau rusak, terenkripsi, atau memakai kompresi yang tidak didukung.",
+        "oversize": "Arsip atau isinya melebihi batas ukuran (200 MB arsip, 1 GB setelah diekstrak).",
+        "ratio": "Rasio kompresi terlalu tinggi (mencurigakan sebagai bom arsip).",
+        "too_many_files": "Arsip berisi lebih dari 50.000 entri.",
+        "link": "Arsip berisi symlink atau hardlink.",
+        "device": "Arsip berisi file khusus (device atau FIFO).",
+        "duplicate": "Arsip berisi path yang sama dua kali, atau file di tempat folder.",
+        "invalid_name": "Arsip berisi nama file yang tidak diizinkan.",
+        "traversal": "Arsip berisi path yang keluar dari folder project (..).",
+        "absolute": "Arsip berisi path absolut.",
+        "git_dir": "Arsip berisi folder .git. Buat arsip tanpa riwayat, mis. dengan git archive.",
+        "empty": "Arsip tidak berisi file.",
+        "unknown": "Arsip ditolak."
+      },
+      "error": {
+        "import_git_failed": "Repository tidak bisa dibuat dari arsip ini (git gagal).",
+        "import_failed": "Impor gagal karena kesalahan server.",
+        "import_not_started": "Arsip diterima, tetapi impor tidak bisa dimulai. Coba lagi.",
+        "import_incomplete": "Impor terhenti sebelum selesai. Unggah arsip lagi."
+      },
+      "conflict": {
+        "import_running": "Impor lain untuk project ini sedang berjalan.",
+        "repository_not_empty": "Project ini sudah punya repository.",
+        "not_an_upload_project": "Project ini tidak dibuat dari arsip.",
+        "project_archived": "Project ini diarsipkan. Aktifkan dulu."
+      }
     }
   }
 }
