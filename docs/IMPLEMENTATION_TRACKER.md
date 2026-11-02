@@ -1253,6 +1253,25 @@ Tidak ditutup:
   - **WP-2.1c** (atau siapa pun yang menulis `repositories.sync_state` selain import): perlindungan `repo/` bertumpu pada event `project.import result=success` per job. Penulis status baru tidak boleh membuat `repo/` tanpa event itu terlihat sebagai publikasi yang gagal.
   - **WP retensi audit** (purge 365 hari, tracker §WP-1.1): event `project.import` success harus tetap ada selama project hidup, atau penanda basi dibersihkan dulu. Alternatifnya, saksi dipindah ke kolom tahan lama (mis. `repositories.import_job_id`, butuh migrasi).
 - **Tidak ditutup (INFO AG-13):**
-  - Mutan yang selamat untuk guard yang gagal dengan aman: `_claim_folder` menganggap semua hasil sebagai commit, `_take_back` tanpa `_keep`, tanpa `FOR SHARE`, tanpa timeout baca ulang, sapu tetap mengaudit saat hasil tidak terbaca.
+  - Mutan yang selamat untuk guard yang gagal dengan aman: `_claim_folder` menganggap semua hasil sebagai commit, `_take_back` tanpa `_keep`, tanpa timeout baca ulang, sapu tetap mengaudit saat hasil tidak terbaca. (Mutan tanpa `FOR SHARE` **tidak** gagal dengan aman; ditutup di delta c7222ee di bawah.)
   - Penantian row lock tanpa `lock_timeout`, sama dengan `_complete` dan `_settle_failure`; dibatasi `time_limit` 40 menit.
+
+#### Delta AG-13 @ c7222ee: **SIGNED OFF 🔒** (F1–F4 tertutup; 1 LOW, 3 INFO); CI @ c7222ee 9/9 hijau
+
+- **CI c7222ee:**
+  - `backend-test` "1424 passed"; `frontend` "Tests 313 passed (313)".
+  - `clean-install`: "project smoke: imported de03baaf-… from smoke.zip through the worker", restore drill dan egress probe lolos.
+  - `security-scan`: Semgrep 299 file, 6 WARNING lama, `gate: PASS (0 blocking)`.
+  - Image backend 50 HIGH tanpa fix, lolos lewat EX-02 (menunggu PO); pip-audit, `npm audit`, dan gitleaks bersih.
+- AG-13 memastikan `FOR SHARE` di `_is_ready` berada pada baris yang dikunci commit `ready` yang masih berjalan. `audit.write` mem-flush UPDATE `repositories` sebelum COMMIT, dan isolasinya READ COMMITTED.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| LOW (T9): `FOR SHARE` di `_is_ready` tanpa test; tracker keliru menyebut mutannya gagal dengan aman (tanpa `FOR SHARE`: `ready` dengan event success tetapi tanpa `repo/`) | probe AG-13 dijadikan test; test menutup sesi pemegang lock di `finally`, jadi mutan gagal tanpa menggantung; baris tracker dikoreksi | `test_the_read_back_waits_for_a_commit_still_settling[commit_lands, commit_rolls_back]`, `test_a_reply_lost_while_the_commit_settles_keeps_the_repository`; mutan tanpa `FOR SHARE` → 3 merah |
+
+- **Lokal:** `pytest -q` → **1426 passed, 1 skipped**; ruff, pyright, dan lint-imports bersih. Putaran ini hanya mengubah test dan dokumen; kode di bawah sign-off c7222ee tidak berubah.
+- **Syarat masuk WP-2.1c (tambahan AG-13, INFO-3):** hanya `_complete` yang boleh membawa project upload dari `importing` ke `ready`.
+- **Tidak ditutup:**
+  - INFO-1: mutan `_has_outcome` fail-closed tidak terdeteksi test. Kebijakannya "duplikat lebih baik daripada hasil hilang".
+  - INFO-2: job yang disalip dan sapu unggahan baru yang membaca bersamaan masih bisa menghasilkan dua hasil (duplikat, bukan hilang).
 

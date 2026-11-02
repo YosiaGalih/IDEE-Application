@@ -1825,3 +1825,101 @@ async def test_a_job_overtaken_after_the_sweep_gave_it_an_outcome_gets_no_second
     assert [(e.metadata_["job_id"], e.metadata_["reason"]) for e in events] == [
         (str(old_job), "import_incomplete")
     ]
+
+
+# --- AG-13 delta at c7222ee: the read-back waits for a commit still settling --------------------------------
+
+
+async def settle_like_complete(engine: AsyncEngine, project_id: uuid.UUID, job_id: uuid.UUID) -> AsyncSession:
+    """A transaction doing what ``_complete`` does, flushed to the server but not committed."""
+    settling = make_sessionmaker(engine)()
+    await settling.execute(select(Project).where(Project.id == project_id).with_for_update(key_share=True))
+    repository = await settling.scalar(select(Repository).where(Repository.project_id == project_id))
+    assert repository is not None and repository.sync_state == "importing"
+    repository.sync_state, repository.error = "ready", None
+    await AuditWriter(Redactor()).write(  # flushes the UPDATE and the INSERT: both on the server, uncommitted
+        settling,
+        actor_type="system",
+        actor_id="project-import",
+        action="project.import",
+        result="success",
+        resource_type="project",
+        resource_id=str(project_id),
+        project_id=project_id,
+        metadata={"job_id": str(job_id)},
+    )
+    return settling
+
+
+@pytest.mark.parametrize("lands", [True, False], ids=["commit_lands", "commit_rolls_back"])
+async def test_the_read_back_waits_for_a_commit_still_settling(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+    lands: bool,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    env = import_env(app, workspace_root, RecordingQueue())
+    job = project_imports._Job(project_id, job_id, workspace_root / str(project_id))  # pyright: ignore[reportPrivateUsage]
+    settling = await settle_like_complete(engine, project_id, job_id)
+    try:
+        reading = asyncio.create_task(project_imports._is_ready(env, job))  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(1.0)
+        waited = not reading.done()  # FOR SHARE waits on the row the settling commit holds
+        await (settling.commit() if lands else settling.rollback())
+    finally:
+        await settling.close()  # a failing run must not leave the row locked for the next test
+    assert waited
+    assert await reading is lands
+
+
+async def test_a_reply_lost_while_the_commit_settles_keeps_the_repository(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_complete``'s COMMIT reply is lost while the same writes still settle in the database (modelled by a
+    transaction that commits a second later): the landed commit keeps ``repo/``."""
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    commit = AsyncSession.commit
+    is_ready = project_imports._is_ready  # pyright: ignore[reportPrivateUsage]
+    lost: list[bool] = []
+    landing: list[asyncio.Task[None]] = []
+
+    async def reply_lost(self: AsyncSession) -> None:
+        if not lost:
+            lost.append(True)
+            raise OperationalError("COMMIT", {}, ConnectionError("reply lost"))
+        await commit(self)
+
+    async def read_back_while_settling(env: project_imports.ImportEnv, job: Any) -> bool | None:
+        settling = await settle_like_complete(engine, job.project_id, job.job_id)
+
+        async def land() -> None:
+            await asyncio.sleep(1.0)
+            await commit(settling)
+            await settling.close()
+
+        landing.append(asyncio.create_task(land()))
+        return await is_ready(env, job)
+
+    monkeypatch.setattr(AsyncSession, "commit", reply_lost)
+    monkeypatch.setattr(project_imports, "_is_ready", read_back_while_settling)
+    try:
+        outcome = await run_job(app, workspace_root, owner_id, project_id, job_id)
+    finally:
+        await asyncio.gather(*landing)  # the settling transaction always ends
+        monkeypatch.undo()
+    assert outcome == "ready"
+    folder = project_folder(workspace_root, project_id)
+    assert names(folder) == ["repo", "uploads"]
+    assert git(folder / "repo", "log", "--format=%s") == "Import from archive proj.zip"
+    assert await repository_state(owner, project_id) == ("ready", None)
