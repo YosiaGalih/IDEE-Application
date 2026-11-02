@@ -1232,3 +1232,27 @@ Tidak ditutup:
   - INFO M11 (`lexists` vs `exists` untuk `repo` symlink menggantung): akibatnya fail-safe (409/`import_failed`).
   - INFO: audit dari sapu bersifat best-effort; bila DB gagal, hasilnya hanya tercatat di log `project_import_audit_failed`.
 
+#### Delta AG-13 @ b3b1906: **SIGNED OFF 🔒** (4 LOW, tanpa MEDIUM ke atas); CI @ b3b1906 9/9 hijau
+
+- **CI b3b1906:**
+  - `backend-test` "1421 passed"; `frontend` "Tests 313 passed (313)".
+  - `clean-install`: "project smoke: imported 9bd7c132-… from smoke.zip through the worker", restore drill semua PASS.
+  - `security-scan`: Semgrep 299 file, 6 WARNING lama, `gate: PASS (0 blocking)`.
+  - Image backend 50 HIGH tanpa fix, lolos lewat EX-02 (menunggu PO); pip-audit, `npm audit`, dan gitleaks bersih.
+- AG-13 tidak menemukan deadlock: setiap transaksi mengunci baris `projects` sebelum `repositories`. `_is_ready` juga tidak menunggu sesinya sendiri: rollback lebih dulu, batas waktu ≈ 32 s.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| F1 (regresi delta sebelumnya): cancel yang tiba setelah thread rename selesai menghapus penanda `repo/` yang sudah terbit → project macet 409, job tanpa hasil | penanda dihapus hanya bila rename melempar `OSError` | `test_a_cancel_after_the_publish_keeps_the_marker_for_the_sweep` (unggahan berikutnya 202 + `import_incomplete`); mutan `BaseException` → merah |
+| F2 (laten sampai WP-2.1c): pembacaan ulang memutuskan dari `sync_state` | `_is_ready` menunggu dengan `FOR SHARE`, lalu memutuskan dari event `project.import` success milik job ini | `test_a_landed_commit_is_kept_even_if_the_state_changed_before_the_read_back`; mutan → merah |
+| F3: `_take_back` yang mendapati commit sudah masuk meninggalkan penanda basi | penanda dihapus bila status `ready` | assert tambahan di `test_taking_back_waits_for_a_commit_still_settling`; mutan → merah |
+| F4: job yang key-nya lenyap mendapat `import_incomplete` dari sapu, lalu `import_superseded` | audit `import_superseded` dilewati bila job sudah punya event `project.import` | `test_a_job_overtaken_after_the_sweep_gave_it_an_outcome_gets_no_second_one`; mutan → merah |
+
+- **Lokal:** `pytest -q` → **1423 passed, 1 skipped**; ruff, pyright, dan lint-imports bersih.
+- **Syarat masuk WP lain** (diminta AG-13, mengikat):
+  - **WP-2.1c** (atau siapa pun yang menulis `repositories.sync_state` selain import): perlindungan `repo/` bertumpu pada event `project.import result=success` per job. Penulis status baru tidak boleh membuat `repo/` tanpa event itu terlihat sebagai publikasi yang gagal.
+  - **WP retensi audit** (purge 365 hari, tracker §WP-1.1): event `project.import` success harus tetap ada selama project hidup, atau penanda basi dibersihkan dulu. Alternatifnya, saksi dipindah ke kolom tahan lama (mis. `repositories.import_job_id`, butuh migrasi).
+- **Tidak ditutup (INFO AG-13):**
+  - Mutan yang selamat untuk guard yang gagal dengan aman: `_claim_folder` menganggap semua hasil sebagai commit, `_take_back` tanpa `_keep`, tanpa `FOR SHARE`, tanpa timeout baca ulang, sapu tetap mengaudit saat hasil tidak terbaca.
+  - Penantian row lock tanpa `lock_timeout`, sama dengan `_complete` dan `_settle_failure`; dibatasi `time_limit` 40 menit.
+
