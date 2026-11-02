@@ -8,13 +8,13 @@ Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-
 
 | | |
 |---|---|
-| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9) |
+| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9), WP-2.1a projects core (PR #10) |
 | Mandat PO | "jalankan P2, P3 dan P4" (2 Nov): WP-2.1, 2.2, 3.1, 3.2, 4.1, 4.2, 4.3 (berhenti di gate G4 untuk PO), SEC-01, bukti G2. Satu sub-WP = satu PR |
 | Branch kerja | `claude/gracious-goodall-3hjh19` |
-| Sedang dikerjakan | **WP-2.1a** projects core (PR #10): CI hijau, AG-13 SIGNED OFF 🔒 @ acdd4b6, ready for review; menunggu merge PO. Keputusan PO terbuka: role global di project yang diberi grant, EX-02 (kini mencakup CVE git), konflik #66 (Python 3.13) |
-| Berikutnya | WP-2.1b (import arsip), 2.1c (file/workspace API), 2.1d (indeks), 2.1e (sesuai pembagian di spec WP-2.1), lalu WP-2.2, P3, P4. Catatan jebakan dari review ada di akhir bagian tracker WP-2.1a |
+| Sedang dikerjakan | **WP-2.1b** import arsip (PR #11): semua review ditutup; AG-13 SIGNED OFF 🔒 @ c7222ee (kode), CI 9/9 hijau; ready for review, menunggu merge PO. Syarat masuk dari AG-13 untuk WP-2.1c dan WP retensi audit ada di tracker WP-2.1b |
+| Berikutnya | 2.1c (file/workspace API), 2.1d (indeks), 2.1e (sesuai pembagian di spec WP-2.1), lalu WP-2.2, P3, P4. Catatan jebakan ada di akhir bagian tracker WP-2.1a dan WP-2.1b |
 | Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3 (U4). Dari WP-1.5a: role owner non-superuser untuk migrate. Dari WP-1.4b: token reset dipindah ke fragment sebelum ada jalur pengiriman tautan; stream task berhenti di status terminal. Dari WP-1.6: access log uvicorn rusak (`RedactingFilter`), healthcheck `scheduler` |
-| Menunggu PO | konflik #36–#65 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; EX-02..EX-06 di DECISIONS (EX-02 kini juga mencakup 5 HIGH tanpa fix dari git di image backend); role global di project yang diberi grant (tracker WP-2.1a); M2 egress sebelum G4; gate G0/G1 |
+| Menunggu PO | konflik #36–#68 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; EX-02..EX-06 di DECISIONS (EX-02 kini juga mencakup 5 HIGH tanpa fix dari git di image backend); role global di project yang diberi grant (tracker WP-2.1a); konflik #66 (Python 3.13), #67 (sumber `upload`), #68 (HTTP 408); M2 egress sebelum G4; gate G0/G1 |
 
 ### WP-1.5a: yang sudah ada (di branch kerja)
 

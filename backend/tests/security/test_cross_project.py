@@ -33,11 +33,13 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("POST", "/api/v1/projects/{id}/archive", None),
     ("POST", "/api/v1/projects/{id}/unarchive", None),
     ("GET", "/api/v1/projects/{id}/stack", None),
+    ("POST", "/api/v1/projects/{id}/imports", None),  # the door answers before the body is read
 ]
 WRITES = {
     ("PATCH", "/api/v1/projects/{id}"),
     ("POST", "/api/v1/projects/{id}/archive"),
     ("POST", "/api/v1/projects/{id}/unarchive"),
+    ("POST", "/api/v1/projects/{id}/imports"),
 }
 
 

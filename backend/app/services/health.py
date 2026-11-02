@@ -22,6 +22,7 @@ from app.core.db import make_engine, make_sessionmaker
 from app.core.logging import get_logger
 from app.gitops.adapter import GitAdapter
 from app.sandbox.client import HttpSandboxClient
+from app.services.job_queue import CeleryJobQueue, JobQueue
 from app.services.projects import CreateGate
 
 ReadinessCheck = Callable[[], Awaitable[bool]]
@@ -50,6 +51,8 @@ class Dependencies:
     sessions: async_sessionmaker[AsyncSession]
     git: GitAdapter = field(default_factory=GitAdapter)
     project_creates: CreateGate = field(default_factory=CreateGate)
+    # Hands long work to the worker (archive import); tests replace it with a recording fake.
+    jobs: JobQueue | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Dependencies:
@@ -71,6 +74,7 @@ class Dependencies:
             # Read once at startup: building ScriptDirectory imports every revision module (blocking I/O).
             migration_heads=frozenset(alembic_heads()),
             sessions=make_sessionmaker(engine),
+            jobs=CeleryJobQueue(settings.redis_url),
         )
 
     async def aclose(self) -> None:

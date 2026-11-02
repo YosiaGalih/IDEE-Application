@@ -32,6 +32,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -44,6 +46,7 @@ from app.core.rbac import RoleGrant, effective_permissions
 from app.gitops.adapter import Author, GitAdapter, GitTarget
 from app.gitops.errors import GitError
 from app.models.projects import Project, Repository
+from app.services import import_lock
 from app.services.task_stats import open_task_count
 from app.workspace.fs import Workspace
 from app.workspace.stack import detect_stack
@@ -121,6 +124,8 @@ class ProjectEnv:
     workspace_root: Path
     creates: CreateGate = field(default_factory=CreateGate)
     limiter: FixedWindowLimiter | None = None  # None only where no HTTP caller exists (tests, workers)
+    # Where import locks live (WP-2.1b); without it an unfinished import is not reported.
+    redis: Redis | None = None
 
 
 @dataclass(frozen=True)
@@ -138,7 +143,12 @@ class RemoteSource:
     url: str
 
 
-Source = BlankSource | TemplateSource | RemoteSource
+@dataclass(frozen=True)
+class UploadSource:
+    """The project's files come later, as an archive (``POST /projects/{id}/imports``, WP-2.1b)."""
+
+
+Source = BlankSource | TemplateSource | RemoteSource | UploadSource
 
 
 @dataclass(frozen=True)
@@ -237,6 +247,11 @@ def _author(actor: Actor) -> Author:
     if not _NAME_CHARACTER.search(name):
         name = email.split("@", 1)[0] if _NAME_CHARACTER.search(email.split("@", 1)[0]) else "KodeKantor user"
     return Author(name, email)
+
+
+def commit_author(actor: Actor) -> Author:
+    """The user as the author of a commit KodeKantor makes for them (create, import)."""
+    return _author(actor)
 
 
 def repo_path(root: Path, project_id: uuid.UUID) -> Path:
@@ -448,13 +463,25 @@ async def create_project(
 
 
 async def _enforce_create_rate(env: ProjectEnv, actor: Actor) -> None:
+    await enforce_rate(
+        env,
+        actor,
+        scope="project-create",
+        limit=CREATE_RATE_LIMIT,
+        window_s=CREATE_RATE_WINDOW_S,
+        message="Too many projects created; try again later",
+    )
+
+
+async def enforce_rate(
+    env: ProjectEnv, actor: Actor, *, scope: str, limit: int, window_s: int, message: str
+) -> None:
+    """Per-user fixed window in Redis; fails closed (503) when the limiter cannot answer."""
     if env.limiter is None:
         return
     try:
         decision = await env.limiter.hit(
-            f"kk:rl:project-create:{actor.user_id}",
-            limit=CREATE_RATE_LIMIT,
-            window_seconds=CREATE_RATE_WINDOW_S,
+            f"kk:rl:{scope}:{actor.user_id}", limit=limit, window_seconds=window_s
         )
     except RateLimiterUnavailable:
         # Fail closed, as login does: an unenforced limit is not a limit.
@@ -462,12 +489,9 @@ async def _enforce_create_rate(env: ProjectEnv, actor: Actor) -> None:
             "DEPENDENCY_UNAVAILABLE", "A required dependency is unavailable", http_status=503
         ) from None
     if not decision.allowed:
-        logger.warning("rate_limited", scope="project-create", user_id=str(actor.user_id))
+        logger.warning("rate_limited", scope=scope, user_id=str(actor.user_id))
         raise AppError(
-            "RATE_LIMITED",
-            "Too many projects created; try again later",
-            http_status=429,
-            headers={"Retry-After": str(decision.retry_after)},
+            "RATE_LIMITED", message, http_status=429, headers={"Retry-After": str(decision.retry_after)}
         )
 
 
@@ -510,7 +534,8 @@ async def _create_project(
     project_id = uuid.uuid4()
     root = env.workspace_root / str(project_id)
     repo = repo_path(env.workspace_root, project_id)
-    provider = "template" if isinstance(source, TemplateSource) else "local"
+    uploading = isinstance(source, UploadSource)
+    provider = "template" if isinstance(source, TemplateSource) else "upload" if uploading else "local"
     stage = "database"
     # Set before mkdir: a cancelled await can still create the folder in its thread.
     folder_may_exist = False
@@ -554,21 +579,31 @@ async def _create_project(
             session.add(project)
             await session.flush()
             repository = Repository(
-                project_id=project_id, provider=provider, branch=default_branch, sync_state="ready"
+                project_id=project_id,
+                provider=provider,
+                branch=default_branch,
+                # An upload project has no files until its archive is imported (WP-2.1b).
+                sync_state="importing" if uploading else "ready",
             )
             session.add(repository)
             await session.flush()
-            stage = "workspace"
-            folder_may_exist = True
-            await asyncio.to_thread(root.mkdir)  # a fresh id: an existing folder is a bug, so no exist_ok
-            stage = "git"
-            first_commit = await _populate(
-                env.git, repo, source, name=name, slug=slug, branch=default_branch, author=_author(actor)
-            )
-            stage = "stack"
-            project.stack = asdict(await detect_stack(Workspace(repo)))
+            first_commit: str | None = None
+            if not isinstance(source, UploadSource):
+                stage = "workspace"
+                folder_may_exist = True
+                await asyncio.to_thread(root.mkdir)  # a fresh id: an existing folder is a bug, so no exist_ok
+                stage = "git"
+                first_commit = await _populate(
+                    env.git, repo, source, name=name, slug=slug, branch=default_branch, author=_author(actor)
+                )
+                stage = "stack"
+                project.stack = asdict(await detect_stack(Workspace(repo)))
             metadata: dict[str, Any] = {
-                "source": "template" if isinstance(source, TemplateSource) else "blank"
+                "source": "upload"
+                if uploading
+                else "template"
+                if isinstance(source, TemplateSource)
+                else "blank"
             }
             if isinstance(source, TemplateSource):
                 metadata["template_id"] = source.template_id
@@ -596,7 +631,9 @@ async def _create_project(
     return created
 
 
-def _created_view(actor: Actor, project: Project, repository: Repository, first_commit: str) -> ProjectView:
+def _created_view(
+    actor: Actor, project: Project, repository: Repository, first_commit: str | None
+) -> ProjectView:
     # Built from what was just written: a read after the commit could fail and report an error for a project
     # that exists (the client would then retry and create a second one).
     return ProjectView(
@@ -660,12 +697,39 @@ async def _audit_unsafe(env: ProjectEnv, project_id: uuid.UUID) -> None:
         logger.exception("project_repository_unsafe_audit_failed", project_id=str(project_id))
 
 
-async def _stats(env: ProjectEnv, project_id: uuid.UUID, open_tasks: int) -> ProjectStats:
+async def _stats(
+    env: ProjectEnv, project_id: uuid.UUID, repository: Repository | None, open_tasks: int
+) -> ProjectStats:
     """The git half of the stats, run with no session open."""
+    if _awaiting_import(repository):
+        assert repository is not None
+        # Not imported yet (or importing): no folder to read; only an import that stopped is a problem.
+        stalled = await _stalled_imports(env, [repository])
+        problem = "import_incomplete" if repository.project_id in stalled else None
+        return ProjectStats(files=None, last_commit=None, open_tasks=open_tasks, repository_problem=problem)
     last_commit, problem = await _repository_check(env, project_id)
     return ProjectStats(
         files=None, last_commit=last_commit, open_tasks=open_tasks, repository_problem=problem
     )
+
+
+def _awaiting_import(repository: Repository | None) -> bool:
+    """A project from an archive whose import has not finished: it has no repository folder yet."""
+    return repository is not None and repository.provider == "upload" and repository.sync_state != "ready"
+
+
+async def _stalled_imports(env: ProjectEnv, repositories: list[Repository]) -> set[uuid.UUID]:
+    """Upload projects waiting for an archive that no import is bringing (no lock: none accepted, or the
+    worker died). Unknown when Redis cannot answer: logged, and nothing reported rather than a guess."""
+    waiting = [r.project_id for r in repositories if r.provider == "upload" and r.sync_state == "importing"]
+    if not waiting or env.redis is None:
+        return set()
+    try:
+        running = await import_lock.running(env.redis, waiting)
+    except RedisError as exc:
+        logger.error("project_import_state_unknown", error_type=type(exc).__name__, count=len(waiting))
+        return set()
+    return set(waiting) - running
 
 
 async def _missing_repositories(env: ProjectEnv, project_ids: list[uuid.UUID]) -> set[uuid.UUID]:
@@ -687,7 +751,7 @@ async def get_project(
         project, permissions = await authorize(session, actor, project_id, "project:read")
         repository = await session.scalar(select(Repository).where(Repository.project_id == project.id))
         open_tasks = await open_task_count(session, project.id) if with_stats else 0
-    stats = await _stats(env, project.id, open_tasks) if with_stats else None
+    stats = await _stats(env, project.id, repository, open_tasks) if with_stats else None
     return ProjectView(project, repository, permissions, stats)
 
 
@@ -738,16 +802,19 @@ async def list_projects(
     ready = [
         project.id
         for project, repository in rows
-        if repository is not None and repository.sync_state == "ready"
+        if repository is not None and not _awaiting_import(repository)
     ]
     missing = await _missing_repositories(env, ready)
+    stalled = await _stalled_imports(env, [repository for _, repository in rows if repository is not None])
+
+    def problem(project_id: uuid.UUID) -> str | None:
+        if project_id in missing:
+            return "repository_missing"
+        return "import_incomplete" if project_id in stalled else None
+
     items = [
         ProjectView(
-            project,
-            repository,
-            permissions_for(actor, project),
-            None,
-            repository_problem="repository_missing" if project.id in missing else None,
+            project, repository, permissions_for(actor, project), None, repository_problem=problem(project.id)
         )
         for project, repository in rows
     ]
@@ -847,7 +914,9 @@ async def update_project(
             await _audit(env, session, actor, project, "project.update", metadata)
         repository, open_tasks = await _read_and_commit(session, project)
     # After the commit nothing may fail the request: _stats reports repository problems, never raises.
-    return ProjectView(project, repository, permissions, await _stats(env, project.id, open_tasks))
+    return ProjectView(
+        project, repository, permissions, await _stats(env, project.id, repository, open_tasks)
+    )
 
 
 async def set_archived(
@@ -867,7 +936,9 @@ async def set_archived(
         await _audit(env, session, actor, project, "project.archive" if archived else "project.unarchive", {})
         repository, open_tasks = await _read_and_commit(session, project)
     # After the commit nothing may fail the request: _stats reports repository problems, never raises.
-    return ProjectView(project, repository, permissions, await _stats(env, project.id, open_tasks))
+    return ProjectView(
+        project, repository, permissions, await _stats(env, project.id, repository, open_tasks)
+    )
 
 
 async def _read_and_commit(session: AsyncSession, project: Project) -> tuple[Repository | None, int]:

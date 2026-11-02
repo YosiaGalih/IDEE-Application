@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 from app.api.deps import AuditDep, CurrentActor, LimiterDep, dependencies, require_project_permission
 from app.core.context import REQUEST_ID_HEADER
 from app.core.errors import envelope, request_id_of
+from app.models.projects import Repository
 from app.services import projects
 from app.services.projects import Actor, ProjectEnv, ProjectView
 
@@ -57,10 +58,16 @@ class GitHttpsIn(_Strict):
     branch: str | None = None
 
 
+class UploadIn(_Strict):
+    """The files come later, as an archive (``POST /projects/{id}/imports``; conflict #67)."""
+
+    type: Literal["upload"]
+
+
 class CreateProjectIn(_Strict):
     name: Annotated[str, StringConstraints(max_length=projects.NAME_MAX * 2)]
     description: Annotated[str, StringConstraints(max_length=projects.DESCRIPTION_MAX)] | None = None
-    source: Annotated[BlankIn | TemplateIn | GitHttpsIn, Field(discriminator="type")]
+    source: Annotated[BlankIn | TemplateIn | GitHttpsIn | UploadIn, Field(discriminator="type")]
     default_branch: str = "main"
 
     @field_validator("name")
@@ -120,6 +127,18 @@ class RepositoryOut(BaseModel):
     last_indexed_at: datetime | None
     error: str | None
 
+    @classmethod
+    def of(cls, repository: Repository, problem: str | None = None) -> RepositoryOut:
+        return cls(
+            provider=repository.provider,
+            remote_url=repository.remote_url,
+            branch=repository.branch,
+            # What the read just found wins over the stored state: a missing repository is never "ready".
+            sync_state="error" if problem is not None else repository.sync_state,
+            last_indexed_at=repository.last_indexed_at,
+            error=problem if problem is not None else repository.error,
+        )
+
 
 class StatsOut(BaseModel):
     files: int | None
@@ -158,17 +177,7 @@ class ProjectOut(BaseModel):
             owner_id=project.owner_id,
             created_at=project.created_at,
             updated_at=project.updated_at,
-            repository=None
-            if repository is None
-            else RepositoryOut(
-                provider=repository.provider,
-                remote_url=repository.remote_url,
-                branch=repository.branch,
-                # What the read just found wins over the stored state: a missing repository is never "ready".
-                sync_state="error" if problem is not None else repository.sync_state,
-                last_indexed_at=repository.last_indexed_at,
-                error=problem if problem is not None else repository.error,
-            ),
+            repository=None if repository is None else RepositoryOut.of(repository, problem),
             permissions=sorted(view.permissions),
             stats=None
             if stats is None
@@ -186,11 +195,12 @@ def _respond(
     status_code: int = 200,
     headers: dict[str, str] | None = None,
     meta: dict[str, Any] | None = None,
+    status: Literal["completed", "accepted"] = "completed",
 ) -> JSONResponse:
     request_id = request_id_of(request)
     # Responses carry the caller's permissions: no shared cache may keep them.
     return JSONResponse(
-        envelope(request_id, status="completed", data=data, meta=meta),
+        envelope(request_id, status=status, data=data, meta=meta),
         status_code=status_code,
         headers={REQUEST_ID_HEADER: request_id, "Cache-Control": "no-store", **(headers or {})},
     )
@@ -205,6 +215,7 @@ def project_env(request: Request, audit: AuditDep, limiter: LimiterDep) -> Proje
         workspace_root=Path(request.app.state.settings.workspace_root),
         creates=deps.project_creates,
         limiter=limiter,
+        redis=deps.redis,
     )
 
 
@@ -257,6 +268,8 @@ async def create_project(
         source = projects.TemplateSource(body.source.template_id)
     elif isinstance(body.source, GitHttpsIn):
         source = projects.RemoteSource(body.source.url)
+    elif isinstance(body.source, UploadIn):
+        source = projects.UploadSource()
     else:
         source = projects.BlankSource()
     view = await projects.create_project(

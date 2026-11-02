@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { apiPath, apiRequest, PageMetaSchema, type PageMeta } from "./client";
 import { ApiError } from "./errors";
+import { apiUpload } from "./upload";
 
 /** `Stack` (API_CONTRACTS §3): what deterministic detection found in the repository. */
 export const StackSchema = z.object({
@@ -62,7 +63,11 @@ export type Template = z.infer<typeof TemplateSchema>;
 export type ProjectListFilter = { status: "active" | "archived" | "all"; q: string; page: number };
 export type ProjectPage = { items: Project[]; meta: PageMeta };
 export const PROJECTS_PAGE_SIZE = 50;
-export type ProjectSource = { type: "blank" } | { type: "template"; template_id: string };
+export type ProjectSource =
+  | { type: "blank" }
+  | { type: "template"; template_id: string }
+  // The files come next, as an archive (POST /projects/{id}/imports).
+  | { type: "upload" };
 export type CreateProjectInput = { name: string; description: string | null; source: ProjectSource };
 
 export async function listProjects(filter: ProjectListFilter, signal?: AbortSignal): Promise<ProjectPage> {
@@ -100,6 +105,46 @@ export async function createProject(input: CreateProjectInput, idempotencyKey: s
   const body = { name: input.name, description: input.description, source: input.source };
   return (await apiRequest("/projects", { method: "POST", body, schema: ProjectSchema, idempotencyKey }))
     .data;
+}
+
+/** Archives the import accepts (FR-015, ADR-005): checked before upload, and again by the server. */
+export const ARCHIVE_MAX_BYTES = 200 * 1024 * 1024;
+export const ARCHIVE_SUFFIXES = [".zip", ".tar", ".tar.gz", ".tgz"] as const;
+
+const RepositorySchema = ProjectSchema.shape.repository.unwrap();
+export const ImportAcceptedSchema = z.object({
+  repository: RepositorySchema,
+  job_id: z.guid(),
+  upload: z.object({ filename: z.string(), size: z.number().int().nonnegative(), sha256: z.string() }),
+});
+export type ImportAccepted = z.infer<typeof ImportAcceptedSchema>;
+
+export async function getProject(projectId: string, signal?: AbortSignal): Promise<Project> {
+  const result = await apiRequest(apiPath("projects", projectId), {
+    schema: ProjectSchema,
+    ...(signal ? { signal } : {}),
+  });
+  return result.data;
+}
+
+/** Streams the archive to the project (202); the import itself runs in a worker. */
+export async function uploadArchive(
+  projectId: string,
+  file: File,
+  options: {
+    idempotencyKey: string;
+    onProgress?: (sent: number, total: number) => void;
+    signal?: AbortSignal;
+  },
+): Promise<ImportAccepted> {
+  const result = await apiUpload(apiPath("projects", projectId, "imports"), {
+    file,
+    schema: ImportAcceptedSchema,
+    idempotencyKey: options.idempotencyKey,
+    ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+  return result.data;
 }
 
 export async function setProjectArchived(projectId: string, archived: boolean): Promise<Project> {

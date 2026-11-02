@@ -9,6 +9,10 @@
 **Record**
 - A key is scoped to the session id, method and path.
 - The request fingerprint (query, content type, body) must match, otherwise 409.
+- **Stream paths** (``stream_paths``, the archive upload): the body is never buffered. The fingerprint is
+  the query plus the declared ``Content-Length``, which is required (400) and capped by
+  ``stream_max_bytes`` (413). The same key with a different body of the same length replays the first
+  answer, whose ``sha256`` names the file it describes.
 - Status, content type, body and a small allowlist of safe headers are replayed; ``Set-Cookie`` never is.
 
 **What is not stored**
@@ -88,12 +92,23 @@ SessionValidator = Callable[[str], Awaitable[SessionIdentity | None]]
 
 class IdempotencyMiddleware:
     def __init__(
-        self, app: ASGIApp, *, redis: Redis, session_validator: SessionValidator, exempt_prefix: str
+        self,
+        app: ASGIApp,
+        *,
+        redis: Redis,
+        session_validator: SessionValidator,
+        exempt_prefix: str,
+        stream_paths: re.Pattern[str] | None = None,
+        stream_max_bytes: int = 0,
     ) -> None:
         self.app = app
         self.redis = redis
         self.validate_session = session_validator
         self.exempt_prefix = exempt_prefix
+        # Uploads (archive import): the body is never buffered here. The fingerprint is the declared length,
+        # so a retry with the same key and the same file replays the answer without a second upload.
+        self.stream_paths = stream_paths
+        self.stream_max_bytes = stream_max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or scope["method"] not in MUTATING_METHODS:
@@ -111,7 +126,15 @@ class IdempotencyMiddleware:
                 scope, send, http_status=400, code="BAD_REQUEST", message="Invalid Idempotency-Key"
             )
             return
-        if _declared_length(headers) > MAX_REQUEST_BODY:
+        streaming = self.stream_paths is not None and self.stream_paths.fullmatch(scope["path"]) is not None
+        declared = headers.get(b"content-length", b"")
+        if streaming and not declared.isdigit():
+            await send_error(
+                scope, send, http_status=400, code="BAD_REQUEST", message="Content-Length is required"
+            )
+            return
+        limit = self.stream_max_bytes if streaming else MAX_REQUEST_BODY
+        if _declared_length(headers) > limit:
             await _too_large(scope, send)
             return
 
@@ -126,16 +149,21 @@ class IdempotencyMiddleware:
             await self.app(scope, receive, send)
             return
 
-        body = await _read_body(receive)
-        if body is None:  # client went away mid-body: nothing to execute, nothing to claim
-            return
-        if len(body) > MAX_REQUEST_BODY:
-            await _too_large(scope, send)
-            return
-
-        fingerprint = hashlib.sha256(
-            b"\n".join([scope.get("query_string", b""), headers.get(b"content-type", b""), body])
-        ).hexdigest()
+        body: bytes | None = None
+        if streaming:
+            fingerprint = hashlib.sha256(
+                b"\n".join([scope.get("query_string", b""), b"stream", declared])
+            ).hexdigest()
+        else:
+            body = await _read_body(receive)
+            if body is None:  # client went away mid-body: nothing to execute, nothing to claim
+                return
+            if len(body) > MAX_REQUEST_BODY:
+                await _too_large(scope, send)
+                return
+            fingerprint = hashlib.sha256(
+                b"\n".join([scope.get("query_string", b""), headers.get(b"content-type", b""), body])
+            ).hexdigest()
         scope_id = f"{identity.session_id}|{scope['method']}|{scope['path']}|{key}"
         redis_key = "kk:idem:" + hashlib.sha256(scope_id.encode()).hexdigest()
         owner = secrets.token_hex(16)
@@ -184,7 +212,7 @@ class IdempotencyMiddleware:
         scope: Scope,
         receive: Receive,
         send: Send,
-        body: bytes,
+        body: bytes | None,
         redis_key: str,
         owner: str,
         fingerprint: str,
@@ -198,10 +226,11 @@ class IdempotencyMiddleware:
 
         async def replay_then_passthrough() -> Message:
             nonlocal delivered
-            if not delivered:
+            if body is not None and not delivered:
                 delivered = True
                 return {"type": "http.request", "body": body, "more_body": False}
-            return await receive()  # disconnect detection keeps working (streaming responses)
+            # Streamed requests read straight from the client; disconnect detection keeps working too.
+            return await receive()
 
         async def capture(message: Message) -> None:
             nonlocal status, size

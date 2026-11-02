@@ -23,7 +23,9 @@ RECOVERY_SWEEP_SECONDS = 30.0  # ARCHITECTURE §5.3
 
 
 def create_celery(settings: Settings) -> Celery:
-    app = Celery("kodekantor", broker=settings.redis_url, include=["app.worker.jobs"])
+    app = Celery(
+        "kodekantor", broker=settings.redis_url, include=["app.worker.jobs", "app.worker.platform_jobs"]
+    )
     app.conf.update(
         task_serializer="json",
         accept_content=["json"],

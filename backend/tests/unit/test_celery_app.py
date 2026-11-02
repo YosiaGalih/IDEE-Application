@@ -47,3 +47,34 @@ def test_worker_logging_is_redacted(capsys) -> None:  # type: ignore[no-untyped-
     get_logger("worker.test").error("probe", leaked=TEST_SECRET_KEY)
     out = capsys.readouterr().out
     assert TEST_SECRET_KEY not in out and '"probe"' in out
+
+
+def test_import_job_is_registered_with_retries_and_a_time_limit(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import uuid
+
+    from app.services.import_lock import LOCK_TTL_S
+    from app.services.job_queue import IMPORT_TASK, CeleryJobQueue
+    from app.services.project_imports import ImportRetry
+    from app.worker import platform_jobs
+
+    app = create_celery(load_settings(make_test_env()))
+    app.loader.import_default_modules()
+    task = app.tasks[IMPORT_TASK]
+    assert tuple(task.autoretry_for) == (ImportRetry,)  # only "outcome unknown" is retried
+    assert task.max_retries == 5
+    assert task.time_limit is not None and task.time_limit < LOCK_TTL_S  # a job never outlives its lock
+
+    seen: dict[str, object] = {}
+
+    async def fake(**kwargs: object) -> str:
+        seen.update(kwargs)
+        return "ready"
+
+    monkeypatch.setattr(platform_jobs, "run_import_job", fake)
+    ids = {name: uuid.uuid4() for name in ("project_id", "job_id", "user_id")}
+    assert task.run(**{name: str(value) for name, value in ids.items()}, filename="x.zip") == "ready"
+    assert seen == {**ids, "filename": "x.zip"}
+
+    # The API side: a broker that stops answering fails the send instead of holding a thread forever.
+    options = CeleryJobQueue("redis://localhost:6379/0")._celery.conf.broker_transport_options
+    assert options["socket_timeout"] > 0 and options["socket_connect_timeout"] > 0

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ARCHIVE_MAX_BYTES, ARCHIVE_SUFFIXES } from "@/api/projects";
 import type id from "@/i18n/locales/id.json";
 
 /** Every message is a key of `projects.errors`; a key added to id.json and not here is a typecheck error. */
@@ -10,6 +11,9 @@ const KEYS: Record<ProjectErrorKey, true> = {
   "projects.errors.descriptionTooLong": true,
   "projects.errors.templateRequired": true,
   "projects.errors.fieldRejected": true,
+  "projects.errors.archiveRequired": true,
+  "projects.errors.archiveTooLarge": true,
+  "projects.errors.archiveType": true,
 };
 export const isProjectErrorKey = (value: string | undefined): value is ProjectErrorKey =>
   value !== undefined && Object.hasOwn(KEYS, value);
@@ -35,13 +39,26 @@ export const newProjectSchema = z
     description: z
       .string()
       .refine((value) => length(value) <= DESCRIPTION_MAX, message("projects.errors.descriptionTooLong")),
-    source: z.enum(["blank", "template"]),
+    source: z.enum(["blank", "template", "archive"]),
     templateId: z.string(),
+    archive: z.instanceof(File).nullable(),
   })
-  .refine((values) => values.source === "blank" || values.templateId !== "", {
+  .refine((values) => values.source !== "template" || values.templateId !== "", {
     message: message("projects.errors.templateRequired"),
     path: ["templateId"],
+  })
+  .superRefine((values, ctx) => {
+    if (values.source !== "archive") return;
+    const file = values.archive;
+    const issue = (key: ProjectErrorKey) => ctx.addIssue({ code: "custom", message: key, path: ["archive"] });
+    if (file === null) issue("projects.errors.archiveRequired");
+    else if (!isArchiveName(file.name)) issue("projects.errors.archiveType");
+    else if (file.size > ARCHIVE_MAX_BYTES) issue("projects.errors.archiveTooLarge");
   });
+
+/** The server decides by the file's bytes; this only spares an upload that would be refused. */
+export const isArchiveName = (name: string) =>
+  ARCHIVE_SUFFIXES.some((suffix) => name.toLowerCase().endsWith(suffix));
 export type NewProjectValues = z.infer<typeof newProjectSchema>;
 
 /** A server VALIDATION_ERROR on a field, shown on that field. */

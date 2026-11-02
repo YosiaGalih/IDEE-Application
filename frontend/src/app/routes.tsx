@@ -5,6 +5,7 @@ import { LoginPage } from "@/features/auth/LoginPage";
 import { RequireSession } from "@/features/auth/RequireSession";
 import { ResetPasswordPage } from "@/features/auth/ResetPasswordPage";
 import { UserMenu } from "@/features/auth/UserMenu";
+import { ImportArchivePage } from "@/features/projects/ImportArchivePage";
 import { NewProjectPage } from "@/features/projects/NewProjectPage";
 import { ProjectsPage } from "@/features/projects/ProjectsPage";
 import { AUTH_PATHS } from "@/lib/safeNext";
@@ -37,6 +38,7 @@ export const routes: RouteObject[] = [
           { index: true, element: page("dashboard") },
           { path: "projects", element: <ProjectsPage /> },
           { path: "projects/new", element: <NewProjectPage /> },
+          { path: "projects/:projectId/import", element: <ImportArchivePage /> },
           { path: "projects/:projectId/workspace", element: page("workspace") },
           { path: "projects/:projectId/tasks", element: page("tasks") },
           { path: "projects/:projectId/preview", element: page("preview") },

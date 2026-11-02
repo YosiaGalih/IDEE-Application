@@ -1,11 +1,11 @@
-import { FilePlus2, LayoutTemplate } from "lucide-react";
-import { useRef } from "react";
+import { FileArchive, FilePlus2, LayoutTemplate } from "lucide-react";
+import { useRef, useState } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate } from "react-router";
 import { ApiError } from "@/api/errors";
 import { useCreateProject, useTemplates } from "@/api/hooks/useProjects";
-import type { CreateProjectInput } from "@/api/projects";
+import type { CreateProjectInput, Project } from "@/api/projects";
 import { Button } from "@/components/ui/Button";
 import { ErrorSummary } from "@/components/ui/ErrorSummary";
 import { FormField } from "@/components/ui/FormField";
@@ -17,9 +17,16 @@ import { cn } from "@/lib/cn";
 import { PROJECTS_PATH, workspacePath } from "@/lib/paths";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { zodResolver } from "@/lib/zodResolver";
+import { ArchiveImport, ArchiveInput } from "./ArchiveImport";
 import { isProjectErrorKey, newProjectSchema, SERVER_FIELD_ERRORS, type NewProjectValues } from "./schemas";
+import { useArchiveImport } from "./useArchiveImport";
 
-const SOURCES = ["blank", "template"] as const;
+const SOURCES = ["blank", "template", "archive"] as const;
+const SOURCE_TEXT = {
+  blank: { icon: FilePlus2, label: "projects.new.blank", hint: "projects.new.blankHint" },
+  template: { icon: LayoutTemplate, label: "projects.new.template", hint: "projects.new.templateHint" },
+  archive: { icon: FileArchive, label: "projects.new.archive", hint: "projects.new.archiveHint" },
+} as const;
 
 function serverFieldErrors(error: unknown) {
   if (!(error instanceof ApiError) || error.code !== "VALIDATION_ERROR" || !Array.isArray(error.details))
@@ -35,10 +42,15 @@ function serverFieldErrors(error: unknown) {
 /** `/projects/new`: a blank project or one from a template (FR-013, FR-014). */
 export function NewProjectPage() {
   const { t } = useTranslation();
-  useDocumentTitle(t("screens.newProject"));
   const navigate = useNavigate();
   const templates = useTemplates();
   const create = useCreateProject();
+  // An archive project: created first, then its archive is uploaded into it (WP-2.1b).
+  const [created, setCreated] = useState<Project | null>(null);
+  useDocumentTitle(t(created ? "screens.importArchive" : "screens.newProject"));
+  // Replace: Back from the workspace must not land on a form that would create a second project.
+  const openWorkspace = (project: Project) => void navigate(workspacePath(project.id), { replace: true });
+  const importer = useArchiveImport({ onReady: openWorkspace });
   // One key per request body: kept only while the answer is unknown, so a retry is answered once.
   const attempt = useRef<{ key: string; body: string } | null>(null);
   const {
@@ -46,10 +58,11 @@ export function NewProjectPage() {
     handleSubmit,
     control,
     setError,
+    setValue,
     formState: { errors, submitCount },
   } = useForm<NewProjectValues>({
     resolver: zodResolver(newProjectSchema),
-    defaultValues: { name: "", description: "", source: "blank", templateId: "" },
+    defaultValues: { name: "", description: "", source: "blank", templateId: "", archive: null },
     shouldFocusError: false,
   });
   const source = useWatch({ control, name: "source" });
@@ -68,14 +81,24 @@ export function NewProjectPage() {
       source:
         values.source === "template"
           ? { type: "template", template_id: values.templateId }
-          : { type: "blank" },
+          : values.source === "archive"
+            ? { type: "upload" }
+            : { type: "blank" },
     };
+    const archive = values.source === "archive" ? values.archive : null;
     const body = JSON.stringify(input);
     if (attempt.current?.body !== body) attempt.current = { key: crypto.randomUUID(), body };
     create.mutate(
       { input, idempotencyKey: attempt.current.key },
       {
-        onSuccess: (project) => void navigate(workspacePath(project.id)),
+        onSuccess: (project) => {
+          if (archive === null) {
+            openWorkspace(project);
+            return;
+          }
+          setCreated(project);
+          importer.send(project.id, archive); // from this event, not an effect: never twice
+        },
         onError: (error) => {
           if (!isOutcomeUnknown(error)) attempt.current = null; // answered: a new attempt gets a new key
           for (const target of serverFieldErrors(error)) {
@@ -156,6 +179,20 @@ export function NewProjectPage() {
     }
   }
 
+  if (created !== null) {
+    return (
+      <div className="mx-auto max-w-2xl space-y-5">
+        <div>
+          <h1 className="text-2xl font-semibold text-fg" data-testid="screen-title">
+            {t("projects.import.title")}
+          </h1>
+          <p className="mt-1 text-sm text-fg-muted">{created.name}</p>
+        </div>
+        <ArchiveImport projectId={created.id} importer={importer} />
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto max-w-2xl space-y-5">
       <div>
@@ -191,7 +228,7 @@ export function NewProjectPage() {
         </div>
         <fieldset className="space-y-2">
           <legend className="text-sm font-medium text-fg">{t("projects.new.source")}</legend>
-          <div className="grid gap-2 sm:grid-cols-2">
+          <div className="grid gap-2 sm:grid-cols-3">
             {SOURCES.map((kind) => (
               <label
                 key={kind}
@@ -206,26 +243,26 @@ export function NewProjectPage() {
                   type="radio"
                   value={kind}
                   className="mt-1 size-4"
-                  {...register("source")}
+                  {...register("source", {
+                    // A file chosen earlier must not be sent after the user left the archive option.
+                    onChange: (event: React.ChangeEvent<HTMLInputElement>) => {
+                      if (event.target.value !== "archive") setValue("archive", null);
+                    },
+                  })}
                 />
-                <span>
-                  <span className="flex items-center gap-1.5 text-sm font-medium text-fg">
-                    {kind === "blank" ? (
-                      <FilePlus2 aria-hidden="true" className="size-4" />
-                    ) : (
-                      <LayoutTemplate aria-hidden="true" className="size-4" />
-                    )}
-                    {t(kind === "blank" ? "projects.new.blank" : "projects.new.template")}
-                  </span>
-                  <span className="block text-xs text-fg-muted">
-                    {t(kind === "blank" ? "projects.new.blankHint" : "projects.new.templateHint")}
-                  </span>
-                </span>
+                <SourceText kind={kind} />
               </label>
             ))}
           </div>
         </fieldset>
         {templateChoices}
+        {source === "archive" ? (
+          <ArchiveInput
+            id="new-project-archive"
+            error={fieldError(errors.archive?.message) ?? null}
+            onChoose={(file) => setValue("archive", file, { shouldValidate: submitCount > 0 })}
+          />
+        ) : null}
         <div className="flex justify-end gap-2">
           <Button asChild variant="secondary">
             <Link to={PROJECTS_PATH}>{t("projects.new.cancel")}</Link>
@@ -237,5 +274,19 @@ export function NewProjectPage() {
         </div>
       </form>
     </div>
+  );
+}
+
+function SourceText({ kind }: { kind: (typeof SOURCES)[number] }) {
+  const { t } = useTranslation();
+  const { icon: Icon, label, hint } = SOURCE_TEXT[kind];
+  return (
+    <span>
+      <span className="flex items-center gap-1.5 text-sm font-medium text-fg">
+        <Icon aria-hidden="true" className="size-4" />
+        {t(label)}
+      </span>
+      <span className="block text-xs text-fg-muted">{t(hint)}</span>
+    </span>
   );
 }

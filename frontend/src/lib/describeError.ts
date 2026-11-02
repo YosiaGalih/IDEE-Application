@@ -19,6 +19,7 @@ const GATEWAY_STATUSES = new Set([502, 503, 504]);
  * - no answer at all (network, timeout) or a 2xx that is not the envelope;
  * - a gateway error page without the envelope (the API restarted mid-request);
  * - 409 CONFLICT from the idempotency store: the first request with this key is still running or already ran.
+ *   A route's own CONFLICT carries `details[].reason` (e.g. an import already running): that is an answer.
  * A retry keeps its Idempotency-Key then, so the server answers it once (API_CONTRACTS §1).
  */
 export const isOutcomeUnknown = (error: unknown): boolean =>
@@ -27,7 +28,14 @@ export const isOutcomeUnknown = (error: unknown): boolean =>
     error.kind === "timeout" ||
     (error.kind === "bad_response" &&
       ((error.status ?? 0) < 400 || GATEWAY_STATUSES.has(error.status ?? 0))) ||
-    (error.kind === "http" && error.status === 409 && error.code === "CONFLICT"));
+    (error.kind === "http" &&
+      error.status === 409 &&
+      error.code === "CONFLICT" &&
+      !hasReason(error.details)));
+
+const hasReason = (details: unknown) =>
+  Array.isArray(details) &&
+  details.some((detail: unknown) => typeof detail === "object" && detail !== null && "reason" in detail);
 
 /**
  * The text for a failed call: the screen's wording for a known code, how long to wait on 429
