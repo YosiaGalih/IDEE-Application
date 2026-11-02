@@ -331,3 +331,43 @@ async def test_init_missing_folder(tmp_path: Path, git: GitAdapter) -> None:
     with pytest.raises(GitError) as caught:
         await git.init(tmp_path / "nope", "main")
     assert caught.value.reason == "not_found"
+
+
+# --- WP-2.1c: commit selected paths, never .kk --------------------------------------------------------------
+
+
+def raw_git(repo: GitTarget, *args: str) -> str:
+    import subprocess  # test helper only: the product runs git through the adapter
+
+    return subprocess.run(  # noqa: S603 - fixed argv, test helper
+        ["git", "--git-dir", str(repo.repo / ".git"), "--work-tree", str(repo.repo), *args],  # noqa: S607
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+async def test_commit_only_the_given_paths(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    write(repo.repo / "b.txt", "b\n")
+    sha = await git.commit(repo, "only a", ME, paths=["a.txt"])
+    assert sha is not None
+    assert raw_git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["a.txt"]
+    assert "b.txt" in raw_git(repo, "status", "--porcelain")
+
+
+async def test_commit_never_stages_kk_even_when_tracked(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / ".kk" / "old.xml", "<old/>\n")
+    raw_git(repo, "add", "-f", ".kk/old.xml")
+    raw_git(repo, "-c", "user.name=x", "-c", "user.email=x@example.test", "commit", "-q", "-m", "tracked kk")
+    write(repo.repo / ".kk" / "old.xml", "<changed/>\n")
+    write(repo.repo / ".kk" / "new.xml", "<new/>\n")
+    write(repo.repo / "x.py", "print(1)\n")
+    sha = await git.commit(repo, "code only", ME)
+    assert sha is not None
+    assert raw_git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["x.py"]
+
+
+async def test_commit_with_only_kk_changes_is_nothing(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / ".kk" / "junit.xml", "<testsuite/>\n")
+    assert await git.commit(repo, "nothing", ME) is None

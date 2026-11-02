@@ -500,3 +500,14 @@ async def test_tree_survives_entries_vanishing(
     names = [e.name for e in (await ws.tree(".", Access.USER_READ)).entries]
     assert "gone.txt" not in names
     assert "src" in names
+
+
+async def test_exclusive_blocks_a_write_until_released(ws: Workspace) -> None:
+    async with ws.exclusive():
+        writing = asyncio.create_task(
+            ws.write_file("src/new.py", "x\n", Access.USER_WRITE, expected_sha256=None)
+        )
+        await asyncio.sleep(0.3)
+        assert not writing.done()
+    change = await writing
+    assert change.change == "added"

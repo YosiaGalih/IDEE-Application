@@ -37,7 +37,7 @@ import secrets
 import stat
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
@@ -328,6 +328,31 @@ class Workspace:
         depth = min(max(depth, 1), MAX_TREE_DEPTH)
         max_entries = min(max(max_entries, 1), MAX_TREE_ENTRIES)
         return await asyncio.to_thread(self._tree, rel, access, depth, max_entries)
+
+    @contextlib.asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        """Hold the workspace lock (the one every write takes) while the caller runs something that must see
+        one consistent tree, e.g. ``git add`` + ``commit``. ``WorkspaceBusy`` after ``LOCK_WAIT_S``."""
+        stack = contextlib.ExitStack()
+
+        def acquire() -> None:
+            _, real = stack.enter_context(self._opened())
+            stack.enter_context(self._locked(real))
+
+        acquiring = asyncio.ensure_future(asyncio.to_thread(acquire))
+        try:
+            await asyncio.shield(acquiring)
+        except BaseException:
+            # Cancelled (or failed) while the thread was still acquiring: it may take the lock after this
+            # point, so wait for it before releasing whatever it took. Never leak a held lock.
+            with contextlib.suppress(BaseException):
+                await acquiring
+            await asyncio.to_thread(stack.close)
+            raise
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(stack.close)
 
     async def disk_usage(self) -> int:
         """Bytes in regular files under the root, symlinks not followed (quota input, ADR-005)."""

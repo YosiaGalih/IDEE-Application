@@ -539,11 +539,34 @@ class GitAdapter:
         return sha
 
     async def commit_all(self, target: GitTarget, message: str, author: Author) -> str | None:
-        """Stage everything and commit; ``None`` when there is nothing to commit."""
+        """Stage everything (but ``.kk``) and commit; ``None`` when there is nothing to commit."""
+        return await self.commit(target, message, author)
+
+    async def commit(
+        self,
+        target: GitTarget,
+        message: str,
+        author: Author,
+        *,
+        paths: list[str] | None = None,
+        exclude: tuple[str, ...] = (".kk",),
+    ) -> str | None:
+        """Stage ``paths`` (everything when ``None``), unstage ``exclude``, and commit; ``None`` when nothing
+        is staged. Paths are literal pathspecs (``GIT_LITERAL_PATHSPECS``), never options or magic.
+
+        ``exclude`` defaults to ``.kk``: sandbox artefacts never enter git (SECURITY_MODEL §4), not even
+        when an imported archive already tracked them (their index entries go back to HEAD's).
+        """
         _message(message)
         _author(author)
+        if paths is not None and not paths:
+            raise GitInputError("path")
+        selected = [_pathspec(path) for path in paths] if paths is not None else []
+        excluded = [_pathspec(path) for path in exclude]
         git_dir, tree = await self._adirs(target)
-        await self._run(["add", "-A"], git_dir=git_dir, work_tree=tree, cwd=tree)
+        await self._run(["add", "-A", "--", *selected], git_dir=git_dir, work_tree=tree, cwd=tree)
+        for path in excluded:
+            await self._unstage(target, git_dir, tree, path)
         staged = await self._run(
             ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
             git_dir=git_dir,
@@ -561,6 +584,18 @@ class GitAdapter:
             env=_identity_env(author, self.committer),
         )
         return await self.current_commit(target)
+
+    async def _unstage(self, target: GitTarget, git_dir: Path, tree: Path, path: str) -> None:
+        """Put ``path``'s index entries back to HEAD (none at all before the first commit). Nothing to do
+        when the index has none: ``restore`` would fail on a pathspec that matches nothing."""
+        listed = await self._run(["ls-files", "-z", "--", path], git_dir=git_dir, work_tree=tree, cwd=tree)
+        if not listed.stdout:
+            return
+        if await self.current_commit(target) is None:
+            command = ["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", path]
+        else:
+            command = ["restore", "--staged", "--", path]
+        await self._run(command, git_dir=git_dir, work_tree=tree, cwd=tree)
 
     async def create_worktree(self, repo: Path, path: Path, branch: str, base: str) -> GitTarget:
         """A worktree on a new ``branch`` from ``base`` (ADR-016: ``kk/task-<8hex>``)."""
