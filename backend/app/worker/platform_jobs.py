@@ -18,13 +18,25 @@ from app.core.db import make_engine, make_sessionmaker
 from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
 from app.services.job_queue import IMPORT_TASK
-from app.services.project_imports import ImportEnv, run_import
+from app.services.project_imports import ImportEnv, ImportRetry, run_import
 from app.services.projects import ProjectEnv
 
+# A job runs well inside its lock (import_lock.LOCK_TTL_S, 45 min): its archive and lock never outlive it.
+IMPORT_TIME_LIMIT_S = 40 * 60
 
-@shared_task(name=IMPORT_TASK)
+
+@shared_task(
+    name=IMPORT_TASK,
+    autoretry_for=(ImportRetry,),
+    max_retries=5,
+    retry_backoff=5,  # 5, 10, 20, 40, 80 s (with jitter): Redis or the database comes back, or the job fails
+    retry_backoff_max=120,
+    time_limit=IMPORT_TIME_LIMIT_S,
+)
 def import_archive(project_id: str, job_id: str, user_id: str, filename: str) -> str:
-    """``ready`` / ``error`` / ``skipped``; the outcome is in the project row, so the result is not stored."""
+    """``ready`` / ``error`` / ``skipped``; the outcome is in the project row, so the result is not stored.
+    ``ImportRetry`` (the outcome could not be decided) runs it again; after the last retry the archive and
+    lock stay until the lock expires, and the project reads ``import_incomplete``."""
     return asyncio.run(
         run_import_job(
             project_id=uuid.UUID(project_id),

@@ -33,6 +33,8 @@ class CeleryJobQueue:
             task_serializer="json",
             accept_content=["json"],
             broker_connection_timeout=2.0,
+            # A broker that stops answering mid-publish fails the send instead of holding a thread forever.
+            broker_transport_options={"socket_timeout": 5.0, "socket_connect_timeout": 2.0},
             # A broker that is down fails the request in seconds (503), never after kombu's long default.
             task_publish_retry_policy={
                 "max_retries": 2,

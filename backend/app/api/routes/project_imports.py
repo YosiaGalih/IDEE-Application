@@ -5,12 +5,17 @@ the file part goes straight to ``ArchiveSink`` on the workspace volume. Nothing 
 container's ``/tmp``. The idempotency middleware lets this path through unbuffered (``stream_paths``).
 
 Every refusal that does not need the file (scope, state, lock, rate) comes from ``begin_import`` before the
-first byte is read.
+first byte is read. While the body streams, the upload's lock is extended every ``KEEP_ALIVE_S``; a body
+that stops arriving for ``UPLOAD_IDLE_S`` is refused (408, not stored by the idempotency middleware, so a
+retry with the same key runs again).
 """
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Annotated
 
@@ -19,18 +24,27 @@ from fastapi.responses import JSONResponse
 from python_multipart import MultipartParser
 from python_multipart.exceptions import ParseError
 from python_multipart.multipart import parse_options_header
+from starlette.requests import ClientDisconnect
 
 from app.api.deps import AuditDep, LimiterDep, dependencies
 from app.api.routes.projects import ProjectWriter, RepositoryOut, _respond, project_env
 from app.core.errors import AppError
+from app.core.logging import get_logger
 from app.services import project_imports
-from app.services.project_imports import ArchiveSink, ImportEnv, UploadInfo
+from app.services.project_imports import ArchiveSink, ImportEnv, ImportSlot, UploadInfo
 
+logger = get_logger(__name__)
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 FIELD = "file"
 # Headers, boundaries and the closing delimiter around the file; a body past this is not an archive upload.
 MULTIPART_OVERHEAD = 1024 * 1024
+BOUNDARY_MAX = 70  # RFC 2046 §5.1.1
+# One part, a few headers each (the parser's own defaults, stated so a library upgrade cannot widen them).
+MAX_HEADER_COUNT = 8
+MAX_HEADER_SIZE = 4224
+UPLOAD_IDLE_S = 60.0  # no byte for this long: the client stalled
+KEEP_ALIVE_S = 60.0  # how often a streaming upload extends its lock
 
 
 def _invalid(message: str) -> AppError:
@@ -57,7 +71,15 @@ def _boundary(content_type: str | None) -> bytes:
     boundary = params.get(b"boundary")
     if kind != b"multipart/form-data" or not boundary:
         raise _invalid("expected multipart/form-data with one file field")
+    if len(boundary) > BOUNDARY_MAX:
+        raise _invalid(f"the multipart boundary is longer than {BOUNDARY_MAX} characters")
     return boundary
+
+
+def _stopped(reason: str) -> AppError:
+    return AppError(
+        "BAD_REQUEST", "The upload stopped before it finished", http_status=408, details=[{"reason": reason}]
+    )
 
 
 @dataclass
@@ -113,7 +135,30 @@ class _Parts:
         self.ended = True
 
 
-async def _receive(request: Request, boundary: bytes, sink: ArchiveSink) -> UploadInfo:
+async def _chunks(request: Request, env: ImportEnv, slot: ImportSlot) -> AsyncIterator[bytes]:
+    """The body as it arrives: refused when it stalls or the client leaves; the lock extended meanwhile."""
+    stream = aiter(request.stream())
+    extended = time.monotonic()
+    while True:
+        try:
+            async with asyncio.timeout(UPLOAD_IDLE_S):
+                chunk = await anext(stream)
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            logger.info("project_import_upload_stalled", project_id=str(slot.project_id))
+            raise _stopped("upload_stalled") from None
+        except ClientDisconnect:
+            logger.info("project_import_client_gone", project_id=str(slot.project_id))
+            raise _stopped("client_disconnected") from None
+        if time.monotonic() - extended >= KEEP_ALIVE_S:
+            await project_imports.keep_alive(env, slot)
+            extended = time.monotonic()
+        yield chunk
+
+
+async def _receive(request: Request, env: ImportEnv, slot: ImportSlot, boundary: bytes) -> UploadInfo:
+    sink = ArchiveSink(slot)
     parts = _Parts()
     parser = MultipartParser(
         boundary,
@@ -127,10 +172,12 @@ async def _receive(request: Request, boundary: bytes, sink: ArchiveSink) -> Uplo
             "on_part_end": parts.on_part_end,
             "on_end": parts.on_end,
         },
+        max_header_count=MAX_HEADER_COUNT,
+        max_header_size=MAX_HEADER_SIZE,
     )
     limit = project_imports.IMPORT_MAX_BYTES + MULTIPART_OVERHEAD
     received = 0
-    async for chunk in request.stream():
+    async for chunk in _chunks(request, env, slot):
         received += len(chunk)
         if received > limit:
             raise AppError("PAYLOAD_TOO_LARGE", "Request body too large", http_status=413)
@@ -159,7 +206,7 @@ async def import_archive(
     boundary = _boundary(request.headers.get("content-type"))
     slot = await project_imports.begin_import(env, actor, project_id)
     try:
-        upload = await _receive(request, boundary, ArchiveSink(slot))
+        upload = await _receive(request, env, slot, boundary)
         accepted = await project_imports.finish_import(env, actor, slot, upload)
     except BaseException:
         # Client gone, limit, type, bad multipart, cancellation: nothing of this upload may stay behind.

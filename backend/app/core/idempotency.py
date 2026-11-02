@@ -9,6 +9,10 @@
 **Record**
 - A key is scoped to the session id, method and path.
 - The request fingerprint (query, content type, body) must match, otherwise 409.
+- **Stream paths** (``stream_paths``, the archive upload): the body is never buffered. The fingerprint is
+  the query plus the declared ``Content-Length``, which is required (400) and capped by
+  ``stream_max_bytes`` (413). The same key with a different body of the same length replays the first
+  answer, whose ``sha256`` names the file it describes.
 - Status, content type, body and a small allowlist of safe headers are replayed; ``Set-Cookie`` never is.
 
 **What is not stored**

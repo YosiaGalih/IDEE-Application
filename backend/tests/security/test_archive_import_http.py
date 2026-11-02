@@ -1,5 +1,6 @@
 """AC-02 through the whole path (WP-2.1b): every hostile archive of WP-1.2b, uploaded over HTTP and run by the
-import job, ends as a visible error with nothing left behind (no repository, no upload, no lock).
+import job, ends as a visible error and one ``project.import`` error event, with nothing left behind (no
+repository, no work folder, no upload, no lock).
 
 The archives and their expected reasons come from ``test_archive_import.REJECT_CASES``; each carries its own
 limits (small ones keep the bombs fast), passed to the job as the worker would pass the defaults.
@@ -13,6 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.services import project_imports
 from tests.integration.test_project_imports import (  # noqa: F401 - fixtures and helpers
@@ -20,6 +22,7 @@ from tests.integration.test_project_imports import (  # noqa: F401 - fixtures an
     create_upload,
     held,
     import_env,
+    import_events,
     queue,
     upload,
 )
@@ -42,6 +45,7 @@ async def test_rejects_over_http(
     owner_id: uuid.UUID,  # noqa: F811
     workspace_root: Path,  # noqa: F811
     queue: RecordingQueue,  # noqa: F811
+    engine: AsyncEngine,
     tmp_path: Path,
 ) -> None:
     builder, reasons = REJECT_CASES[case]
@@ -55,6 +59,7 @@ async def test_rejects_over_http(
         assert reasons == {"format"}
         assert response.json()["error"]["code"] == "UNSUPPORTED_FILE_TYPE"
         assert queue.calls == []
+        assert await import_events(engine, project_id) == []  # no import was ever requested
     else:
         assert response.status_code == 202, response.text
         job_id = uuid.UUID(response.json()["data"]["job_id"])
@@ -67,6 +72,9 @@ async def test_rejects_over_http(
         kind, _, reason = (data["repository"]["error"] or "").partition(":")
         assert (data["repository"]["sync_state"], kind) == ("error", "archive_rejected")
         assert reason in reasons
+        # T10: one outcome event, with the same reason the user sees.
+        assert await import_events(engine, project_id) == [("error", data["repository"]["error"])]
     assert not (workspace_root / str(project_id) / "repo").exists()
+    assert sorted(p.name for p in (workspace_root / str(project_id)).iterdir()) == ["uploads"]
     assert list(uploads.iterdir()) == []
     assert await held(project_id) is None

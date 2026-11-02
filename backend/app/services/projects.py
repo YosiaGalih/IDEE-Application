@@ -701,7 +701,8 @@ async def _stats(
     env: ProjectEnv, project_id: uuid.UUID, repository: Repository | None, open_tasks: int
 ) -> ProjectStats:
     """The git half of the stats, run with no session open."""
-    if repository is not None and repository.sync_state != "ready":
+    if _awaiting_import(repository):
+        assert repository is not None
         # Not imported yet (or importing): no folder to read; only an import that stopped is a problem.
         stalled = await _stalled_imports(env, [repository])
         problem = "import_incomplete" if repository.project_id in stalled else None
@@ -710,6 +711,11 @@ async def _stats(
     return ProjectStats(
         files=None, last_commit=last_commit, open_tasks=open_tasks, repository_problem=problem
     )
+
+
+def _awaiting_import(repository: Repository | None) -> bool:
+    """A project from an archive whose import has not finished: it has no repository folder yet."""
+    return repository is not None and repository.provider == "upload" and repository.sync_state != "ready"
 
 
 async def _stalled_imports(env: ProjectEnv, repositories: list[Repository]) -> set[uuid.UUID]:
@@ -796,7 +802,7 @@ async def list_projects(
     ready = [
         project.id
         for project, repository in rows
-        if repository is not None and repository.sync_state == "ready"
+        if repository is not None and not _awaiting_import(repository)
     ]
     missing = await _missing_repositories(env, ready)
     stalled = await _stalled_imports(env, [repository for _, repository in rows if repository is not None])
