@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { API, deferred, fail, ok, renderApp, signedIn } from "@/__tests__/harness";
+import { API, deferred, fail, ok, okPage, renderApp, signedIn } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
 
 const server = setupServer();
@@ -51,7 +51,7 @@ function backend(reply: () => Response | Promise<Response> = () => ok(created())
   server.use(
     signedIn(),
     http.get(`${API}/projects/templates`, () => ok(TEMPLATES)),
-    http.get(`${API}/projects`, () => ok([])),
+    http.get(`${API}/projects`, () => okPage([])),
     http.post(`${API}/projects`, async ({ request }) => {
       state.bodies.push(await request.json());
       state.keys.push(request.headers.get("Idempotency-Key"));
@@ -110,6 +110,13 @@ describe("NewProjectPage", () => {
     expect(screen.getByLabelText(id.projects.new.name)).toHaveAccessibleDescription(
       id.projects.errors.nameTooLong,
     );
+    // A bidi override makes a name display as another one: refused, as the backend does.
+    await userEvent.clear(screen.getByLabelText(id.projects.new.name));
+    await fillName("Tira\u202eevil");
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    expect(screen.getByLabelText(id.projects.new.name)).toHaveAccessibleDescription(
+      id.projects.errors.nameInvalid,
+    );
     expect(state.bodies).toEqual([]);
   });
 
@@ -133,7 +140,7 @@ describe("NewProjectPage", () => {
     await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
     await waitFor(() =>
       expect(screen.getByLabelText(id.projects.new.name)).toHaveAccessibleDescription(
-        id.projects.errors.nameInvalid,
+        id.projects.errors.fieldRejected,
       ),
     );
   });
@@ -180,7 +187,7 @@ describe("NewProjectPage", () => {
     expect(state.keys[0]).not.toBe(state.keys[1]);
   });
 
-  it("uses a new key after an answered failure (a stored 409 must not replay)", async () => {
+  it("uses a new key after a failure that did not run (503 from a dependency)", async () => {
     let failing = true;
     const state = backend(() => (failing ? fail(503, "DEPENDENCY_UNAVAILABLE") : ok(created())));
     renderApp("/projects/new");
@@ -191,6 +198,89 @@ describe("NewProjectPage", () => {
     await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
     await waitFor(() => expect(state.keys).toHaveLength(2));
     expect(state.keys[0]).not.toBe(state.keys[1]);
+  });
+
+  it.each([
+    ["409 CONFLICT from the idempotency store", () => fail(409, "CONFLICT", "in progress")],
+    ["a gateway 502 page", () => new HttpResponse("<html>502 Bad Gateway</html>", { status: 502 })],
+  ])("keeps the key and says the outcome is unknown on %s", async (_case, reply) => {
+    let first = true;
+    const state = backend(() => {
+      if (!first) return ok(created());
+      first = false;
+      return reply();
+    });
+    const { router } = renderApp("/projects/new");
+    await fillName("Kalkulator");
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    expect(await screen.findByText(id.projects.new.outcomeUnknown)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/projects/${PROJECT_ID}/workspace`));
+    expect(state.keys[0]).toBe(state.keys[1]);
+  });
+
+  it("uses a new key after a git failure (it ran and was rolled back)", async () => {
+    let first = true;
+    const state = backend(() => {
+      if (!first) return ok(created());
+      first = false;
+      return fail(500, "GIT_ERROR");
+    });
+    renderApp("/projects/new");
+    await fillName("Kalkulator");
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    await screen.findByText(id.states.error.title);
+    expect(screen.queryByText(id.projects.new.outcomeUnknown)).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    await waitFor(() => expect(state.keys).toHaveLength(2));
+    expect(state.keys[0]).not.toBe(state.keys[1]);
+  });
+
+  it("marks the project list stale after a failed create, so the list shows what the server has", async () => {
+    backend(() => HttpResponse.error());
+    const { queryClient } = renderApp("/projects/new");
+    queryClient.setQueryData(["projects", "list", { status: "active", q: "" }], []);
+    await fillName("Kalkulator");
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    await screen.findByText(id.projects.new.outcomeUnknown);
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryState(["projects", "list", { status: "active", q: "" }])?.isInvalidated,
+      ).toBe(true),
+    );
+  });
+
+  it("counts characters as the backend does (code points), and says the server refused a field", async () => {
+    const state = backend(() =>
+      HttpResponse.json(
+        {
+          request_id: "r-422",
+          status: "failed",
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "x",
+            details: [{ loc: ["body", "description"], msg: "nul" }],
+          },
+        },
+        { status: 422 },
+      ),
+    );
+    renderApp("/projects/new");
+    await fillName("😀".repeat(70)); // 140 UTF-16 units, 70 characters: allowed
+    await userEvent.click(screen.getByRole("button", { name: id.projects.new.submit }));
+    await waitFor(() => expect(state.bodies).toHaveLength(1));
+    expect(await screen.findByRole("alert")).toHaveTextContent(id.projects.new.serverFieldSummary);
+    expect(screen.getByLabelText(id.projects.new.description)).toHaveAccessibleDescription(
+      id.projects.errors.fieldRejected,
+    );
+  });
+
+  it("says when there is no template to choose", async () => {
+    backend();
+    server.use(http.get(`${API}/projects/templates`, () => ok([])));
+    renderApp("/projects/new");
+    await userEvent.click(await screen.findByRole("radio", { name: new RegExp(id.projects.new.template) }));
+    expect(await screen.findByText(id.projects.new.noTemplates)).toBeInTheDocument();
   });
 
   it("shows the degraded state with the request id on 503", async () => {

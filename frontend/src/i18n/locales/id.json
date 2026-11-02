@@ -218,7 +218,7 @@
     "noStack": "Belum terdeteksi",
     "empty": {
       "title": "Belum ada project",
-      "body": "Buat project kosong atau mulai dari template yang siap dijalankan.",
+      "body": "Buat project kosong atau mulai dari template yang siap dijalankan. Project yang diarsipkan tampil di filter Diarsipkan.",
       "filteredTitle": "Tidak ada project yang cocok",
       "filteredBody": "Ubah kata pencarian atau filter status."
     },
@@ -243,14 +243,28 @@
       "submitting": "Membuat…",
       "cancel": "Batal",
       "outcomeUnknown": "Jawaban server tidak sampai, jadi hasilnya belum pasti: project mungkin sudah dibuat. Periksa daftar project sebelum mencoba lagi.",
-      "errorSummary": "Periksa kembali isian yang ditandai."
+      "errorSummary": "Periksa kembali isian yang ditandai.",
+      "noTemplates": "Belum ada template yang tersedia. Pilih project kosong.",
+      "serverFieldSummary": "Server menolak isian yang ditandai."
     },
     "errors": {
       "nameRequired": "Isi nama project.",
       "nameTooLong": "Nama project maksimal 120 karakter.",
-      "nameInvalid": "Nama project tidak boleh berisi karakter kontrol.",
+      "nameInvalid": "Nama project tidak boleh berisi karakter kontrol atau karakter tak terlihat.",
       "descriptionTooLong": "Deskripsi maksimal 2000 karakter.",
-      "templateRequired": "Pilih salah satu template."
+      "templateRequired": "Pilih salah satu template.",
+      "fieldRejected": "Server menolak isian ini. Periksa lalu coba lagi."
+    },
+    "archived": "{{name}} diarsipkan.",
+    "unarchived": "{{name}} aktif lagi.",
+    "archiveConflict": "Status project sudah berubah di tempat lain. Daftar dimuat ulang.",
+    "archiveOutcomeUnknown": "Jawaban server tidak sampai, jadi hasilnya belum pasti. Daftar dimuat ulang untuk menunjukkan status terbaru.",
+    "repositoryProblem": "Repository bermasalah",
+    "pagination": {
+      "label": "Halaman daftar project",
+      "previous": "Sebelumnya",
+      "next": "Berikutnya",
+      "status": "Halaman {{page}} dari {{pages}} · {{total}} project"
     }
   }
 }

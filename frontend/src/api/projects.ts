@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { apiPath, apiRequest } from "./client";
+import { apiPath, apiRequest, PageMetaSchema, type PageMeta } from "./client";
+import { ApiError } from "./errors";
 
 /** `Stack` (API_CONTRACTS §3): what deterministic detection found in the repository. */
 export const StackSchema = z.object({
@@ -58,18 +59,33 @@ export const TemplateSchema = z.object({
 });
 export type Template = z.infer<typeof TemplateSchema>;
 
-export type ProjectListFilter = { status: "active" | "archived" | "all"; q: string };
+export type ProjectListFilter = { status: "active" | "archived" | "all"; q: string; page: number };
+export type ProjectPage = { items: Project[]; meta: PageMeta };
+export const PROJECTS_PAGE_SIZE = 50;
 export type ProjectSource = { type: "blank" } | { type: "template"; template_id: string };
 export type CreateProjectInput = { name: string; description: string | null; source: ProjectSource };
 
-export async function listProjects(filter: ProjectListFilter, signal?: AbortSignal): Promise<Project[]> {
-  const params = new URLSearchParams({ status: filter.status });
+export async function listProjects(filter: ProjectListFilter, signal?: AbortSignal): Promise<ProjectPage> {
+  const params = new URLSearchParams({
+    status: filter.status,
+    page: String(filter.page),
+    page_size: String(PROJECTS_PAGE_SIZE),
+  });
   if (filter.q.trim()) params.set("q", filter.q.trim());
   const result = await apiRequest(`/projects?${params.toString()}`, {
     schema: z.array(ProjectSchema),
     ...(signal ? { signal } : {}),
   });
-  return result.data;
+  const meta = PageMetaSchema.safeParse(result.meta);
+  if (!meta.success) {
+    // Without the total, a later page would silently look like the end of the list.
+    throw new ApiError({
+      kind: "bad_response",
+      message: `List meta does not match the expected shape: ${meta.error.message}`,
+      requestId: result.requestId,
+    });
+  }
+  return { items: result.data, meta: meta.data };
 }
 
 export async function listTemplates(signal?: AbortSignal): Promise<Template[]> {

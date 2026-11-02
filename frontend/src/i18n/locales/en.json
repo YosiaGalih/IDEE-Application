@@ -218,7 +218,7 @@
     "noStack": "Not detected yet",
     "empty": {
       "title": "No projects yet",
-      "body": "Create an empty project or start from a template that runs as is.",
+      "body": "Create an empty project or start from a template that runs as is. Archived projects are under the Archived filter.",
       "filteredTitle": "No matching projects",
       "filteredBody": "Change the search words or the status filter."
     },
@@ -243,14 +243,28 @@
       "submitting": "Creating…",
       "cancel": "Cancel",
       "outcomeUnknown": "The server's answer did not arrive, so the outcome is unknown: the project may have been created. Check the project list before retrying.",
-      "errorSummary": "Check the marked fields."
+      "errorSummary": "Check the marked fields.",
+      "noTemplates": "No templates are available yet. Choose an empty project.",
+      "serverFieldSummary": "The server refused the marked fields."
     },
     "errors": {
       "nameRequired": "Enter a project name.",
       "nameTooLong": "Use at most 120 characters.",
-      "nameInvalid": "The name cannot contain control characters.",
+      "nameInvalid": "The name cannot contain control or invisible characters.",
       "descriptionTooLong": "Use at most 2000 characters.",
-      "templateRequired": "Choose a template."
+      "templateRequired": "Choose a template.",
+      "fieldRejected": "The server refused this value. Check it and try again."
+    },
+    "archived": "{{name}} archived.",
+    "unarchived": "{{name}} is active again.",
+    "archiveConflict": "The project's status changed elsewhere. The list was reloaded.",
+    "archiveOutcomeUnknown": "The server's answer did not arrive, so the outcome is unknown. The list was reloaded to show the current status.",
+    "repositoryProblem": "Repository problem",
+    "pagination": {
+      "label": "Project list pages",
+      "previous": "Previous",
+      "next": "Next",
+      "status": "Page {{page}} of {{pages}} · {{total}} projects"
     }
   }
 }

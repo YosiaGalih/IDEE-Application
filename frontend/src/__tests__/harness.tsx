@@ -21,6 +21,14 @@ export const me = { user, roles: [{ role: "owner", scope: "global" }], permissio
 
 export const ok = (data: unknown) =>
   HttpResponse.json({ request_id: "r-ok-0001", status: "completed", data });
+/** A list answer with its `meta` (API_CONTRACTS §1); the total defaults to the rows given. */
+export const okPage = (data: unknown[], meta: { page?: number; page_size?: number; total?: number } = {}) =>
+  HttpResponse.json({
+    request_id: "r-ok-0001",
+    status: "completed",
+    data,
+    meta: { page: 1, page_size: 50, total: data.length, ...meta },
+  });
 export const fail = (status: number, code: string, message = "refused", headers?: Record<string, string>) =>
   HttpResponse.json(
     { request_id: "r-err-0001", status: "failed", error: { code, message } },

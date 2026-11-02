@@ -11,15 +11,23 @@ type Options = {
   unknownOutcome?: string;
 };
 
+/** A gateway's own 502/503/504 page (no envelope): the request may have reached the API and run. */
+const GATEWAY_STATUSES = new Set([502, 503, 504]);
+
 /**
- * No answer from the server, or an answer that is not the error envelope on a 2xx: the call may have worked.
- * A retry of such a call keeps its Idempotency-Key, so the server answers it once (API_CONTRACTS §1).
+ * The call may have run although no success came back:
+ * - no answer at all (network, timeout) or a 2xx that is not the envelope;
+ * - a gateway error page without the envelope (the API restarted mid-request);
+ * - 409 CONFLICT from the idempotency store: the first request with this key is still running or already ran.
+ * A retry keeps its Idempotency-Key then, so the server answers it once (API_CONTRACTS §1).
  */
-export const isUnanswered = (error: unknown): boolean =>
+export const isOutcomeUnknown = (error: unknown): boolean =>
   error instanceof ApiError &&
   (error.kind === "network" ||
     error.kind === "timeout" ||
-    (error.kind === "bad_response" && (error.status ?? 0) < 400));
+    (error.kind === "bad_response" &&
+      ((error.status ?? 0) < 400 || GATEWAY_STATUSES.has(error.status ?? 0))) ||
+    (error.kind === "http" && error.status === 409 && error.code === "CONFLICT"));
 
 /**
  * The text for a failed call: the screen's wording for a known code, how long to wait on 429
@@ -45,7 +53,7 @@ export function describeError(
   }
   const state = uxStateForError(error);
   const body =
-    unknownOutcome !== undefined && api !== null && isUnanswered(api)
+    unknownOutcome !== undefined && api !== null && isOutcomeUnknown(api)
       ? unknownOutcome
       : t(`states.${state}.body`);
   return { title: t(`states.${state}.title`), body, requestId };

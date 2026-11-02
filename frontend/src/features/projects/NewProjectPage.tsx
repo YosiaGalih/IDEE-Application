@@ -12,14 +12,13 @@ import { FormField } from "@/components/ui/FormField";
 import { Label } from "@/components/ui/Label";
 import { Spinner } from "@/components/ui/Spinner";
 import { StateView } from "@/components/ui/StateView";
-import { describeError, isUnanswered } from "@/lib/describeError";
+import { describeError, isOutcomeUnknown } from "@/lib/describeError";
 import { cn } from "@/lib/cn";
+import { PROJECTS_PATH, workspacePath } from "@/lib/paths";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { zodResolver } from "@/lib/zodResolver";
-import { workspacePath } from "./ProjectsPage";
 import { isProjectErrorKey, newProjectSchema, SERVER_FIELD_ERRORS, type NewProjectValues } from "./schemas";
 
-const PROJECTS_PATH = "/projects";
 const SOURCES = ["blank", "template"] as const;
 
 function serverFieldErrors(error: unknown) {
@@ -78,7 +77,7 @@ export function NewProjectPage() {
       {
         onSuccess: (project) => void navigate(workspacePath(project.id)),
         onError: (error) => {
-          if (!isUnanswered(error)) attempt.current = null; // answered: a new attempt gets a new key
+          if (!isOutcomeUnknown(error)) attempt.current = null; // answered: a new attempt gets a new key
           for (const target of serverFieldErrors(error)) {
             setError(target.field, { type: "server", message: target.key });
           }
@@ -91,7 +90,14 @@ export function NewProjectPage() {
 
   const hasFieldErrors = Object.keys(errors).length > 0;
   const summary = create.isError
-    ? describeError(create.error, t, { unknownOutcome: t("projects.new.outcomeUnknown") })
+    ? serverFieldErrors(create.error).length > 0
+      ? // A retry with the same input fails again: point at the fields, not at "try again".
+        {
+          title: t("projects.new.serverFieldSummary"),
+          body: null,
+          requestId: create.error instanceof ApiError ? create.error.requestId : null,
+        }
+      : describeError(create.error, t, { unknownOutcome: t("projects.new.outcomeUnknown") })
     : hasFieldErrors
       ? { title: t("projects.new.errorSummary"), body: null, requestId: null }
       : null;
@@ -109,6 +115,8 @@ export function NewProjectPage() {
           </Button>
         </div>
       );
+    } else if (templates.data.length === 0) {
+      templateChoices = <p className="text-sm text-fg-muted">{t("projects.new.noTemplates")}</p>;
     } else {
       templateChoices = (
         <fieldset

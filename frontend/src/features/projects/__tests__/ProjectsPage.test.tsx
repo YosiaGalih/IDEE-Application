@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { API, deferred, fail, ok, renderApp, signedIn } from "@/__tests__/harness";
+import { API, deferred, fail, ok, okPage, renderApp, signedIn } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
 
 const server = setupServer();
@@ -57,7 +57,7 @@ function backend(rows: () => unknown[] | Response) {
     http.get(`${API}/projects`, ({ request }) => {
       state.queries.push(new URL(request.url).searchParams);
       const result = rows();
-      return result instanceof Response ? result : ok(result);
+      return result instanceof Response ? result : okPage(result);
     }),
     http.post(`${API}/projects/:id/:action`, ({ params }) => {
       state.archived.push(`${String(params.action)}:${String(params.id)}`);
@@ -74,7 +74,7 @@ describe("ProjectsPage", () => {
     server.use(
       http.get(`${API}/projects`, async () => {
         await gate;
-        return ok([project()]);
+        return okPage([project()]);
       }),
     );
     renderApp("/projects");
@@ -114,7 +114,7 @@ describe("ProjectsPage", () => {
       http.get(`${API}/projects`, async () => {
         if (!first) await gate;
         first = false;
-        return ok([project()]);
+        return okPage([project()]);
       }),
     );
     renderApp("/projects");
@@ -126,6 +126,70 @@ describe("ProjectsPage", () => {
     await waitFor(() =>
       expect(screen.getByRole("table").parentElement).toHaveAttribute("aria-busy", "false"),
     );
+  });
+
+  it("keeps the search box in step with the URL, and a status change applies what is typed", async () => {
+    const state = backend(() => [project()]);
+    const { router } = renderApp("/projects?q=kalk");
+    const box = await screen.findByLabelText(id.projects.search.label);
+    expect(box).toHaveValue("kalk");
+    await userEvent.click(screen.getByRole("navigation").querySelector('a[href="/projects"]') as HTMLElement);
+    await waitFor(() => expect(router.state.location.search).toBe(""));
+    expect(box).toHaveValue("");
+    await userEvent.type(box, "foo");
+    await userEvent.selectOptions(screen.getByLabelText(id.projects.statusFilter.label), "all");
+    await waitFor(() => expect(router.state.location.search).toBe("?status=all&q=foo"));
+    expect(state.queries.at(-1)?.get("q")).toBe("foo");
+  });
+
+  it("shows loading, never 'no projects', while a new filter loads over an empty list", async () => {
+    const { gate, release } = deferred();
+    let calls = 0;
+    backend(() => []);
+    server.use(
+      http.get(`${API}/projects`, async () => {
+        calls += 1;
+        if (calls === 1) return okPage([]);
+        await gate;
+        return okPage([project()]);
+      }),
+    );
+    renderApp("/projects?status=archived");
+    await screen.findByText(id.projects.empty.filteredTitle);
+    await userEvent.selectOptions(screen.getByLabelText(id.projects.statusFilter.label), "active");
+    expect(await screen.findByRole("status")).toHaveTextContent(id.states.loading.title);
+    expect(screen.queryByText(id.projects.empty.title)).toBeNull();
+    release();
+    expect(await screen.findByRole("link", { name: "Kalkulator" })).toBeInTheDocument();
+  });
+
+  it("says a project was archived and moves focus to the heading", async () => {
+    backend(() => [project()]);
+    renderApp("/projects");
+    await userEvent.click(
+      await screen.findByRole("button", { name: id.projects.archiveOf.replace("{{name}}", "Kalkulator") }),
+    );
+    expect(
+      await screen.findByText(id.projects.archived.replace("{{name}}", "Kalkulator")),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveFocus();
+  });
+
+  it("marks a project whose repository has a problem", async () => {
+    backend(() => [
+      project({
+        repository: {
+          provider: "local",
+          remote_url: null,
+          branch: "main",
+          sync_state: "error",
+          last_indexed_at: null,
+          error: "repository_missing",
+        },
+      }),
+    ]);
+    renderApp("/projects");
+    expect(await screen.findByText(id.projects.repositoryProblem)).toBeInTheDocument();
   });
 
   it("offers a first project when there is none", async () => {
@@ -174,7 +238,7 @@ describe("ProjectsPage", () => {
     await userEvent.click(
       await screen.findByRole("button", { name: id.projects.archiveOf.replace("{{name}}", "Kalkulator") }),
     );
-    expect(await screen.findByRole("alert")).toHaveTextContent(id.states.error.title);
+    expect(await screen.findByRole("alert")).toHaveTextContent(id.projects.archiveConflict);
     expect(screen.getByRole("link", { name: "Kalkulator" })).toBeInTheDocument();
   });
 
@@ -194,6 +258,56 @@ describe("ProjectsPage", () => {
     backend(() => [{ ...project(), id: "not-a-uuid" }]);
     renderApp("/projects");
     expect(await screen.findByRole("alert")).toHaveTextContent(id.states.error.title);
+  });
+
+  it("refuses a list without its page meta (a later page would look like the end)", async () => {
+    backend(() => ok([project()]));
+    renderApp("/projects");
+    expect(await screen.findByRole("alert")).toHaveTextContent(id.states.error.title);
+  });
+
+  it("pages through a long list, and a new filter starts at its first page", async () => {
+    const state = backend(() => []);
+    server.use(
+      http.get(`${API}/projects`, ({ request }) => {
+        const params = new URL(request.url).searchParams;
+        state.queries.push(params);
+        const page = Number(params.get("page"));
+        return okPage([project({ name: `P${page}` })], { page, total: 120 });
+      }),
+    );
+    const { router } = renderApp("/projects");
+    const pager = await screen.findByRole("navigation", { name: id.projects.pagination.label });
+    expect(pager).toHaveTextContent(
+      id.projects.pagination.status
+        .replace("{{page}}", "1")
+        .replace("{{pages}}", "3")
+        .replace("{{total}}", "120"),
+    );
+    expect(state.queries.at(-1)?.get("page_size")).toBe("50");
+    expect(within(pager).getByRole("button", { name: id.projects.pagination.previous })).toBeDisabled();
+    await userEvent.click(within(pager).getByRole("button", { name: id.projects.pagination.next }));
+    await waitFor(() => expect(router.state.location.search).toBe("?page=2"));
+    expect(await screen.findByRole("link", { name: "P2" })).toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText(id.projects.statusFilter.label), "all");
+    await waitFor(() => expect(router.state.location.search).toBe("?status=all"));
+    expect(state.queries.at(-1)?.get("page")).toBe("1");
+  });
+
+  it("moves to the last page with rows when the page is past the end", async () => {
+    const state = backend(() => []);
+    server.use(
+      http.get(`${API}/projects`, ({ request }) => {
+        const params = new URL(request.url).searchParams;
+        state.queries.push(params);
+        const page = Number(params.get("page"));
+        return okPage(page > 2 ? [] : [project()], { page, total: 60 });
+      }),
+    );
+    const { router } = renderApp("/projects?page=5");
+    expect(await screen.findByRole("link", { name: "Kalkulator" })).toBeInTheDocument();
+    expect(router.state.location.search).toBe("?page=2");
+    expect(screen.queryByText(id.projects.empty.title)).toBeNull();
   });
 
   it("is reachable from the sidebar", async () => {
