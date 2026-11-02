@@ -26,7 +26,8 @@ from sqlalchemy import select
 
 from app.core.errors import AppError
 from app.core.logging import get_logger
-from app.gitops.adapter import GitTarget
+from app.gitops.adapter import Branch, GitStatus, GitTarget, LogEntry
+from app.gitops.diffparse import Diff
 from app.models.projects import Project, Repository
 from app.services.projects import Actor, ProjectEnv, authorize, repo_path
 from app.workspace.fs import FileChange, TreeResult, Workspace
@@ -278,3 +279,32 @@ async def apply_patch(
         {"files": len(changes), "paths": [change.path for change in changes[:AUDIT_PATHS_MAX]]},
     )
     return changes
+
+
+# --- git reads ----------------------------------------------------------------------------------------------
+
+DIFF_MAX_BYTES = 1024 * 1024  # API_CONTRACTS §4 ``Diff.truncated`` past this
+
+
+async def git_status(env: ProjectEnv, actor: Actor, project_id: uuid.UUID) -> GitStatus:
+    repo = await open_repo(env, actor, project_id, "git:read", write=False)
+    return await env.git.status(repo.target)
+
+
+async def git_diff(
+    env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, base: str | None, path: str | None
+) -> Diff:
+    """``base`` (default HEAD) against the working tree, untracked files included (``head`` is None)."""
+    repo = await open_repo(env, actor, project_id, "git:read", write=False)
+    paths = [path] if path else None
+    return await env.git.diff(repo.target, base=base, paths=paths, max_bytes=DIFF_MAX_BYTES)
+
+
+async def git_branches(env: ProjectEnv, actor: Actor, project_id: uuid.UUID) -> list[Branch]:
+    repo = await open_repo(env, actor, project_id, "git:read", write=False)
+    return await env.git.branches(repo.target)
+
+
+async def git_log(env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, limit: int) -> list[LogEntry]:
+    repo = await open_repo(env, actor, project_id, "git:read", write=False)
+    return await env.git.log(repo.target, limit=limit)

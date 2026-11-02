@@ -41,6 +41,10 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("POST", "/api/v1/projects/{id}/files", {"path": "new.txt", "type": "file"}),
     ("DELETE", "/api/v1/projects/{id}/files/{path}", None),  # the door answers before the query is checked
     ("POST", "/api/v1/projects/{id}/patches", {"diff": "x"}),
+    ("GET", "/api/v1/projects/{id}/git/status", None),
+    ("GET", "/api/v1/projects/{id}/git/diff", None),
+    ("GET", "/api/v1/projects/{id}/git/branches", None),
+    ("GET", "/api/v1/projects/{id}/git/log", None),
 ]
 FILE = "README.md"  # exists in every blank project
 WRITES = {
