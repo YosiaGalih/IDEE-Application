@@ -37,10 +37,14 @@ def upgrade() -> None:
             "provider IN ('local', 'template', 'upload', 'git_https')", name=op.f("ck_repositories_provider")
         ),
         sa.CheckConstraint(
-            "sync_state IN ('ready', 'importing', 'indexing', 'error')", name=op.f("ck_repositories_sync_state")
+            "sync_state IN ('ready', 'importing', 'indexing', 'error')",
+            name=op.f("ck_repositories_sync_state"),
         ),
         sa.ForeignKeyConstraint(
-            ["project_id"], ["projects.id"], name=op.f("fk_repositories_project_id_projects"), ondelete="CASCADE"
+            ["project_id"],
+            ["projects.id"],
+            name=op.f("fk_repositories_project_id_projects"),
+            ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_repositories")),
         sa.UniqueConstraint("project_id", name=op.f("uq_repositories_project_id")),
