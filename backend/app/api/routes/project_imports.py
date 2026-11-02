@@ -6,8 +6,8 @@ container's ``/tmp``. The idempotency middleware lets this path through unbuffer
 
 Every refusal that does not need the file (scope, state, lock, rate) comes from ``begin_import`` before the
 first byte is read. While the body streams, the upload's lock is extended every ``KEEP_ALIVE_S``; a body
-that stops arriving for ``UPLOAD_IDLE_S`` is refused (408, not stored by the idempotency middleware, so a
-retry with the same key runs again).
+that stops arriving for ``UPLOAD_IDLE_S``, or is still arriving after ``UPLOAD_MAX_S``, is refused (408,
+not stored by the idempotency middleware, so a retry with the same key runs again).
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ BOUNDARY_MAX = 70  # RFC 2046 §5.1.1
 MAX_HEADER_COUNT = 8
 MAX_HEADER_SIZE = 4224
 UPLOAD_IDLE_S = 60.0  # no byte for this long: the client stalled
+UPLOAD_MAX_S = 30 * 60.0  # the whole body within this (the web client gives up at 30 minutes too)
 KEEP_ALIVE_S = 60.0  # how often a streaming upload extends its lock
 
 
@@ -138,7 +139,7 @@ class _Parts:
 async def _chunks(request: Request, env: ImportEnv, slot: ImportSlot) -> AsyncIterator[bytes]:
     """The body as it arrives: refused when it stalls or the client leaves; the lock extended meanwhile."""
     stream = aiter(request.stream())
-    extended = time.monotonic()
+    started = extended = time.monotonic()
     while True:
         try:
             async with asyncio.timeout(UPLOAD_IDLE_S):
@@ -151,6 +152,10 @@ async def _chunks(request: Request, env: ImportEnv, slot: ImportSlot) -> AsyncIt
         except ClientDisconnect:
             logger.info("project_import_client_gone", project_id=str(slot.project_id))
             raise _stopped("client_disconnected") from None
+        if time.monotonic() - started > UPLOAD_MAX_S:
+            # A trickle that never stalls would otherwise hold the connection and the lock indefinitely.
+            logger.info("project_import_upload_too_slow", project_id=str(slot.project_id))
+            raise _stopped("upload_too_slow")
         if time.monotonic() - extended >= KEEP_ALIVE_S:
             await project_imports.keep_alive(env, slot)
             extended = time.monotonic()

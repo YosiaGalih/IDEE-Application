@@ -29,14 +29,15 @@ IMPORT_TIME_LIMIT_S = 40 * 60
     name=IMPORT_TASK,
     autoretry_for=(ImportRetry,),
     max_retries=5,
-    retry_backoff=5,  # 5, 10, 20, 40, 80 s (with jitter): Redis or the database comes back, or the job fails
+    retry_backoff=5,  # waits of up to 5, 10, 20, 40, 80 s (random, below each): Redis or the DB comes back
     retry_backoff_max=120,
     time_limit=IMPORT_TIME_LIMIT_S,
 )
 def import_archive(project_id: str, job_id: str, user_id: str, filename: str) -> str:
     """``ready`` / ``error`` / ``skipped``; the outcome is in the project row, so the result is not stored.
-    ``ImportRetry`` (the outcome could not be decided) runs it again; after the last retry the archive and
-    lock stay until the lock expires, and the project reads ``import_incomplete``."""
+    ``ImportRetry`` (the outcome could not be decided) runs it again; after the last retry, or when the retry
+    cannot be queued because Redis (also the broker) is down, the archive and lock stay until the lock
+    expires, the project reads ``import_incomplete``, and the next upload clears and audits them."""
     return asyncio.run(
         run_import_job(
             project_id=uuid.UUID(project_id),

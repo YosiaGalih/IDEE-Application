@@ -72,9 +72,10 @@ _SNIFF_BYTES = 512
 _HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 DEFAULT_LIMITS = ArchiveLimits()  # ADR-005
 _OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-# What an import writes next to ``repo/`` in the project folder: a job's work folder, its staging, and the
-# staging of an extraction straight into ``repo/``.
+# What an import writes next to ``repo/`` in the project folder: a job's work folder, its publish marker,
+# its staging, a ``repo/`` set aside, and the staging of an extraction straight into ``repo/``.
 _LEFTOVER_PREFIXES = (".import-", "..import-", ".repo.importing-")
+_PUBLISHED = ".published"  # .import-<job_id>.published: written just before the rename to repo/
 _WORKER = ("system", "project-import")
 # Failures that say nothing about the archive: the job is retried, never failed, on these.
 _TRANSIENT = (RedisError, SQLAlchemyError, ConnectionError, TimeoutError)
@@ -263,8 +264,7 @@ async def begin_import(env: ImportEnv, actor: Actor, project_id: uuid.UUID) -> I
         logger.info("project_import_refused", project_id=str(project_id), reason="import_running")
         raise _conflict("import_running")
     try:
-        # Again, now that no job can finish: one that did between the first check and the lock made a repo.
-        await _check(env, actor, project_id)
+        await _claim_folder(env, actor, slot)
         await _sweep(env, slot)
         await asyncio.to_thread(_make_uploads, slot.uploads)
     except BaseException:
@@ -273,19 +273,51 @@ async def begin_import(env: ImportEnv, actor: Actor, project_id: uuid.UUID) -> I
     return slot
 
 
+async def _claim_folder(env: ImportEnv, actor: Actor, slot: ImportSlot) -> None:
+    """Check the project again and set an unfinished import's ``repo/`` aside, under the project row lock.
+
+    A job holds that row lock from its last lock check, through the rename to ``repo/``, to its ``ready``
+    commit. Taking it here means a job either finished (``ready``: refused) or will find its lock gone, even
+    if the Redis key vanished without expiring. Only a ``repo/`` with an import's publish marker is set aside;
+    any other ``repo/`` is not an import's to remove (409 ``repository_not_empty``).
+    """
+    async with env.projects.sessions() as session:
+        project, _ = await authorize(session, actor, slot.project_id, "project:write", lock=True)
+        repository = await session.scalar(select(Repository).where(Repository.project_id == project.id))
+        reason = _refusal(project, repository)
+        if reason is None and not await asyncio.to_thread(_set_aside_repo, slot.uploads.parent):
+            reason = "repository_not_empty"
+        if reason:
+            logger.info("project_import_refused", project_id=str(slot.project_id), reason=reason)
+            raise _conflict(reason)
+
+
+def _set_aside_repo(root: Path) -> bool:
+    """Move an unfinished import's ``repo/`` out of the way (the sweep removes it); False when ``repo/``
+    exists without a publish marker."""
+    repo = root / "repo"
+    if not os.path.lexists(repo):
+        return True
+    if not any(root.glob(f".import-*{_PUBLISHED}")):
+        return False
+    os.rename(repo, root / f".import-sweep-{uuid.uuid4().hex}")
+    return True
+
+
 async def _sweep(env: ImportEnv, slot: ImportSlot) -> None:
-    """Clear what interrupted imports left (a dead upload's ``.part``, a dead job's archive, work folder,
-    staging or unfinished ``repo/``). Safe only here: the lock is held and the project is not ``ready``, so
-    nothing else writes these, and an upload project's ``repo/`` holds nothing until an import finished."""
+    """Clear what interrupted imports left: a dead upload's ``.part``, a dead job's archive, work folder,
+    staging, publish marker, or the ``repo/`` set aside by ``_claim_folder``. Safe only here: the lock is
+    held and the project is not ``ready``, so nothing else writes these. Each dead job found gets the
+    ``project.import`` outcome it never wrote (``import_incomplete``)."""
     root = slot.uploads.parent
 
     def leftovers() -> list[Path]:
         if not root.is_dir():
             return []
         found = [entry for entry in root.iterdir() if entry.name.startswith(_LEFTOVER_PREFIXES)]
-        if os.path.lexists(root / "repo"):
-            found.append(root / "repo")
-        if slot.uploads.is_dir() and not slot.uploads.is_symlink():
+        if slot.uploads.is_symlink():
+            found.append(slot.uploads)
+        elif slot.uploads.is_dir():
             found.extend(slot.uploads.iterdir())
         return found
 
@@ -297,19 +329,39 @@ async def _sweep(env: ImportEnv, slot: ImportSlot) -> None:
             error_type=type(exc).__name__,
         )
 
-    def sweep() -> tuple[int, bool]:
+    def sweep() -> tuple[int, set[uuid.UUID], bool]:
         found = leftovers()
-        return len(found), _remove_paths(found, report)
+        return len(found), _dead_jobs(found), _remove_paths(found, report)
 
     try:
-        count, clean = await asyncio.to_thread(sweep)
+        count, dead, clean = await asyncio.to_thread(sweep)
     except OSError as exc:
         report(str(root), exc)
-        count, clean = 0, False
+        count, dead, clean = 0, set(), False
     if not clean:
         raise _conflict("cleanup_failed")
     if count:
         logger.warning("project_import_leftovers_removed", project_id=str(slot.project_id), count=count)
+    for job_id in sorted(dead, key=str):
+        await _write_audit_detached(
+            env, slot.project_id, {"job_id": str(job_id), "reason": "import_incomplete"}
+        )
+
+
+def _dead_jobs(found: list[Path]) -> set[uuid.UUID]:
+    """Accepted jobs these files belong to (an archive or a work folder; a ``.part`` was never accepted)."""
+    jobs: set[uuid.UUID] = set()
+    for path in found:
+        name = path.name
+        if name.endswith(".archive"):
+            raw = name.removesuffix(".archive")
+        elif name.startswith(".import-") and not name.startswith(".import-sweep-"):
+            raw = name.removeprefix(".import-").removesuffix(_PUBLISHED)
+        else:
+            continue
+        with contextlib.suppress(ValueError):
+            jobs.add(uuid.UUID(raw))
+    return jobs
 
 
 def _make_uploads(uploads: Path) -> None:
@@ -560,6 +612,12 @@ class _Job:
     def repo(self) -> Path:
         return self.root / "repo"
 
+    @property
+    def marker(self) -> Path:
+        """Written just before the rename to ``repo/``, removed once the outcome is known: a ``repo/`` with a
+        marker was published by an import whose ``ready`` commit may not have landed."""
+        return self.root / f".import-{self.job_id}{_PUBLISHED}"
+
     def leftovers(self) -> list[Path]:
         """This job's work folder and its staging (``import_archive`` stages next to its destination)."""
         if not self.root.is_dir():
@@ -606,18 +664,20 @@ async def run_import(
         return "skipped"
     keep = False
     try:
-        await _remove(env, job, await asyncio.to_thread(job.leftovers))  # an earlier, killed run of this job
-        refusal = await _still_ours(env, job, user_id, archive_present=claim is not None)
-        if refusal is not None:
-            return refusal
-        return await _run(env, job, user_id, clean_filename(filename), limits)
-    except ImportRetry:
-        keep = True
-        raise
+        try:
+            await _remove(env, job, await asyncio.to_thread(job.leftovers))  # an earlier, killed run
+            refusal = await _still_ours(env, job, user_id, archive_present=claim is not None)
+            if refusal is not None:
+                return refusal
+            return await _run(env, job, user_id, clean_filename(filename), limits)
+        except ImportRetry:
+            keep = True
+            raise
+        finally:
+            await _remove(env, job, await asyncio.to_thread(job.leftovers))
+            if not keep:
+                await _abort(env, job.slot)
     finally:
-        await _remove(env, job, await asyncio.to_thread(job.leftovers))
-        if not keep:
-            await _abort(env, job.slot)
         if claim is not None:
             os.close(claim)
 
@@ -663,6 +723,8 @@ async def _still_ours(env: ImportEnv, job: _Job, user_id: uuid.UUID, *, archive_
         raise ImportRetry() from None
     if not _waiting(project, repository):
         logger.warning("project_import_not_waiting", project_id=str(job.project_id), job_id=str(job.job_id))
+        if repository is not None and repository.sync_state == "ready":
+            await _remove(env, job, [job.marker])  # an earlier run's commit did land
         return "skipped"
     if not archive_present:
         # Held lock, waiting project, no archive: this worker does not see the upload volume.
@@ -673,6 +735,7 @@ async def _still_ours(env: ImportEnv, job: _Job, user_id: uuid.UUID, *, archive_
 
 async def _run(env: ImportEnv, job: _Job, user_id: uuid.UUID, filename: str, limits: ArchiveLimits) -> str:
     try:
+        await _take_back(env, job)
         outcome = await _import(env, job, user_id, filename, limits)
         return await _complete(env, job, outcome)
     except _NotWaiting:
@@ -697,6 +760,26 @@ async def _run(env: ImportEnv, job: _Job, user_id: uuid.UUID, filename: str, lim
         logger.exception("project_import_failed", project_id=str(job.project_id), job_id=str(job.job_id))
         code = "import_failed"
     return await _fail(env, job, user_id, code)
+
+
+async def _take_back(env: ImportEnv, job: _Job) -> None:
+    """An earlier run of this job published ``repo/`` but its ``ready`` commit did not land (the project still
+    waits, and this job holds the lock): its marker proves that ``repo/`` is this job's. Take it back and
+    start over."""
+
+    def take_back() -> bool:
+        if not job.marker.exists():
+            return False
+        if os.path.lexists(job.repo):
+            os.rename(job.repo, job.work)
+        job.marker.unlink()
+        return True
+
+    if await asyncio.to_thread(take_back):
+        logger.warning(
+            "project_import_publish_taken_back", project_id=str(job.project_id), job_id=str(job.job_id)
+        )
+        await _remove(env, job, [job.work])
 
 
 async def _keep(env: ImportEnv, job: _Job) -> None:
@@ -729,7 +812,8 @@ async def _import(
 
 async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> str:
     """Publish ``repo/`` and mark the project ``ready`` together: the rename happens inside the transaction
-    and is undone if the commit fails."""
+    (under the project row lock, which ``begin_import`` also takes before it sets anything aside) and is
+    undone if the commit fails. The marker stays only while the commit's outcome is unknown."""
     async with env.projects.sessions() as session:
         project = await session.scalar(
             select(Project).where(Project.id == job.project_id).with_for_update(key_share=True)
@@ -740,8 +824,9 @@ async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> str:
         assert project is not None and repository is not None
         await _keep(env, job)
         if await asyncio.to_thread(os.path.lexists, job.repo):
-            # Not this job's (it publishes only here); the next upload clears it.
+            # Not this job's: it publishes only here, and takes back its own earlier publish first.
             raise RuntimeError("the project already has a repo folder")
+        await asyncio.to_thread(job.marker.touch)
         await asyncio.to_thread(os.rename, job.work, job.repo)
         try:
             project.stack = outcome.stack
@@ -770,13 +855,17 @@ async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> str:
             ready = await _is_ready(env, job)
             if ready:
                 logger.warning("project_import_commit_reply_lost", project_id=str(job.project_id))
+                await _remove(env, job, [job.marker])
                 return "ready"
             if ready is None:
-                # Unknown whether the commit landed: keep ``repo/`` (a retry sees the outcome).
+                # Unknown whether the commit landed: keep ``repo/`` and its marker. The retry finds the
+                # project ``ready`` (done) or still waiting (``_take_back``).
                 logger.error("project_import_commit_unknown", project_id=str(job.project_id))
                 raise ImportRetry() from None
             await asyncio.to_thread(os.rename, job.repo, job.work)
+            await _remove(env, job, [job.marker])
             raise
+    await _remove(env, job, [job.marker])
     logger.info("project_import_ready", project_id=str(job.project_id), files=outcome.report.files)
     return "ready"
 

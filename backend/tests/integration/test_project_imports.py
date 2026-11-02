@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI
+from redis import Redis as SyncRedis
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import select
@@ -35,6 +36,7 @@ from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
 from app.gitops.errors import GitError
 from app.models.audit import AuditEvent
+from app.models.projects import Project
 from app.services import import_lock, project_imports, projects
 from app.services.import_lock import lock_key
 from app.workspace.archive import ArchiveLimits
@@ -703,6 +705,12 @@ async def test_the_job_never_removes_a_repo_folder_it_did_not_publish(
     assert (folder / "repo" / "precious.txt").read_text() == "keep"
     assert names(folder) == ["repo", "uploads"]  # only its own work folder went
     assert await repository_state(owner, project_id) == ("error", "import_failed")
+    # Nor does the next upload: no import's publish marker says this repo/ is an import's to remove.
+    response = await upload(owner, project_id, small_zip(tmp_path))
+    assert response.status_code == 409
+    assert response.json()["error"]["details"] == [{"reason": "repository_not_empty"}]
+    assert (folder / "repo" / "precious.txt").read_text() == "keep"
+    assert await held(project_id) is None
 
 
 async def test_a_new_upload_clears_what_an_interrupted_import_left(
@@ -711,6 +719,7 @@ async def test_a_new_upload_clears_what_an_interrupted_import_left(
     owner_id: uuid.UUID,  # noqa: F811
     workspace_root: Path,  # noqa: F811
     queue: RecordingQueue,
+    engine: AsyncEngine,
     tmp_path: Path,
 ) -> None:
     """AG-13 (T9): a job killed after it published ``repo/``, a dead upload and a dead extraction."""
@@ -718,6 +727,7 @@ async def test_a_new_upload_clears_what_an_interrupted_import_left(
     await drop_lock(project_id)  # the dead job's lock expired
     folder = project_folder(workspace_root, project_id)
     (folder / "repo" / ".git").mkdir(parents=True)  # published, never committed
+    (folder / f".import-{old_job}.published").touch()  # its publish marker
     (folder / "uploads" / f"{uuid.uuid4()}.part").write_bytes(b"half an upload")
     (folder / f".import-{old_job}").mkdir()
     (folder / f"..import-{old_job}.importing-0a1b2c").mkdir()
@@ -729,6 +739,9 @@ async def test_a_new_upload_clears_what_an_interrupted_import_left(
     new_job = uuid.UUID(response.json()["data"]["job_id"])
     assert names(folder) == ["uploads"]
     assert names(folder / "uploads") == [f"{new_job}.archive"]
+    assert await import_events(engine, project_id) == [
+        ("error", "import_incomplete")
+    ]  # the dead job's outcome
     assert await run_job(app, workspace_root, owner_id, project_id, new_job) == "ready"
     head = git(folder / "repo", "rev-parse", "HEAD")
     # The dead job delivered late finds nothing of its own and changes nothing.
@@ -1197,3 +1210,339 @@ async def test_a_slow_upload_keeps_its_lock_while_it_streams(
     response = await owner.post(IMPORTS.format(id=project["id"]), content=slow(), headers=sent)
     assert response.status_code == 202, response.text
     assert await held(project["id"]) == response.json()["data"]["job_id"]
+
+
+# --- delta review round: publish marker, row lock, guards ------------------------------------------------
+
+
+async def test_a_ready_project_refuses_an_upload_and_nothing_is_swept(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "ready"
+    folder = project_folder(workspace_root, project_id)
+    (folder / f".import-{uuid.uuid4()}").mkdir()
+    (folder / "uploads" / "junk.part").write_bytes(b"x")
+    response = await upload(owner, project_id, small_zip(tmp_path))
+    assert response.status_code == 409
+    assert response.json()["error"]["details"] == [{"reason": "repository_not_empty"}]
+    assert len(names(folder)) == 3 and (folder / "uploads" / "junk.part").exists()
+    assert git(folder / "repo", "log", "--format=%s") == "Import from archive proj.zip"
+    assert await held(project_id) is None
+
+
+async def test_the_sweep_never_follows_a_link(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+    workspace_root: Path,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    project = await create_upload(owner)
+    folder = project_folder(workspace_root, project["id"])
+    outside = tmp_path / "outside"
+    for name in ("a", "b", "c"):
+        (outside / name).mkdir(parents=True)
+        (outside / name / "keep.txt").write_text("keep")
+    (folder / "uploads").mkdir(parents=True)
+    (folder / "uploads" / "link.part").symlink_to(outside / "a")
+    (folder / f".import-{uuid.uuid4()}").symlink_to(outside / "b")
+    (folder / "repo").symlink_to(outside / "c")
+    (folder / f".import-{uuid.uuid4()}.published").touch()
+    response = await upload(owner, project["id"], small_zip(tmp_path))
+    assert response.status_code == 202, response.text
+    assert names(folder) == ["uploads"]
+    assert all((outside / name / "keep.txt").read_text() == "keep" for name in ("a", "b", "c"))
+
+
+async def test_an_upload_racing_a_publish_waits_for_its_commit(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AG-13 delta: the Redis key vanishes between the job's last lock check and its commit (Redis restart,
+    an operator). The new upload's re-check and sweep wait for the job's row lock, then see ``ready``."""
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    write = AuditWriter.write
+    racing: list[asyncio.Task[httpx.Response]] = []
+
+    async def write_then_race(self: AuditWriter, session: AsyncSession, **event: Any) -> None:
+        if event.get("action") == "project.import" and event.get("result") == "success" and not racing:
+            await drop_lock(project_id)
+            racing.append(asyncio.create_task(upload(owner, project_id, small_zip(tmp_path))))
+            await asyncio.sleep(0.5)  # the upload reaches the row lock while repo/ is published, uncommitted
+        await write(self, session, **event)
+
+    monkeypatch.setattr(AuditWriter, "write", write_then_race)
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "ready"
+    response = await racing[0]
+    assert response.status_code == 409
+    assert response.json()["error"]["details"] == [{"reason": "repository_not_empty"}]
+    folder = project_folder(workspace_root, project_id)
+    assert git(folder / "repo", "log", "--format=%s") == "Import from archive proj.zip"
+    assert names(folder) == ["repo", "uploads"]
+    assert await repository_state(owner, project_id) == ("ready", None)
+
+
+async def test_a_commit_with_an_unknown_outcome_is_taken_back_by_the_retry(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+
+    async def fails(self: AsyncSession) -> None:
+        raise OperationalError("COMMIT", {}, ConnectionError("database is down"))
+
+    async def unknown(*_: object) -> bool | None:
+        return None
+
+    monkeypatch.setattr(AsyncSession, "commit", fails)
+    monkeypatch.setattr(project_imports, "_is_ready", unknown)
+    with pytest.raises(project_imports.ImportRetry):
+        await run_job(app, workspace_root, owner_id, project_id, job_id)
+    monkeypatch.undo()
+    folder = project_folder(workspace_root, project_id)
+    assert names(folder) == [f".import-{job_id}.published", "repo", "uploads"]  # kept: the outcome is unknown
+    assert await repository_state(owner, project_id) == ("importing", None)
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "ready"  # the retry
+    assert names(folder) == ["repo", "uploads"]
+    assert git(folder / "repo", "log", "--format=%s") == "Import from archive proj.zip"
+
+
+async def test_a_commit_with_an_unknown_outcome_that_landed_is_left_alone(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    commit = AsyncSession.commit
+
+    async def committed_then_lost(self: AsyncSession) -> None:
+        await commit(self)
+        raise OperationalError("COMMIT", {}, ConnectionError("reply lost"))
+
+    async def unknown(*_: object) -> bool | None:
+        return None
+
+    monkeypatch.setattr(AsyncSession, "commit", committed_then_lost)
+    monkeypatch.setattr(project_imports, "_is_ready", unknown)
+    with pytest.raises(project_imports.ImportRetry):
+        await run_job(app, workspace_root, owner_id, project_id, job_id)
+    monkeypatch.undo()
+    folder = project_folder(workspace_root, project_id)
+    head = git(folder / "repo", "rev-parse", "HEAD")
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "skipped"  # the retry
+    assert names(folder) == ["repo", "uploads"]  # marker and archive gone, repo kept
+    assert git(folder / "repo", "rev-parse", "HEAD") == head
+    assert await repository_state(owner, project_id) == ("ready", None)
+    assert await held(project_id) is None
+
+
+async def test_a_lock_lost_during_extraction_stops_before_git(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    extract = project_imports.import_archive
+    inits: list[Path] = []
+
+    def extract_then_expire(*args: Any, **kwargs: Any) -> Any:
+        report = extract(*args, **kwargs)
+        client = SyncRedis.from_url(make_test_env()["REDIS_URL"])
+        try:
+            client.delete(lock_key(project_id))
+        finally:
+            client.close()
+        return report
+
+    async def init(self: GitAdapter, repo: Path, branch: str) -> None:
+        inits.append(repo)
+
+    monkeypatch.setattr(project_imports, "import_archive", extract_then_expire)
+    monkeypatch.setattr(GitAdapter, "init", init)
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "error"
+    assert inits == []
+    assert await repository_state(owner, project_id) == ("error", "import_expired")
+    assert names(project_folder(workspace_root, project_id)) == ["uploads"]
+
+
+async def test_a_job_overtaken_before_publishing_never_publishes(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    commit_all = GitAdapter.commit_all
+
+    async def commit_then_overtaken(self: GitAdapter, *args: Any, **kwargs: Any) -> str | None:
+        head = await commit_all(self, *args, **kwargs)
+        await hold_lock(project_id, "a-newer-upload")
+        return head
+
+    monkeypatch.setattr(GitAdapter, "commit_all", commit_then_overtaken)
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "skipped"
+    assert names(project_folder(workspace_root, project_id)) == ["uploads"]
+    assert await held(project_id) == "a-newer-upload"
+    assert await import_events(engine, project_id) == [("error", "import_superseded")]
+
+
+async def test_publishing_waits_for_the_project_row_lock(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    async with make_sessionmaker(engine)() as holder:
+        await holder.execute(select(Project).where(Project.id == project_id).with_for_update())
+        job = asyncio.create_task(run_job(app, workspace_root, owner_id, project_id, job_id))
+        await asyncio.sleep(2.0)
+        assert not job.done()
+        assert not (project_folder(workspace_root, project_id) / "repo").exists()
+        await holder.rollback()
+    assert await job == "ready"
+
+
+async def test_recording_a_failure_waits_for_the_project_row_lock(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    env = import_env(app, workspace_root, RecordingQueue())
+    async with make_sessionmaker(engine)() as holder:
+        await holder.execute(select(Project).where(Project.id == project_id).with_for_update())
+        settle = asyncio.create_task(
+            project_imports._settle_failure(
+                env, project_id, job_id, "import_failed", actor=("system", "test")
+            )  # pyright: ignore[reportPrivateUsage]
+        )
+        await asyncio.sleep(0.5)
+        assert not settle.done()
+        await holder.rollback()
+    assert await settle == "error"
+
+
+async def test_a_cancelled_abort_still_cleans_up(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    env = import_env(app, workspace_root, RecordingQueue())
+    project_id = uuid.UUID(str((await create_upload(owner))["id"]))
+    slot = await project_imports.begin_import(env, owner_actor(owner_id), project_id)
+    slot.part.write_bytes(b"half")
+    aborting = asyncio.create_task(project_imports.abort_import(env, slot))
+    await asyncio.sleep(0)
+    aborting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await aborting
+    for _ in range(50):
+        if await held(project_id) is None:
+            break
+        await asyncio.sleep(0.05)
+    assert await held(project_id) is None
+    assert not slot.part.exists()
+
+
+async def test_a_lock_error_after_the_set_frees_the_lock(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = import_env(app, workspace_root, RecordingQueue())
+    project_id = uuid.UUID(str((await create_upload(owner))["id"]))
+    acquire = import_lock.acquire
+
+    async def set_then_fail(*args: Any) -> bool:
+        await acquire(*args)
+        raise RedisConnectionError("the reply was lost")
+
+    monkeypatch.setattr(import_lock, "acquire", set_then_fail)
+    with pytest.raises(AppError) as unavailable:
+        await project_imports.begin_import(env, owner_actor(owner_id), project_id)
+    assert unavailable.value.http_status == 503
+    assert await held(project_id) is None
+
+
+async def test_a_refused_database_connection_is_retried(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+
+    async def refused(*_: object, **__: object) -> None:
+        raise ConnectionRefusedError("connection refused")  # what asyncpg raises, unwrapped, on connect
+
+    monkeypatch.setattr(AsyncSession, "get", refused)
+    with pytest.raises(project_imports.ImportRetry):
+        await run_job(app, workspace_root, owner_id, project_id, job_id)
+    monkeypatch.undo()
+    assert names(project_folder(workspace_root, project_id) / "uploads") == [f"{job_id}.archive"]
+    assert await held(project_id) == str(job_id)
+
+
+async def test_an_upload_that_never_ends_is_408(
+    owner: httpx.AsyncClient,  # noqa: F811
+    queue: RecordingQueue,
+    workspace_root: Path,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(import_routes, "UPLOAD_MAX_S", 0.3)
+    project = await create_upload(owner)
+    body, content_type = multipart([("file", "a.zip", small_zip(tmp_path))])
+
+    async def trickle():  # type: ignore[no-untyped-def]
+        for start in range(0, len(body), 20):
+            yield body[start : start + 20]
+            await asyncio.sleep(0.05)  # never idle long enough to stall, never done
+
+    sent = headers(owner) | {"Content-Type": content_type, "Content-Length": str(len(body))}
+    response = await owner.post(IMPORTS.format(id=project["id"]), content=trickle(), headers=sent)
+    assert response.status_code == 408
+    assert response.json()["error"]["details"] == [{"reason": "upload_too_slow"}]
+    assert list((project_folder(workspace_root, project["id"]) / "uploads").iterdir()) == []
+    assert await held(project["id"]) is None
