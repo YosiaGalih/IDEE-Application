@@ -1647,6 +1647,7 @@ async def test_taking_back_waits_for_a_commit_still_settling(
         await settling.commit()
     assert await retry == "skipped"
     assert git(folder / "repo", "log", "--format=%s") == "Import from archive proj.zip"
+    assert names(folder) == ["repo", "uploads"]  # its marker went once the commit was seen to land
 
 
 async def test_a_job_whose_retries_ran_out_gets_its_outcome_from_the_next_upload(
@@ -1731,3 +1732,96 @@ async def test_an_uploads_folder_that_is_a_link_is_replaced_not_followed(
     assert not (folder / "uploads").is_symlink()
     assert names(folder / "uploads") == [f"{response.json()['data']['job_id']}.archive"]
     assert names(outside) == ["keep.txt"]
+
+
+# --- AG-13 delta at b3b1906 ---------------------------------------------------------------------------------
+
+
+async def test_a_cancel_after_the_publish_keeps_the_marker_for_the_sweep(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    rename = os.rename
+
+    def renamed_then_cancelled(src: Any, dst: Any) -> None:
+        rename(src, dst)
+        if Path(dst).name == "repo":
+            raise asyncio.CancelledError()  # the cancel lands after the thread already renamed
+
+    monkeypatch.setattr(os, "rename", renamed_then_cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await run_job(app, workspace_root, owner_id, project_id, job_id)
+    monkeypatch.undo()
+    folder = project_folder(workspace_root, project_id)
+    assert names(folder) == [f".import-{job_id}.published", "repo", "uploads"]
+    assert (await upload(owner, project_id, small_zip(tmp_path))).status_code == 202  # not stuck at 409
+    assert names(folder) == ["uploads"]
+    assert await import_events(engine, project_id) == [("error", "import_incomplete")]
+
+
+async def test_a_landed_commit_is_kept_even_if_the_state_changed_before_the_read_back(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, job_id = await accepted_upload(owner, small_zip(tmp_path))
+    commit = AsyncSession.commit
+    done: list[bool] = []
+
+    async def committed_then_changed(self: AsyncSession) -> None:
+        await commit(self)
+        if done:
+            return
+        done.append(True)
+        async with make_sessionmaker(engine)() as other:  # someone else (WP-2.1c) records a problem
+            repository = await other.scalar(select(Repository).where(Repository.project_id == project_id))
+            assert repository is not None
+            repository.sync_state, repository.error = "error", "repository_unreadable"
+            await commit(other)
+        raise OperationalError("COMMIT", {}, ConnectionError("reply lost"))
+
+    monkeypatch.setattr(AsyncSession, "commit", committed_then_changed)
+    assert await run_job(app, workspace_root, owner_id, project_id, job_id) == "ready"
+    monkeypatch.undo()
+    folder = project_folder(workspace_root, project_id)
+    assert git(folder / "repo", "log", "--format=%s") == "Import from archive proj.zip"
+    assert names(folder) == ["repo", "uploads"]
+
+
+async def test_a_job_overtaken_after_the_sweep_gave_it_an_outcome_gets_no_second_one(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    queue: RecordingQueue,
+    engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    project_id, old_job = await accepted_upload(owner, small_zip(tmp_path))
+    await drop_lock(project_id)  # the key vanished (an AOF tail lost, an operator)
+    response = await upload(owner, project_id, small_zip(tmp_path))
+    assert response.status_code == 202, response.text
+    assert await run_job(app, workspace_root, owner_id, project_id, old_job) == "skipped"
+    async with make_sessionmaker(engine)() as session:
+        events = (
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "project.import", AuditEvent.project_id == project_id
+                )
+            )
+        ).all()
+    assert [(e.metadata_["job_id"], e.metadata_["reason"]) for e in events] == [
+        (str(old_job), "import_incomplete")
+    ]

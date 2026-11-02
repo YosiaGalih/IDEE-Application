@@ -812,7 +812,9 @@ async def _take_back(env: ImportEnv, job: _Job) -> None:
         )
         repository = await session.scalar(select(Repository).where(Repository.project_id == job.project_id))
         if not _waiting(project, repository):
-            raise _NotWaiting()  # it landed after all
+            if repository is not None and repository.sync_state == "ready":
+                await _remove(env, job, [job.marker])  # it landed after all
+            raise _NotWaiting()
         await _keep(env, job)
         await asyncio.to_thread(take_back)
     logger.warning(
@@ -868,8 +870,10 @@ async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> str:
         await asyncio.to_thread(job.marker.touch)
         try:
             await asyncio.to_thread(os.rename, job.work, job.repo)
-        except BaseException:
-            await _remove(env, job, [job.marker])  # nothing was published
+        except OSError:
+            # The rename failed: nothing was published. (A cancel may arrive after the thread renamed, so
+            # only this error proves it; otherwise the marker stays for the next upload's sweep.)
+            await _remove(env, job, [job.marker])
             raise
         try:
             project.stack = outcome.stack
@@ -916,19 +920,21 @@ async def _complete(env: ImportEnv, job: _Job, outcome: _Outcome) -> str:
 
 
 async def _is_ready(env: ImportEnv, job: _Job) -> bool | None:
-    """Did the ``ready`` commit land? ``FOR SHARE`` waits for a commit still settling in the database; None
-    when the database does not answer in time."""
+    """Did this job's ``ready`` commit land? ``FOR SHARE`` waits for a commit still settling in the database,
+    then this job's ``project.import`` success event decides (written in that same transaction; the state
+    alone could since have been changed by someone else). None when the database does not answer in time."""
     try:
         async with asyncio.timeout(_READ_BACK_S), env.projects.sessions() as session:
-            state = await session.scalar(
-                select(Repository.sync_state)
+            await session.execute(
+                select(Repository.project_id)
                 .where(Repository.project_id == job.project_id)
                 .with_for_update(read=True)
             )
+            committed = await _jobs_with_outcome(session, job.project_id, result="success")
     except Exception:
         logger.exception("project_import_state_unknown", project_id=str(job.project_id))
         return None
-    return state == "ready"
+    return job.job_id in committed
 
 
 async def _fail(env: ImportEnv, job: _Job, user_id: uuid.UUID, code: str) -> str:
@@ -948,16 +954,28 @@ async def _fail(env: ImportEnv, job: _Job, user_id: uuid.UUID, code: str) -> str
         raise ImportRetry() from None
     if settled == "superseded":
         logger.warning("project_import_superseded", project_id=str(job.project_id), job_id=str(job.job_id))
-        await _write_audit_detached(
-            env,
-            job.project_id,
-            {"job_id": str(job.job_id), "reason": "import_superseded", "user_id": str(user_id)},
-        )
+        if not await _has_outcome(env, job):  # a newer upload's sweep may already have written it
+            await _write_audit_detached(
+                env,
+                job.project_id,
+                {"job_id": str(job.job_id), "reason": "import_superseded", "user_id": str(user_id)},
+            )
         return "skipped"
     if settled == "not_waiting":
         logger.warning("project_import_not_waiting", project_id=str(job.project_id), job_id=str(job.job_id))
         return "skipped"
     return "error"
+
+
+async def _has_outcome(env: ImportEnv, job: _Job) -> bool:
+    """Whether this job already has a ``project.import`` event (False when that cannot be read: the event is
+    then written, and a duplicate beats a missing outcome)."""
+    try:
+        async with env.projects.sessions() as session:
+            return job.job_id in await _jobs_with_outcome(session, job.project_id)
+    except Exception:
+        logger.exception("project_import_audit_failed", project_id=str(job.project_id))
+        return False
 
 
 async def _remove(env: ImportEnv, job: _Job, paths: list[Path]) -> None:
