@@ -4,15 +4,17 @@ File ini ditulis untuk melanjutkan pembangunan KodeKantor setelah kredit cloud h
 
 Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-continuation-under-usage-limits.md`. File ini hanya memuat posisi terakhir dan langkah berikutnya.
 
-## Status (31 Okt 2026)
+## Status (2 Nov 2026)
 
 | | |
 |---|---|
-| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c backup/restore (PR #6), WP-1.5d Semgrep + Trivy (PR #7), WP-1.4a fondasi frontend (PR #8, di-merge PO 31 Okt) |
-| Branch kerja | `claude/gracious-goodall-3hjh19` (dimulai ulang dari `main` setelah PR #8 di-merge) |
-| Sedang dikerjakan | **WP-1.4b** (unit U10, 🔒 sesi): layar login/lupa/reset/ganti password, penjaga sesi, menu pengguna; cakupan dipersempit (konflik #63). Lihat tracker bagian WP-1.4b. PR #9: CI hijau, AG-13 SIGNED OFF @ db1872a; menunggu merge PO |
-| Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3. PR #3 di-merge tanpa itu; review putaran 2 menolak karena N1, lalu N1–N5 diperbaiki tetapi belum diverifikasi reviewer (U4, sesi terpisah). Dari WP-1.5a: L1 `--forwarded-allow-ips`, role owner non-superuser untuk migrate, Trivy/Semgrep sebelum G1 (tracker WP-1.5a) |
-| Menunggu PO | konflik dokumen #36–#64 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8 (#56/#57 aturan dan cakupan Trivy, #58 Redis 8 atau Valkey, #59 catatan review, #63 cakupan WP-1.4, #64 email reset belum ada di produksi); persetujuan EX-02..EX-06 di DECISIONS; M2 egress sebelum G4; gate G0/G1 |
+| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9) |
+| Mandat PO | "jalankan P2, P3 dan P4" (2 Nov): WP-2.1, 2.2, 3.1, 3.2, 4.1, 4.2, 4.3 (berhenti di gate G4 untuk PO), SEC-01, bukti G2. Satu sub-WP = satu PR |
+| Branch kerja | `claude/gracious-goodall-3hjh19` |
+| Sedang dikerjakan | **WP-2.1a** projects core (PR #10, draft). Temuan review backend, frontend, dan silent-failure sudah ditutup; LOW dari AG-13 ditutup kecuali satu yang menunggu keputusan PO (lihat tracker WP-2.1a). Yang tersisa: CI hijau pada commit akhir (bukti T8), delta review AG-13, lalu PR ready |
+| Berikutnya | WP-2.1b (import arsip), 2.1c (file/workspace API), 2.1d (indeks), 2.1e (sesuai pembagian di spec WP-2.1), lalu WP-2.2, P3, P4. Catatan jebakan dari review ada di akhir bagian tracker WP-2.1a |
+| Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3 (U4). Dari WP-1.5a: role owner non-superuser untuk migrate. Dari WP-1.4b: token reset dipindah ke fragment sebelum ada jalur pengiriman tautan; stream task berhenti di status terminal. Dari WP-1.6: access log uvicorn rusak (`RedactingFilter`), healthcheck `scheduler` |
+| Menunggu PO | konflik #36–#65 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; EX-02..EX-06 di DECISIONS (EX-02 kini juga mencakup 5 HIGH tanpa fix dari git di image backend); role global di project yang diberi grant (tracker WP-2.1a); M2 egress sebelum G4; gate G0/G1 |
 
 ### WP-1.5a: yang sudah ada (di branch kerja)
 

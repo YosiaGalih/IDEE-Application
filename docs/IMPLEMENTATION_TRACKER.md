@@ -1059,3 +1059,57 @@ Syarat AG-13 yang terbawa:
 - token reset dipindah ke fragment (`/reset-password#<token>`) sebelum jalur pengiriman tautan mana pun (email atau admin/CLI, konflik #64). Ini juga menutup LOW masking nginx dan kebocoran lewat perantara milik operator (CDN/WAF/proxy);
 - stream berhenti pada status terminal task dan batas event di memori (dari WP-1.4a), sebelum layar task dirilis.
 
+
+### WP-2.1a — projects core: create/list/read/update/archive, otorisasi berscope project (FR-012–014, FR-017, FR-018, FR-022, AC-01, AC-02 bagian create)
+
+Spec: `docs/superpowers/specs/2026-11-02-wp-2.1-platform-services-design.md` (pembagian 2.1a–2.1e dan rancangan 2.1a). Plan: `docs/superpowers/plans/2026-11-02-wp-2.1a-projects-core.md`. Cakupan dan penundaan: konflik #65 (`git_https` ditolak sampai egress G4; WP-2.1b–e menyusul).
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Backend `ruff check .`, `ruff format --check .`, `pyright`, `lint-imports` | bersih; 0 error; 3 kontrak dipertahankan |
+| Backend `pytest -q -p no:randomly` (PostgreSQL 16 + Redis 7 lokal) | **1318 passed, 1 skipped** (sebelumnya 1292). Urutan terbalik (`tests/security/test_cross_project.py` lalu `tests/integration/test_projects.py`) → 71 passed |
+| Mutan backend (perbaikan review) | 8 mutan: `commit_attempted=False`, kategori tersembunyi hanya `Cc`, rate limit selalu lolos, audit settings tanpa nilai, `sync_state` tanpa masalah repo, `open_tasks` memakai `TERMINAL`, route `/stack` tanpa `require_project_permission` → semuanya merah. Pola `q` di route dilepas → selamat, karena service juga menolak karakter kontrol (pertahanan berlapis, disengaja) |
+| Frontend `format:check`, `lint`, `lint:guards`, `typecheck`, `vite build` | bersih; guard menolak pelanggarannya |
+| Frontend `vitest run` | **278 test** di 18 file (sebelumnya 243) |
+| CI @ bed63ac (sebelum perbaikan review) | 9/9 hijau. `clean-install`: "project smoke: created … from python-basic, first commit e48331a…". Trivy: image backend 50 HIGH tanpa fix (5 baru dari dependensi git: `libcurl3t64-gnutls`, `perl`, `perl-modules`, `libperl`), lolos lewat EX-02 (menunggu PO); `gate: PASS`. Semgrep: 284 file, 6 WARNING lama |
+| Backend nyata + Vite + Chromium, DB `kodekantor_live` | create blank dan template, daftar, cari, arsip/aktifkan, `git log` di workspace cocok; user lain melihat daftar kosong dan 404 di URL project |
+
+#### Review WP-2.1a @ 0ac5f13: `kk-backend-reviewer` (**BLOCK**: 2 BLOCK, 8 SHOULD, 9 NIT), `kk-frontend-reviewer` (3 SHOULD, 6 NIT), `kk-silent-failure-hunter` (1 HIGH, 7 MEDIUM, 9 LOW), AG-13 `kk-security-reviewer` (**NOT SIGNED OFF**, tanpa temuan pemblokir: 9 LOW; menunggu bukti T8 di CI dan delta review)
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| backend B1 + silent M7: `open_tasks` menghitung task `completed`/`failed` | `services/task_stats.py`: open = semua status kecuali `completed, failed, cancelled, rejected`. Spec diperbarui ("non-terminal" ≠ `TERMINAL` di `workflow.states`) | `test_open_tasks_counts_only_unfinished_tasks` (satu task per status → 9); mutan `TERMINAL` → merah |
+| backend B2 + silent M2 + AG-13 LOW (cleanup): invarian all-or-nothing pecah di 3 jalur | pembersihan sebagai task yang di-shield. Bila `COMMIT` sendiri gagal, sesi baru memutuskan apakah folder disimpan. Bila tidak, `rmtree` dengan `onexc` yang mencatat log. `folder_may_exist` diset sebelum `mkdir`. `close()` sesi yang melempar tetap diikuti pembersihan | 3 test: commit sampai lalu melempar → baris + folder tetap; `close()` melempar → folder hilang, 0 baris; cancel di tengah git → 0 baris, 0 folder. Mutan `commit_attempted=False` → merah |
+| backend S1 + AG-13 LOW: `ProjectAccess` tidak dibuat | `api/deps.py`: `require_project_permission(perm)` (404 di luar scope, 403 tanpa izin) di setiap route `{project_id}`; service tetap memeriksa ulang; `current_actor` membawa IP klien | `test_every_project_route_has_the_project_door` menelusuri router, termasuk route tersembunyi (saran AG-13); mutan route tanpa pintu → merah |
+| backend S2 + AG-13 LOW (DoS) + silent L6: koneksi DB dan advisory lock dipegang selama git; satu user bisa memperlambat semua | `CreateGate` per app: satu create per owner, 4 per proses, yang menunggu tanpa koneksi. 20 create/user/10 menit (429 + `Retry-After`, Redis mati → 503). `lock_timeout` 10 s → 429. Git pada GET/PATCH/arsip setelah sesi ditutup/commit | `test_creates_are_rate_limited_per_user`; mutan → merah |
+| backend S3 + AG-13 (catatan): daftar tanpa pagination | `page`, `page_size` (≤ 200, default 50), `meta {page, page_size, total}`; frontend: `?page=` di URL, navigasi halaman, halaman di luar jangkauan pindah ke halaman terakhir; `meta` tidak valid → error | `test_list_is_paginated`; 3 test layar (pindah halaman, filter → halaman 1, `meta` hilang) |
+| backend S4: `q=%00` → 500 | pola `Query` + cek service → 422 | `test_search_refuses_control_characters` |
+| backend S5: `list_templates()` blocking di event loop | katalog dibaca sekali saat startup (`load_templates` di lifespan, `to_thread`), lalu cache | review kode; suite |
+| backend S6: celah test | 401 di semua route (dengan pasangan CSRF valid), `CSRF_FAILED` di POST/PATCH/arsip, replay `Idempotency-Key` → satu project, invarian di atas | `test_cross_project.py` +12 kasus, `test_projects.py` +12 test |
+| backend S7 + AG-13 T8: belum ada bukti image dengan git | CI `clean-install` + Trivy @ bed63ac (tabel atas): 5 HIGH baru tanpa fix dari perl/libcurl, dalam cakupan EX-02 | log CI |
+| backend S8 + AG-13 LOW (audit) + silent M4: audit settings tanpa nilai, tanpa IP; create gagal dan `git_https` ditolak tanpa jejak | `project.update` mencatat `{fields, settings:{key: nilai}}` hanya bila berubah. Semua event project membawa `ip`. Create gagal → log `project_create_failed` (tahap, alasan) + audit `result=error`; `git_https` → audit `result=denied` | assert audit di test PATCH, create, dan `git_https`; mutan → merah |
+| silent H1 + backend N4: repo hilang/rusak tampil sehat | `repository.sync_state="error"`, `error=<kode>` (`repository_missing/_unreadable/_unsafe/_without_commit`), log level error, `repository_unsafe` diaudit; daftar mengecek folder; badge "Masalah repository" di layar | `test_a_missing_repository_is_reported_not_hidden` (GET, daftar, PATCH); test layar; mutan → merah |
+| silent M1 + backend N5: create/update yang sudah commit bisa menjawab 500 | respons dibangun dari data yang sudah dimuat. `updated_at` dimuat di dalam transaksi; git setelah commit tidak pernah melempar | test PATCH dengan repo hilang → 200 |
+| silent M3: kegagalan git → 409 disimpan idempotency 24 jam | 500 `GIT_ERROR` (kontrak §1 mengizinkan) | test diperbarui |
+| silent M5/M6 + frontend S: hasil tak pasti, daftar basi, kunci idempotency | aturan satu key per body; key disimpan hanya selama hasil belum pasti (jaringan, 2xx tanpa envelope, halaman gateway 502/503/504, 409 `CONFLICT`); daftar di-invalidate `onSettled` tanpa ditunggu | test layar |
+| AG-13 LOW: bidi/zero-width/C1 di nama project | Unicode `Cc/Cf/Zl/Zp` ditolak di service, route, dan skema frontend; author commit tanpa karakter itu | 3 kasus 422, test `_author`, test form; mutan → merah |
+| AG-13 LOW + backend N2: lock sebelum keputusan izin | izin diputuskan dulu, baru `FOR NO KEY UPDATE` | review kode; matriks 404/403 |
+| AG-13 LOW + backend N8: smoke script | password lewat stdin (`--data-binary @-`), id divalidasi UUID sebelum masuk `sh -c`, menolak `APP_DOMAIN` selain `localhost`, `fail` ke stderr, `last_commit` dibandingkan dengan `git log` di volume, project dicek di daftar | `bash -n`; dijalankan dengan domain lain → menolak; CI `clean-install` |
+| AG-13 LOW: test bergantung urutan | query audit difilter `resource_id` | urutan terbalik → 71 passed |
+| backend N1: author hanya tanda baca | jatuh ke bagian lokal email, lalu "KodeKantor user" | `test_author_is_what_git_accepts_and_a_reader_sees` |
+| backend N3: spec `CONFLICT` vs kode `INVALID_TRANSITION` | spec diperbarui ke `INVALID_TRANSITION` | spec |
+| backend N6 + silent L1: PATCH no-op diaudit; null dibuang diam-diam | `settings: null` dan kunci `null` → 422; audit hanya bila berubah | test PATCH |
+| frontend 3 SHOULD + 6 NIT | sinkron kotak cari dengan URL, loading bukan "kosong", pengumuman arsip + fokus, teks error arsip per kode, ringkasan error field dari server, teks tanpa template, path terpusat (`lib/paths.ts`), panjang per code point | test layar per butir |
+
+Tidak ditutup (alasan):
+- **AG-13 LOW, role global di project yang diberi grant** (admin global + `readonly` di project X → bisa menulis X): perilaku persis API_CONTRACTS §2. **Keputusan PO:** biarkan, atau batasi role global dengan grant project. `test_a_global_role_counts_inside_a_project_it_was_granted` mengunci perilaku sekarang sampai PO memutuskan.
+- **backend N7:** `repo_path` diturunkan dari id, bukan dari `workspace_ref`. Untuk tier S hasilnya sama; tier M (workspace store) harus membacanya.
+- **backend N9:** route tanpa `response_model` (pola repo yang sama dengan `auth.py`).
+- **silent L3 sebagian, L8, L9:** "Belum terdeteksi" pada stack kosong, arsip tanpa peringatan task berjalan, slug generik untuk nama non-Latin. Bersifat kosmetik atau informasional; arsip vs task berjalan diatur WP-3.1.
+- **AG-13 [Menebak]:** cancel saat `to_thread(materialize)` dapat membiarkan thread salin masih menulis ketika `rmtree` berjalan. Kegagalan hapus di-log per path; penyapu folder yatim menyusul (catatan di bawah).
+
+Catatan untuk WP berikutnya (dari review, belum diubah):
+- 2.1b/`git_https`: ekstrak `reserve_slug` dari create. Sanitasi `RepositoryOut.error` bila berasal dari remote.
+- 2.1c: kunci per repo untuk commit/PUT. Kebijakan status untuk project `archived` dan `deleting_pending_approval` (PATCH masih jalan saat menunggu approval hapus; WP-3.1 harus membuat rename menggantikan approval `project_delete`). Simpan `sync_state=error` secara persisten. Siapkan penyapu folder yatim.
+- Hapus project harus menghapus workspace. `stack` tidak pernah diperbarui setelah create.
+- Sandbox: `.git` ada di dalam `repo/`. Mount `repo/` ke sandbox harus read-only atau tidak ada. `.kk/` belum di-exclude dari git (`commit_all` memakai `add -A`), bertentangan dengan SECURITY_MODEL §4.
