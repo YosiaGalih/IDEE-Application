@@ -332,27 +332,44 @@ class Workspace:
     @contextlib.asynccontextmanager
     async def exclusive(self) -> AsyncIterator[None]:
         """Hold the workspace lock (the one every write takes) while the caller runs something that must see
-        one consistent tree, e.g. ``git add`` + ``commit``. ``WorkspaceBusy`` after ``LOCK_WAIT_S``."""
-        stack = contextlib.ExitStack()
+        one consistent tree, e.g. ``git add`` + ``commit``. ``WorkspaceBusy`` after ``LOCK_WAIT_S``.
 
-        def acquire() -> None:
-            _, real = stack.enter_context(self._opened())
-            stack.enter_context(self._locked(real))
-
-        acquiring = asyncio.ensure_future(asyncio.to_thread(acquire))
+        The wait polls a non-blocking ``flock`` from the event loop: a waiter holds no executor thread (the
+        lock holder and every other project keep the pool), and a cancel takes effect at once.
+        """
+        lock_fd = await asyncio.to_thread(self._lock_fd)
         try:
-            await asyncio.shield(acquiring)
-        except BaseException:
-            # Cancelled (or failed) while the thread was still acquiring: it may take the lock after this
-            # point, so wait for it before releasing whatever it took. Never leak a held lock.
-            with contextlib.suppress(BaseException):
-                await acquiring
-            await asyncio.to_thread(stack.close)
-            raise
-        try:
+            deadline = time.monotonic() + LOCK_WAIT_S
+            delay = 0.005
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise WorkspaceBusy() from None
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 0.1)
             yield
         finally:
-            await asyncio.to_thread(stack.close)
+            os.close(lock_fd)  # releases the lock
+
+    def _lock_fd(self) -> int:
+        fd, real = open_root(self.root)
+        try:
+            return self._open_lock_file(real)
+        finally:
+            os.close(fd)
+
+    def _open_lock_file(self, real: str) -> int:
+        """The lock file for the root at ``real`` (one per root, outside it), opened, not yet locked."""
+        os.makedirs(self.lock_dir, mode=0o700, exist_ok=True)
+        name = hashlib.sha256(os.fsencode(real)).hexdigest()[:32] + ".lock"
+        dir_fd = os.open(self.lock_dir, _DIR_FLAGS)
+        try:
+            return os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
 
     async def disk_usage(self) -> int:
         """Bytes in regular files under the root, symlinks not followed (quota input, ADR-005)."""
@@ -379,15 +396,7 @@ class Workspace:
 
     @contextlib.contextmanager
     def _locked(self, real: str) -> Iterator[None]:
-        os.makedirs(self.lock_dir, mode=0o700, exist_ok=True)
-        name = hashlib.sha256(os.fsencode(real)).hexdigest()[:32] + ".lock"
-        dir_fd = os.open(self.lock_dir, _DIR_FLAGS)
-        try:
-            lock_fd = os.open(
-                name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd
-            )
-        finally:
-            os.close(dir_fd)
+        lock_fd = self._open_lock_file(real)
         try:
             deadline = time.monotonic() + LOCK_WAIT_S
             delay = 0.005

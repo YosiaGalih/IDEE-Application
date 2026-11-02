@@ -65,15 +65,23 @@ async def test_magic_pathspec_is_literal(
     assert git(repo, "rev-parse", "HEAD") == head  # never "commit everything"
 
 
-async def test_a_retried_write_with_the_same_key_runs_once(
+async def test_a_failed_add_leaves_nothing_for_the_next_commit(
     owner: httpx.AsyncClient,  # noqa: F811
     workspace_root: Path,  # noqa: F811
 ) -> None:
+    """AG-13 P11: ``add`` stages some paths, then fails on an ignored one; the next commit holds its own."""
     project: dict[str, Any] = await blank(owner)
-    sent = headers(owner)
-    body = {"content": "# Once\n", "expected_sha256": None}
-    first = await owner.put(url(project, "files/new.md"), json=body, headers=sent)
-    again = await owner.put(url(project, "files/new.md"), json=body, headers=sent)
-    assert (first.status_code, again.status_code) == (200, 200)
-    assert again.headers.get("idempotent-replay") == "true"
-    assert again.json()["data"] == first.json()["data"]
+    repo = repo_of(workspace_root, project)
+    (repo / ".gitignore").write_text("ignored.txt\n")
+    git(repo, "add", ".gitignore")
+    git(repo, "-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "-q", "-m", "ignore")
+    for name in ("a.txt", "ignored.txt", "c.txt"):
+        (repo / name).write_text(f"{name}\n")
+    failed = await post_json(
+        owner, project, "git/commit", {"message": "x", "paths": ["a.txt", "ignored.txt"]}
+    )
+    assert failed.status_code == 409
+    assert (
+        await post_json(owner, project, "git/commit", {"message": "only c", "paths": ["c.txt"]})
+    ).status_code == 201
+    assert git(repo, "show", "--name-only", "--format=", "HEAD") == "c.txt"

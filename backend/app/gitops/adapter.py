@@ -42,6 +42,8 @@ from app.gitops.errors import GitError, GitInputError
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 TASK_BRANCH_PREFIX = "kk/task-"
 WORKSPACE_TEMP_PATTERN = ".kk-tmp-*"  # app.workspace.fs.TEMP_PREFIX; gitops must not import workspace
+SANDBOX_ARTIFACTS_PATTERN = "/.kk/"  # sandbox artefacts never enter git (SECURITY_MODEL §4)
+_EXCLUDE_PATTERNS = (WORKSPACE_TEMP_PATTERN, SANDBOX_ARTIFACTS_PATTERN)
 STDERR_KEEP = 2048
 _CHUNK = 64 * 1024
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
@@ -174,7 +176,7 @@ _MESSAGE_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # log() se
 
 
 def _message(message: str) -> str:
-    if not 1 <= len(message) <= 5000 or _MESSAGE_FORBIDDEN.search(message):
+    if not 1 <= len(message) <= 5000 or not message.strip() or _MESSAGE_FORBIDDEN.search(message):
         raise GitInputError("message")
     return message
 
@@ -564,9 +566,56 @@ class GitAdapter:
         selected = [_pathspec(path) for path in paths] if paths is not None else []
         excluded = [_pathspec(path) for path in exclude]
         git_dir, tree = await self._adirs(target)
-        await self._run(["add", "-A", "--", *selected], git_dir=git_dir, work_tree=tree, cwd=tree)
-        for path in excluded:
-            await self._unstage(target, git_dir, tree, path)
+        if target.worktree is None:
+            await asyncio.to_thread(_ensure_excludes, git_dir)
+        # The commit holds exactly what this call stages: whatever an earlier, failed run left in the index is
+        # put back to HEAD first, and again if this run fails.
+        await self._reset_index(target, git_dir, tree)
+        try:
+            await self._run(["add", "-A", "--", *selected], git_dir=git_dir, work_tree=tree, cwd=tree)
+            for path in excluded:
+                await self._unstage(target, git_dir, tree, path)
+            staged = await self._run(
+                ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                check=False,
+            )
+            if staged.returncode == 0:
+                return None
+            await self._run(
+                ["commit", "-q", "--no-verify", "-m", message],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                env=_identity_env(author, self.committer),
+            )
+        except BaseException as exc:
+            if isinstance(exc, GitError) and exc.reason == "timeout":
+                # This adapter killed git (SIGKILL): an index.lock it held is ours to remove, or every later
+                # commit fails. Callers serialise commits on one index (the workspace lock).
+                await asyncio.to_thread(_remove_index_lock, git_dir)
+            with contextlib.suppress(Exception):
+                await self._reset_index(target, git_dir, tree)
+            raise
+        return await self.current_commit(target)
+
+    async def commit_files(self, target: GitTarget, commit: str) -> list[str]:
+        """The paths a commit changed (evidence for the audit trail)."""
+        if not _SHA.fullmatch(commit):
+            raise GitInputError("ref")
+        git_dir, tree = await self._adirs(target)
+        result = await self._run(
+            ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", commit],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+        )
+        return [name for name in result.stdout.decode("utf-8", "replace").split("\0") if name]
+
+    async def _reset_index(self, target: GitTarget, git_dir: Path, tree: Path) -> None:
+        """Put the whole index back to HEAD (empty before the first commit); no-op when nothing is staged."""
         staged = await self._run(
             ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
             git_dir=git_dir,
@@ -575,15 +624,12 @@ class GitAdapter:
             check=False,
         )
         if staged.returncode == 0:
-            return None
-        await self._run(
-            ["commit", "-q", "--no-verify", "-m", message],
-            git_dir=git_dir,
-            work_tree=tree,
-            cwd=tree,
-            env=_identity_env(author, self.committer),
-        )
-        return await self.current_commit(target)
+            return
+        if await self.current_commit(target) is None:
+            command = ["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", "."]
+        else:
+            command = ["restore", "--staged", "--", "."]
+        await self._run(command, git_dir=git_dir, work_tree=tree, cwd=tree)
 
     async def _unstage(self, target: GitTarget, git_dir: Path, tree: Path, path: str) -> None:
         """Put ``path``'s index entries back to HEAD (none at all before the first commit). Nothing to do
@@ -703,14 +749,22 @@ def _gitfile_points_at(gitfile: str, registered: Path) -> bool:
 
 
 def _ensure_excludes(git_dir: Path) -> None:
-    """Keep the workspace's own temp files out of every commit (``info/exclude`` covers all worktrees)."""
+    """Keep the workspace's temp files and the sandbox's ``.kk/`` out of every commit, and out of status
+    (``info/exclude`` covers all worktrees)."""
     exclude = git_dir / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     current = exclude.read_text() if exclude.exists() else ""
-    if WORKSPACE_TEMP_PATTERN not in current.splitlines():
+    missing = [pattern for pattern in _EXCLUDE_PATTERNS if pattern not in current.splitlines()]
+    if missing:
         separator = "" if current.endswith("\n") or not current else "\n"
         with exclude.open("a") as handle:
-            handle.write(f"{separator}{WORKSPACE_TEMP_PATTERN}\n")
+            handle.write(separator + "".join(f"{pattern}\n" for pattern in missing))
+
+
+def _remove_index_lock(git_dir: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        (git_dir / "index.lock").unlink()
+        logger.error("git_index_lock_removed", git_dir=git_dir.name)
 
 
 async def _kill(proc: asyncio.subprocess.Process) -> None:

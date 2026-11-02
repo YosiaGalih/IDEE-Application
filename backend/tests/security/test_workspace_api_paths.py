@@ -76,3 +76,34 @@ async def test_paths_from_the_url_never_leave_the_repository(
     assert refused(delete), delete.text
     assert {p: p.read_bytes() for p in before} == before
     assert (repo / ".git" / "config").read_bytes() == git_config
+
+
+async def test_paths_in_bodies_never_leave_the_repository(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    """AG-13 P4: the path in a ``POST /files`` body, in a patch, and in ``?path=`` of the tree."""
+    project: dict[str, Any] = await blank(owner)
+    repo = repo_of(workspace_root, project)
+    secret = repo.parent / "secret.txt"
+    secret.write_text("project secret\n")
+    git_config = (repo / ".git" / "config").read_bytes()
+    created = [
+        await owner.post(url(project, "files"), json={"path": path, "type": kind}, headers=headers(owner))
+        for path in ("../secret.txt", ".git/hooks/pre-commit", "a/../../x")
+        for kind in ("file", "dir")
+    ]
+    patches = [
+        await owner.post(
+            url(project, "patches"),
+            json={"diff": f"--- /dev/null\n+++ b/{target}\n@@ -0,0 +1 @@\n+pwned\n"},
+            headers=headers(owner),
+        )
+        for target in ("../secret.txt", ".git/config", "../../above.txt")
+    ]
+    tree = await owner.get(url(project, "tree"), params={"path": ".."})
+    for response in [*created, *patches, tree]:
+        assert refused(response), response.text
+    assert secret.read_text() == "project secret\n"
+    assert (repo / ".git" / "config").read_bytes() == git_config
+    assert not (workspace_root / "above.txt").exists()

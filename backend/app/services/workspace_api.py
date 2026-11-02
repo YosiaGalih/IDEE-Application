@@ -17,25 +17,29 @@ use this module (they write task worktrees through the ToolGateway).
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import uuid
-from dataclasses import dataclass
-from pathlib import PurePosixPath
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
 
 from sqlalchemy import select
 
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.gitops.adapter import Branch, GitStatus, GitTarget, LogEntry
-from app.gitops.diffparse import Diff
+from app.gitops.diffparse import Diff, DiffStats
 from app.models.projects import Project, Repository
 from app.services.projects import Actor, ProjectEnv, authorize, commit_author, repo_path
+from app.workspace import fs
+from app.workspace.errors import AlreadyExists, PatchRollbackFailed, PathViolation, VersionConflict
 from app.workspace.fs import FileChange, TreeResult, Workspace
 from app.workspace.policy import Access
 
 logger = get_logger(__name__)
 
-AUDIT_PATHS_MAX = 100  # paths listed in one patch event; the count is always exact
+AUDIT_PATHS_MAX = 100  # paths listed in one event; the count is always exact
+SANDBOX_DIR = ".kk"  # sandbox artefacts (SECURITY_MODEL §4): never committed, hidden from status and diff
 
 _TASK_REF = re.compile(r"task:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -86,6 +90,12 @@ def language_for(path: str) -> str | None:
     return _LANGUAGES.get(PurePosixPath(name).suffix.lower())
 
 
+def _reason(error: AppError) -> str | None:
+    details = error.details or []
+    reason = details[0].get("reason") if details else None
+    return reason if isinstance(reason, str) else None
+
+
 def _conflict(reason: str) -> AppError:
     return AppError(
         "CONFLICT", "The repository cannot do this now", http_status=409, details=[{"reason": reason}]
@@ -107,14 +117,35 @@ async def open_repo(
     async with env.sessions() as session:
         project, _ = await authorize(session, actor, project_id, permission)
         repository = await session.scalar(select(Repository).where(Repository.project_id == project.id))
-    if repository is None or repository.sync_state != "ready":
+    if repository is None:  # every project has one (2.1a): an invariant broke, not a state to wait out
+        logger.error("workspace_repository_row_missing", project_id=str(project.id))
+        raise AppError("INTERNAL_ERROR", "Internal error", http_status=500)
+    if repository.sync_state == "error":
+        raise AppError(
+            "CONFLICT",
+            "The repository cannot do this now",
+            http_status=409,
+            details=[{"reason": "repository_error", "error": repository.error}],
+        )
+    if repository.sync_state != "ready":  # importing, indexing: it will be ready
         raise _conflict("repository_not_ready")
     repo = repo_path(env.workspace_root, project.id)
-    if not await asyncio.to_thread((repo / ".git").is_dir):
+    if not await asyncio.to_thread(_is_git_dir, repo / ".git"):
+        logger.error("workspace_repository_missing", project_id=str(project.id))
         raise _conflict("repository_missing")
     if write and project.status != "active":
-        raise _conflict("project_archived")
+        raise _conflict("project_archived" if project.status == "archived" else "project_not_active")
     return Repo(project, repository, Workspace(repo), GitTarget(repo))
+
+
+def _is_git_dir(path: Path) -> bool:
+    """A real folder, not a symlink to one (the git adapter refuses those too)."""
+    return os.path.isdir(path) and not os.path.islink(path)
+
+
+def _in_sandbox_dir(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    return bool(parts) and parts[0] == SANDBOX_DIR
 
 
 # --- reads --------------------------------------------------------------------------------------------------
@@ -124,7 +155,9 @@ async def tree(
     env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, path: str = ".", depth: int = 3
 ) -> TreeResult:
     repo = await open_repo(env, actor, project_id, "workspace:read", write=False)
-    return await repo.workspace.tree(path, Access.USER_READ, depth=depth)
+    return await repo.workspace.tree(
+        path or ".", Access.USER_READ, depth=depth, max_entries=fs.MAX_TREE_ENTRIES
+    )
 
 
 @dataclass(frozen=True)
@@ -140,7 +173,7 @@ class FileView:
 
 def _check_ref(ref: str | None) -> None:
     """``main`` (or nothing) is the working tree of ``repo/``. Task worktrees arrive with tasks (WP-3.1)."""
-    if ref is None or ref == "main":
+    if not ref or ref == "main":
         return
     if _TASK_REF.fullmatch(ref):
         raise AppError("NOT_FOUND", "Not found", http_status=404)
@@ -173,23 +206,34 @@ async def read_file(
 
 
 async def _audit(
-    env: ProjectEnv, actor: Actor, project_id: uuid.UUID, action: str, metadata: dict[str, object]
+    env: ProjectEnv,
+    actor: Actor,
+    project_id: uuid.UUID,
+    action: str,
+    metadata: dict[str, object],
+    *,
+    result: str = "success",
 ) -> None:
-    """One event per successful write (paths and shas, never content). The change already happened on disk:
-    a failed event is logged at error level, never turned into a failed request the client would retry."""
-    try:
+    """One event per write (paths and shas, never content), written to its end even if the request is
+    cancelled: the change already happened on disk. A failed event is logged at error level, never turned into
+    a failed request the client would retry (and then get ``VERSION_CONFLICT``)."""
+
+    async def write() -> None:
         await env.audit.write_detached(
             env.sessions,
             actor_type="user",
             actor_id=str(actor.user_id),
             action=action,
-            result="success",
+            result=result,
             resource_type="project",
             resource_id=str(project_id),
             project_id=project_id,
             metadata=metadata,
             ip=actor.ip,
         )
+
+    try:
+        await asyncio.shield(asyncio.ensure_future(write()))
     except Exception:
         logger.exception("workspace_audit_failed", project_id=str(project_id), action=action)
 
@@ -234,7 +278,16 @@ async def create(
         created = await repo.workspace.make_dir(path, Access.USER_WRITE)
         metadata: dict[str, object] = {"path": created, "type": "dir"}
     else:
-        change = await repo.workspace.write_file(path, content or "", Access.USER_WRITE, expected_sha256=None)
+        try:
+            change = await repo.workspace.write_file(
+                path, content or "", Access.USER_WRITE, expected_sha256=None
+            )
+        except VersionConflict:
+            raise AlreadyExists() from None  # a file is there: the name is taken, nothing to reload
+        except PathViolation as exc:
+            if _reason(exc) == "not_regular":
+                raise AlreadyExists() from None  # a folder is there
+            raise
         created = change.path
         metadata = {"path": created, "type": "file", "sha256": change.sha256}
     await _audit(env, actor, project_id, "workspace.file_created", metadata)
@@ -270,7 +323,20 @@ async def apply_patch(
             details=[{"loc": ["body", "target"], "msg": "only main until task worktrees exist"}],
         )
     repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
-    changes = await repo.workspace.apply_patch(diff, Access.USER_WRITE)
+    try:
+        changes = await repo.workspace.apply_patch(diff, Access.USER_WRITE)
+    except PatchRollbackFailed as exc:
+        # The tree is partly patched: that change must be on the record, not only in a log line.
+        paths = [str(detail.get("path")) for detail in exc.details or []]
+        await _audit(
+            env,
+            actor,
+            project_id,
+            "workspace.patch_applied",
+            {"reason": "rollback_failed", "paths": paths[:AUDIT_PATHS_MAX]},
+            result="error",
+        )
+        raise
     await _audit(
         env,
         actor,
@@ -287,8 +353,11 @@ DIFF_MAX_BYTES = 1024 * 1024  # API_CONTRACTS §4 ``Diff.truncated`` past this
 
 
 async def git_status(env: ProjectEnv, actor: Actor, project_id: uuid.UUID) -> GitStatus:
+    """``.kk`` is left out (it can never be committed), so ``clean`` means "nothing to commit"."""
     repo = await open_repo(env, actor, project_id, "git:read", write=False)
-    return await env.git.status(repo.target)
+    status = await env.git.status(repo.target)
+    changes = [change for change in status.changes if not _in_sandbox_dir(change.path)]
+    return replace(status, changes=changes, clean=not changes)
 
 
 async def git_diff(
@@ -297,7 +366,16 @@ async def git_diff(
     """``base`` (default HEAD) against the working tree, untracked files included (``head`` is None)."""
     repo = await open_repo(env, actor, project_id, "git:read", write=False)
     paths = [path] if path else None
-    return await env.git.diff(repo.target, base=base, paths=paths, max_bytes=DIFF_MAX_BYTES)
+    diff = await env.git.diff(repo.target, base=base, paths=paths, max_bytes=DIFF_MAX_BYTES)
+    files = [file for file in diff.files if not _in_sandbox_dir(file.path)]
+    if len(files) == len(diff.files):
+        return diff
+    stats = DiffStats(
+        files=len(files),
+        additions=sum(file.additions for file in files),
+        deletions=sum(file.deletions for file in files),
+    )
+    return replace(diff, files=files, stats=stats)
 
 
 async def git_branches(env: ProjectEnv, actor: Actor, project_id: uuid.UUID) -> list[Branch]:
@@ -315,17 +393,23 @@ async def git_log(env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, limit
 RESERVED_BRANCH_PREFIX = "kk/"  # task and user branches belong to the platform (FR-114, §13.3)
 
 
+def _reserved_branch(name: str) -> bool:
+    """``kk`` itself would block every ``kk/task-*`` ref (a file and a folder cannot share a name);
+    ``refs/...`` and ``HEAD`` would make refs that read as something else."""
+    return name in ("kk", "HEAD") or name.startswith((RESERVED_BRANCH_PREFIX, "refs/"))
+
+
 async def create_branch(
     env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, name: str, from_ref: str | None
 ) -> Branch:
     """A new branch at ``from_ref`` (default HEAD). Only the ref is created: no checkout, the working tree
     and its uncommitted edits stay as they are. Deleting or moving branches is not offered (FR-118)."""
-    if name.startswith(RESERVED_BRANCH_PREFIX):
+    if _reserved_branch(name):
         raise AppError(
             "VALIDATION_ERROR",
             "Input did not pass validation",
             http_status=422,
-            details=[{"loc": ["body", "name"], "msg": f"names under {RESERVED_BRANCH_PREFIX} are reserved"}],
+            details=[{"loc": ["body", "name"], "msg": "kk, kk/..., refs/... and HEAD are reserved"}],
         )
     repo = await open_repo(env, actor, project_id, "git:branch", write=True)
     if any(branch.name == name for branch in await env.git.branches(repo.target)):
@@ -341,16 +425,29 @@ async def commit(
     """Commit the working tree of ``repo/`` (or only ``paths``) on its current branch, as the user. Holds the
     workspace lock, so a concurrent save is either in this commit or left for the next one, never half in.
     ``.kk`` is never staged (SECURITY_MODEL §4). Nothing staged → 409 ``nothing_to_commit``."""
+    if paths is not None and any(_in_sandbox_dir(path) for path in paths):
+        raise AppError(
+            "VALIDATION_ERROR",
+            "Input did not pass validation",
+            http_status=422,
+            details=[{"loc": ["body", "paths"], "msg": "path_excluded: .kk is never committed"}],
+        )
     repo = await open_repo(env, actor, project_id, "workspace:write", write=True)
     async with repo.workspace.exclusive():
         sha = await env.git.commit(repo.target, message, commit_author(actor), paths=paths)
     if sha is None:
         raise _conflict("nothing_to_commit")
+    files = await env.git.commit_files(repo.target, sha)
     await _audit(
         env,
         actor,
         project_id,
         "git.commit",
-        {"commit": sha, "paths": len(paths) if paths is not None else None},
+        {
+            "commit": sha,
+            "selected": len(paths) if paths is not None else None,  # None: the whole working tree
+            "files": len(files),
+            "paths": files[:AUDIT_PATHS_MAX],  # what the commit holds, not what was asked for
+        },
     )
     return sha

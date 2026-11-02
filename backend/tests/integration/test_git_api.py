@@ -165,7 +165,9 @@ async def test_commit_records_the_user_as_author_and_audits(
     assert response.json()["data"] == {"commit": commit}
     assert git(repo, "log", "-1", "--format=%an|%s") == "Tira|Fix readme"
     assert git(repo, "show", "--name-only", "--format=", "HEAD") == "README.md"
-    assert await workspace_events(engine, project, "git.commit") == [{"commit": commit, "paths": 1}]
+    assert await workspace_events(engine, project, "git.commit") == [
+        {"commit": commit, "selected": 1, "files": 1, "paths": ["README.md"]}
+    ]
 
 
 async def test_commit_with_nothing_is_409(owner: httpx.AsyncClient, workspace_root: Path) -> None:  # noqa: F811
@@ -212,3 +214,76 @@ async def test_a_commit_waits_for_a_write_in_progress(
         await asyncio.sleep(0.5)
         assert not committing.done()
     assert (await committing).status_code == 201
+
+
+# --- review round -------------------------------------------------------------------------------------------
+
+
+async def test_git_writes_on_an_archived_project_are_refused(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    project, repo = await project_with_repo(owner, workspace_root)
+    (repo / "README.md").write_text("# changed\n")
+    assert (await owner.post(url(project, "archive"), headers=headers(owner))).status_code == 200
+    branch = await post_json(owner, project, "git/branch", {"name": "late"})
+    commit = await post_json(owner, project, "git/commit", {"message": "late"})
+    assert [(r.status_code, r.json()["error"]["details"][0]["reason"]) for r in (branch, commit)] == [
+        (409, "project_archived")
+    ] * 2
+    assert (await owner.get(url(project, "git/status"))).status_code == 200
+
+
+async def test_reserved_branch_names(owner: httpx.AsyncClient, workspace_root: Path) -> None:  # noqa: F811
+    project, _ = await project_with_repo(owner, workspace_root)
+    for name in ("kk", "kk/task-x", "refs/heads/x", "HEAD"):
+        response = await post_json(owner, project, "git/branch", {"name": name})
+        assert response.status_code == 422, (name, response.text)
+
+
+async def test_a_paths_commit_holds_only_its_paths_after_a_failure(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    """Review BLOCK: a failed commit must not leave its staging for the next ``paths`` commit."""
+    project, repo = await project_with_repo(owner, workspace_root)
+    (repo / "a.txt").write_text("a\n")
+    (repo / "secret.txt").write_text("do not commit\n")
+    blank_message = await post_json(owner, project, "git/commit", {"message": "   "})
+    assert blank_message.status_code == 422
+    raw(repo, "add", "secret.txt")  # staged by anything else that failed half-way
+    assert (
+        await post_json(owner, project, "git/commit", {"message": "a", "paths": ["a.txt"]})
+    ).status_code == 201
+    assert git(repo, "show", "--name-only", "--format=", "HEAD") == "a.txt"
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_selected_kk_paths_are_refused(owner: httpx.AsyncClient, workspace_root: Path) -> None:  # noqa: F811
+    project, repo = await project_with_repo(owner, workspace_root)
+    (repo / "a.txt").write_text("a\n")
+    for paths in ([".kk/x.xml"], ["a.txt", ".kk"], ["./.kk/x.xml"]):
+        response = await post_json(owner, project, "git/commit", {"message": "x", "paths": paths})
+        assert response.status_code == 422, (paths, response.text)
+
+
+async def test_status_and_diff_hide_kk(owner: httpx.AsyncClient, workspace_root: Path) -> None:  # noqa: F811
+    project, repo = await project_with_repo(owner, workspace_root)
+    (repo / ".kk").mkdir()
+    (repo / ".kk" / "old.xml").write_text("<old/>\n")
+    raw(repo, "add", "-f", ".kk/old.xml")
+    raw(repo, "commit", "-q", "-m", "tracked kk")  # e.g. from an imported archive
+    (repo / ".kk" / "old.xml").write_text("<changed/>\n")
+    (repo / ".kk" / "new.xml").write_text("<new/>\n")
+    status = (await owner.get(url(project, "git/status"))).json()["data"]
+    assert (status["clean"], status["changes"]) == (True, [])
+    diff = (await owner.get(url(project, "git/diff"))).json()["data"]
+    assert (diff["files"], diff["stats"]["files"]) == ([], 0)
+
+
+async def test_too_many_path_bytes_are_422(owner: httpx.AsyncClient, workspace_root: Path) -> None:  # noqa: F811
+    project, _ = await project_with_repo(owner, workspace_root)
+    paths = [f"{n:04d}" + "x" * 4000 for n in range(40)]  # 160 KiB
+    response = await post_json(owner, project, "git/commit", {"message": "x", "paths": paths})
+    assert response.status_code == 422
+    assert (await post_json(owner, project, "git/commit", {"message": "x", "paths": []})).status_code == 422

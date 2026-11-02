@@ -13,7 +13,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.deps import require_project_permission
 from app.api.routes.projects import EnvDep, _respond
@@ -27,8 +27,12 @@ GitBrancher = Annotated[Actor, Depends(require_project_permission("git:branch"))
 WorkspaceWriter = Annotated[Actor, Depends(require_project_permission("workspace:write"))]
 
 
+PATHS_MAX = 500
+PATHS_MAX_BYTES = 128 * 1024  # git receives them as arguments: stay far below the kernel's ARG_MAX
+
+
 class NewBranch(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
 
     name: Annotated[str, Field(min_length=1, max_length=255)]
     from_ref: Annotated[str | None, Field(alias="from", min_length=1, max_length=255)] = None
@@ -39,8 +43,23 @@ class NewCommit(BaseModel):
 
     message: Annotated[str, Field(min_length=1, max_length=5000)]
     paths: Annotated[
-        list[Annotated[str, Field(min_length=1, max_length=4096)]] | None, Field(max_length=1000)
+        list[Annotated[str, Field(min_length=1, max_length=4096)]] | None,
+        Field(min_length=1, max_length=PATHS_MAX),
     ] = None
+
+    @field_validator("message")
+    @classmethod
+    def _not_blank(cls, message: str) -> str:
+        if not message.strip():
+            raise ValueError("the message is blank")
+        return message
+
+    @field_validator("paths")
+    @classmethod
+    def _bounded(cls, paths: list[str] | None) -> list[str] | None:
+        if paths is not None and sum(len(path.encode()) for path in paths) > PATHS_MAX_BYTES:
+            raise ValueError(f"paths exceed {PATHS_MAX_BYTES} bytes in total")
+        return paths
 
 
 @router.get("/{project_id}/git/status")

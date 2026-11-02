@@ -15,7 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.db import make_sessionmaker
 from app.models.audit import AuditEvent
+from app.models.projects import Repository
 from app.workspace import fs
+from app.workspace.errors import PatchRollbackFailed
+from app.workspace.fs import Workspace
 from tests.integration.test_project_imports import create_upload
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     PROJECTS,
@@ -338,3 +341,151 @@ async def test_an_archived_project_is_read_only(owner: httpx.AsyncClient) -> Non
         await owner.post(url(project, "patches"), json={"diff": "x"}, headers=headers(owner)),
     ]
     assert [(r.status_code, reason(r)) for r in writes] == [(409, "project_archived")] * 4
+
+
+# --- review round -------------------------------------------------------------------------------------------
+
+
+async def test_post_on_an_existing_file_is_a_conflict(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    project = await blank(owner)
+    response = await owner.post(
+        url(project, "files"), json={"path": "README.md", "type": "file"}, headers=headers(owner)
+    )
+    assert (response.status_code, response.json()["error"]["code"]) == (409, "CONFLICT")
+
+
+async def test_tree_lists_more_than_500_entries(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    project = await blank(owner)
+    many = repo_of(workspace_root, project) / "many"
+    many.mkdir()
+    for n in range(600):
+        (many / f"f{n:03d}.txt").write_text("x")
+    body = (await owner.get(url(project, "tree"), params={"path": "many", "depth": 1})).json()
+    assert (len(body["data"]), body["meta"]) == (600, {"truncated": False})
+
+
+async def test_empty_ref_and_tree_path_mean_the_root(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    project = await blank(owner)
+    assert (await owner.get(url(project, "files/README.md"), params={"ref": ""})).status_code == 200
+    assert (await owner.get(url(project, "tree"), params={"path": ""})).status_code == 200
+
+
+async def test_unknown_body_fields_are_refused(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    project = await blank(owner)
+    sent = headers(owner)
+    put = await owner.put(
+        url(project, "files/README.md"),
+        json={"content": "x", "expected_sha256": None, "force": True},
+        headers=sent,
+    )
+    post = await owner.post(
+        url(project, "files"), json={"path": "n", "type": "file", "mode": 777}, headers=headers(owner)
+    )
+    patch = await owner.post(
+        url(project, "patches"), json={"diff": "x", "apply": "partial"}, headers=headers(owner)
+    )
+    assert [r.status_code for r in (put, post, patch)] == [422, 422, 422]
+
+
+async def test_writes_need_a_ready_repository(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    project = await create_upload(owner)
+    response = await put(owner, project, "README.md", "# x\n", None)
+    assert (response.status_code, reason(response)) == (409, "repository_not_ready")
+    assert not (workspace_root / project["id"]).exists()  # nothing created for an unfinished import
+
+
+async def test_a_failed_import_is_reported_as_an_error(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    project = await create_upload(owner)
+    async with make_sessionmaker(engine)() as session:
+        repository = await session.scalar(
+            select(Repository).where(Repository.project_id == uuid.UUID(project["id"]))
+        )
+        assert repository is not None
+        repository.sync_state, repository.error = "error", "archive_rejected:git_dir"
+        await session.commit()
+    response = await owner.get(url(project, "tree"))
+    assert response.status_code == 409
+    assert response.json()["error"]["details"] == [
+        {"reason": "repository_error", "error": "archive_rejected:git_dir"}
+    ]
+
+
+async def test_a_symlinked_git_dir_is_a_missing_repository(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    project = await blank(owner)
+    repo = repo_of(workspace_root, project)
+    shutil.move(str(repo / ".git"), str(tmp_path / "elsewhere.git"))
+    (repo / ".git").symlink_to(tmp_path / "elsewhere.git")
+    response = await owner.get(url(project, "tree"))
+    assert (response.status_code, reason(response)) == (409, "repository_missing")
+
+
+async def test_a_busy_workspace_answer_is_not_kept_for_the_key(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = await blank(owner)
+    repo = repo_of(workspace_root, project)
+    readme = sha((repo / "README.md").read_bytes())
+    monkeypatch.setattr(fs, "LOCK_WAIT_S", 0.2)
+    sent = headers(owner)
+    body = {"content": "# Saved\n", "expected_sha256": readme}
+    async with Workspace(repo).exclusive():  # a commit in progress
+        busy = await owner.put(url(project, "files/README.md"), json=body, headers=sent)
+    assert (busy.status_code, reason(busy), busy.headers.get("retry-after")) == (409, "busy", "1")
+    retried = await owner.put(url(project, "files/README.md"), json=body, headers=sent)
+    assert retried.status_code == 200, retried.text  # the same key runs again, not a replayed 409
+    assert retried.headers.get("idempotent-replay") is None
+
+
+async def test_a_patch_that_cannot_be_rolled_back_is_on_the_record(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = await blank(owner)
+
+    async def half_applied(*_: object, **__: object) -> list[object]:
+        raise PatchRollbackFailed(["a.txt"])
+
+    monkeypatch.setattr(Workspace, "apply_patch", half_applied)
+    response = await owner.post(url(project, "patches"), json={"diff": "x"}, headers=headers(owner))
+    assert response.status_code == 500
+    async with make_sessionmaker(engine)() as session:
+        events = (
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "workspace.patch_applied", AuditEvent.resource_id == project["id"]
+                )
+            )
+        ).all()
+    assert [(e.result, e.metadata_) for e in events] == [
+        ("error", {"reason": "rollback_failed", "paths": ["a.txt"]})
+    ]
+
+
+async def test_a_retried_write_with_the_same_key_runs_once(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    project = await blank(owner)
+    sent = headers(owner)
+    body = {"content": "# Once\n", "expected_sha256": None}
+    first = await owner.put(url(project, "files/new.md"), json=body, headers=sent)
+    again = await owner.put(url(project, "files/new.md"), json=body, headers=sent)
+    assert (first.status_code, again.status_code) == (200, 200)
+    assert again.headers.get("idempotent-replay") == "true"
+    assert again.json()["data"] == first.json()["data"]

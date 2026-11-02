@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from app.gitops.adapter import Author, GitAdapter, GitTarget
-from app.gitops.errors import GitError
+from app.gitops.errors import GitError, GitInputError
 
 ME = Author("Dev", "dev@example.test")
 
@@ -371,3 +371,87 @@ async def test_commit_never_stages_kk_even_when_tracked(git: GitAdapter, repo: G
 async def test_commit_with_only_kk_changes_is_nothing(git: GitAdapter, repo: GitTarget) -> None:
     write(repo.repo / ".kk" / "junit.xml", "<testsuite/>\n")
     assert await git.commit(repo, "nothing", ME) is None
+
+
+# --- WP-2.1c review round: index hygiene, .kk, timeouts, evidence -------------------------------------------
+
+
+async def test_a_stale_staged_file_never_rides_a_paths_commit(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    write(repo.repo / "b.txt", "secret\n")
+    raw_git(repo, "add", "b.txt")  # left staged by an earlier, failed run
+    await git.commit(repo, "only a", ME, paths=["a.txt"])
+    assert raw_git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["a.txt"]
+    assert raw_git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_a_failed_commit_leaves_nothing_staged(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+
+    async def failing(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "commit":
+            raise GitError("commit_failed")
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", failing)
+    with pytest.raises(GitError):
+        await git.commit(repo, "fails", ME)
+    monkeypatch.undo()
+    assert raw_git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_a_blank_commit_message_is_refused(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    with pytest.raises(GitInputError):
+        await git.commit(repo, "   \n", ME)
+    assert raw_git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_the_first_commit_never_stages_kk(tmp_path: Path, git: GitAdapter) -> None:
+    root = tmp_path / "fresh"
+    root.mkdir()
+    await git.init(root, "main")
+    write(root / ".kk" / "junit.xml", "<x/>\n")
+    write(root / "a.py", "print(1)\n")
+    target = GitTarget(root)
+    assert await git.commit(target, "first", ME) is not None
+    assert raw_git(target, "show", "--name-only", "--format=", "HEAD").splitlines() == ["a.py"]
+
+
+async def test_kk_is_ignored_by_status(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / ".kk" / "junit.xml", "<x/>\n")
+    await git.commit(repo, "nothing", ME)  # writes info/exclude
+    status = await git.status(repo)
+    assert status.clean and status.changes == []
+
+
+async def test_a_timeout_leaves_no_index_lock(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+    lock = repo.repo / ".git" / "index.lock"
+
+    async def killed(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "add":
+            lock.write_text("")  # what a git killed mid-add leaves behind
+            raise GitError("timeout")
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", killed)
+    with pytest.raises(GitError):
+        await git.commit(repo, "slow", ME)
+    monkeypatch.undo()
+    assert not lock.exists()
+    assert await git.commit(repo, "recovered", ME) is not None
+
+
+async def test_commit_files_lists_what_the_commit_holds(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    write(repo.repo / "d" / "b.txt", "b\n")
+    sha = await git.commit(repo, "two", ME)
+    assert sha is not None
+    assert await git.commit_files(repo, sha) == ["a.txt", "d/b.txt"]

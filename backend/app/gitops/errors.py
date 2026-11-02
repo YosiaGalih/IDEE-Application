@@ -9,7 +9,15 @@ class GitError(AppError):
     """git failed or was stopped (timeout, output cap, not a registered worktree, ...)."""
 
     def __init__(self, reason: str) -> None:
-        super().__init__("GIT_ERROR", "Git operation failed", http_status=409, details=[{"reason": reason}])
+        # A timeout is transient: Retry-After lets the idempotency middleware free the key for a retry.
+        headers = {"Retry-After": "5"} if reason == "timeout" else None
+        super().__init__(
+            "GIT_ERROR",
+            "Git operation failed",
+            http_status=409,
+            details=[{"reason": reason}],
+            headers=headers,
+        )
         self.reason = reason
 
 

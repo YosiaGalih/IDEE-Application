@@ -16,6 +16,7 @@ from app.workspace.errors import (
     FileTooLarge,
     PathViolation,
     VersionConflict,
+    WorkspaceBusy,
     WorkspaceNotFound,
 )
 from app.workspace.fs import ANY_VERSION, Workspace
@@ -511,3 +512,57 @@ async def test_exclusive_blocks_a_write_until_released(ws: Workspace) -> None:
         assert not writing.done()
     change = await writing
     assert change.change == "added"
+
+
+async def test_exclusive_gives_up_with_busy_and_stays_usable(
+    ws: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fs, "LOCK_WAIT_S", 0.3)
+    async with ws.exclusive():
+        with pytest.raises(WorkspaceBusy):
+            async with ws.exclusive():
+                pass
+    async with ws.exclusive():  # released: free again
+        pass
+
+
+async def test_exclusive_cancel_is_prompt_and_leaks_nothing(ws: Workspace) -> None:
+    async with ws.exclusive():
+
+        async def wait() -> None:
+            async with ws.exclusive():
+                pass
+
+        waiter = asyncio.create_task(wait())
+        await asyncio.sleep(0.1)
+        waiter.cancel()
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert asyncio.get_running_loop().time() - started < 0.5  # not LOCK_WAIT_S
+    async with asyncio.timeout(1):
+        async with ws.exclusive():
+            pass
+
+
+async def test_exclusive_releases_when_the_body_fails(ws: Workspace) -> None:
+    with pytest.raises(RuntimeError):
+        async with ws.exclusive():
+            raise RuntimeError("boom")
+    async with asyncio.timeout(1):
+        async with ws.exclusive():
+            pass
+
+
+async def test_exclusive_waiters_do_not_park_threads(ws: Workspace) -> None:
+    async with ws.exclusive():
+
+        async def wait() -> None:
+            async with ws.exclusive():
+                pass
+
+        waiters = [asyncio.create_task(wait()) for _ in range(40)]
+        await asyncio.sleep(0.2)
+        async with asyncio.timeout(1):  # the default executor still has room
+            assert await asyncio.to_thread(lambda: 1) == 1
+    await asyncio.gather(*waiters)
