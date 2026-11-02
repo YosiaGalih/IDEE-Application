@@ -1151,11 +1151,13 @@ Spec: `docs/superpowers/specs/2026-11-02-wp-2.1b-archive-import-design.md`. Plan
 | Pemeriksaan | Hasil aktual |
 |---|---|
 | Backend `ruff check .`, `ruff format --check .`, `pyright`, `lint-imports` | bersih; 0 error; 3 kontrak dipertahankan |
-| Backend `pytest -q` (PostgreSQL 16 + Redis 7 lokal, setelah putaran review) | **1402 passed, 1 skipped**. Urutan terbalik (`test_archive_import_http` → `test_cross_project` → `test_project_imports` → `test_celery_app`) → 115 passed |
+| Backend `pytest -q` (PostgreSQL 16 + Redis 7 lokal) | putaran review: **1402 passed, 1 skipped**; urutan terbalik (`test_archive_import_http` → `test_cross_project` → `test_project_imports` → `test_celery_app`) → 115 passed. Putaran delta: **1415 passed, 1 skipped** |
 | Mutan backend (putaran review) | 13 mutan: tanpa `flock`, tanpa sapu, `_is_ready` dimatikan, tanpa `keep_alive` di `finish_import`, tanpa pengembalian `repo/` saat commit gagal, `_abort` walau retry, rate limit sebelum cek status, tanpa batas boundary, tanpa perpanjangan lock saat streaming, tanpa `ClientDisconnect`, tanpa idle timeout → semuanya merah. Dua selamat dengan alasan: cek `lexists(repo)` sebelum publikasi (rename ke folder berisi tetap gagal `ENOTEMPTY`; klaim "tidak menghapus `repo/` asing" tetap terbukti) dan `keep_alive` di route pada test lock-hilang (`finish_import` juga menangkapnya; test perpanjangan lock ditambahkan dan membunuh mutan itu) |
 | Frontend `format:check`, `lint`, `lint:guards`, `typecheck`, `vite build` | bersih |
 | Frontend `vitest run` | **313 test** di 21 file (sebelumnya 278 di WP-2.1a) |
 | CI @ fc52a8f (sebelum putaran review) | 9/9 hijau. `clean-install`: "project smoke: imported 4bdb1cb3-… from smoke.zip through the worker" (lewat Caddy, job worker sungguhan); restore drill semua PASS. `security-scan`: Semgrep 297 file, 6 temuan lama, `gate: PASS (0 blocking)`; `kodekantor/backend:dev` 50 HIGH tanpa fix (EX-02); pip-audit "No known vulnerabilities found"; `npm audit` 0; gitleaks "no leaks found" |
+| CI @ 6e4a06e (putaran review) | **9/9 hijau.** `backend-test` "1403 passed"; `frontend` "Tests 313 passed (313)". `clean-install`: "project smoke: imported e626aa45-… from smoke.zip through the worker", restore drill semua PASS. `security-scan`: Semgrep 299 file, 6 temuan lama, `gate: PASS (0 blocking)`; `kodekantor/backend:dev` 50 HIGH tanpa fix, lolos lewat EX-02 yang **masih menunggu persetujuan PO**; pip-audit "No known vulnerabilities found"; `npm audit` 0; gitleaks "no leaks found" |
+| Mutan putaran delta | 14 mutan, semuanya merah: claim tanpa row lock, tanpa `_take_back`, sapu tanpa cek penanda, tanpa `_keep` setelah ekstraksi, tanpa `_keep` sebelum publikasi, `_complete` dan `_settle_failure` tanpa `FOR NO KEY UPDATE`, `abort_import` tanpa shield, tanpa `_abort` saat `acquire` melempar, `_TRANSIENT` tanpa `ConnectionError`, tanpa audit job mati, penanda tidak dihapus setelah commit masuk, `rmtree` pada symlink, tanpa batas 30 menit |
 | Backend nyata + Vite + Chromium | zip valid → `repo/` dengan commit "Import from archive kalkulator-main.zip", author pengunggah, folder pembungkus di-strip; zip berisi `.git` → alasan `git_dir` tampil dengan saran `git archive`; unggah ulang → workspace |
 
 #### Review WP-2.1b @ fc52a8f: `kk-backend-reviewer` (WARN: 5 SHOULD, 6 NIT), `kk-frontend-reviewer` (**BLOCK**: 1 BLOCK, 6 SHOULD, 7 NIT), `kk-silent-failure-hunter` (8 MEDIUM, 10 LOW), AG-13 `kk-security-reviewer` (**SIGNED OFF 🔒** @ fc52a8f: 1 MEDIUM, 3 LOW, 3 INFO)
@@ -1188,4 +1190,25 @@ Tidak ditutup (alasan):
 - **AG-13 INFO:** `user_id` di pesan antrean tidak dicocokkan dengan pelaku `import_requested`; otoritas bertumpu pada Redis privat. Diterima untuk tier S.
 - **frontend NIT:** belum ada tombol batal unggahan (XHR tetap jalan bila halaman ditinggal). Server menyapu sisanya; diangkat lagi bila ada keluhan.
 - **`flock` per host:** klaim run hanya berlaku bila semua worker satu node (tier S). Tier M/L dengan worker di banyak node butuh klaim lintas host.
+
+#### Delta review WP-2.1b @ 6e4a06e: `kk-backend-reviewer` (WARN: S1–S5, NIT1–6 CLOSED dengan catatan; 3 SHOULD, 5 NIT baru), AG-13 (**SIGNED OFF 🔒** @ 6e4a06e: 4 LOW, 5 INFO)
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| AG-13 LOW (T9/T2): bila key Redis lenyap antara pemeriksaan lock terakhir job dan commit-nya, sapu unggahan baru menghapus `repo/` yang baru dipublikasikan (direproduksi AG-13) | pemeriksaan ulang dan penyingkiran `repo/` di `begin_import` memakai row lock project yang dipegang job dari `_keep` sampai commit `ready` | `test_an_upload_racing_a_publish_waits_for_its_commit` (probe AG-13 dijadikan test: unggahan menunggu, lalu 409, `repo/` utuh); mutan tanpa row lock → merah |
+| backend SHOULD-1: hasil commit tak pasti → retry gagal `import_failed` karena menemukan `repo/` miliknya sendiri | penanda `.import-<job_id>.published` ditulis sebelum rename; retry dengan penanda + project masih menunggu → `repo/` diambil kembali dan import diulang; commit yang ternyata masuk → retry `skipped`, penanda dihapus | `test_a_commit_with_an_unknown_outcome_is_taken_back_by_the_retry`, `test_a_commit_with_an_unknown_outcome_that_landed_is_left_alone` |
+| backend SHOULD-3: sapu menghapus `repo/` berdasarkan status DB saja (jebakan WP-2.1c) | hanya `repo/` berpenanda yang disingkirkan; `repo/` lain → 409 `repository_not_empty`, utuh | `test_the_job_never_removes_a_repo_folder_it_did_not_publish` (kini juga unggah ulang → 409); mutan tanpa cek penanda → merah |
+| backend SHOULD-2: 13 guard tanpa test | test untuk lock hilang setelah ekstraksi (git tidak jalan), disalip sebelum publikasi, row lock `_complete` dan `_settle_failure`, shield `abort_import`, `_abort` saat `acquire` melempar, `ConnectionRefusedError` → retry | 7 test baru; mutan masing-masing → merah |
+| AG-13 LOW (T10): akhir import tanpa audit (time limit, cancel, retry yang tak terantre) | sapu menulis `project.import result=error reason=import_incomplete` untuk setiap job mati yang ditemukan (arsip atau folder kerja) | assert audit di `test_a_new_upload_clears_what_an_interrupted_import_left`; mutan → merah |
+| AG-13 LOW (T4) + backend NIT-A: tanpa batas waktu total unggahan | 30 menit (sama dengan klien web) → 408 `upload_too_slow` | `test_an_upload_that_never_ends_is_408`; mutan → merah |
+| AG-13 LOW: sifat utama sapu tanpa test regresi | project `ready` → 409 tanpa menyapu; symlink di `uploads/`, folder kerja, dan `repo/` hanya di-unlink | `test_a_ready_project_refuses_an_upload_and_nothing_is_swept`, `test_the_sweep_never_follows_a_link`; mutan `rmtree` pada symlink → merah |
+| backend NIT-B: retry karena Redis mati menumpang broker yang sama | didokumentasikan (spec, docstring task): retry yang tak terantre berakhir `import_incomplete`, lalu sapu + audit pada unggahan berikutnya; komentar backoff dikoreksi (jitter acak) | spec |
+| backend NIT-C: fd klaim ditutup terakhir di `finally` | `os.close` di `finally` terluar | review kode |
+| backend NIT-D, NIT-E: drift spec; 202 vs §3 | spec diperbarui (alasan 409 lengkap, penanda, row lock, 30 menit); konflik #67 mencatat bentuk 202 | spec, §8 |
+
+Tidak ditutup:
+- **AG-13 INFO I2:** run terlambat dari job yang disalip bisa menulis `import_superseded` lebih dari sekali, dan sapu menulis `import_incomplete` untuk arsip job yang belum jalan (antrean > 45 menit). Duplikat jejak, bukan jejak yang hilang.
+- **AG-13 INFO I3:** job yang dibunuh tepat setelah commit `ready` (tanpa redelivery) meninggalkan arsip ≤ 200 MiB di project `ready`, karena sapu tidak berjalan untuk project `ready`. Penyapu folder yatim WP-2.1c harus mencakup `uploads/` project `ready`.
+- **AG-13 INFO I4:** error `_claim` selain `BlockingIOError` (ELOOP, EACCES) tidak bisa dipicu user; berakhir `import_incomplete`.
+- **backend NIT6:** `_awaiting_import` setara dengan pemeriksaan lama selama blank/template selalu `ready`; tidak ada test yang membedakan.
 

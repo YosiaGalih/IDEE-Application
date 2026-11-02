@@ -369,8 +369,9 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - Keputusan Lead: tambah `{type:"upload"}`. Project dibuat dengan `sync_state = importing` tanpa folder workspace, lalu arsip diunggah ke `/imports`.
     - Import ke project blank/template ditolak (409 `repository_not_empty`, FR-015 "tanpa overwrite").
     - Usulan perubahan kontrak: tambahkan sumber `upload` di §3, dan `error` repository berisi kode (`archive_rejected:<reason>`, `import_git_failed`, `import_failed`, `import_not_started`, `import_expired`, `import_incomplete`). Alasan 409 route import: `repository_not_empty`, `not_an_upload_project`, `import_running`, `project_archived`, `import_expired`, `cleanup_failed`.
+    - Jawaban 202 route import: `{repository, job_id, upload: {filename, size, sha256}}` (§11 #14), sedangkan §3 hanya menyebut `{repository}`. Usulan: §3 mengikuti §11 #14.
 68. **HTTP 408 untuk unggahan yang macet atau putus (WP-2.1b).**
-    - Tabel error API_CONTRACTS §1 tidak punya 408. Route `/imports` menjawab 408 dengan kode yang sudah ada, `BAD_REQUEST`, dan `details.reason` ∈ `upload_stalled` (tidak ada byte 60 detik) atau `client_disconnected`.
+    - Tabel error API_CONTRACTS §1 tidak punya 408. Route `/imports` menjawab 408 dengan kode yang sudah ada, `BAD_REQUEST`, dan `details.reason` ∈ `upload_stalled` (tidak ada byte 60 detik), `upload_too_slow` (belum selesai setelah 30 menit) atau `client_disconnected`.
     - Alasannya: middleware idempotency tidak menyimpan 408 (§1 "respons transien"), sehingga retry dengan key yang sama berjalan lagi. Jawaban 400 akan tersimpan 24 jam dan memutar ulang penolakan untuk unggahan yang sebenarnya sah.
     - Usulan perubahan kontrak: tambahkan baris `408 | BAD_REQUEST` (atau kode baru `REQUEST_TIMEOUT`) di §1. Keputusan Lead.
 
