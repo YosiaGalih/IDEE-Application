@@ -1212,3 +1212,23 @@ Tidak ditutup:
 - **AG-13 INFO I4:** error `_claim` selain `BlockingIOError` (ELOOP, EACCES) tidak bisa dipicu user; berakhir `import_incomplete`.
 - **backend NIT6:** `_awaiting_import` setara dengan pemeriksaan lama selama blank/template selalu `ready`; tidak ada test yang membedakan.
 
+#### Delta AG-13 @ 9cb4223: **SIGNED OFF 🔒** (1 MEDIUM laten, 3 LOW, 2 INFO); CI @ 9cb4223 9/9 hijau
+
+- **CI 9cb4223:**
+  - `backend-test` "1416 passed"; `frontend` "Tests 313 passed (313)".
+  - `clean-install`: "project smoke: imported f159a8e3-… from smoke.zip through the worker", restore drill semua PASS.
+  - `security-scan`: Semgrep 299 file, 6 WARNING lama (`insecure-file-permissions`), `gate: PASS (0 blocking)`.
+  - Image backend 50 HIGH tanpa fix, lolos lewat EX-02 (menunggu PO); pip-audit, `npm audit`, dan gitleaks bersih.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| MEDIUM (T9, laten sampai WP-2.1c): penanda basi di project `ready` (commit masuk, hasil tak pasti, retry tak pernah jalan) mengizinkan sapu menghapus repo nyata begitu `sync_state = error` disimpan (probe P3b AG-13) | penanda hanya berlaku untuk job tanpa audit `project.import result=success` (ditulis di transaksi `ready` yang sama, append-only) | `test_a_committed_jobs_stale_marker_never_sweeps_its_repository` (P3b jadi test: 409, HEAD utuh); mutan → merah |
+| LOW (T9): `_take_back` dan `_is_ready` membaca tanpa row lock; commit run 1 yang masih berjalan lalu masuk meninggalkan `ready` tanpa `repo/` (probe P4) | `_take_back` di bawah row lock project, cek ulang `_waiting`, `_keep`, baru rename. `_is_ready` me-rollback sesi gagal lalu membaca dengan `FOR SHARE` (≤ 30 s) | `test_taking_back_waits_for_a_commit_still_settling` (P4 jadi test); mutan `_take_back` tanpa row lock → merah. `FOR SHARE` di `_is_ready`: hanya review kode |
+| LOW (T10): dua hasil bertentangan untuk satu job; penanda tertinggal saat rename gagal | rename yang gagal menghapus penanda; sapu melewati job yang sudah punya event `project.import` | `test_a_job_with_an_outcome_is_not_given_a_second_one`; 2 mutan → merah |
+| LOW: mutan cabang `.archive` di `_dead_jobs` dan cabang `uploads/` symlink selamat | test untuk keduanya | `test_a_job_whose_retries_ran_out_gets_its_outcome_from_the_next_upload`, `test_an_uploads_folder_that_is_a_link_is_replaced_not_followed`; mutan → merah |
+
+- **Lokal setelah putaran ini:** `pytest -q` → **1420 passed, 1 skipped**; ruff, pyright, dan lint-imports bersih.
+- **Tidak ditutup:**
+  - INFO M11 (`lexists` vs `exists` untuk `repo` symlink menggantung): akibatnya fail-safe (409/`import_failed`).
+  - INFO: audit dari sapu bersifat best-effort; bila DB gagal, hasilnya hanya tercatat di log `project_import_audit_failed`.
+
