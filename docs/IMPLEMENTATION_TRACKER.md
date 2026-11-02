@@ -1073,6 +1073,7 @@ Spec: `docs/superpowers/specs/2026-11-02-wp-2.1-platform-services-design.md` (pe
 | Frontend `vitest run` | **278 test** di 18 file (sebelumnya 243) |
 | CI @ bed63ac (sebelum perbaikan review) | 9/9 hijau. `clean-install`: "project smoke: created … from python-basic, first commit e48331a…". Trivy: image backend 50 HIGH tanpa fix (5 baru dari dependensi git: `libcurl3t64-gnutls`, `perl`, `perl-modules`, `libperl`), lolos lewat EX-02 (menunggu PO); `gate: PASS`. Semgrep: 284 file, 6 WARNING lama |
 | Backend nyata + Vite + Chromium, DB `kodekantor_live` | create blank dan template, daftar, cari, arsip/aktifkan, `git log` di workspace cocok; user lain melihat daftar kosong dan 404 di URL project |
+| CI @ cd34fbc (setelah perbaikan review) | **9/9 hijau.** `clean-install`: smoke yang diperketat → "project smoke: created 6feed4a1-… from python-basic, first commit 030927e4…" (commit di volume = jawaban API, project ada di daftar); restore drill memulihkan repo hasil API, `git fsck` bersih. `security-scan`: `kodekantor/backend:dev` debian 13.7, 50 HIGH, semuanya tanpa fix (perl/libcurl dari git, util-linux, ncurses, systemd, sqlite), lolos lewat EX-02 (menunggu PO), `gate: PASS (0 blocking)`; Semgrep 285 file, 6 WARNING lama; gitleaks "no leaks found"; `npm audit` 0 |
 
 #### Review WP-2.1a @ 0ac5f13: `kk-backend-reviewer` (**BLOCK**: 2 BLOCK, 8 SHOULD, 9 NIT), `kk-frontend-reviewer` (3 SHOULD, 6 NIT), `kk-silent-failure-hunter` (1 HIGH, 7 MEDIUM, 9 LOW), AG-13 `kk-security-reviewer` (**NOT SIGNED OFF**, tanpa temuan pemblokir: 9 LOW; menunggu bukti T8 di CI dan delta review)
 
@@ -1100,6 +1101,9 @@ Spec: `docs/superpowers/specs/2026-11-02-wp-2.1-platform-services-design.md` (pe
 | backend N3: spec `CONFLICT` vs kode `INVALID_TRANSITION` | spec diperbarui ke `INVALID_TRANSITION` | spec |
 | backend N6 + silent L1: PATCH no-op diaudit; null dibuang diam-diam | `settings: null` dan kunci `null` → 422; audit hanya bila berubah | test PATCH |
 | frontend 3 SHOULD + 6 NIT | sinkron kotak cari dengan URL, loading bukan "kosong", pengumuman arsip + fokus, teks error arsip per kode, ringkasan error field dari server, teks tanpa template, path terpusat (`lib/paths.ts`), panjang per code point | test layar per butir |
+
+Temuan saat menjalankan:
+- **Semgrep memblokir perbaikan saya sendiri** (CI @ 37c34f1): `text(f"SET LOCAL lock_timeout = …")` (`avoid-sqlalchemy-text`). Nilainya konstanta modul, jadi tidak bisa diinjeksi, tetapi gate-nya benar. Diganti dengan `set_config('lock_timeout', :timeout, true)` ber-bind (cd34fbc). Test baru menahan advisory lock owner dari koneksi lain: hasilnya 429 dalam batas waktu. Mutan dengan timeout mati → gagal dalam 15 s, tidak menggantung.
 
 Tidak ditutup (alasan):
 - **AG-13 LOW, role global di project yang diberi grant** (admin global + `readonly` di project X → bisa menulis X): perilaku persis API_CONTRACTS §2. **Keputusan PO:** biarkan, atau batasi role global dengan grant project. `test_a_global_role_counts_inside_a_project_it_was_granted` mengunci perilaku sekarang sampai PO memutuskan.
