@@ -1378,7 +1378,8 @@ Spec: `docs/superpowers/specs/2026-11-04-wp-2.1d-index-search-design.md`. Plan: 
 | Mutan | 18 mutan pada guard (`-e`, filter policy, glob, escape LIKE, urutan simbol, filter kind, batas hasil, rate limit, kunci job, pelepasan kunci, reuse, shortcut unchanged, batas file, pemicu create/import, `index_soon`, bahasa di `classify`): semua merah. Mutan "tanpa filter glob" sempat selamat; test teks diperkuat (glob `*.md`) lalu merah |
 | Syarat masuk AG-13 WP-2.1b/2.1c | tidak ada penulis `sync_state`/`error` baru (`test_index_never_writes_repository_state`); job indeks tidak menulis index git (grep pada object database, `GIT_OPTIONAL_LOCKS=0` untuk working tree) |
 
-| CI @ 48c2ca6 dan sebelumnya | semua job hijau kecuali `security-scan`: Trivy memblokir `kodekantor/web:dev` karena `libexpat 2.9.0-r0 → 2.10.0-r0` (CVE-2026-117610, CVE-2026-118370). `main` juga merah karena sebab yang sama (run 46bf6cf dan run terjadwal 3 Nov); bukan dari PR ini. Usulan patch satu baris di `frontend/Dockerfile` ada di komentar PR #13, menunggu keputusan PO |
+| CI @ 48c2ca6 dan sebelumnya | semua job hijau kecuali `security-scan`: Trivy memblokir `kodekantor/web:dev` karena `libexpat 2.9.0-r0 → 2.10.0-r0` (CVE-2026-113351, CVE-2026-117610, CVE-2026-118370). `main` juga merah karena sebab yang sama (run 46bf6cf dan run terjadwal 3 Nov); bukan dari PR ini. Usulan patch satu baris di `frontend/Dockerfile` ada di komentar PR #13, menunggu keputusan PO |
+| CI @ f25bb4e (hanya docs) | `sandbox-isolation` merah sekali: `test_memory_limit` → `('failed', 137, None)`, padahal hijau di 48c2ca6 dengan kode sandbox identik. Bukan dari PR ini; dugaan [Menebak]: `docker_driver.py` membaca `State.OOMKilled` sekali tepat setelah exit, sedangkan event OOM bisa datang belakangan. Usulan patch dan re-run sekali: komentar PR #13 |
 
 #### Review WP-2.1d @ 7484e90: `kk-backend-reviewer` (**APPROVE**: 0 BLOCK, 5 SHOULD, 6 NIT), `kk-silent-failure-hunter` (2 HIGH, 4 MEDIUM, 4 LOW), AG-13 (**NOT SIGNED OFF**: 2 MEDIUM, 3 LOW, 4 INFO)
 
@@ -1422,4 +1423,33 @@ Tidak ditutup (alasan):
 - **WP-3.x (tool agent `repo.search_text`/`repo.search_symbol`, `AGENT_READ`):** `Budget` total per pencarian untuk `.agentignore` yang tidak tepercaya (200 pola `**/x/**/*.y` ≈ 70 s CPU untuk 226 ribu match); `AGENT_READ_LIMIT` berlaku untuk preview; preview dan nama simbol dibungkus sebagai untrusted dan diredaksi sebelum ke model (T1/T5).
 - **WP-3.1 (pencarian di worktree task):** git 2.43 memeriksa folder induk lalu membuka file berdasarkan path (TOCTOU bila sandbox menulis worktree bersamaan): cari hanya saat sandbox task berhenti, atau jalankan pencarian di dalam sandbox.
 
-Delta AG-13 @ 48c2ca6: menyusul.
+#### Delta AG-13 @ 48c2ca6 (f25bb4e hanya docs): **SIGNED OFF 🔒** (0 CRITICAL/HIGH/MEDIUM; 2 LOW, 5 INFO baru)
+
+AG-13 menyatakan M1, M2, L1, L2, L3, dan I4 tertutup, dengan bukti berikut:
+- **M1, regex:** HTTP probe 422 untuk pola yang meledak dan untuk 6 upaya bypass lewat escape.
+- **M1, CPU dalam kuota 1 CPU:** loop tetap 95/96 tick/s saat 1 git jalan (sebelumnya 26), dan 84 tick/s saat 2 git (p95 27 ms).
+- **M2:** jeda loop 12–83 ms pada batas 1 MiB (sebelumnya 620–1001 ms).
+- **L2:** 12/12 run `truncated`, tanpa satu pun tunggu ≥ 1 s.
+
+Pemeriksaan AG-13 di DB `kodekantor_test_ag13`: **1737 passed, 1 skipped**. ruff, pyright, dan lint-imports bersih. Migrasi 0005 bolak-balik lulus. Syarat masuk WP-2.1b/2.1c tetap utuh.
+
+Penutupan di bawah dilakukan di commit kode setelah f25bb4e. Lokal: lihat baris bukti di bawah tabel.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| D2 LOW (T10): permintaan yang masuk di putaran terakhir (`MAX_ROUNDS`) dijawab `reused`, tetapi tidak ada putaran yang melayaninya (`again` tertinggal, kunci dilepas) | bila `finish` meminta putaran lagi di `MAX_ROUNDS`: kunci dilepas lalu `index_soon` mengirim job baru; worker kini membawa `CeleryJobQueue` | `test_a_request_in_the_last_round_is_handed_to_a_new_job`; mutan tanpa hand-over → merah |
+| D4 INFO: `--threads=1` tidak dikunci test | argv git yang sebenarnya diperiksa lewat HTTP, untuk mode teks dan regex | `test_a_text_search_runs_git_on_one_thread`; mutan `threads=None` → merah |
+
+Tidak ditutup (alasan):
+- **D1 LOW (T4), memori DFA glibc.** Regex tanpa `{` dan tanpa backreference masih bisa membuat cache state 0,4–0,73 GB per git dalam 10 s. Dua slot per proses bisa melewati limit api 1536M.
+  - Menurut probe AG-13, OOM killer cgroup membunuh git (proses terbesar) dan api tetap hidup [Kemungkinan Besar untuk uvicorn nyata]. Jadi yang gagal adalah pencarian si peminta sendiri.
+  - Batas keras (RLIMIT_AS sekitar 512 MiB lewat `prlimit` untuk git pencarian) mengubah cara adapter memulai proses dan harus dibuktikan di image. Ini dijadwalkan bersama syarat masuk WP-3.1.
+  - Opsi termurah bila PO ingin ditutup sekarang: `MAX_TEXT_SEARCHES = 1`, tetapi itu memperparah D3. Keputusan ada di PO.
+- **D3 INFO:** dua pembaca dengan pola 10 s dapat memegang kedua slot, sehingga user lain mendapat 429 untuk pencarian teks. Ini DoS tingkat fitur; tindak lanjutnya bersama D1, karena timeout regex yang lebih pendek meredakan keduanya.
+- **D5 INFO:** test regresi L2 bersifat probabilistik (mutan merah 5/6 run), karena hang aslinya memang tidak deterministik.
+- **D6 INFO:**
+  - Tenggat yang jatuh tepat saat `commit` bisa menghasilkan audit success disusul audit error `time_limit`. Ini duplikat, bukan celah [Menebak, tidak direproduksi].
+  - Drain di `_kill` tanpa batas waktu, tetapi hanya menunggu EOF seperti `wait()` sebelumnya.
+  - I3 (git yatim) praktis tertutup, karena tenggat 15 menit lebih pendek dari `time_limit` 20 menit.
+- **D7 INFO:** cancel melepas slot saat parse di thread masih berjalan. Jalur ini tidak terpicu oleh disconnect di uvicorn.
+- **Catatan versi:** `show-ref --exists` butuh git ≥ 2.43; image memakai git Debian trixie [Kemungkinan Besar 2.47]. Pada git yang lebih lama, branch unborn gagal tertutup sebagai `head_unreadable`.
