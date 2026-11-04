@@ -52,11 +52,13 @@ export function DashboardPage() {
       />
     );
   } else {
-    const { data, failedQueueTotal } = dashboard.data;
+    const { data, unavailable, failedQueueTotal } = dashboard.data;
+    // Only a dashboard with nothing at all is "new": an archived project's failed task still needs attention.
     const isNew =
+      Object.values(data.metrics).every((count) => count === 0) &&
+      failedQueueTotal === 0 &&
       data.recent_projects.length === 0 &&
-      data.recent_tasks.length === 0 &&
-      data.metrics.active_projects === 0;
+      data.recent_tasks.length === 0;
     // Filtering is local: the box narrows what the dashboard already has, it never asks the server again.
     const recentTasks = needle ? data.recent_tasks.filter(taskMatches(needle)) : data.recent_tasks;
     const queue = needle ? data.failed_queue.filter(taskMatches(needle)) : data.failed_queue;
@@ -103,8 +105,8 @@ export function DashboardPage() {
               />
               <RecentTasks tasks={recentTasks} isFiltered={isFiltered} />
               <RecentProjects projects={projects} isFiltered={isFiltered} />
-              <UsageSummary usage={data.usage} />
-              <AgentActivity />
+              <UsageSummary usage={data.usage} isUnavailable={unavailable.has("usage")} />
+              <AgentActivity runs={data.agent_activity} isUnavailable={unavailable.has("agent_activity")} />
             </div>
           </>
         )}

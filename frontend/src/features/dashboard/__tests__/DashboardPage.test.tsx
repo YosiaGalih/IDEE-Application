@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { dashboardData, dashboardMeta, project, task } from "@/__tests__/dashboardFixtures";
+import { agentRun, dashboardData, dashboardMeta, project, task } from "@/__tests__/dashboardFixtures";
 import { API, deferred, fail, renderApp, signedIn, user } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
 
@@ -44,10 +44,22 @@ describe("DashboardPage", () => {
       }),
     ).toBeInTheDocument();
     const metrics = await screen.findByRole("region", { name: id.dashboard.metrics.title });
-    expect(within(metrics).getByText(id.dashboard.metrics.completed_tasks).parentElement).toHaveTextContent(
-      "3",
+    // Each metric has its own fixture value: the exact number must sit under its own label.
+    const shown = Object.fromEntries(
+      within(metrics)
+        .getAllByRole("listitem")
+        .map((item): [string, string] => [
+          item.firstElementChild?.firstElementChild?.textContent ?? "",
+          item.textContent ?? "",
+        ]),
     );
-    expect(within(metrics).getByText(id.dashboard.metrics.failed_tasks).parentElement).toHaveTextContent("1");
+    expect(shown).toEqual({
+      [id.dashboard.metrics.active_projects]: `${id.dashboard.metrics.active_projects}2`,
+      [id.dashboard.metrics.running_tasks]: `${id.dashboard.metrics.running_tasks}4`,
+      [id.dashboard.metrics.completed_tasks]: `${id.dashboard.metrics.completed_tasks}3`,
+      [id.dashboard.metrics.failed_tasks]: `${id.dashboard.metrics.failed_tasks}1`,
+      [id.dashboard.metrics.waiting_approval]: `${id.dashboard.metrics.waiting_approval}5`,
+    });
     const recent = region(id.dashboard.recentTasks.title);
     expect(within(recent).getByRole("link", { name: "Tambahkan fungsi multiply" })).toHaveAttribute(
       "href",
@@ -68,15 +80,82 @@ describe("DashboardPage", () => {
     );
   });
 
-  it("never shows a number for what is not recorded", async () => {
+  it("says not available for the parts the server lists, never a number", async () => {
     backend();
     renderApp("/");
     const agents = await screen.findByRole("region", { name: id.dashboard.agents.title });
     expect(within(agents).getByText(id.dashboard.agents.body)).toBeInTheDocument();
-    expect(within(agents).queryByText(/\d/)).toBeNull();
+    expect(within(agents).getByText(id.dashboard.unavailable)).toBeInTheDocument();
     const usage = region(id.dashboard.usage.title);
-    expect(within(usage).getAllByText(id.dashboard.unavailable)).toHaveLength(3);
-    expect(within(usage).queryByText("0")).toBeNull();
+    const values = within(usage).getAllByRole("definition");
+    expect(values.map((value) => value.textContent)).toEqual(Array(3).fill(id.dashboard.unavailable));
+  });
+
+  it("shows recorded usage with how it was obtained, and tokens next to an unknown cost", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 275306,
+      output_tokens: 4143,
+      estimated_cost: 0.5,
+      cost_status: "estimated",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const [input, output, cost] = within(usage).getAllByRole("definition");
+    expect(input).toHaveTextContent(`275.306${id.dashboard.costStatus.estimated}`);
+    expect(output).toHaveTextContent(`4.143${id.dashboard.costStatus.estimated}`);
+    expect(cost).toHaveTextContent(/0,50/);
+    expect(cost).toHaveTextContent(id.dashboard.costStatus.estimated);
+  });
+
+  it("never prints a cost whose status says it is unknown", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 0,
+      output_tokens: 12,
+      estimated_cost: 0,
+      cost_status: "unavailable",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const [input, output, cost] = within(usage).getAllByRole("definition");
+    expect(input).toHaveTextContent(/^0$/); // a counted 0 is a real 0
+    expect(output).toHaveTextContent(/^12$/);
+    expect(cost).toHaveTextContent(id.dashboard.unavailable);
+  });
+
+  it("lists agent runs once they are recorded, and says when there are none", async () => {
+    const data = dashboardData();
+    data.agent_activity = [agentRun()];
+    backend(() => answer(data, dashboardMeta({ unavailable: ["usage"] })));
+    const { unmount } = renderApp("/");
+    const agents = await screen.findByRole("region", { name: id.dashboard.agents.title });
+    expect(within(agents).getByRole("link", { name: "General Code Implementation Agent" })).toHaveAttribute(
+      "href",
+      `/tasks/${agentRun().task_id}`,
+    );
+    expect(within(agents).queryByText(id.dashboard.unavailable)).toBeNull();
+    unmount();
+    data.agent_activity = [];
+    renderApp("/");
+    const empty = await screen.findByRole("region", { name: id.dashboard.agents.title });
+    expect(within(empty).getByText(id.dashboard.agents.empty)).toBeInTheDocument();
+  });
+
+  it("shows a project whose repository has a problem as such, not as healthy", async () => {
+    const data = dashboardData();
+    const broken = project();
+    data.recent_projects = [
+      { ...broken, repository: { ...broken.repository, sync_state: "error", error: "repository_missing" } },
+    ];
+    backend(() => answer(data));
+    renderApp("/");
+    const projects = await screen.findByRole("region", { name: id.dashboard.recentProjects.title });
+    expect(within(projects).getByText(id.dashboard.recentProjects.repositoryProblem)).toBeInTheDocument();
   });
 
   it("shows how many more need attention", async () => {
@@ -112,7 +191,43 @@ describe("DashboardPage", () => {
     expect(
       within(region(id.dashboard.queue.title)).getByText(id.dashboard.queue.filteredEmpty),
     ).toBeInTheDocument();
+    // Case does not matter, and the slug counts too.
+    const box = screen.getByRole("searchbox", { name: id.dashboard.searchLabel });
+    await userEvent.clear(box);
+    await userEvent.type(box, "TOKO");
+    expect(
+      within(region(id.dashboard.recentProjects.title)).getByRole("link", { name: "Toko" }),
+    ).toBeInTheDocument();
     expect(state.requests).toBe(1);
+  });
+
+  it("never says nothing matches about queue items it did not load", async () => {
+    backend(() => answer(dashboardData(), dashboardMeta({ failed_queue_total: 14 })));
+    renderApp("/");
+    await screen.findByRole("region", { name: id.dashboard.queue.title });
+    await userEvent.type(screen.getByRole("searchbox", { name: id.dashboard.searchLabel }), "pembayaran");
+    expect(
+      within(region(id.dashboard.queue.title)).getByText(
+        id.dashboard.queue.filteredEmptyPartial.replace("{{shown}}", "1").replace("{{more}}", "13"),
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the attention queue when the only project is archived", async () => {
+    const data = dashboardData();
+    data.metrics = {
+      active_projects: 0,
+      running_tasks: 0,
+      completed_tasks: 0,
+      failed_tasks: 1,
+      waiting_approval: 0,
+    };
+    data.recent_projects = [];
+    data.recent_tasks = [];
+    backend(() => answer(data));
+    renderApp("/");
+    expect(await screen.findByRole("region", { name: id.dashboard.queue.title })).toBeInTheDocument();
+    expect(screen.queryByText(id.dashboard.empty.title)).toBeNull();
   });
 
   it("offers a new project and explains why tasks cannot be created yet", async () => {
@@ -169,6 +284,7 @@ describe("DashboardPage", () => {
     renderApp("/");
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(id.states.permission_denied.title);
+    expect(within(alert).queryByRole("button")).toBeNull(); // retrying cannot grant the right
     expect(screen.queryByRole("region", { name: id.dashboard.metrics.title })).toBeNull();
   });
 

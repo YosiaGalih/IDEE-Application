@@ -343,7 +343,7 @@
     "newProject": "New project",
     "newTask": "New task",
     "newTaskUnavailable": "Creating tasks is not available in this version yet.",
-    "searchLabel": "Filter projects and tasks",
+    "searchLabel": "Filter the projects and tasks shown",
     "searchPlaceholder": "Project name or task title",
     "unavailable": "not available",
     "updated": "Updated {{time}}",
@@ -353,7 +353,7 @@
       "running_tasks": "Running tasks",
       "completed_tasks": "Completed tasks",
       "failed_tasks": "Failed tasks",
-      "waiting_approval": "Waiting for approval"
+      "waiting_approval": "Tasks waiting for approval"
     },
     "recentTasks": {
       "title": "Recent tasks",
@@ -366,11 +366,14 @@
       "filteredEmpty": "No matching tasks need attention.",
       "more": "{{count}} more",
       "open": "Open",
-      "openOf": "Open task {{title}}"
+      "openOf": "Open task {{title}}",
+      "filteredEmptyPartial": "Nothing matches among the {{shown}} tasks shown; {{more}} more are not loaded."
     },
     "agents": {
       "title": "Agent activity",
-      "body": "The platform does not record agent runs yet, so there is no activity to show."
+      "body": "The platform does not record agent runs yet, so there is no activity to show.",
+      "empty": "No agent runs yet.",
+      "duration": "{{ms}} ms"
     },
     "usage": {
       "title": "Model usage",
@@ -386,12 +389,24 @@
       "empty": "No active projects yet.",
       "filteredEmpty": "No matching projects.",
       "active": "Active",
-      "noStack": "Stack not detected yet"
+      "noStack": "Stack not detected yet",
+      "importing": "Importing",
+      "repositoryProblem": "Repository problem",
+      "status": {
+        "archived": "Archived",
+        "deleting_pending_approval": "Waiting for delete approval",
+        "deleted": "Deleted"
+      }
     },
     "empty": {
       "title": "No projects yet",
       "body": "Create your first project to start working with agents.",
       "action": "Create your first project"
+    },
+    "costStatus": {
+      "estimated": "estimate",
+      "partial": "partial (not all priced)",
+      "actual": "actual"
     }
   }
 }

@@ -6,13 +6,14 @@ import {
   FolderOpen,
   Hourglass,
   Loader2,
+  TriangleAlert,
   XCircle,
   type LucideIcon,
 } from "lucide-react";
 import { useId, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
-import type { Dashboard, TaskSummary } from "@/api/dashboard";
+import type { AgentRunSummary, Dashboard, TaskSummary } from "@/api/dashboard";
 import type { Project } from "@/api/projects";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -142,6 +143,13 @@ export function AttentionQueue({ tasks, total, shown, isFiltered }: QueueProps) 
   const { t } = useTranslation();
   // The server sends up to ten: say how many more there are, never pretend the list is complete.
   const more = Math.max(0, total - shown);
+  // The filter only sees what was loaded: "nothing matches" would be a claim about tasks it never saw.
+  let emptyText = t("dashboard.queue.empty");
+  if (isFiltered)
+    emptyText =
+      more > 0
+        ? t("dashboard.queue.filteredEmptyPartial", { shown, more })
+        : t("dashboard.queue.filteredEmpty");
   return (
     <Section
       title={t("dashboard.queue.title")}
@@ -151,11 +159,7 @@ export function AttentionQueue({ tasks, total, shown, isFiltered }: QueueProps) 
         ) : null
       }
     >
-      <TaskList
-        isQueue
-        tasks={tasks}
-        emptyText={t(isFiltered ? "dashboard.queue.filteredEmpty" : "dashboard.queue.empty")}
-      />
+      <TaskList isQueue tasks={tasks} emptyText={emptyText} />
     </Section>
   );
 }
@@ -171,27 +175,73 @@ function Unavailable() {
   );
 }
 
-export function AgentActivity() {
+type AgentActivityProps = { runs: AgentRunSummary[]; isUnavailable: boolean };
+
+/** Agent runs (FR-009). The server says when it records none (`meta.unavailable`); the screen follows. */
+export function AgentActivity({ runs, isUnavailable }: AgentActivityProps) {
   const { t } = useTranslation();
-  return (
-    <Section title={t("dashboard.agents.title")} aside={<Unavailable />}>
+  const format = useDateTime();
+  let body: ReactNode;
+  if (isUnavailable) {
+    body = (
       <p className="flex items-start gap-2 text-sm text-fg-muted">
         <Activity aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
         {t("dashboard.agents.body")}
       </p>
+    );
+  } else if (runs.length === 0) {
+    body = <p className="text-sm text-fg-muted">{t("dashboard.agents.empty")}</p>;
+  } else {
+    body = (
+      <ul className="divide-y divide-line">
+        {runs.map((run) => (
+          <li
+            key={run.id}
+            className="flex flex-wrap items-start justify-between gap-3 py-3 first:pt-0 last:pb-0"
+          >
+            <div className="min-w-0 break-words">
+              <Link to={taskPath(run.task_id)} className="font-medium text-brand-600 hover:underline">
+                {run.agent_name}
+              </Link>
+              <p className="text-xs text-fg-muted">
+                <time dateTime={run.started_at}>{format.format(new Date(run.started_at))}</time>
+                {run.duration_ms !== null
+                  ? ` · ${t("dashboard.agents.duration", { ms: run.duration_ms })}`
+                  : null}
+              </p>
+            </div>
+            <Badge tone="neutral">{run.status}</Badge>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  return (
+    <Section title={t("dashboard.agents.title")} aside={isUnavailable ? <Unavailable /> : null}>
+      {body}
     </Section>
   );
 }
 
-export function UsageSummary({ usage }: { usage: Dashboard["usage"] }) {
+type UsageProps = { usage: Dashboard["usage"]; isUnavailable: boolean };
+
+/** Model usage of the month (FR-011, AC-16): every number carries how it was obtained. */
+export function UsageSummary({ usage, isUnavailable }: UsageProps) {
   const { t, i18n } = useTranslation();
   const format = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeZone: "UTC" });
+  const integer = new Intl.NumberFormat(i18n.language);
+  const money = new Intl.NumberFormat(i18n.language, { style: "currency", currency: "USD" });
   // The period is [start, end): its last day is the one before `end`.
   const lastDay = new Date(new Date(usage.period.end).getTime() - 1);
+  const hasCost = !isUnavailable && usage.cost_status !== "unavailable";
   const values = [
-    { key: "inputTokens", value: usage.input_tokens },
-    { key: "outputTokens", value: usage.output_tokens },
-    { key: "cost", value: usage.estimated_cost },
+    { key: "inputTokens", text: usage.input_tokens === null ? null : integer.format(usage.input_tokens) },
+    { key: "outputTokens", text: usage.output_tokens === null ? null : integer.format(usage.output_tokens) },
+    // A cost is shown only with a status that says what it is (estimate, partial, actual).
+    {
+      key: "cost",
+      text: hasCost && usage.estimated_cost !== null ? money.format(usage.estimated_cost) : null,
+    },
   ] as const;
   return (
     <Section
@@ -206,18 +256,56 @@ export function UsageSummary({ usage }: { usage: Dashboard["usage"] }) {
       }
     >
       <dl className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        {values.map(({ key, value }) => (
+        {values.map(({ key, text }) => (
           <div key={key} className="rounded-[var(--radius-control)] border border-line p-3">
             <dt className="text-sm text-fg-muted">{t(`dashboard.usage.${key}`)}</dt>
-            {/* Until usage is recorded every value is unknown; a recorded value comes with WP-3.1. */}
             <dd className="mt-1">
-              {usage.cost_status === "unavailable" || value === null ? <Unavailable /> : value}
+              {isUnavailable || text === null ? (
+                <Unavailable />
+              ) : (
+                <span className="flex flex-wrap items-baseline gap-2">
+                  <span className="font-semibold text-fg">{text}</span>
+                  {usage.cost_status !== "unavailable" ? (
+                    <Badge tone="neutral">{t(`dashboard.costStatus.${usage.cost_status}`)}</Badge>
+                  ) : null}
+                </span>
+              )}
             </dd>
           </div>
         ))}
       </dl>
-      <p className="mt-3 text-sm text-fg-muted">{t("dashboard.usage.body")}</p>
+      {isUnavailable ? <p className="mt-3 text-sm text-fg-muted">{t("dashboard.usage.body")}</p> : null}
     </Section>
+  );
+}
+
+function ProjectBadges({ project }: { project: Project }) {
+  const { t } = useTranslation();
+  const repository = project.repository;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {project.status === "active" ? (
+        <Badge tone="success">
+          <CheckCircle2 aria-hidden="true" className="size-3.5" />
+          {t("dashboard.recentProjects.active")}
+        </Badge>
+      ) : (
+        <Badge tone="neutral">{t(`dashboard.recentProjects.status.${project.status}`)}</Badge>
+      )}
+      {repository?.sync_state === "importing" ? (
+        <Badge tone="info">
+          <Loader2 aria-hidden="true" className="size-3.5" />
+          {t("dashboard.recentProjects.importing")}
+        </Badge>
+      ) : null}
+      {repository?.sync_state === "error" ? (
+        // What the server found (a missing folder, an unfinished import): the project is not healthy.
+        <Badge tone="warning" title={repository.error ?? undefined}>
+          <TriangleAlert aria-hidden="true" className="size-3.5" />
+          {t("dashboard.recentProjects.repositoryProblem")}
+        </Badge>
+      ) : null}
+    </div>
   );
 }
 
@@ -261,10 +349,7 @@ export function RecentProjects({ projects, isFiltered }: { projects: Project[]; 
                     </p>
                   </div>
                 </div>
-                <Badge tone="success">
-                  <CheckCircle2 aria-hidden="true" className="size-3.5" />
-                  {t("dashboard.recentProjects.active")}
-                </Badge>
+                <ProjectBadges project={project} />
               </li>
             );
           })}

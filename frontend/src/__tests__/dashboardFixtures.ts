@@ -34,7 +34,7 @@ export function project(overrides: Record<string, unknown> = {}) {
       branch: "main",
       sync_state: "ready",
       last_indexed_at: null,
-      error: null,
+      error: null as string | null,
     },
     permissions: ["project:read", "project:write", "workspace:read"],
     stats: null,
@@ -62,19 +62,34 @@ export function task(overrides: Record<string, unknown> = {}) {
   };
 }
 
+export function agentRun(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+    task_id: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+    project_id: PROJECT_ID,
+    agent_id: "B14",
+    agent_name: "General Code Implementation Agent",
+    status: "succeeded",
+    started_at: "2026-11-03T09:00:00+00:00",
+    duration_ms: 1200,
+    ...overrides,
+  };
+}
+
 export function dashboardData() {
   return {
+    // A distinct value per metric: a number shown under the wrong label cannot pass.
     metrics: {
-      active_projects: 1,
-      running_tasks: 0,
+      active_projects: 2,
+      running_tasks: 4,
       completed_tasks: 3,
       failed_tasks: 1,
-      waiting_approval: 0,
+      waiting_approval: 5,
     },
     recent_projects: [project()],
     recent_tasks: [task()],
     failed_queue: [task()],
-    agent_activity: [] as unknown[],
+    agent_activity: [] as ReturnType<typeof agentRun>[],
     usage: {
       period: { start: "2026-11-01T00:00:00Z", end: "2026-12-01T00:00:00Z" },
       ...UNAVAILABLE_USAGE,
