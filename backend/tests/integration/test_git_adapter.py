@@ -594,9 +594,18 @@ async def test_list_files_lists_blobs_of_a_commit(git: GitAdapter, repo: GitTarg
     os.symlink("f.txt", repo.repo / "link")
     sha = await git.commit(repo, "files", ME)
     assert sha is not None
-    files, truncated = await git.list_files(repo, sha)
-    assert not truncated
-    assert {(f.path, f.size) for f in files} == {("f.txt", 6), ("keep.md", 5), ("src/app.py", 11)}
+    listing = await git.list_files(repo, sha)
+    assert (listing.truncated, listing.skipped_paths) == (False, 0)
+    assert {(f.path, f.size) for f in listing.files} == {("f.txt", 6), ("keep.md", 5), ("src/app.py", 11)}
+
+
+async def test_list_files_counts_paths_that_are_not_utf8(git: GitAdapter, repo: GitTarget) -> None:
+    (repo.repo / os.fsdecode(b"\xff.txt")).write_text("x\n")
+    sha = await git.commit(repo, "latin-1 name", ME)
+    assert sha is not None
+    listing = await git.list_files(repo, sha)
+    assert listing.skipped_paths == 1
+    assert "f.txt" in {f.path for f in listing.files}
 
 
 async def test_grep_finds_text_in_the_working_tree_including_untracked(

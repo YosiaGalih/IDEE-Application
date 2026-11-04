@@ -47,6 +47,7 @@ from app.gitops.adapter import Author, GitAdapter, GitTarget
 from app.gitops.errors import GitError
 from app.models.projects import Project, Repository
 from app.services import import_lock
+from app.services.index_stats import indexed_file_count
 from app.services.task_stats import open_task_count
 from app.workspace.fs import Workspace
 from app.workspace.stack import detect_stack
@@ -698,9 +699,13 @@ async def _audit_unsafe(env: ProjectEnv, project_id: uuid.UUID) -> None:
 
 
 async def _stats(
-    env: ProjectEnv, project_id: uuid.UUID, repository: Repository | None, open_tasks: int
+    env: ProjectEnv,
+    project_id: uuid.UUID,
+    repository: Repository | None,
+    open_tasks: int,
+    files: int | None,
 ) -> ProjectStats:
-    """The git half of the stats, run with no session open."""
+    """The git half of the stats, run with no session open; ``files`` comes from the index (WP-2.1d)."""
     if _awaiting_import(repository):
         assert repository is not None
         # Not imported yet (or importing): no folder to read; only an import that stopped is a problem.
@@ -709,7 +714,7 @@ async def _stats(
         return ProjectStats(files=None, last_commit=None, open_tasks=open_tasks, repository_problem=problem)
     last_commit, problem = await _repository_check(env, project_id)
     return ProjectStats(
-        files=None, last_commit=last_commit, open_tasks=open_tasks, repository_problem=problem
+        files=files, last_commit=last_commit, open_tasks=open_tasks, repository_problem=problem
     )
 
 
@@ -751,7 +756,8 @@ async def get_project(
         project, permissions = await authorize(session, actor, project_id, "project:read")
         repository = await session.scalar(select(Repository).where(Repository.project_id == project.id))
         open_tasks = await open_task_count(session, project.id) if with_stats else 0
-    stats = await _stats(env, project.id, repository, open_tasks) if with_stats else None
+        files = await indexed_file_count(session, repository) if with_stats else None
+    stats = await _stats(env, project.id, repository, open_tasks, files) if with_stats else None
     return ProjectView(project, repository, permissions, stats)
 
 
@@ -912,10 +918,10 @@ async def update_project(
                 # Booleans, never secret: turning an approval control off must leave its value on record.
                 metadata["settings"] = changed_settings
             await _audit(env, session, actor, project, "project.update", metadata)
-        repository, open_tasks = await _read_and_commit(session, project)
+        repository, open_tasks, files = await _read_and_commit(session, project)
     # After the commit nothing may fail the request: _stats reports repository problems, never raises.
     return ProjectView(
-        project, repository, permissions, await _stats(env, project.id, repository, open_tasks)
+        project, repository, permissions, await _stats(env, project.id, repository, open_tasks, files)
     )
 
 
@@ -934,20 +940,23 @@ async def set_archived(
             )
         project.status = target
         await _audit(env, session, actor, project, "project.archive" if archived else "project.unarchive", {})
-        repository, open_tasks = await _read_and_commit(session, project)
+        repository, open_tasks, files = await _read_and_commit(session, project)
     # After the commit nothing may fail the request: _stats reports repository problems, never raises.
     return ProjectView(
-        project, repository, permissions, await _stats(env, project.id, repository, open_tasks)
+        project, repository, permissions, await _stats(env, project.id, repository, open_tasks, files)
     )
 
 
-async def _read_and_commit(session: AsyncSession, project: Project) -> tuple[Repository | None, int]:
+async def _read_and_commit(
+    session: AsyncSession, project: Project
+) -> tuple[Repository | None, int, int | None]:
     """Read what the response needs from the database, then commit. Git runs later, with no lock held."""
     repository = await session.scalar(select(Repository).where(Repository.project_id == project.id))
     open_tasks = await open_task_count(session, project.id)
+    files = await indexed_file_count(session, repository)
     await _load_updated_at(session, project)
     await session.commit()
-    return repository, open_tasks
+    return repository, open_tasks, files
 
 
 async def _load_updated_at(session: AsyncSession, project: Project) -> None:

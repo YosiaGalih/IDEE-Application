@@ -153,6 +153,13 @@ class TreeFile:
 
 
 @dataclass(frozen=True)
+class TreeListing:
+    files: list[TreeFile]
+    truncated: bool  # the listing was cut at ``max_output``
+    skipped_paths: int  # regular files whose names are not UTF-8 (not addressable through the API)
+
+
+@dataclass(frozen=True)
 class GrepMatch:
     path: str
     line: int
@@ -562,10 +569,9 @@ class GitAdapter:
             output_truncated=result.truncated,
         )
 
-    async def list_files(self, target: GitTarget, commit: str) -> tuple[list[TreeFile], bool]:
+    async def list_files(self, target: GitTarget, commit: str) -> TreeListing:
         """The regular files of ``commit``'s tree, read from the object database (no working tree, no symlink
-        followed). Symlinks, submodules and paths that are not UTF-8 are left out; ``True`` when the listing
-        was cut at ``max_output``."""
+        followed). Symlinks and submodules are left out; paths that are not UTF-8 are counted, not listed."""
         if not _SHA.fullmatch(commit):
             raise GitInputError("ref")
         git_dir, tree = await self._adirs(target)
@@ -580,16 +586,17 @@ class GitAdapter:
         if result.truncated:
             records = records[:-1]  # the last record may be cut
         files: list[TreeFile] = []
+        skipped = 0
         for record in records:
             meta, _, raw_path = record.partition(b"\t")
             fields = meta.split()
             if len(fields) != 4 or fields[0] not in (b"100644", b"100755") or fields[1] != b"blob":
-                continue
+                continue  # symlink, submodule, tree, or the empty tail after the last NUL
             try:
                 files.append(TreeFile(raw_path.decode("utf-8"), int(fields[3])))
             except (UnicodeDecodeError, ValueError):
-                continue
-        return files, result.truncated
+                skipped += 1
+        return TreeListing(files, result.truncated, skipped)
 
     async def grep(
         self,
