@@ -382,6 +382,15 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - Indeks = isi commit HEAD, bukan working tree; cari teks = working tree. Kegagalan indeks hanya tercatat di audit `project.index result=error` dan log, karena `Project.repository` tidak punya field status indeks. Usulan: Lead menilai perlu tidaknya `repository.index_error`.
     - `POST /index` saat job berjalan → 202 dengan `job_id` yang sedang berjalan (`meta.reused`), bukan 409.
     - **Review WP-2.1d:** `repositories.index_truncated` (boolean, default false) ditambahkan, belum ada di DATA_MODEL: indeks yang berhenti di batas harus terlihat dan dibangun ulang (temuan silent-failure H2). Pencarian menambah `meta.skipped`, `meta.index_truncated`, 422 `regex_unsupported` (backreference dan `{m,n}`), serta 429 untuk pencarian teks yang masih berjalan. Usulan: DATA_MODEL dan API_CONTRACTS §3 mencantumkannya.
+70. **Dashboard (WP-2.1e).** Spec: `docs/superpowers/specs/2026-11-04-wp-2.1e-dashboard-design.md`.
+    - **Antrean di respons:** FR-010 meminta antrean task gagal di dashboard, tetapi bentuk `GET /dashboard` di §3 tidak memuatnya. Ditambahkan `failed_queue: [TaskSummary]` (maks 10; status `failed`, `interrupted`, `needs_changes`, `waiting_approval`) dan `meta.failed_queue_total`.
+    - **Nama project di task:** `TaskSummary` ditambah `project_name`, karena layar menampilkan nama project di bawah setiap task.
+    - **Bagian tanpa sumber data:** `meta.unavailable` (`agent_activity`, `usage`) menandai bagian yang tabelnya belum ada (`agent_runs`, `usage_records`). Layar menampilkannya sebagai "tidak tersedia", bukan 0 atau daftar kosong; `agent_activity` tetap berupa daftar.
+    - **Bentuk periode usage:** `usage.period` = `{start, end}`, yaitu bulan kalender berjalan dalam UTC, setengah terbuka.
+    - **Arti metrik:** `running_tasks` = `running` + `validating`. `waiting_approval` dan `has_pending_approval` diturunkan dari `tasks.status` sampai tabel approval ada (WP-3.1).
+    - **Ditunda ke WP-3.1:** quick create task dinonaktifkan, dan aksi antrean (resume/retry/putuskan approval) hanya **Buka**, sampai API task dan approval ada.
+    - **Beda dengan mockup:** mockup screen-02 memuat kartu keenam "Dalam antrean", yang tidak ada di kontrak, jadi tidak dibuat.
+    - **Usulan:** API_CONTRACTS §3 dan §11 mencantumkan `failed_queue`, `project_name`, `meta.unavailable`, dan bentuk `period`.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
