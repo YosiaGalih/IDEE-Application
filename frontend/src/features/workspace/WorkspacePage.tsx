@@ -1,44 +1,49 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, GitBranch, PanelBottomClose, PanelBottomOpen } from "lucide-react";
-import { useCallback, useEffect, useId, useReducer, useRef, useState, type FormEvent } from "react";
+import { AlertTriangle, ArrowLeft, GitBranch, PanelBottomClose, PanelBottomOpen } from "lucide-react";
+import { useCallback, useEffect, useId, useReducer, useRef, useState, type KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useBlocker, useParams } from "react-router";
 import { ApiError } from "@/api/errors";
 import { useProject } from "@/api/hooks/useProjects";
 import { gitStatusKey, treeKey } from "@/api/hooks/useWorkspace";
+import type { Project } from "@/api/projects";
 import { uxStateForError } from "@/api/uxState";
 import { createPath, deleteFile, getFile, putFile, VersionConflict, type FileContent } from "@/api/workspace";
 import { Button } from "@/components/ui/Button";
-import { Dialog, DialogContent } from "@/components/ui/Dialog";
-import { Input } from "@/components/ui/Input";
-import { Label } from "@/components/ui/Label";
 import { StateView } from "@/components/ui/StateView";
 import { cn } from "@/lib/cn";
-import { describeError } from "@/lib/describeError";
 import { PROJECTS_PATH } from "@/lib/paths";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
+import type { RevealRequest } from "./CodeEditor";
 import { ConflictDialog } from "./ConflictDialog";
 import { EditorArea } from "./EditorArea";
 import { initialTabs, isDirty, tabsReducer, type TabsAction } from "./editorTabs";
 import { Explorer } from "./Explorer";
-import { disposeModel } from "./lazyEditor";
+import { disposeModel, disposeProjectModels } from "./lazyEditor";
 import { SearchPanel } from "./SearchPanel";
-import type { RepoReason } from "./workspaceErrors";
+import { ConfirmDialog, CreateDialog, DeleteDialog } from "./workspaceDialogs";
+import { saveErrorOf, workspaceErrorText, type RepoReason } from "./workspaceErrors";
 
 const RIGHT_TABS = ["search", "chat"] as const;
+type RightTab = (typeof RIGHT_TABS)[number];
 /** Why a project that is not active cannot be changed (the workspace API's 409 reasons). */
 const STATUS_REASON: Partial<Record<string, RepoReason>> = {
   archived: "project_archived",
   deleting_pending_approval: "project_not_active",
 };
 
-const parentOf = (path: string) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".");
-const saveErrorCode = (error: unknown) => {
-  if (!(error instanceof ApiError)) return "generic";
-  if (error.status === 404) return "not_found";
-  if (error.status === 403) return "forbidden";
-  return error.code ?? error.kind;
+/** The folders a path sits in, root first: creating `a/b/c.txt` can create `a` and `a/b` as well. */
+const foldersAbove = (path: string) => {
+  const parts = path.split("/");
+  return [".", ...parts.slice(1).map((_, index) => parts.slice(0, index + 1).join("/"))];
 };
+
+const kindOf = (file: FileContent) =>
+  file.too_large ? "large" : file.content === null || file.encoding === "binary" ? "binary" : "text";
+
+// Module-wide, so they stay unique when the workspace mounts again.
+let openSequence = 0;
+let revealSequence = 0;
 
 /** `/projects/:projectId/workspace` (layar 4, FR-026–032): explorer, editor, search; chat and terminal later. */
 export function WorkspacePage() {
@@ -46,44 +51,45 @@ export function WorkspacePage() {
   const { t } = useTranslation();
   const project = useProject(projectId);
   useDocumentTitle(project.data?.name ?? t("screens.workspace"));
-  if (project.isPending) return <StateView state="loading" />;
-  if (project.isError)
-    return (
-      <StateView
-        state={uxStateForError(project.error)}
-        titleAs="h1"
-        requestId={project.error instanceof ApiError ? project.error.requestId : null}
-        onAction={() => void project.refetch()}
-      />
-    );
-  const repository = project.data.repository;
-  if (repository === null || repository.sync_state !== "ready") {
-    const reason = repository?.sync_state === "error" ? "repository_missing" : "repository_not_ready";
-    return (
-      <StateView
-        state="partial_success"
-        titleAs="h1"
-        title={project.data.name}
-        detail={t(`workspace.repo.${reason}`)}
-      />
-    );
+  // Only without any project data: once the workspace shows, a failed refresh must not unmount the
+  // open tabs (and the unsaved text in them). It is said in a banner instead.
+  if (project.data === undefined) {
+    if (project.isError)
+      return (
+        <StateView
+          state={uxStateForError(project.error)}
+          titleAs="h1"
+          requestId={project.error instanceof ApiError ? project.error.requestId : null}
+          onAction={() => void project.refetch()}
+        />
+      );
+    return <StateView state="loading" />;
   }
   return (
     <Workspace
+      key={projectId}
       projectId={projectId}
-      name={project.data.name}
-      branch={repository.branch}
-      status={project.data.status}
-      canWrite={project.data.permissions.includes("workspace:write") && project.data.status === "active"}
+      project={project.data}
+      refreshError={project.isError ? project.error : null}
+      onRefresh={() => void project.refetch()}
     />
   );
 }
 
-type WorkspaceProps = { projectId: string; name: string; branch: string; status: string; canWrite: boolean };
+type WorkspaceProps = { projectId: string; project: Project; refreshError: unknown; onRefresh: () => void };
 
-function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps) {
+function Workspace({ projectId, project, refreshError, onRefresh }: WorkspaceProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const repository = project.repository;
+  const repoReason: RepoReason | null =
+    repository === null || repository.sync_state !== "ready"
+      ? repository?.sync_state === "error"
+        ? "repository_error"
+        : "repository_not_ready"
+      : null;
+  const canWrite =
+    project.permissions.includes("workspace:write") && project.status === "active" && repoReason === null;
   const [state, dispatchToReact] = useReducer(tabsReducer, initialTabs);
   // Handlers read the tabs from this ref, which runs the same pure reducer at dispatch time: Monaco can
   // deliver Ctrl+S before React renders the last keystroke, and the save must send what is on screen.
@@ -92,15 +98,18 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
     stateRef.current = tabsReducer(stateRef.current, action);
     dispatchToReact(action);
   }, []);
-  const [revealLine, setRevealLine] = useState<number | null>(null);
-  const [openError, setOpenError] = useState<string | null>(null);
+  const [reveal, setReveal] = useState<RevealRequest | null>(null);
+  const [openError, setOpenError] = useState<{ path: string; text: string; requestId: string | null } | null>(
+    null,
+  );
   const [conflictPath, setConflictPath] = useState<string | null>(null);
   const [conflictRound, setConflictRound] = useState(0);
   const [closePath, setClosePath] = useState<string | null>(null);
   const [creating, setCreating] = useState<"file" | "dir" | null>(null);
   const [deletePath, setDeletePath] = useState<string | null>(null);
-  const [rightTab, setRightTab] = useState<"search" | "chat">("search");
+  const [rightTab, setRightTab] = useState<RightTab>("search");
   const [isBottomOpen, setIsBottomOpen] = useState(true);
+  const rightId = useId();
   const hasDirty = state.tabs.some(isDirty);
   const blocker = useBlocker(
     ({ currentLocation, nextLocation }) => hasDirty && currentLocation.pathname !== nextLocation.pathname,
@@ -113,9 +122,14 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, [hasDirty]);
 
+  // Leaving the workspace frees the editor models (text and undo history) of this project.
+  useEffect(() => () => disposeProjectModels(projectId), [projectId]);
+
   const refreshAround = useCallback(
     (path: string) => {
-      void queryClient.invalidateQueries({ queryKey: treeKey(projectId, parentOf(path)) });
+      for (const folder of foldersAbove(path)) {
+        void queryClient.invalidateQueries({ queryKey: treeKey(projectId, folder) });
+      }
       void queryClient.invalidateQueries({ queryKey: gitStatusKey(projectId) });
     },
     [projectId, queryClient],
@@ -124,54 +138,53 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
   const openFile = useCallback(
     async (path: string, line?: number) => {
       setOpenError(null);
+      // Only a search hit moves the cursor; opening from the explorer forgets an earlier request.
+      setReveal(line ? { path, line, nonce: (revealSequence += 1) } : null);
       if (stateRef.current.tabs.some((tab) => tab.path === path)) {
         dispatch({ type: "activated", path });
-        setRevealLine(line ?? null);
         return;
       }
+      let file: FileContent;
       try {
-        const file = await getFile(projectId, path);
-        const kind = file.too_large
-          ? "large"
-          : file.content === null || file.encoding === "binary"
-            ? "binary"
-            : "text";
-        dispatch({
-          type: "opened",
-          path,
-          kind,
-          content: file.content ?? "",
-          sha: file.sha256,
-          language: file.language,
-          size: file.size,
-        });
-        setRevealLine(line ?? null);
-      } catch {
-        setOpenError(path);
+        file = await getFile(projectId, path);
+      } catch (error) {
+        setOpenError({ path, ...workspaceErrorText(t, error) });
+        return;
       }
+      dispatch({
+        type: "opened",
+        openId: (openSequence += 1),
+        path,
+        kind: kindOf(file),
+        content: file.content ?? "",
+        sha: file.sha256,
+        language: file.language,
+        size: file.size,
+      });
     },
-    [dispatch, projectId],
+    [dispatch, projectId, t],
   );
 
   const write = useCallback(
     async (path: string, expectedSha: string | null) => {
       const tab = stateRef.current.tabs.find((candidate) => candidate.path === path);
-      if (!tab || tab.kind !== "text" || !canWrite) return;
-      const content = tab.content;
-      dispatch({ type: "saveStarted", path, content });
+      // One write per tab at a time: a second one would carry the same sha and conflict with the first.
+      if (!tab || tab.kind !== "text" || !canWrite || tab.status === "saving") return;
+      const { content, openId } = tab;
+      dispatch({ type: "saveStarted", openId, path, content });
       try {
         const saved = await putFile(projectId, path, content, expectedSha);
-        dispatch({ type: "saveSucceeded", path, content, sha: saved.sha256 });
-        setConflictPath(null);
+        dispatch({ type: "saveSucceeded", openId, path, content, sha: saved.sha256 });
+        setConflictPath((current) => (current === path ? null : current));
         refreshAround(path); // the explorer's size and Git badge follow the save
       } catch (error) {
         if (error instanceof VersionConflict) {
           // Never resolved here: the user decides in the dialog (a second conflict opens it again).
-          dispatch({ type: "conflict", path, serverSha: error.currentSha });
+          dispatch({ type: "conflict", openId, path, serverSha: error.currentSha });
           setConflictPath(path);
           setConflictRound((round) => round + 1);
         } else {
-          dispatch({ type: "saveFailed", path, error: saveErrorCode(error) });
+          dispatch({ type: "saveFailed", openId, path, error: saveErrorOf(error) });
         }
       }
     },
@@ -200,12 +213,33 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
     if (tab && isDirty(tab)) setClosePath(path);
     else close(path);
   };
-  const handleReload = (path: string, file: FileContent) => {
-    dispatch({ type: "reloaded", path, content: file.content ?? "", sha: file.sha256 });
+  const handleReload = (path: string, content: string, sha: string) => {
+    dispatch({ type: "reloaded", path, content, sha });
     setConflictPath(null);
   };
+  const handleRightKey = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+    const step = event.key === "ArrowRight" ? 1 : RIGHT_TABS.length - 1;
+    const next = RIGHT_TABS[(RIGHT_TABS.indexOf(rightTab) + step) % RIGHT_TABS.length] ?? "search";
+    setRightTab(next);
+    document.getElementById(`${rightId}-tab-${next}`)?.focus();
+  };
+
+  // A repository that is not ready, before anything was opened: nothing to show but why.
+  if (repoReason !== null && state.tabs.length === 0)
+    return (
+      <StateView
+        state="partial_success"
+        titleAs="h1"
+        title={project.name}
+        detail={t(`workspace.repo.${repoReason}`)}
+      />
+    );
 
   const conflictTab = state.tabs.find((tab) => tab.path === conflictPath) ?? null;
+  const deleteTab = state.tabs.find((tab) => tab.path === deletePath) ?? null;
+  const refreshFailure = refreshError === null ? null : workspaceErrorText(t, refreshError);
+  const statusReason = STATUS_REASON[project.status];
   return (
     <div className="-m-6 flex min-h-[32rem] flex-col lg:h-[calc(100vh-4rem)]">
       <header className="flex flex-wrap items-center gap-3 border-b border-line bg-surface px-4 py-2">
@@ -217,19 +251,48 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
           {t("workspace.back")}
         </Link>
         <h1 className="text-lg font-semibold text-fg" data-testid="screen-title">
-          {name}
+          {project.name}
         </h1>
-        <span className="inline-flex items-center gap-1 rounded border border-line px-2 py-0.5 font-mono text-xs text-fg-muted">
-          <GitBranch aria-hidden="true" className="size-3.5" />
-          {t("workspace.branch", { name: branch })}
-        </span>
-        {STATUS_REASON[status] ? (
-          <span className="text-xs text-status-warning">{t(`workspace.repo.${STATUS_REASON[status]}`)}</span>
+        {repository ? (
+          <span className="inline-flex items-center gap-1 rounded border border-line px-2 py-0.5 font-mono text-xs text-fg-muted">
+            <GitBranch aria-hidden="true" className="size-3.5" />
+            {t("workspace.branch", { name: repository.branch })}
+          </span>
+        ) : null}
+        {statusReason ? (
+          <span className="text-xs text-status-warning">{t(`workspace.repo.${statusReason}`)}</span>
         ) : null}
       </header>
+      {refreshFailure ? (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center gap-2 bg-status-warning-bg px-4 py-2 text-sm text-status-warning"
+        >
+          <AlertTriangle aria-hidden="true" className="size-4" />
+          {t("workspace.projectStale")} {refreshFailure.text}
+          {refreshFailure.requestId ? (
+            <span className="font-mono text-xs">
+              {t("common.requestId", { id: refreshFailure.requestId })}
+            </span>
+          ) : null}
+          <Button size="sm" variant="secondary" onClick={onRefresh}>
+            {t("workspace.retry")}
+          </Button>
+        </div>
+      ) : null}
+      {repoReason !== null ? (
+        <p role="status" className="bg-status-warning-bg px-4 py-2 text-sm text-status-warning">
+          {t(`workspace.repo.${repoReason}`)} {t("workspace.repoChangedWhileOpen")}
+        </p>
+      ) : null}
       {openError ? (
         <p role="alert" className="bg-status-danger-bg px-4 py-2 text-sm text-status-danger">
-          {t("workspace.editor.openFailed", { path: openError })}
+          {t("workspace.editor.openFailed", { path: openError.path })} {openError.text}
+          {openError.requestId ? (
+            <span className="ml-1 font-mono text-xs">
+              {t("common.requestId", { id: openError.requestId })}
+            </span>
+          ) : null}
         </p>
       ) : null}
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[16rem_minmax(0,1fr)_20rem]">
@@ -246,7 +309,7 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
           tabs={state.tabs}
           active={state.active}
           canWrite={canWrite}
-          revealLine={revealLine}
+          reveal={reveal}
           onActivate={(path) => dispatch({ type: "activated", path })}
           onClose={handleClose}
           onEdit={(path, content) => dispatch({ type: "edited", path, content })}
@@ -261,10 +324,14 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
             {RIGHT_TABS.map((key) => (
               <button
                 key={key}
+                id={`${rightId}-tab-${key}`}
                 type="button"
                 role="tab"
                 aria-selected={rightTab === key}
+                aria-controls={`${rightId}-panel`}
+                tabIndex={rightTab === key ? 0 : -1}
                 onClick={() => setRightTab(key)}
+                onKeyDown={handleRightKey}
                 className={cn(
                   "px-3 py-2 text-sm",
                   rightTab === key ? "border-b-2 border-brand-600 text-fg" : "text-fg-muted",
@@ -274,7 +341,12 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
               </button>
             ))}
           </div>
-          <div role="tabpanel" className="min-h-0 flex-1 overflow-auto">
+          <div
+            role="tabpanel"
+            id={`${rightId}-panel`}
+            aria-labelledby={`${rightId}-tab-${rightTab}`}
+            className="min-h-0 flex-1 overflow-auto"
+          >
             {rightTab === "search" ? (
               <SearchPanel projectId={projectId} onOpen={(path, line) => void openFile(path, line)} />
             ) : (
@@ -322,7 +394,7 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
           projectId={projectId}
           tab={conflictTab}
           onClose={() => setConflictPath(null)}
-          onReload={(file) => handleReload(conflictTab.path, file)}
+          onReload={(content, sha) => handleReload(conflictTab.path, content, sha)}
           onOverwrite={(serverSha) => void write(conflictTab.path, serverSha)}
         />
       ) : null}
@@ -354,8 +426,11 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
           type={creating}
           onCancel={() => setCreating(null)}
           onCreate={async (path) => {
-            await createPath(projectId, path, creating);
-            refreshAround(path);
+            try {
+              await createPath(projectId, path, creating);
+            } finally {
+              refreshAround(path); // also after a failure: the explorer shows what is really there
+            }
             setCreating(null);
             if (creating === "file") void openFile(path);
           }}
@@ -364,133 +439,21 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
       {deletePath ? (
         <DeleteDialog
           path={deletePath}
+          hasUnsaved={deleteTab !== null && isDirty(deleteTab)}
           onCancel={() => setDeletePath(null)}
           onDelete={async () => {
-            const open = stateRef.current.tabs.find((tab) => tab.path === deletePath);
-            const sha = open ? open.sha : (await getFile(projectId, deletePath)).sha256;
-            await deleteFile(projectId, deletePath, sha);
-            if (open) close(deletePath);
-            refreshAround(deletePath);
+            try {
+              // The open tab's sha: a file changed on the server since it was read is refused (409).
+              const sha = deleteTab ? deleteTab.sha : (await getFile(projectId, deletePath)).sha256;
+              await deleteFile(projectId, deletePath, sha);
+            } finally {
+              refreshAround(deletePath);
+            }
+            if (deleteTab) close(deletePath);
             setDeletePath(null);
           }}
         />
       ) : null}
     </div>
-  );
-}
-
-type ConfirmProps = {
-  title: string;
-  body: string;
-  confirm: string;
-  cancel: string;
-  onConfirm: () => void;
-  onCancel: () => void;
-};
-
-function ConfirmDialog({ title, body, confirm, cancel, onConfirm, onCancel }: ConfirmProps) {
-  return (
-    <Dialog open onOpenChange={(isOpen) => !isOpen && onCancel()}>
-      <DialogContent title={title} description={body}>
-        <div className="mt-4 flex justify-end gap-2">
-          <Button variant="ghost" onClick={onCancel}>
-            {cancel}
-          </Button>
-          <Button variant="danger" onClick={onConfirm}>
-            {confirm}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-type CreateProps = { type: "file" | "dir"; onCancel: () => void; onCreate: (path: string) => Promise<void> };
-
-function CreateDialog({ type, onCancel, onCreate }: CreateProps) {
-  const { t } = useTranslation();
-  const inputId = useId();
-  const [path, setPath] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [isBusy, setIsBusy] = useState(false);
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const clean = path.trim().replace(/^\/+/, "");
-    if (!clean) return;
-    setIsBusy(true);
-    setError(null);
-    try {
-      await onCreate(clean);
-    } catch (caught) {
-      setError(`${t("workspace.create.failed", { path: clean })} ${describeError(caught, t).title}`);
-      setIsBusy(false);
-    }
-  };
-  return (
-    <Dialog open onOpenChange={(isOpen) => !isOpen && onCancel()}>
-      <DialogContent
-        title={t(type === "file" ? "workspace.create.titleFile" : "workspace.create.titleFolder")}
-      >
-        <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-2">
-          <Label htmlFor={inputId}>{t("workspace.create.path")}</Label>
-          <Input
-            id={inputId}
-            value={path}
-            onChange={(event) => setPath(event.target.value)}
-            className="font-mono"
-          />
-          {error ? (
-            <p role="alert" className="text-sm text-status-danger">
-              {error}
-            </p>
-          ) : null}
-          <div className="mt-2 flex justify-end gap-2">
-            <Button type="button" variant="ghost" onClick={onCancel}>
-              {t("workspace.create.cancel")}
-            </Button>
-            <Button type="submit" disabled={isBusy || !path.trim()}>
-              {t("workspace.create.submit")}
-            </Button>
-          </div>
-        </form>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-type DeleteProps = { path: string; onCancel: () => void; onDelete: () => Promise<void> };
-
-function DeleteDialog({ path, onCancel, onDelete }: DeleteProps) {
-  const { t } = useTranslation();
-  const [error, setError] = useState<string | null>(null);
-  const [isBusy, setIsBusy] = useState(false);
-  const handleDelete = async () => {
-    setIsBusy(true);
-    setError(null);
-    try {
-      await onDelete();
-    } catch (caught) {
-      setError(`${t("workspace.remove.failed", { path })} ${describeError(caught, t).title}`);
-      setIsBusy(false);
-    }
-  };
-  return (
-    <Dialog open onOpenChange={(isOpen) => !isOpen && onCancel()}>
-      <DialogContent title={t("workspace.remove.title")} description={t("workspace.remove.body", { path })}>
-        {error ? (
-          <p role="alert" className="text-sm text-status-danger">
-            {error}
-          </p>
-        ) : null}
-        <div className="mt-4 flex justify-end gap-2">
-          <Button variant="ghost" onClick={onCancel}>
-            {t("workspace.remove.cancel")}
-          </Button>
-          <Button variant="danger" disabled={isBusy} onClick={() => void handleDelete()}>
-            {t("workspace.remove.submit")}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
   );
 }

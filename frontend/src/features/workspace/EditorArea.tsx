@@ -8,14 +8,14 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { Suspense } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/Button";
-import { StateView } from "@/components/ui/StateView";
 import { cn } from "@/lib/cn";
 import { formatBytes } from "@/lib/formatBytes";
+import type { RevealRequest } from "./CodeEditor";
 import type { Tab, TabStatus } from "./editorTabs";
-import { LazyCodeEditor } from "./lazyEditor";
+import { EditorSlot } from "./lazyEditor";
+import { saveFailureText } from "./workspaceErrors";
 
 const STATUS_ICON: Record<TabStatus, LucideIcon> = {
   saved: CheckCircle2,
@@ -32,7 +32,7 @@ type Props = {
   tabs: Tab[];
   active: string | null;
   canWrite: boolean;
-  revealLine: number | null;
+  reveal: RevealRequest | null;
   onActivate: (path: string) => void;
   onClose: (path: string) => void;
   onEdit: (path: string, content: string) => void;
@@ -57,7 +57,7 @@ export function EditorArea({
   tabs,
   active,
   canWrite,
-  revealLine,
+  reveal,
   onActivate,
   onClose,
   onEdit,
@@ -68,9 +68,13 @@ export function EditorArea({
   const tab = tabs.find((candidate) => candidate.path === active) ?? null;
   return (
     <section aria-label={t("workspace.layout.main")} className="flex min-h-0 min-w-0 flex-col bg-[#1e1e1e]">
-      <div role="tablist" className="flex overflow-x-auto border-b border-line bg-surface">
+      {/* A list of buttons, not an ARIA tablist: each open file also has its own close button. */}
+      <ul
+        aria-label={t("workspace.editor.openFiles")}
+        className="flex overflow-x-auto border-b border-line bg-surface"
+      >
         {tabs.map((item) => (
-          <div
+          <li
             key={item.path}
             className={cn(
               "flex shrink-0 items-center gap-2 border-r border-line px-3 py-2 text-sm",
@@ -79,8 +83,7 @@ export function EditorArea({
           >
             <button
               type="button"
-              role="tab"
-              aria-selected={item.path === active}
+              aria-current={item.path === active ? "true" : undefined}
               onClick={() => onActivate(item.path)}
               className="flex items-center gap-2"
             >
@@ -95,13 +98,13 @@ export function EditorArea({
             >
               <X aria-hidden="true" className="size-3.5" />
             </button>
-          </div>
+          </li>
         ))}
-      </div>
+      </ul>
       {tab === null ? (
         <p className="m-auto p-6 text-sm text-fg-muted">{t("workspace.editor.empty")}</p>
       ) : (
-        <div role="tabpanel" className="flex min-h-0 flex-1 flex-col">
+        <div className="flex min-h-0 flex-1 flex-col">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line bg-surface px-3 py-1.5">
             <span className="min-w-0 truncate font-mono text-xs text-fg">{tab.path}</span>
             <div className="flex items-center gap-2">
@@ -130,9 +133,12 @@ export function EditorArea({
               className="flex flex-wrap items-center gap-2 bg-status-danger-bg px-3 py-2 text-sm text-status-danger"
             >
               <AlertTriangle aria-hidden="true" className="size-4" />
-              {t(
-                `workspace.editor.failed.${tab.error === "not_found" || tab.error === "forbidden" ? tab.error : "generic"}`,
-              )}
+              {saveFailureText(t, tab.error)}
+              {tab.error?.requestId ? (
+                <span className="font-mono text-xs">
+                  {t("common.requestId", { id: tab.error.requestId })}
+                </span>
+              ) : null}
               {canWrite ? (
                 <Button size="sm" variant="secondary" onClick={() => onSave(tab.path)}>
                   {t("workspace.editor.failed.retry")}
@@ -143,21 +149,25 @@ export function EditorArea({
           {!canWrite && tab.kind === "text" ? (
             <p className="bg-surface px-3 py-1 text-xs text-fg-muted">{t("workspace.editor.readOnly")}</p>
           ) : null}
+          {tab.mixedEol && tab.kind === "text" ? (
+            <p className="bg-surface px-3 py-1 text-xs text-status-warning">
+              {t("workspace.editor.mixedEol")}
+            </p>
+          ) : null}
           {tab.kind === "text" ? (
             <div className="min-h-0 flex-1">
-              <Suspense fallback={<StateView state="loading" />}>
-                <LazyCodeEditor
-                  projectId={projectId}
-                  path={tab.path}
-                  value={tab.content}
-                  language={tab.language}
-                  isReadOnly={!canWrite}
-                  ariaLabel={t("workspace.editor.editorOf", { name: tab.path })}
-                  onChange={(content) => onEdit(tab.path, content)}
-                  onSave={() => onSave(tab.path)}
-                  revealLine={revealLine}
-                />
-              </Suspense>
+              <EditorSlot
+                projectId={projectId}
+                path={tab.path}
+                value={tab.content}
+                version={`${tab.openId}:${tab.revision}`}
+                language={tab.language}
+                isReadOnly={!canWrite}
+                ariaLabel={t("workspace.editor.editorOf", { name: tab.path })}
+                onChange={(content) => onEdit(tab.path, content)}
+                onSave={() => onSave(tab.path)}
+                reveal={reveal}
+              />
             </div>
           ) : (
             <FileMeta tab={tab} />

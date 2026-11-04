@@ -38,34 +38,53 @@ export function disposeModel(projectId: string, path: string): void {
   monaco.editor.getModel(modelUri(projectId, path))?.dispose();
 }
 
-type Props = {
+/** Frees every model of a project, when its workspace goes away. */
+export function disposeProjectModels(projectId: string): void {
+  for (const model of monaco.editor.getModels()) {
+    if (model.uri.scheme === "kk" && model.uri.authority === projectId) model.dispose();
+  }
+}
+
+/** The text version each model holds: the editor writes `value` into a model only for a new version. */
+const appliedVersion = new WeakMap<monaco.editor.ITextModel, string>();
+
+/** A request to move the cursor to a line (a search hit); `nonce` makes the same hit work twice. */
+export type RevealRequest = { path: string; line: number; nonce: number };
+
+export type EditorProps = {
   projectId: string;
   path: string;
   value: string;
+  /**
+   * Changes only when the server's text replaces the editor's (opening, reloading). Between versions
+   * Monaco is the source of truth: `value` trails it by a render, and writing it back would undo keystrokes.
+   */
+  version: string;
   language: string | null;
   isReadOnly: boolean;
   ariaLabel: string;
   onChange: (value: string) => void;
   onSave: () => void;
-  /** A line to move the cursor to (from a search hit). */
-  revealLine?: number | null;
+  reveal?: RevealRequest | null;
 };
 
 export function CodeEditor({
   projectId,
   path,
   value,
+  version,
   language,
   isReadOnly,
   ariaLabel,
   onChange,
   onSave,
-  revealLine,
-}: Props) {
+  reveal,
+}: EditorProps) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const callbacks = useRef({ onChange, onSave });
   const applying = useRef(false);
+  const revealed = useRef<number | null>(null);
   useEffect(() => {
     // The latest handlers for Monaco's listeners, which are registered once.
     callbacks.current = { onChange, onSave };
@@ -80,7 +99,6 @@ export function CodeEditor({
     });
     instance.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => callbacks.current.onSave());
     const listener = instance.onDidChangeModelContent(() => {
-      // Our own setValue (a reload) is not an edit by the user.
       if (applying.current) return;
       const model = instance.getModel();
       if (model) callbacks.current.onChange(model.getValue());
@@ -99,15 +117,20 @@ export function CodeEditor({
     const instance = editor.current;
     if (!instance) return;
     const uri = modelUri(projectId, path);
-    const model =
-      monaco.editor.getModel(uri) ?? monaco.editor.createModel(value, monacoLanguage(language), uri);
+    let model = monaco.editor.getModel(uri);
+    if (!model) {
+      model = monaco.editor.createModel(value, monacoLanguage(language), uri);
+      appliedVersion.set(model, version);
+    }
     if (instance.getModel() !== model) instance.setModel(model);
-    if (model.getValue() !== value) {
+    if (appliedVersion.get(model) !== version) {
+      // Our own setValue (a reload) is not an edit by the user.
       applying.current = true;
       model.setValue(value);
       applying.current = false;
+      appliedVersion.set(model, version);
     }
-  }, [projectId, path, value, language]);
+  }, [projectId, path, value, version, language]);
 
   useEffect(() => {
     editor.current?.updateOptions({ readOnly: isReadOnly, ariaLabel });
@@ -115,16 +138,18 @@ export function CodeEditor({
 
   useEffect(() => {
     const instance = editor.current;
-    if (!instance || !revealLine) return;
-    instance.revealLineInCenter(revealLine);
-    instance.setPosition({ lineNumber: revealLine, column: 1 });
+    // Only for the file it was asked for, and once: switching tabs does not move another file's cursor.
+    if (!instance || !reveal || reveal.path !== path || revealed.current === reveal.nonce) return;
+    revealed.current = reveal.nonce;
+    instance.revealLineInCenter(reveal.line);
+    instance.setPosition({ lineNumber: reveal.line, column: 1 });
     instance.focus();
-  }, [revealLine, path]);
+  }, [reveal, path]);
 
   return <div ref={container} className="h-full min-h-[20rem] w-full" />;
 }
 
-type DiffProps = { original: string; modified: string; language: string | null; ariaLabel: string };
+export type DiffProps = { original: string; modified: string; language: string | null; ariaLabel: string };
 
 /** Server version (left) against the user's version (right), read only: for a save conflict. */
 export function DiffView({ original, modified, language, ariaLabel }: DiffProps) {

@@ -20,13 +20,15 @@ const TreeEntrySchema: z.ZodType<TreeEntry> = z.lazy(() =>
   }),
 );
 
+const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
+
 /** `GET /files/{path}` (API_CONTRACTS §4): a binary or too large file comes without content. */
 export const FileContentSchema = z.object({
   path: z.string(),
   content: z.string().nullable(),
   encoding: z.enum(["utf-8", "binary"]),
   size: z.number().int().nonnegative(),
-  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  sha256: Sha256Schema,
   language: z.string().nullable(),
   too_large: z.boolean(),
 });
@@ -87,7 +89,8 @@ export class VersionConflict extends ApiError {
   }
 }
 
-const ConflictDetailsSchema = z.array(z.object({ current_sha256: z.string().nullable() }).loose()).min(1);
+// Malformed details give `null`: the conflict dialog then reads the server's version itself.
+const ConflictDetailsSchema = z.array(z.object({ current_sha256: Sha256Schema.nullable() }).loose()).min(1);
 
 /** The API path of a file: each segment encoded, so `#`, `%` and spaces in names stay part of the name. */
 export function filePath(projectId: string, path: string): string {
@@ -134,7 +137,7 @@ export async function putFile(
     const result = await apiRequest(filePath(projectId, path), {
       method: "PUT",
       body: { content, expected_sha256: expectedSha },
-      schema: z.object({ path: z.string(), sha256: z.string() }),
+      schema: z.object({ path: z.string(), sha256: Sha256Schema }),
     });
     return result.data;
   } catch (error) {

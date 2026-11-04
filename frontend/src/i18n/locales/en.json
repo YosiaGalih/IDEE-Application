@@ -457,13 +457,19 @@
         "not_found": "The file no longer exists on the server.",
         "forbidden": "You may not save this file.",
         "generic": "The save failed. Your changes are still in this tab.",
-        "retry": "Try saving again"
+        "retry": "Try saving again",
+        "unknown_outcome": "It is not certain whether the file was saved: the server's answer did not arrive. Save again; if the file changed on the server, the conflict dialog shows it.",
+        "rate_limited": "Too many requests. Wait a moment, then save again."
       },
       "binary": "Binary files are not shown in the editor.",
       "tooLarge": "This file is too large to open in the editor.",
       "size": "Size",
       "sha": "SHA-256",
-      "openFailed": "{{path}} could not be opened."
+      "openFailed": "{{path}} could not be opened.",
+      "openFiles": "Open files",
+      "mixedEol": "This file mixes line endings (CRLF and LF). The editor makes them uniform, so saving also changes the line endings of other lines.",
+      "unavailable": "The editor could not be loaded (the connection dropped or the app was updated). The file can still be read below.",
+      "reloadPage": "Reload the page"
     },
     "conflict": {
       "title": "Save conflict",
@@ -477,7 +483,9 @@
       "overwrite": "Overwrite with my version",
       "reloadConfirm": "Your changes in this tab will be discarded.",
       "diffLabel": "Server version (left) and your version (right)",
-      "cancel": "Decide later"
+      "cancel": "Decide later",
+      "notText": "The server's version is not text (a binary or too large file), so it can neither be shown nor loaded into the editor.",
+      "retry": "Read again"
     },
     "unsaved": {
       "title": "Unsaved changes",
@@ -492,14 +500,19 @@
       "path": "Path from the project root",
       "submit": "Create",
       "cancel": "Cancel",
-      "failed": "{{path}} could not be created."
+      "failed": "{{path}} could not be created.",
+      "exists": "That path already exists, or the same request is still being processed.",
+      "unknownOutcome": "It is not certain whether the path was created; the explorer is read again to check."
     },
     "remove": {
       "title": "Delete file",
       "body": "Delete {{path}} from the workspace? This cannot be undone from this screen.",
       "submit": "Delete",
       "cancel": "Cancel",
-      "failed": "{{path}} could not be deleted."
+      "failed": "{{path}} could not be deleted.",
+      "changed": "The file changed on the server since it was opened; open it again before deleting it.",
+      "unknownOutcome": "It is not certain whether the file was deleted; the explorer is read again to check.",
+      "unsaved": "The unsaved changes in this file's tab are lost too."
     },
     "search": {
       "title": "Search",
@@ -538,7 +551,11 @@
       "repository_not_ready": "The project's repository is not ready yet (for example, still importing).",
       "repository_missing": "The project's repository folder was not found on the server.",
       "project_archived": "This project is archived; files can only be read.",
-      "project_not_active": "This project is not active; files cannot be changed."
-    }
+      "project_not_active": "This project is not active; files cannot be changed.",
+      "repository_error": "The project's repository has a problem on the server; files cannot be read or changed."
+    },
+    "projectStale": "The project could not be refreshed; what is shown may be out of date.",
+    "retry": "Try again",
+    "repoChangedWhileOpen": "Open tabs stay; copy any unsaved changes before leaving the page."
   }
 }

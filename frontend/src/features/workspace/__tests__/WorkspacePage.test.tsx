@@ -1,19 +1,21 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { project as projectFixture } from "@/__tests__/dashboardFixtures";
-import { API, fail, renderApp, signedIn } from "@/__tests__/harness";
+import { API, deferred, fail, renderApp, signedIn } from "@/__tests__/harness";
+import { getProject } from "@/api/projects";
 import id from "@/i18n/locales/id.json";
 
 // jsdom cannot run Monaco: the editor is a textarea that keeps the same contract.
 vi.mock("@/features/workspace/CodeEditor", () => ({
   CodeEditor: (props: {
     ariaLabel: string;
+    path: string;
     value: string;
     isReadOnly: boolean;
-    revealLine?: number | null;
+    reveal?: { path: string; line: number } | null;
     onChange: (value: string) => void;
     onSave: () => void;
   }) => (
@@ -22,7 +24,7 @@ vi.mock("@/features/workspace/CodeEditor", () => ({
         aria-label={props.ariaLabel}
         value={props.value}
         readOnly={props.isReadOnly}
-        data-reveal-line={props.revealLine ?? ""}
+        data-reveal-line={props.reveal?.path === props.path ? props.reveal.line : ""}
         onChange={(event) => props.onChange(event.target.value)}
         onKeyDown={(event) => {
           if ((event.ctrlKey || event.metaKey) && event.key === "s") {
@@ -46,6 +48,7 @@ vi.mock("@/features/workspace/CodeEditor", () => ({
     <div data-testid="diff">{`${props.original}|${props.modified}`}</div>
   ),
   disposeModel: () => undefined,
+  disposeProjectModels: () => undefined,
 }));
 
 const server = setupServer();
@@ -91,7 +94,10 @@ const textFile = (path: string, content: string, sha = SHA_1) => ({
 type Options = {
   permissions?: string[];
   files?: Record<string, unknown>;
-  put?: (body: { content: string; expected_sha256: string | null }, path: string) => Response;
+  put?: (
+    body: { content: string; expected_sha256: string | null },
+    path: string,
+  ) => Response | Promise<Response>;
   gitFails?: boolean;
   tree?: Record<string, { entries: unknown[]; truncated?: boolean }>;
 };
@@ -154,6 +160,7 @@ const openFromExplorer = async (name: string) =>
     await screen.findByRole("button", { name: id.workspace.explorer.openOf.replace("{{name}}", name) }),
   );
 const status = (label: string) => screen.getAllByText(label);
+const openFiles = () => screen.getByRole("list", { name: id.workspace.editor.openFiles });
 
 describe("WorkspacePage", () => {
   it("loads the root, opens folders lazily and marks changed files", async () => {
@@ -188,7 +195,7 @@ describe("WorkspacePage", () => {
     renderApp(`/projects/${PROJECT}/workspace`);
     await openFromExplorer("app.py");
     await openFromExplorer("app.py");
-    expect(screen.getAllByRole("tab", { name: /app\.py/ })).toHaveLength(1);
+    expect(within(openFiles()).getAllByRole("button", { name: /^app\.py/ })).toHaveLength(1);
     const editor = await editorOf("app.py");
     fireEvent.change(editor, { target: { value: "x = 2\n" } });
     expect(status(id.workspace.editor.status.dirty).length).toBeGreaterThan(0);
@@ -255,6 +262,194 @@ describe("WorkspacePage", () => {
     expect(state.puts).toHaveLength(2);
   });
 
+  it("writes once when Overwrite is pressed twice, and says in the dialog when that write fails", async () => {
+    const answer = deferred();
+    let round = 0;
+    const files: Record<string, unknown> = { "app.py": textFile("app.py", "x = 1\n") };
+    const state = backend({
+      files,
+      put: async () => {
+        round += 1;
+        if (round === 1) {
+          files["app.py"] = textFile("app.py", "theirs\n", SHA_3);
+          return conflict(SHA_3);
+        }
+        await answer.gate;
+        return fail(500, "INTERNAL_ERROR");
+      },
+    });
+    renderApp(`/projects/${PROJECT}/workspace`);
+    await openFromExplorer("app.py");
+    const editor = await editorOf("app.py");
+    fireEvent.change(editor, { target: { value: "mine\n" } });
+    fireEvent.keyDown(editor, { key: "s", ctrlKey: true });
+    const dialog = await screen.findByRole("dialog", { name: id.workspace.conflict.title });
+    const overwrite = await within(dialog).findByRole("button", { name: id.workspace.conflict.overwrite });
+    fireEvent.click(overwrite);
+    fireEvent.click(overwrite);
+    await waitFor(() => expect(overwrite).toBeDisabled());
+    expect(within(dialog).getByRole("button", { name: id.workspace.conflict.reload })).toBeDisabled();
+    answer.release();
+    expect(await within(dialog).findByText(id.workspace.editor.failed.generic)).toBeInTheDocument();
+    expect(state.puts).toHaveLength(2);
+    expect(overwrite).toBeEnabled();
+  });
+
+  it("never offers to load a server version that is not text into the editor", async () => {
+    const files: Record<string, unknown> = { "app.py": textFile("app.py", "x = 1\n") };
+    backend({
+      files,
+      put: () => {
+        files["app.py"] = {
+          path: "app.py",
+          content: null,
+          encoding: "binary",
+          size: 9,
+          sha256: SHA_3,
+          language: null,
+          too_large: false,
+        };
+        return conflict(SHA_3);
+      },
+    });
+    renderApp(`/projects/${PROJECT}/workspace`);
+    await openFromExplorer("app.py");
+    const editor = await editorOf("app.py");
+    fireEvent.change(editor, { target: { value: "mine\n" } });
+    fireEvent.keyDown(editor, { key: "s", ctrlKey: true });
+    const dialog = await screen.findByRole("dialog", { name: id.workspace.conflict.title });
+    expect(await within(dialog).findByText(id.workspace.conflict.notText)).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: id.workspace.conflict.reload })).toBeNull();
+    expect(within(dialog).queryByRole("button", { name: id.workspace.conflict.diff })).toBeNull();
+    expect(within(dialog).getByRole("button", { name: id.workspace.conflict.overwrite })).toBeEnabled();
+  });
+
+  it("says when a save may have been written, and why the server refused one", async () => {
+    let round = 0;
+    backend({
+      files: { "app.py": textFile("app.py", "x\n") },
+      put: () => {
+        round += 1;
+        if (round === 1) return HttpResponse.error();
+        return HttpResponse.json(
+          {
+            request_id: "r-archived",
+            status: "failed",
+            error: { code: "CONFLICT", message: "x", details: [{ reason: "project_archived" }] },
+          },
+          { status: 409 },
+        );
+      },
+    });
+    renderApp(`/projects/${PROJECT}/workspace`);
+    await openFromExplorer("app.py");
+    const editor = await editorOf("app.py");
+    fireEvent.change(editor, { target: { value: "y\n" } });
+    fireEvent.keyDown(editor, { key: "s", ctrlKey: true });
+    expect(await screen.findByText(id.workspace.editor.failed.unknown_outcome)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: id.workspace.editor.failed.retry }));
+    const alert = await screen.findByText(id.workspace.repo.project_archived);
+    expect(alert.closest("[role=alert]")).toHaveTextContent("r-archived");
+    expect(screen.queryAllByText(id.workspace.editor.status.saved)).toHaveLength(0);
+  });
+
+  it("keeps the open tabs and their unsaved text when the project cannot be read again", async () => {
+    backend({ files: { "app.py": textFile("app.py", "x = 1\n") } });
+    const { queryClient } = renderApp(`/projects/${PROJECT}/workspace`);
+    await openFromExplorer("app.py");
+    fireEvent.change(await editorOf("app.py"), { target: { value: "unsaved\n" } });
+    server.use(http.get(`${API}/projects/${PROJECT}`, () => fail(500, "INTERNAL_ERROR")));
+    await act(() => queryClient.refetchQueries({ queryKey: ["projects"] }));
+    expect(await screen.findByText(id.workspace.projectStale, { exact: false })).toBeInTheDocument();
+    expect(await editorOf("app.py")).toHaveValue("unsaved\n");
+  });
+
+  it("starts empty in another project's workspace: no tab of the first one carries over", async () => {
+    const other = "0d4f2a1b-1c2d-4e3f-8a9b-0c1d2e3f4a5b";
+    backend({ files: { "app.py": textFile("app.py", "x = 1\n") } });
+    server.use(
+      http.get(`${API}/projects/${other}`, () => ok(projectFixture({ id: other, name: "Lain" }))),
+      http.get(`${API}/projects/${other}/tree`, () => ok([], { truncated: false })),
+      http.get(`${API}/projects/${other}/git/status`, () =>
+        ok({ branch: "main", head: "c".repeat(40), clean: true, changes: [] }),
+      ),
+    );
+    const { router, queryClient } = renderApp(`/projects/${PROJECT}/workspace`);
+    // The other project is already known (e.g. from the list), so its workspace shows without loading.
+    await queryClient.prefetchQuery({
+      queryKey: ["projects", "detail", other],
+      queryFn: () => getProject(other),
+    });
+    await openFromExplorer("app.py");
+    await editorOf("app.py");
+    await act(() => router.navigate(`/projects/${other}/workspace`));
+    expect(await screen.findByRole("heading", { level: 1, name: "Lain" })).toBeInTheDocument();
+    expect(within(openFiles()).queryAllByRole("button")).toHaveLength(0);
+  });
+
+  it("says why a file could not be opened", async () => {
+    backend();
+    server.use(http.get(`${BASE}/files/*`, () => fail(403, "FORBIDDEN")));
+    renderApp(`/projects/${PROJECT}/workspace`);
+    await openFromExplorer("app.py");
+    const alert = await screen.findByText(id.workspace.editor.openFailed.replace("{{path}}", "app.py"), {
+      exact: false,
+    });
+    expect(alert).toHaveTextContent(id.states.permission_denied.title);
+  });
+
+  it("reads every folder above a new path again, so a folder created on the way shows", async () => {
+    const state = backend({ files: { "newdir/x.py": textFile("newdir/x.py", "") } });
+    server.use(
+      http.post(`${BASE}/files`, () =>
+        HttpResponse.json(
+          { request_id: "r", status: "completed", data: { path: "newdir/x.py" } },
+          { status: 201 },
+        ),
+      ),
+    );
+    renderApp(`/projects/${PROJECT}/workspace`);
+    await screen.findByRole("button", { name: id.workspace.explorer.openOf.replace("{{name}}", "app.py") });
+    const rootReads = state.treeReads.filter((path) => path === ".").length;
+    await userEvent.click(screen.getByRole("button", { name: id.workspace.explorer.newFile }));
+    await userEvent.type(screen.getByLabelText(id.workspace.create.path), "newdir/x.py");
+    await userEvent.click(screen.getByRole("button", { name: id.workspace.create.submit }));
+    await waitFor(() => expect(state.treeReads.filter((path) => path === ".")).toHaveLength(rootReads + 1));
+    expect(await editorOf("newdir/x.py")).toBeInTheDocument();
+  });
+
+  it("warns that deleting a file drops its unsaved text, and says when it changed on the server", async () => {
+    backend({ files: { "app.py": textFile("app.py", "x\n") } });
+    server.use(
+      http.delete(`${BASE}/files/*`, () =>
+        HttpResponse.json(
+          {
+            request_id: "r-del",
+            status: "failed",
+            error: {
+              code: "VERSION_CONFLICT",
+              message: "x",
+              details: [{ path: "app.py", current_sha256: SHA_3 }],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderApp(`/projects/${PROJECT}/workspace`);
+    await openFromExplorer("app.py");
+    fireEvent.change(await editorOf("app.py"), { target: { value: "unsaved\n" } });
+    await userEvent.click(
+      screen.getByRole("button", { name: id.workspace.explorer.deleteOf.replace("{{name}}", "app.py") }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: id.workspace.remove.title });
+    expect(within(dialog).getByText(id.workspace.remove.unsaved)).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: id.workspace.remove.submit }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(id.workspace.remove.changed);
+    await userEvent.click(within(dialog).getByRole("button", { name: id.workspace.remove.cancel }));
+    expect(await editorOf("app.py")).toHaveValue("unsaved\n");
+  });
+
   it("says a save failed when the file is gone, never saved", async () => {
     backend({ files: { "app.py": textFile("app.py", "x\n") }, put: () => fail(404, "NOT_FOUND") });
     renderApp(`/projects/${PROJECT}/workspace`);
@@ -283,7 +478,7 @@ describe("WorkspacePage", () => {
     await userEvent.click(
       within(await screen.findByRole("dialog")).getByRole("button", { name: id.workspace.unsaved.discard }),
     );
-    await waitFor(() => expect(screen.queryByRole("tab", { name: /app\.py/ })).toBeNull());
+    await waitFor(() => expect(within(openFiles()).queryByRole("button", { name: /^app\.py/ })).toBeNull());
   });
 
   it("shows a binary file as metadata, not in the editor", async () => {

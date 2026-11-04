@@ -457,13 +457,19 @@
         "not_found": "File tidak ada lagi di server.",
         "forbidden": "Kamu tidak punya izin menyimpan file ini.",
         "generic": "Penyimpanan gagal. Perubahanmu masih ada di tab ini.",
-        "retry": "Coba simpan lagi"
+        "retry": "Coba simpan lagi",
+        "unknown_outcome": "Belum pasti apakah file tersimpan: jawaban server tidak sampai. Simpan lagi; bila file sudah berubah di server, dialog konflik menunjukkannya.",
+        "rate_limited": "Terlalu banyak permintaan. Tunggu sebentar, lalu simpan lagi."
       },
       "binary": "File biner tidak ditampilkan di editor.",
       "tooLarge": "File terlalu besar untuk dibuka di editor.",
       "size": "Ukuran",
       "sha": "SHA-256",
-      "openFailed": "File {{path}} tidak dapat dibuka."
+      "openFailed": "File {{path}} tidak dapat dibuka.",
+      "openFiles": "File terbuka",
+      "mixedEol": "Akhir baris di file ini campuran (CRLF dan LF). Editor menyeragamkannya, jadi menyimpan juga mengubah akhir baris di baris lain.",
+      "unavailable": "Editor tidak dapat dimuat (koneksi terputus atau versi aplikasi berubah). Isi file tetap bisa dibaca di bawah.",
+      "reloadPage": "Muat ulang halaman"
     },
     "conflict": {
       "title": "Konflik penyimpanan",
@@ -477,7 +483,9 @@
       "overwrite": "Timpa dengan versi saya",
       "reloadConfirm": "Perubahanmu di tab ini akan dibuang.",
       "diffLabel": "Versi server (kiri) dan versi kamu (kanan)",
-      "cancel": "Putuskan nanti"
+      "cancel": "Putuskan nanti",
+      "notText": "Versi server bukan teks (file biner atau terlalu besar), jadi tidak dapat ditampilkan atau dimuat ke editor.",
+      "retry": "Baca lagi"
     },
     "unsaved": {
       "title": "Perubahan belum disimpan",
@@ -492,14 +500,19 @@
       "path": "Path dari root project",
       "submit": "Buat",
       "cancel": "Batal",
-      "failed": "Tidak dapat membuat {{path}}."
+      "failed": "Tidak dapat membuat {{path}}.",
+      "exists": "Path itu sudah ada, atau permintaan yang sama masih diproses.",
+      "unknownOutcome": "Belum pasti apakah path sudah dibuat; explorer dibaca ulang untuk memeriksanya."
     },
     "remove": {
       "title": "Hapus file",
       "body": "Hapus {{path}} dari workspace? Tindakan ini tidak bisa dibatalkan dari layar ini.",
       "submit": "Hapus",
       "cancel": "Batal",
-      "failed": "Tidak dapat menghapus {{path}}."
+      "failed": "Tidak dapat menghapus {{path}}.",
+      "changed": "File berubah di server sejak dibuka; buka ulang file sebelum menghapusnya.",
+      "unknownOutcome": "Belum pasti apakah file sudah terhapus; explorer dibaca ulang untuk memeriksanya.",
+      "unsaved": "Perubahan yang belum disimpan di tab file ini ikut hilang."
     },
     "search": {
       "title": "Cari",
@@ -538,7 +551,11 @@
       "repository_not_ready": "Repository project belum siap (misalnya masih diimpor).",
       "repository_missing": "Folder repository project tidak ditemukan di server.",
       "project_archived": "Project ini diarsipkan; file hanya bisa dibaca.",
-      "project_not_active": "Project ini tidak aktif; file tidak bisa diubah."
-    }
+      "project_not_active": "Project ini tidak aktif; file tidak bisa diubah.",
+      "repository_error": "Repository project bermasalah di server; file tidak dapat dibaca atau diubah."
+    },
+    "projectStale": "Data project tidak dapat diperbarui; yang tampil mungkin sudah tidak terbaru.",
+    "retry": "Coba lagi",
+    "repoChangedWhileOpen": "Tab yang terbuka tetap ada; salin perubahan yang belum disimpan sebelum meninggalkan halaman."
   }
 }
