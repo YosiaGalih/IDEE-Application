@@ -381,6 +381,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - `repositories.sync_state = indexing` tidak dipakai: job indeks tidak menulis status repository, supaya IDE tetap bisa dipakai selama indeks berjalan dan sesuai syarat masuk AG-13 dari WP-2.1b. Usulan: Lead memutuskan apakah nilai `indexing` dihapus dari DATA_MODEL atau dicadangkan untuk v2.1.
     - Indeks = isi commit HEAD, bukan working tree; cari teks = working tree. Kegagalan indeks hanya tercatat di audit `project.index result=error` dan log, karena `Project.repository` tidak punya field status indeks. Usulan: Lead menilai perlu tidaknya `repository.index_error`.
     - `POST /index` saat job berjalan → 202 dengan `job_id` yang sedang berjalan (`meta.reused`), bukan 409.
+    - **Review WP-2.1d:** `repositories.index_truncated` (boolean, default false) ditambahkan, belum ada di DATA_MODEL: indeks yang berhenti di batas harus terlihat dan dibangun ulang (temuan silent-failure H2). Pencarian menambah `meta.skipped`, `meta.index_truncated`, 422 `regex_unsupported` (backreference dan `{m,n}`), serta 429 untuk pencarian teks yang masih berjalan. Usulan: DATA_MODEL dan API_CONTRACTS §3 mencantumkannya.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
