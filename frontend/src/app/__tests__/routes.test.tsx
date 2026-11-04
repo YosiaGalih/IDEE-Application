@@ -1,9 +1,11 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { createMemoryRouter, RouterProvider, type RouteObject } from "react-router";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { renderApp, signedIn, signedOut } from "@/__tests__/harness";
+import { dashboardData, dashboardMeta } from "@/__tests__/dashboardFixtures";
+import { API, renderApp, signedIn, signedOut, user } from "@/__tests__/harness";
 import { ApiError } from "@/api/errors";
 import { routes } from "@/app/routes";
 import en from "@/i18n/locales/en.json";
@@ -14,9 +16,19 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
-/** Signed in: the session guard lets the app shell through. */
+/** Signed in: the session guard lets the app shell through. `/` is the dashboard, which asks for its data. */
 function renderAt(path: string) {
-  server.use(signedIn());
+  server.use(
+    signedIn(),
+    http.get(`${API}/dashboard`, () =>
+      HttpResponse.json({
+        request_id: "r-1",
+        status: "completed",
+        data: dashboardData(),
+        meta: dashboardMeta(),
+      }),
+    ),
+  );
   return renderApp(path);
 }
 
@@ -64,15 +76,15 @@ describe("route map (ARCHITECTURE §3.1b)", () => {
   });
 
   it("switches the language from the top bar and records it on <html lang>", async () => {
-    renderAt("/");
+    renderAt("/approvals"); // a name that differs between the two languages
     await userEvent.selectOptions(await screen.findByRole("combobox"), "en");
-    expect(screen.getByTestId("screen-title")).toHaveTextContent(en.screens.dashboard);
+    expect(screen.getByTestId("screen-title")).toHaveTextContent(en.screens.approvals);
     expect(document.documentElement.lang).toBe("en");
     await userEvent.selectOptions(screen.getByRole("combobox"), "id");
   });
 
   it.each([
-    ["/", id.screens.dashboard],
+    ["/", id.dashboard.greeting.replace("{{name}}", user.display_name)],
     ["/projects/p1/tasks", id.screens.tasks],
     ["/projects/p1/workspace", id.screens.workspace],
     ["/tasks/t1/acceptance", id.screens.acceptance],

@@ -2,6 +2,7 @@ import { z } from "zod";
 import { apiRequest } from "./client";
 import { ApiError } from "./errors";
 import { ProjectSchema } from "./projects";
+import { TASK_STATUSES } from "./taskStatus";
 
 /** `cost_status` (DATA_MODEL usage_records): `unavailable` is unknown, never 0 (AC-16). */
 export const COST_STATUSES = ["estimated", "partial", "actual", "unavailable"] as const;
@@ -18,7 +19,7 @@ export const TaskSummarySchema = z.object({
   project_id: z.guid(),
   project_name: z.string(),
   title: z.string(),
-  status: z.string(),
+  status: z.enum(TASK_STATUSES),
   status_reason: z.string().nullable(),
   current_step: z.string().nullable(),
   workflow_type: z.string(),

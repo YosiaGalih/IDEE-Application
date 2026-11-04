@@ -107,7 +107,13 @@
     "validating": "Divalidasi",
     "completed": "Selesai",
     "failed": "Gagal",
-    "cancelled": "Dibatalkan"
+    "cancelled": "Dibatalkan",
+    "draft": "Draf",
+    "needs_clarification": "Butuh klarifikasi",
+    "planned": "Direncanakan",
+    "needs_changes": "Perlu perubahan",
+    "interrupted": "Terhenti",
+    "rejected": "Ditolak"
   },
   "common": {
     "requestId": "ID permintaan: {{id}}",
@@ -326,6 +332,66 @@
       "runningHere": "Impor arsip untuk project ini sedang berjalan.",
       "openList": "Buka daftar project",
       "stalled": "Unggahan terhenti sebelum selesai. Coba lagi."
+    }
+  },
+  "dashboard": {
+    "eyebrow": "Dashboard",
+    "greeting": "Selamat datang, {{name}}",
+    "greetingAnonymous": "Selamat datang",
+    "summary": "Ringkasan project, task, dan antrean yang perlu perhatian, hanya untuk project yang bisa kamu lihat.",
+    "quickCreate": "Buat cepat",
+    "newProject": "Project baru",
+    "newTask": "Task baru",
+    "newTaskUnavailable": "Pembuatan task belum tersedia di versi ini.",
+    "searchLabel": "Saring project dan task",
+    "searchPlaceholder": "Nama project atau judul task",
+    "unavailable": "tidak tersedia",
+    "updated": "Diperbarui {{time}}",
+    "metrics": {
+      "title": "Metrik utama",
+      "active_projects": "Project aktif",
+      "running_tasks": "Task berjalan",
+      "completed_tasks": "Task selesai",
+      "failed_tasks": "Task gagal",
+      "waiting_approval": "Menunggu persetujuan"
+    },
+    "recentTasks": {
+      "title": "Task terbaru",
+      "empty": "Belum ada task.",
+      "filteredEmpty": "Tidak ada task yang cocok."
+    },
+    "queue": {
+      "title": "Perlu perhatian",
+      "empty": "Tidak ada task yang perlu perhatian.",
+      "filteredEmpty": "Tidak ada task perlu perhatian yang cocok.",
+      "more": "{{count}} lainnya",
+      "open": "Buka",
+      "openOf": "Buka task {{title}}"
+    },
+    "agents": {
+      "title": "Aktivitas agent",
+      "body": "Run agent belum direkam oleh platform, jadi aktivitasnya belum bisa ditampilkan."
+    },
+    "usage": {
+      "title": "Penggunaan model",
+      "period": "Periode {{start}} – {{end}}",
+      "inputTokens": "Token input",
+      "outputTokens": "Token output",
+      "cost": "Biaya",
+      "body": "Token dan biaya belum direkam, jadi ditampilkan sebagai tidak tersedia, bukan nol."
+    },
+    "recentProjects": {
+      "title": "Project terbaru",
+      "seeAll": "Lihat semua project",
+      "empty": "Belum ada project aktif.",
+      "filteredEmpty": "Tidak ada project yang cocok.",
+      "active": "Aktif",
+      "noStack": "Stack belum terdeteksi"
+    },
+    "empty": {
+      "title": "Belum ada project",
+      "body": "Buat project pertama untuk mulai bekerja dengan agent.",
+      "action": "Buat project pertama"
     }
   }
 }
