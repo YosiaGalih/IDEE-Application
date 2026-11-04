@@ -66,6 +66,8 @@ async def test_text_search_glob_limit_and_truncated(
     body = response.json()
     assert len(body["data"]) == 50 and body["meta"]["truncated"] is True
     assert {hit["path"] for hit in body["data"]} == {"many.txt"}
+    only_md = (await owner.get(search_url(project["id"], q="needle", glob="*.md"))).json()
+    assert ([hit["path"] for hit in only_md["data"]], only_md["meta"]["truncated"]) == (["other.md"], False)
 
 
 async def test_text_search_regex_and_invalid_regex(
