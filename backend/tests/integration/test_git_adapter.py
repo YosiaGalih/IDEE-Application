@@ -584,3 +584,111 @@ async def test_commit_files_lists_what_the_commit_holds(git: GitAdapter, repo: G
     sha = await git.commit(repo, "two", ME)
     assert sha is not None
     assert await git.commit_files(repo, sha) == ["a.txt", "d/b.txt"]
+
+
+# --- WP-2.1d: list a commit's files, grep a tree or a commit ----------------------------------------------
+
+
+async def test_list_files_lists_blobs_of_a_commit(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "src" / "app.py", "print('x')\n")
+    os.symlink("f.txt", repo.repo / "link")
+    sha = await git.commit(repo, "files", ME)
+    assert sha is not None
+    files, truncated = await git.list_files(repo, sha)
+    assert not truncated
+    assert {(f.path, f.size) for f in files} == {("f.txt", 6), ("keep.md", 5), ("src/app.py", 11)}
+
+
+async def test_grep_finds_text_in_the_working_tree_including_untracked(
+    git: GitAdapter, repo: GitTarget
+) -> None:
+    write(repo.repo / "new.txt", "one\nsay Hello there\n")
+    result = await git.grep(repo, ["Hello"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [(m.path, m.line, m.column, m.text) for m in result.matches] == [
+        ("new.txt", 2, 5, "say Hello there")
+    ]
+    assert not result.truncated
+
+
+async def test_grep_is_literal_unless_regex(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "x.txt", "axb\n")
+    literal = await git.grep(repo, ["a.b"], commit=None, fixed=True, ignore_case=False,
+                             only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    regex = await git.grep(repo, ["a.b"], commit=None, fixed=False, ignore_case=False,
+                           only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert literal.matches == []
+    assert [m.path for m in regex.matches] == ["x.txt"]
+
+
+async def test_grep_ignore_case(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "x.txt", "MiXeD\n")
+    result = await git.grep(repo, ["mixed"], commit=None, fixed=True, ignore_case=True,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [m.text for m in result.matches] == ["MiXeD"]
+
+
+async def test_grep_on_a_commit_reads_the_tree_not_the_files(git: GitAdapter, repo: GitTarget) -> None:
+    head = await git.current_commit(repo)
+    assert head is not None
+    write(repo.repo / "f.txt", "changed on disk\n")
+    result = await git.grep(repo, ["b"], commit=head, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [(m.path, m.line, m.column, m.text) for m in result.matches] == [("f.txt", 2, None, "b")]
+
+
+async def test_grep_only_matching_prints_the_match(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "big.js", "function   huge" + "x" * (1 << 20) + "\n")
+    sha = await git.commit(repo, "big", ME)
+    assert sha is not None
+    pattern = "^function[[:space:]]+[a-z]{4}"
+    result = await git.grep(repo, [pattern], commit=sha, fixed=False, ignore_case=False,
+                            only_matching=True, timeout_s=10, max_output=1 << 16)  # fmt: skip
+    assert [m.text for m in result.matches] == ["function   huge"]
+
+
+async def test_grep_no_match_is_empty(git: GitAdapter, repo: GitTarget) -> None:
+    result = await git.grep(repo, ["nowhere-to-be-found"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert (result.matches, result.truncated, result.skipped_paths) == ([], False, 0)
+
+
+async def test_grep_invalid_regex_is_an_input_error(git: GitAdapter, repo: GitTarget) -> None:
+    with pytest.raises(GitInputError) as raised:
+        await git.grep(repo, ["("], commit=None, fixed=False, ignore_case=False,
+                       only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert raised.value.reason == "regex"
+
+
+async def test_grep_paths_with_colons_and_spaces(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "we:ird" / "a b.txt", "needle\n")
+    result = await git.grep(repo, ["needle"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [m.path for m in result.matches] == ["we:ird/a b.txt"]
+
+
+async def test_grep_skips_paths_that_are_not_utf8(git: GitAdapter, repo: GitTarget) -> None:
+    (repo.repo / os.fsdecode(b"\xff.txt")).write_text("needle\n")
+    write(repo.repo / "ok.txt", "needle\n")
+    result = await git.grep(repo, ["needle"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [m.path for m in result.matches] == ["ok.txt"]
+    assert result.skipped_paths == 1
+
+
+async def test_grep_output_cap_truncates(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "many.txt", "needle line\n" * 100)
+    result = await git.grep(repo, ["needle"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=200)  # fmt: skip
+    assert result.truncated
+    assert 0 < len(result.matches) < 100
+    assert all(m.text == "needle line" for m in result.matches)  # no partial record
+
+
+async def test_grep_timeout_is_a_git_error(git: GitAdapter, repo: GitTarget) -> None:
+    for index in range(200):
+        write(repo.repo / f"d{index}" / "f.txt", "needle\n" * 50)
+    with pytest.raises(GitError) as raised:
+        await git.grep(repo, ["(n|e)*d"], commit=None, fixed=False, ignore_case=False,
+                       only_matching=False, timeout_s=0.001, max_output=1 << 20)  # fmt: skip
+    assert raised.value.reason == "timeout"

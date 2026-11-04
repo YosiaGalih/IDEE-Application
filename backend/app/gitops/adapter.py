@@ -144,6 +144,29 @@ class _Result:
     truncated: bool = False  # stdout was cut at ``max_output`` (only when the caller allowed it)
 
 
+@dataclass(frozen=True)
+class TreeFile:
+    """A regular file of a commit's tree (``ls-tree``)."""
+
+    path: str
+    size: int
+
+
+@dataclass(frozen=True)
+class GrepMatch:
+    path: str
+    line: int
+    column: int | None  # 1-based byte column of the first match; working tree only
+    text: str  # the line, or only the match with ``only_matching``
+
+
+@dataclass(frozen=True)
+class GrepResult:
+    matches: list[GrepMatch]
+    truncated: bool  # output cut at ``max_output``: more matches exist
+    skipped_paths: int  # matches in files whose names are not UTF-8 (not addressable through the API)
+
+
 class _TooLarge(Exception):
     pass
 
@@ -232,8 +255,11 @@ class GitAdapter:
         env: dict[str, str] | None = None,
         check: bool = True,
         truncate: bool = False,
+        timeout_s: float | None = None,
+        max_output: int | None = None,
     ) -> _Result:
-        """Run git. ``truncate``: past ``max_output`` stop reading and return what was read (no error)."""
+        """Run git. ``truncate``: past ``max_output`` stop reading and return what was read (no error).
+        ``timeout_s`` and ``max_output`` override the adapter's limits for this call."""
         argv = [self.git]
         for setting in _CONFIG:
             argv += ["-c", setting]
@@ -252,7 +278,10 @@ class GitAdapter:
             start_new_session=True,  # its own process group, so a timeout kills every child too
         )
         try:
-            stdout, stderr, cut = await asyncio.wait_for(self._collect(proc, truncate), self.timeout_s)
+            stdout, stderr, cut = await asyncio.wait_for(
+                self._collect(proc, truncate, self.max_output if max_output is None else max_output),
+                self.timeout_s if timeout_s is None else timeout_s,
+            )
         except TimeoutError:
             await _kill(proc)
             raise GitError("timeout") from None
@@ -268,7 +297,9 @@ class GitAdapter:
             raise GitError(f"{args[0]}_failed")
         return result
 
-    async def _collect(self, proc: asyncio.subprocess.Process, truncate: bool) -> tuple[bytes, bytes, bool]:
+    async def _collect(
+        self, proc: asyncio.subprocess.Process, truncate: bool, limit: int
+    ) -> tuple[bytes, bytes, bool]:
         assert proc.stdout is not None and proc.stderr is not None
         stdout_stream, stderr_stream = proc.stdout, proc.stderr
 
@@ -276,10 +307,10 @@ class GitAdapter:
             chunks: list[bytes] = []
             size = 0
             while chunk := await stdout_stream.read(_CHUNK):
-                if size + len(chunk) > self.max_output:
+                if size + len(chunk) > limit:
                     if not truncate:
                         raise _TooLarge()
-                    chunks.append(chunk[: self.max_output - size])
+                    chunks.append(chunk[: limit - size])
                     return b"".join(chunks), True
                 size += len(chunk)
                 chunks.append(chunk)
@@ -529,6 +560,89 @@ class GitAdapter:
             head=None,
             max_bytes=max_bytes,
             output_truncated=result.truncated,
+        )
+
+    async def list_files(self, target: GitTarget, commit: str) -> tuple[list[TreeFile], bool]:
+        """The regular files of ``commit``'s tree, read from the object database (no working tree, no symlink
+        followed). Symlinks, submodules and paths that are not UTF-8 are left out; ``True`` when the listing
+        was cut at ``max_output``."""
+        if not _SHA.fullmatch(commit):
+            raise GitInputError("ref")
+        git_dir, tree = await self._adirs(target)
+        result = await self._run(
+            ["ls-tree", "-r", "-z", "--long", "--full-tree", commit],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+            truncate=True,
+        )
+        records = result.stdout.split(b"\0")
+        if result.truncated:
+            records = records[:-1]  # the last record may be cut
+        files: list[TreeFile] = []
+        for record in records:
+            meta, _, raw_path = record.partition(b"\t")
+            fields = meta.split()
+            if len(fields) != 4 or fields[0] not in (b"100644", b"100755") or fields[1] != b"blob":
+                continue
+            try:
+                files.append(TreeFile(raw_path.decode("utf-8"), int(fields[3])))
+            except (UnicodeDecodeError, ValueError):
+                continue
+        return files, result.truncated
+
+    async def grep(
+        self,
+        target: GitTarget,
+        patterns: list[str],
+        *,
+        commit: str | None,
+        fixed: bool,
+        ignore_case: bool,
+        only_matching: bool,
+        timeout_s: float,
+        max_output: int,
+    ) -> GrepResult:
+        """``git grep`` over the working tree with untracked files (``commit=None``: ignored files and
+        ``.git`` are never read, symlinks are not followed) or over ``commit``'s tree. Patterns follow ``-e``
+        (never options); ``fixed``: literal strings, else POSIX ERE. The regex runs inside git, which this
+        adapter kills at ``timeout_s`` (``GitError("timeout")``): no pattern can hold the event loop."""
+        if not patterns or any(not p or "\0" in p or "\n" in p or "\r" in p for p in patterns):
+            raise GitInputError("pattern")
+        if commit is not None and not _SHA.fullmatch(commit):
+            raise GitInputError("ref")
+        git_dir, tree = await self._adirs(target)
+        args = ["grep", "-z", "-n", "-I", "--no-color", "-F" if fixed else "-E"]
+        if ignore_case:
+            args.append("-i")
+        if only_matching:
+            args.append("-o")
+        if commit is None:
+            args += ["--untracked", "--column"]
+        for pattern in patterns:
+            args += ["-e", pattern]
+        args += [commit, "--"] if commit is not None else ["--"]
+        result = await self._run(
+            args,
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+            check=False,
+            truncate=True,
+            timeout_s=timeout_s,
+            max_output=max_output,
+        )
+        if result.returncode not in (0, 1) and not result.truncated:
+            stderr = result.stderr.decode("utf-8", "replace")
+            if result.returncode == 128 and stderr.startswith(("fatal: -e option", "fatal: command line")):
+                raise GitInputError("regex")
+            self._log_failure("grep", result, tree)
+            raise GitError("grep_failed")
+        return _parse_grep(
+            result.stdout,
+            prefix=f"{commit}:".encode() if commit is not None else b"",
+            with_column=commit is None,
+            truncated=result.truncated,
         )
 
     # --- write ---------------------------------------------------------------------------------------------
@@ -787,6 +901,39 @@ class GitAdapter:
             return MergeResult(False, None, [], "dirty")
         self._log_failure("merge", result, tree)
         raise GitError("merge_failed")
+
+
+def _parse_grep(data: bytes, *, prefix: bytes, with_column: bool, truncated: bool) -> GrepResult:
+    """``git grep -z -n [--column]`` output, one record per match: ``<prefix><path>\\0<line>\\0`` then
+    ``[<column>\\0]<text>\\n``. Paths are printed verbatim (they may hold ``:``, spaces, even newlines), so
+    records are read field by field. A record cut by the output cap is dropped."""
+    matches: list[GrepMatch] = []
+    skipped = 0
+    position = 0
+    fields = 3 if with_column else 2
+    while position < len(data):
+        parts: list[bytes] = []
+        for _ in range(fields):
+            end = data.find(b"\0", position)
+            if end < 0:
+                break
+            parts.append(data[position:end])
+            position = end + 1
+        end = data.find(b"\n", position)
+        if len(parts) < fields or end < 0:
+            break  # incomplete last record (output cap)
+        text_bytes = data[position:end]
+        position = end + 1
+        raw_path = parts[0].removeprefix(prefix)
+        try:
+            path = raw_path.decode("utf-8")
+            line = int(parts[1])
+            column = int(parts[2]) if with_column else None
+        except (UnicodeDecodeError, ValueError):
+            skipped += 1
+            continue
+        matches.append(GrepMatch(path, line, column, text_bytes.decode("utf-8", "replace")))
+    return GrepResult(matches, truncated, skipped)
 
 
 def _gitfile_points_at(gitfile: str, registered: Path) -> bool:
