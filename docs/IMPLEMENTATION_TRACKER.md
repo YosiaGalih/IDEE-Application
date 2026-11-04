@@ -1378,7 +1378,7 @@ Spec: `docs/superpowers/specs/2026-11-04-wp-2.1d-index-search-design.md`. Plan: 
 | Mutan | 18 mutan pada guard (`-e`, filter policy, glob, escape LIKE, urutan simbol, filter kind, batas hasil, rate limit, kunci job, pelepasan kunci, reuse, shortcut unchanged, batas file, pemicu create/import, `index_soon`, bahasa di `classify`): semua merah. Mutan "tanpa filter glob" sempat selamat; test teks diperkuat (glob `*.md`) lalu merah |
 | Syarat masuk AG-13 WP-2.1b/2.1c | tidak ada penulis `sync_state`/`error` baru (`test_index_never_writes_repository_state`); job indeks tidak menulis index git (grep pada object database, `GIT_OPTIONAL_LOCKS=0` untuk working tree) |
 
-| CI @ 48c2ca6 dan sebelumnya | semua job hijau kecuali `security-scan`: Trivy memblokir `kodekantor/web:dev` karena `libexpat 2.9.0-r0 → 2.10.0-r0` (CVE-2026-113351, CVE-2026-117610, CVE-2026-118370). `main` juga merah karena sebab yang sama (run 46bf6cf dan run terjadwal 3 Nov); bukan dari PR ini. Usulan patch satu baris di `frontend/Dockerfile` ada di komentar PR #13, menunggu keputusan PO |
+| CI @ 48c2ca6 dan sebelumnya | semua job hijau kecuali `security-scan`: Trivy memblokir `kodekantor/web:dev` karena `libexpat 2.9.0-r0 → 2.10.0-r0` (CVE-2026-113351, CVE-2026-117610, CVE-2026-118370). `main` juga merah karena sebab yang sama (run 46bf6cf dan run terjadwal 3 Nov); bukan dari PR ini. Usulan patch satu baris di `frontend/Dockerfile` ada di komentar PR #13. **Keputusan PO (4 Nov): patch masuk PR #13**, karena PR terpisah butuh branch kedua. `libexpat>=2.10.0-r0` dinaikkan di tahap runtime `web`, mengikuti pola brotli-libs WP-1.4a; EX-03 tetap tidak berlaku untuk `web`. hadolint v2.14.0 lokal: exit 0. Bukti bahwa paket terpasang dan Trivy lulus datang dari CI, karena proxy sesi menolak `dl-cdn.alpinelinux.org` |
 | CI @ f25bb4e (hanya docs) | `sandbox-isolation` merah sekali: `test_memory_limit` → `('failed', 137, None)`, padahal hijau di 48c2ca6 dengan kode sandbox identik. Bukan dari PR ini; dugaan [Menebak]: `docker_driver.py` membaca `State.OOMKilled` sekali tepat setelah exit, sedangkan event OOM bisa datang belakangan. Usulan patch dan re-run sekali: komentar PR #13 |
 
 #### Review WP-2.1d @ 7484e90: `kk-backend-reviewer` (**APPROVE**: 0 BLOCK, 5 SHOULD, 6 NIT), `kk-silent-failure-hunter` (2 HIGH, 4 MEDIUM, 4 LOW), AG-13 (**NOT SIGNED OFF**: 2 MEDIUM, 3 LOW, 4 INFO)
@@ -1422,6 +1422,9 @@ Tidak ditutup (alasan):
 **Syarat masuk WP berikutnya (AG-13, mengikat):**
 - **WP-3.x (tool agent `repo.search_text`/`repo.search_symbol`, `AGENT_READ`):** `Budget` total per pencarian untuk `.agentignore` yang tidak tepercaya (200 pola `**/x/**/*.y` ≈ 70 s CPU untuk 226 ribu match); `AGENT_READ_LIMIT` berlaku untuk preview; preview dan nama simbol dibungkus sebagai untrusted dan diredaksi sebelum ke model (T1/T5).
 - **WP-3.1 (pencarian di worktree task):** git 2.43 memeriksa folder induk lalu membuka file berdasarkan path (TOCTOU bila sandbox menulis worktree bersamaan): cari hanya saat sandbox task berhenti, atau jalankan pencarian di dalam sandbox.
+- **WP-3.1 (AG-13 D1 dan D3, keputusan PO 4 Nov):**
+  - Git pencarian mendapat batas memori keras, misalnya RLIMIT_AS sekitar 512 MiB lewat `prlimit`, dibuktikan di image backend. Alternatifnya, pencarian dijalankan di sandbox dengan limit memori sendiri.
+  - Timeout mode regex ditinjau ulang, karena memori tumbuh sekitar 70 MB/s dan dua slot bisa dipegang satu pengguna.
 
 #### Delta AG-13 @ 48c2ca6 (f25bb4e hanya docs): **SIGNED OFF 🔒** (0 CRITICAL/HIGH/MEDIUM; 2 LOW, 5 INFO baru)
 
@@ -1444,7 +1447,8 @@ Tidak ditutup (alasan):
 - **D1 LOW (T4), memori DFA glibc.** Regex tanpa `{` dan tanpa backreference masih bisa membuat cache state 0,4–0,73 GB per git dalam 10 s. Dua slot per proses bisa melewati limit api 1536M.
   - Menurut probe AG-13, OOM killer cgroup membunuh git (proses terbesar) dan api tetap hidup [Kemungkinan Besar untuk uvicorn nyata]. Jadi yang gagal adalah pencarian si peminta sendiri.
   - Batas keras (RLIMIT_AS sekitar 512 MiB lewat `prlimit` untuk git pencarian) mengubah cara adapter memulai proses dan harus dibuktikan di image. Ini dijadwalkan bersama syarat masuk WP-3.1.
-  - Opsi termurah bila PO ingin ditutup sekarang: `MAX_TEXT_SEARCHES = 1`, tetapi itu memperparah D3. Keputusan ada di PO.
+  - Opsi termurah bila PO ingin ditutup sekarang: `MAX_TEXT_SEARCHES = 1`, tetapi itu memperparah D3.
+  - **Keputusan PO (4 Nov): ditunda ke WP-3.1**, sesuai rekomendasi; menjadi syarat masuk WP-3.1 di bawah.
 - **D3 INFO:** dua pembaca dengan pola 10 s dapat memegang kedua slot, sehingga user lain mendapat 429 untuk pencarian teks. Ini DoS tingkat fitur; tindak lanjutnya bersama D1, karena timeout regex yang lebih pendek meredakan keduanya.
 - **D5 INFO:** test regresi L2 bersifat probabilistik (mutan merah 5/6 run), karena hang aslinya memang tidak deterministik.
 - **D6 INFO:**
