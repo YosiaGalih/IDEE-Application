@@ -15,6 +15,7 @@ import type { GitStatus, TreeEntry } from "@/api/workspace";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { formatBytes } from "@/lib/formatBytes";
+import { workspaceErrorText } from "./workspaceErrors";
 
 type GitChange = GitStatus["changes"][number]["status"];
 const GIT_MARK: Record<GitChange, string> = {
@@ -38,7 +39,10 @@ type Props = {
 export function Explorer({ projectId, canWrite, activePath, onOpen, onCreate, onDelete }: Props) {
   const { t } = useTranslation();
   const git = useGitStatus(projectId);
-  const changes = new Map((git.data?.changes ?? []).map((change) => [change.path, change.status]));
+  // After a failed refresh the last markers may be stale: none is shown rather than old ones.
+  const changes = new Map(
+    (git.isError ? [] : (git.data?.changes ?? [])).map((change) => [change.path, change.status]),
+  );
   return (
     <nav
       aria-label={t("workspace.explorer.title")}
@@ -95,6 +99,27 @@ type FolderProps = {
   onDelete: (path: string) => void;
 };
 
+/** Why a folder could not be read (permission, repository state, ...), with a way to try again. */
+function FolderError({ error, depth, onRetry }: { error: unknown; depth: number; onRetry: () => void }) {
+  const { t } = useTranslation();
+  const { text, requestId } = workspaceErrorText(t, error);
+  return (
+    <div
+      role="alert"
+      className="flex flex-wrap items-center gap-x-2 px-3 py-1 text-xs text-status-danger"
+      style={{ paddingLeft: `${depth + 1}rem` }}
+    >
+      <span>
+        {t("workspace.explorer.loadFailed")} {text}
+      </span>
+      {requestId ? <span className="font-mono">{t("common.requestId", { id: requestId })}</span> : null}
+      <Button variant="ghost" size="sm" className="h-6 px-1" onClick={onRetry}>
+        {t("workspace.retry")}
+      </Button>
+    </div>
+  );
+}
+
 function Folder_({ projectId, path, depth, ...rest }: FolderProps) {
   const { t } = useTranslation();
   const tree = useTree(projectId, path);
@@ -108,22 +133,21 @@ function Folder_({ projectId, path, depth, ...rest }: FolderProps) {
         <Spinner />
       </div>
     );
-  if (tree.isError)
-    return (
-      <p
-        role="alert"
-        className="px-3 py-1 text-xs text-status-danger"
-        style={{ paddingLeft: `${depth + 1}rem` }}
-      >
-        {t("workspace.explorer.loadFailed")}
-      </p>
-    );
+  if (tree.data === undefined)
+    return <FolderError error={tree.error} depth={depth} onRetry={() => void tree.refetch()} />;
   const entries = [...tree.data.entries].sort((a, b) =>
     a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1,
   );
   return (
     <ul>
-      {entries.length === 0 ? (
+      {/* A failed refresh keeps the entries already read, and says they may be out of date. */}
+      {tree.isError ? (
+        <li>
+          <FolderError error={tree.error} depth={depth} onRetry={() => void tree.refetch()} />
+        </li>
+      ) : null}
+      {/* "Empty" only for a complete answer: a cut-off one with no entries is not an empty folder. */}
+      {entries.length === 0 && !tree.data.truncated ? (
         <li className="px-3 py-1 text-xs text-fg-muted" style={{ paddingLeft: `${depth + 1}rem` }}>
           {t("workspace.explorer.empty")}
         </li>

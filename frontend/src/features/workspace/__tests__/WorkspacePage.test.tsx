@@ -179,6 +179,46 @@ describe("WorkspacePage", () => {
     expect(within(explorer).getByText(id.workspace.explorer.truncated)).toBeInTheDocument();
   });
 
+  it("says why the tree could not be read and reads it again on request", async () => {
+    let refuse = true;
+    backend();
+    server.use(
+      http.get(`${BASE}/tree`, () =>
+        refuse
+          ? fail(403, "FORBIDDEN")
+          : ok([{ path: "a.py", name: "a.py", type: "file", size: 1 }], { truncated: false }),
+      ),
+    );
+    renderApp(`/projects/${PROJECT}/workspace`);
+    const explorer = await screen.findByRole("navigation", { name: id.workspace.explorer.title });
+    const alert = await within(explorer).findByRole("alert");
+    expect(alert).toHaveTextContent(id.workspace.explorer.loadFailed);
+    expect(alert).toHaveTextContent(id.states.permission_denied.title);
+    refuse = false;
+    await userEvent.click(within(alert).getByRole("button", { name: id.workspace.retry }));
+    expect(await within(explorer).findByText("a.py")).toBeInTheDocument();
+    expect(within(explorer).queryByRole("alert")).toBeNull();
+  });
+
+  it("never calls a cut-off folder with no entries empty", async () => {
+    backend({ tree: { ".": { entries: [], truncated: true } } });
+    renderApp(`/projects/${PROJECT}/workspace`);
+    const explorer = await screen.findByRole("navigation", { name: id.workspace.explorer.title });
+    expect(await within(explorer).findByText(id.workspace.explorer.truncated)).toBeInTheDocument();
+    expect(within(explorer).queryByText(id.workspace.explorer.empty)).toBeNull();
+  });
+
+  it("drops Git markers it can no longer confirm", async () => {
+    backend();
+    const { queryClient } = renderApp(`/projects/${PROJECT}/workspace`);
+    const explorer = await screen.findByRole("navigation", { name: id.workspace.explorer.title });
+    expect(await within(explorer).findByText(id.workspace.git.modified)).toBeInTheDocument();
+    server.use(http.get(`${BASE}/git/status`, () => fail(500, "INTERNAL_ERROR")));
+    await act(() => queryClient.refetchQueries({ queryKey: ["workspace", PROJECT, "git-status"] }));
+    expect(await within(explorer).findByText(id.workspace.explorer.gitUnavailable)).toBeInTheDocument();
+    expect(within(explorer).queryByText(id.workspace.git.modified)).toBeNull();
+  });
+
   it("keeps the explorer when git status cannot be read, and says so", async () => {
     backend({ gitFails: true });
     renderApp(`/projects/${PROJECT}/workspace`);
@@ -561,6 +601,33 @@ describe("WorkspacePage", () => {
     await userEvent.click(within(search).getByLabelText(id.workspace.search.regex));
     await userEvent.click(within(search).getByRole("button", { name: id.workspace.search.submit }));
     expect(await screen.findByText(id.workspace.search.error.regex_unsupported)).toBeInTheDocument();
+  });
+
+  it("says no results only for a whole answer, and asks again when the same search is submitted", async () => {
+    const answers = [
+      { hits: [], meta: { truncated: true, skipped: 0 } },
+      { hits: [], meta: { truncated: false, skipped: 0 } },
+    ];
+    let calls = 0;
+    backend();
+    server.use(
+      http.get(`${BASE}/search`, () => {
+        const answer = answers[Math.min(calls, answers.length - 1)];
+        calls += 1;
+        return ok(answer?.hits, answer?.meta);
+      }),
+    );
+    renderApp(`/projects/${PROJECT}/workspace`);
+    const search = await screen.findByRole("search");
+    const submit = within(search).getByRole("button", { name: id.workspace.search.submit });
+    expect(submit).toBeDisabled(); // nothing to search for yet
+    await userEvent.type(within(search).getByLabelText(id.workspace.search.q, { selector: "input" }), "zzz");
+    await userEvent.click(submit);
+    expect(await screen.findByText(id.workspace.search.truncated)).toBeInTheDocument();
+    expect(screen.queryByText(id.workspace.search.empty)).toBeNull();
+    await userEvent.click(submit);
+    expect(await screen.findByText(id.workspace.search.empty)).toBeInTheDocument();
+    expect(calls).toBe(2);
   });
 
   it("says chat and the terminal are not available yet", async () => {

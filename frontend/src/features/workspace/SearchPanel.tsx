@@ -3,7 +3,7 @@ import { useId, useState, type FormEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "@/api/errors";
 import { useSearch } from "@/api/hooks/useWorkspace";
-import type { SearchParams } from "@/api/workspace";
+import type { SearchMeta, SearchParams } from "@/api/workspace";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Label } from "@/components/ui/Label";
@@ -14,6 +14,10 @@ import { reasonOf } from "./workspaceErrors";
 const MODES = ["text", "symbol"] as const;
 
 type Props = { projectId: string; onOpen: (path: string, line: number) => void };
+
+/** "No results" only for a whole answer: not when it was cut, skipped files, or had no index to use. */
+const isComplete = (asked: SearchParams, meta: SearchMeta) =>
+  !meta.truncated && !meta.skipped && !meta.index_truncated && !(asked.mode === "symbol" && !meta.indexed_at);
 
 /** Text and symbol search (FR-020, FR-021): runs on submit, says when the answer is partial. */
 export function SearchPanel({ projectId, onOpen }: Props) {
@@ -28,10 +32,13 @@ export function SearchPanel({ projectId, onOpen }: Props) {
   };
   const [draft, setDraft] = useState<SearchParams>({ q: "", mode: "text", regex: false, ignoreCase: true });
   const [asked, setAsked] = useState<SearchParams | null>(null);
-  const search = useSearch(projectId, asked);
+  const [attempt, setAttempt] = useState(0);
+  const search = useSearch(projectId, asked, attempt);
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (draft.q.trim()) setAsked({ ...draft, q: draft.q });
+    if (!draft.q.trim()) return;
+    setAsked({ ...draft });
+    setAttempt((count) => count + 1);
   };
   const errorText = (error: unknown) => {
     const reason = reasonOf(error);
@@ -103,7 +110,7 @@ export function SearchPanel({ projectId, onOpen }: Props) {
             />
           </>
         )}
-        <Button type="submit" size="sm">
+        <Button type="submit" size="sm" disabled={!draft.q.trim()}>
           <Search aria-hidden="true" className="size-4" />
           {t("workspace.search.submit")}
         </Button>
@@ -142,7 +149,7 @@ export function SearchPanel({ projectId, onOpen }: Props) {
               {t("workspace.search.skipped", { count: search.data.meta.skipped })}
             </p>
           ) : null}
-          {search.data.hits.length === 0 ? (
+          {search.data.hits.length === 0 && isComplete(asked, search.data.meta) ? (
             <p className="text-fg-muted">{t("workspace.search.empty")}</p>
           ) : null}
           <ul className="min-h-0 divide-y divide-line overflow-auto">

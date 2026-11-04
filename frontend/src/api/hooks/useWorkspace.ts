@@ -22,10 +22,13 @@ export function useGitStatus(projectId: string) {
   });
 }
 
-/** A search runs only when asked (a submitted form), never per keystroke; a refusal is not retried. */
-export function useSearch(projectId: string, params: SearchParams | null) {
+/**
+ * A search runs only when asked (a submitted form), never per keystroke; a refusal is not retried.
+ * `attempt` counts submissions: the same query submitted again asks the server again (files change).
+ */
+export function useSearch(projectId: string, params: SearchParams | null, attempt = 0) {
   return useQuery({
-    queryKey: [...workspaceKey(projectId), "search", params],
+    queryKey: [...workspaceKey(projectId), "search", params, attempt],
     queryFn: ({ signal }) => searchProject(projectId, params as SearchParams, signal),
     enabled: params !== null && params.q.trim() !== "",
     retry: false,
