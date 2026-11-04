@@ -1363,3 +1363,19 @@ Bukti AG-13:
 | **I-9:** grace drain (30 s + 30 s) lebih panjang dari `stop_grace_period` default Docker (10 s); sinyal kedua melewati lifespan | risiko sisa, tidak ditutup di WP ini (infra). Usulan (Lead): `stop_grace_period` service `api` ≥ grace drain di `infra/compose.yml`; penutupan penuh butuh outbox audit |
 
 Dibawa ke WP berikutnya (AG-13 I-b, syarat masuk): penghapusan `index.lock` dan reset index mengandaikan satu penulis per index. Pemanggil baru `GitAdapter.commit` di worktree task dan `merge_branch` di `repo/` (WP-3.x, merge queue) **wajib** memegang `Workspace(root).exclusive()`. I-e (I2, I5, I6) tetap di daftar "Tidak ditutup" di atas; I4 [Kemungkinan Besar] sudah dimitigasi desain sandbox (artefak di mount terpisah, `repo/` read-only), dikonfirmasi saat pembaca evidence dibuat.
+
+### WP-2.1d (🔒 path/git) — indeks repository dan pencarian (FR-020, FR-021, FR-023; AC-03 bagian "mencari")
+
+Spec: `docs/superpowers/specs/2026-11-04-wp-2.1d-index-search-design.md`. Plan: `docs/superpowers/plans/2026-11-04-wp-2.1d-index-search.md`. Konflik #69 (parameter tambahan, `sha256` null, `indexing` tidak dipakai). Hanya backend; layar pencarian IDE tetap WP-2.2.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Backend `ruff check .`, `ruff format --check .`, `pyright`, `lint-imports` | bersih; 0 error; 3 kontrak dipertahankan |
+| Backend `pytest -q` (PostgreSQL 16 + Redis 7 lokal) | implementasi @ 7484e90: **1710 passed, 1 skipped** |
+| Migrasi 0005 | `upgrade head → downgrade -1 → upgrade head` lulus (alembic API, DB uji); `compare_metadata` model ↔ skema: 0 perbedaan |
+| Bukti T2 git grep | probe git 2.43: symlink file/folder ke luar repo (ter-track maupun untracked) tidak diikuti; `test_symlinks_out_of_the_repository_are_not_searched`, `test_git_dir_is_never_searched` |
+| Pola simbol ERE ↔ klasifikasi Python | `test_symbol_patterns_find_every_language_through_git`: 32 contoh definisi di 7 bahasa ditemukan lewat `git grep -o` sungguhan dan diklasifikasikan sama |
+| Mutan | 18 mutan pada guard (`-e`, filter policy, glob, escape LIKE, urutan simbol, filter kind, batas hasil, rate limit, kunci job, pelepasan kunci, reuse, shortcut unchanged, batas file, pemicu create/import, `index_soon`, bahasa di `classify`): semua merah. Mutan "tanpa filter glob" sempat selamat; test teks diperkuat (glob `*.md`) lalu merah |
+| Syarat masuk AG-13 WP-2.1b/2.1c | tidak ada penulis `sync_state`/`error` baru (`test_index_never_writes_repository_state`); job indeks tidak menulis index git (grep pada object database, `GIT_OPTIONAL_LOCKS=0` untuk working tree) |
+
+Review: menyusul.

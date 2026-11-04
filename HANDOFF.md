@@ -4,15 +4,15 @@ File ini ditulis untuk melanjutkan pembangunan KodeKantor setelah kredit cloud h
 
 Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-continuation-under-usage-limits.md`. File ini hanya memuat posisi terakhir dan langkah berikutnya.
 
-## Status (2 Nov 2026)
+## Status (4 Nov 2026)
 
 | | |
 |---|---|
-| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9), WP-2.1a projects core (PR #10), WP-2.1b import arsip (PR #11) |
+| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9), WP-2.1a projects core (PR #10), WP-2.1b import arsip (PR #11), WP-2.1c API workspace dan git (PR #12) |
 | Mandat PO | "jalankan P2, P3 dan P4" (2 Nov): WP-2.1, 2.2, 3.1, 3.2, 4.1, 4.2, 4.3 (berhenti di gate G4 untuk PO), SEC-01, bukti G2. Satu sub-WP = satu PR |
 | Branch kerja | `claude/gracious-goodall-3hjh19` |
-| Sedang dikerjakan | **WP-2.1c** API workspace dan git (PR #12): implementasi, tiga review, delta AG-13 @ 2bab00c (M1, L1, L2, I-a, I-d) dan @ b733ecc (2 LOW) ditutup (tracker WP-2.1c); AG-13 SIGNED OFF @ 3e5f1c7 (head kode, CI 9/9 hijau); INFO I-6..I-9 dicatat. Syarat masuk tambahan untuk pemanggil `merge_branch`/commit worktree: bukti index = tree di `_landed` (I-6). Syarat masuk baru: setiap penulis index git (commit worktree task, `merge_branch`) wajib memegang `Workspace.exclusive()` |
-| Berikutnya | 2.1d (indeks), 2.1e (dashboard), lalu WP-2.2 (layar IDE), P3, P4. Catatan jebakan ada di akhir bagian tracker WP-2.1a, WP-2.1b, dan WP-2.1c |
+| Sedang dikerjakan | **WP-2.1d** indeks repository dan pencarian (PR #13): spec, plan, implementasi (Task 1–6), 1710 passed; review backend, silent-failure, dan AG-13 berjalan; lalu tracker, body PR, ready. Syarat masuk dari WP-2.1c tetap: penulis index git memegang `Workspace.exclusive()`, bukti index = tree di `_landed` (I-6) |
+| Berikutnya | 2.1e (dashboard), lalu WP-2.2 (layar IDE), P3, P4. Catatan jebakan ada di akhir bagian tracker WP-2.1a, WP-2.1b, WP-2.1c, dan WP-2.1d |
 | Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3 (U4). Dari WP-1.5a: role owner non-superuser untuk migrate. Dari WP-1.4b: token reset dipindah ke fragment sebelum ada jalur pengiriman tautan; stream task berhenti di status terminal. Dari WP-1.6: access log uvicorn rusak (`RedactingFilter`), healthcheck `scheduler` |
 | Menunggu PO | konflik #36–#68 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; EX-02..EX-06 di DECISIONS (EX-02 kini juga mencakup 5 HIGH tanpa fix dari git di image backend); role global di project yang diberi grant (tracker WP-2.1a); konflik #66 (Python 3.13), #67 (sumber `upload`), #68 (HTTP 408); M2 egress sebelum G4; gate G0/G1 |
 
