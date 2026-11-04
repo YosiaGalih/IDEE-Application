@@ -18,6 +18,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card, CardTitle } from "@/components/ui/Card";
 import { StatusPill } from "@/components/ui/StatusPill";
+import { cn } from "@/lib/cn";
 import { PROJECTS_PATH, taskPath, workspacePath } from "@/lib/paths";
 
 type Metric = keyof Dashboard["metrics"];
@@ -35,8 +36,8 @@ type SectionProps = { title: string; aside?: ReactNode; children: ReactNode; cla
 function Section({ title, aside, children, className }: SectionProps) {
   const headingId = useId();
   return (
-    <Card aria-labelledby={headingId} className={className}>
-      <div className="mb-3 flex items-baseline justify-between gap-3">
+    <Card aria-labelledby={headingId} className={cn("min-w-0 break-words", className)}>
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
         <CardTitle id={headingId}>{title}</CardTitle>
         {aside}
       </div>
@@ -53,9 +54,12 @@ export function MetricCards({ metrics }: { metrics: Dashboard["metrics"] }) {
       <h2 id={headingId} className="mb-3 text-base font-semibold text-fg">
         {t("dashboard.metrics.title")}
       </h2>
-      <ul className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+      <ul className="grid grid-cols-[repeat(auto-fit,minmax(min(9rem,100%),1fr))] gap-3">
         {METRICS.map(({ key, icon: Icon }) => (
-          <li key={key} className="rounded-[var(--radius-card)] border border-line bg-surface p-4 shadow-sm">
+          <li
+            key={key}
+            className="min-w-0 break-words rounded-[var(--radius-card)] border border-line bg-surface p-4 shadow-sm"
+          >
             <div className="flex flex-col gap-2">
               <span className="flex items-center gap-2 text-sm text-fg-muted">
                 <Icon aria-hidden="true" className="size-4" />
@@ -84,8 +88,11 @@ function TaskList({ tasks, emptyText, isQueue = false }: TaskListProps) {
   return (
     <ul className="divide-y divide-line">
       {tasks.map((task) => (
-        <li key={task.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
-          <div className="min-w-0">
+        <li
+          key={task.id}
+          className="flex flex-wrap items-start justify-between gap-3 py-3 first:pt-0 last:pb-0"
+        >
+          <div className="min-w-0 break-words">
             {isQueue ? (
               <p className="font-medium text-fg">{task.title}</p>
             ) : (
@@ -236,11 +243,11 @@ export function RecentProjects({ projects, isFiltered }: { projects: Project[]; 
             return (
               <li
                 key={project.id}
-                className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0"
+                className="flex flex-wrap items-start justify-between gap-3 py-3 first:pt-0 last:pb-0"
               >
                 <div className="flex min-w-0 items-start gap-2">
                   <FolderOpen aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-fg-muted" />
-                  <div className="min-w-0">
+                  <div className="min-w-0 break-words">
                     <Link
                       to={workspacePath(project.id)}
                       className="font-medium text-brand-600 hover:underline"

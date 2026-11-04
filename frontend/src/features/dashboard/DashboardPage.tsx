@@ -94,7 +94,7 @@ export function DashboardPage() {
                 />
               </div>
             </div>
-            <div className="grid gap-6 xl:grid-cols-2">
+            <div className="grid gap-6 xl:grid-cols-2 [&>*]:min-w-0">
               <AttentionQueue
                 tasks={queue}
                 total={failedQueueTotal}
@@ -113,7 +113,7 @@ export function DashboardPage() {
   }
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-6 p-6">
+    <div className="mx-auto flex w-full min-w-0 max-w-7xl flex-col gap-6">
       <header className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p className="text-xs font-semibold uppercase tracking-wide text-fg-muted">
