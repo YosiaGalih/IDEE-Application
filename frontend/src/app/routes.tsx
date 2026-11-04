@@ -5,6 +5,7 @@ import { LoginPage } from "@/features/auth/LoginPage";
 import { RequireSession } from "@/features/auth/RequireSession";
 import { ResetPasswordPage } from "@/features/auth/ResetPasswordPage";
 import { UserMenu } from "@/features/auth/UserMenu";
+import { DashboardPage } from "@/features/dashboard/DashboardPage";
 import { ImportArchivePage } from "@/features/projects/ImportArchivePage";
 import { NewProjectPage } from "@/features/projects/NewProjectPage";
 import { ProjectsPage } from "@/features/projects/ProjectsPage";
@@ -35,7 +36,7 @@ export const routes: RouteObject[] = [
         ),
         errorElement: <RouteErrorPage />,
         children: [
-          { index: true, element: page("dashboard") },
+          { index: true, element: <DashboardPage /> },
           { path: "projects", element: <ProjectsPage /> },
           { path: "projects/new", element: <NewProjectPage /> },
           { path: "projects/:projectId/import", element: <ImportArchivePage /> },

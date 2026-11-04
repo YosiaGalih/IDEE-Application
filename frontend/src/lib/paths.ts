@@ -6,3 +6,4 @@ export const NEW_PROJECT_PATH = "/projects/new";
 export const workspacePath = (projectId: string) =>
   generatePath("/projects/:projectId/workspace", { projectId });
 export const importPath = (projectId: string) => generatePath("/projects/:projectId/import", { projectId });
+export const taskPath = (taskId: string) => generatePath("/tasks/:taskId", { taskId });

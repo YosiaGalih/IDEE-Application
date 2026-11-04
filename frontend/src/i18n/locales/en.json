@@ -107,7 +107,13 @@
     "validating": "Validating",
     "completed": "Completed",
     "failed": "Failed",
-    "cancelled": "Cancelled"
+    "cancelled": "Cancelled",
+    "draft": "Draft",
+    "needs_clarification": "Needs clarification",
+    "planned": "Planned",
+    "needs_changes": "Needs changes",
+    "interrupted": "Interrupted",
+    "rejected": "Rejected"
   },
   "common": {
     "requestId": "Request ID: {{id}}",
@@ -326,6 +332,81 @@
       "runningHere": "An archive import for this project is running.",
       "openList": "Open the project list",
       "stalled": "The upload stopped before it finished. Try again."
+    }
+  },
+  "dashboard": {
+    "eyebrow": "Dashboard",
+    "greeting": "Welcome, {{name}}",
+    "greetingAnonymous": "Welcome",
+    "summary": "Your projects, tasks, and what needs attention, for the projects you can see.",
+    "quickCreate": "Quick create",
+    "newProject": "New project",
+    "newTask": "New task",
+    "newTaskUnavailable": "Creating tasks is not available in this version yet.",
+    "searchLabel": "Filter the projects and tasks shown",
+    "searchPlaceholder": "Project name or task title",
+    "unavailable": "not available",
+    "updated": "Updated {{time}}",
+    "metrics": {
+      "title": "Key metrics",
+      "active_projects": "Active projects",
+      "running_tasks": "Running tasks",
+      "completed_tasks": "Completed tasks",
+      "failed_tasks": "Failed tasks",
+      "waiting_approval": "Tasks waiting for approval"
+    },
+    "recentTasks": {
+      "title": "Recent tasks",
+      "empty": "No tasks yet.",
+      "filteredEmpty": "No matching tasks."
+    },
+    "queue": {
+      "title": "Needs attention",
+      "empty": "No tasks need attention.",
+      "filteredEmpty": "No matching tasks need attention.",
+      "more": "{{count}} more",
+      "open": "Open",
+      "openOf": "Open task {{title}}",
+      "filteredEmptyPartial": "Nothing matches among the {{shown}} tasks shown; {{more}} more are not loaded."
+    },
+    "agents": {
+      "title": "Agent activity",
+      "body": "The platform does not record agent runs yet, so there is no activity to show.",
+      "empty": "No agent runs yet.",
+      "duration": "{{ms}} ms"
+    },
+    "usage": {
+      "title": "Model usage",
+      "period": "Period {{start}} – {{end}}",
+      "inputTokens": "Input tokens",
+      "outputTokens": "Output tokens",
+      "cost": "Cost",
+      "body": "Tokens and cost are not recorded yet, so they show as not available, not as zero."
+    },
+    "recentProjects": {
+      "title": "Recent projects",
+      "seeAll": "See all projects",
+      "empty": "No active projects yet.",
+      "filteredEmpty": "No matching projects.",
+      "active": "Active",
+      "noStack": "Stack not detected yet",
+      "importing": "Importing",
+      "repositoryProblem": "Repository problem",
+      "status": {
+        "archived": "Archived",
+        "deleting_pending_approval": "Waiting for delete approval",
+        "deleted": "Deleted"
+      }
+    },
+    "empty": {
+      "title": "No projects yet",
+      "body": "Create your first project to start working with agents.",
+      "action": "Create your first project"
+    },
+    "costStatus": {
+      "estimated": "estimate",
+      "partial": "partial (not all priced)",
+      "actual": "actual"
     }
   }
 }

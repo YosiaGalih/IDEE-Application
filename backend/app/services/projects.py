@@ -34,7 +34,7 @@ from typing import Any, Literal
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import ColumnElement, and_, func, or_, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -769,6 +769,14 @@ class ProjectPage:
     total: int
 
 
+def visible_projects_filter(actor: Actor) -> ColumnElement[bool]:
+    """The projects ``actor`` can see, as a WHERE clause: the visibility rule of core/rbac.py (the owner, or a
+    role scoped to the project; a global role never widens it), never a deleted project. The one rule for the
+    project list and every view that adds projects up (the dashboard, AC-01)."""
+    granted = {grant.project_id for grant in actor.grants if grant.project_id is not None}
+    return and_(or_(Project.owner_id == actor.user_id, Project.id.in_(granted)), Project.status != "deleted")
+
+
 async def list_projects(
     env: ProjectEnv,
     actor: Actor,
@@ -782,12 +790,7 @@ async def list_projects(
         raise _invalid("page_size", f"page >= 1 and page_size 1-{PAGE_SIZE_MAX}", where="query")
     if q is not None and _CONTROL.search(q):
         raise _invalid("q", "must not contain control characters", where="query")
-    granted = {grant.project_id for grant in actor.grants if grant.project_id is not None}
-    # The visibility rule of core/rbac.py: the owner, or a role scoped to the project.
-    conditions = [
-        or_(Project.owner_id == actor.user_id, Project.id.in_(granted)),
-        Project.status != "deleted",
-    ]
+    conditions = [visible_projects_filter(actor)]
     if status != "all":
         conditions.append(Project.status == status)
     if q:
@@ -805,6 +808,15 @@ async def list_projects(
     async with env.sessions() as session:
         total = await session.scalar(select(func.count()).select_from(Project).where(*conditions)) or 0
         rows = (await session.execute(statement)).all()
+    items = await project_views(env, actor, [(project, repository) for project, repository in rows])
+    return ProjectPage(items=items, page=page, page_size=page_size, total=total)
+
+
+async def project_views(
+    env: ProjectEnv, actor: Actor, rows: list[tuple[Project, Repository | None]]
+) -> list[ProjectView]:
+    """List rows as the screens show them: with the actor's permissions and what a look at the disk finds
+    (a missing repository, an import that stalled). Rows read in any session; the checks run after it."""
     ready = [
         project.id
         for project, repository in rows
@@ -818,13 +830,12 @@ async def list_projects(
             return "repository_missing"
         return "import_incomplete" if project_id in stalled else None
 
-    items = [
+    return [
         ProjectView(
             project, repository, permissions_for(actor, project), None, repository_problem=problem(project.id)
         )
         for project, repository in rows
     ]
-    return ProjectPage(items=items, page=page, page_size=page_size, total=total)
 
 
 @functools.cache

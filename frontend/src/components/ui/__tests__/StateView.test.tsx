@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { UxState } from "@/api/uxState";
 import { StateView } from "@/components/ui/StateView";
+import { TASK_STATUSES } from "@/api/taskStatus";
 import { StatusPill, type ActionStatus } from "@/components/ui/StatusPill";
 import id from "@/i18n/locales/id.json";
 
@@ -57,7 +58,7 @@ describe("StatusPill", () => {
     "failed",
     "cancelled",
   ];
-  it.each(STATUSES)("shows %s as text with an icon", (status) => {
+  it.each([...new Set([...STATUSES, ...TASK_STATUSES])])("shows %s as text with an icon", (status) => {
     const { container } = render(<StatusPill status={status} />);
     expect(screen.getByText(id.status[status])).toBeInTheDocument();
     expect(container.querySelector("svg")).not.toBeNull();
