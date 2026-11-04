@@ -408,5 +408,154 @@
       "partial": "partial (not all priced)",
       "actual": "actual"
     }
+  },
+  "workspace": {
+    "back": "Back to projects",
+    "branch": "Branch {{name}}",
+    "layout": {
+      "main": "Workspace",
+      "right": "Right panel",
+      "bottom": "Bottom panel",
+      "showBottom": "Show bottom panel",
+      "hideBottom": "Hide bottom panel"
+    },
+    "explorer": {
+      "title": "Explorer",
+      "newFile": "New file",
+      "newFolder": "New folder",
+      "deleteOf": "Delete {{name}}",
+      "expandOf": "Open folder {{name}}",
+      "collapseOf": "Close folder {{name}}",
+      "openOf": "Open file {{name}}",
+      "truncated": "This folder was cut short; not every entry is shown.",
+      "gitUnavailable": "Git status could not be read, so change markers are not shown.",
+      "empty": "This folder is empty.",
+      "loadFailed": "The folder could not be loaded."
+    },
+    "git": {
+      "added": "Added",
+      "modified": "Modified",
+      "deleted": "Deleted",
+      "untracked": "Untracked",
+      "conflicted": "Conflicted"
+    },
+    "editor": {
+      "empty": "Choose a file in the explorer to open it.",
+      "save": "Save",
+      "saveOf": "Save {{name}}",
+      "closeOf": "Close tab {{name}}",
+      "editorOf": "Editor {{name}}",
+      "readOnly": "Read only: you may not change files in this project.",
+      "status": {
+        "saved": "Saved",
+        "dirty": "Unsaved",
+        "saving": "Saving…",
+        "failed": "Save failed",
+        "conflict": "Conflict"
+      },
+      "failed": {
+        "not_found": "The file no longer exists on the server.",
+        "forbidden": "You may not save this file.",
+        "generic": "The save failed. Your changes are still in this tab.",
+        "retry": "Try saving again",
+        "unknown_outcome": "It is not certain whether the file was saved: the server's answer did not arrive. Save again; if the file changed on the server, the conflict dialog shows it.",
+        "rate_limited": "Too many requests. Wait a moment, then save again."
+      },
+      "binary": "Binary files are not shown in the editor.",
+      "tooLarge": "This file is too large to open in the editor.",
+      "size": "Size",
+      "sha": "SHA-256",
+      "openFailed": "{{path}} could not be opened.",
+      "openFiles": "Open files",
+      "mixedEol": "This file mixes line endings (CRLF and LF). The editor makes them uniform, so saving also changes the line endings of other lines.",
+      "unavailable": "The editor could not be loaded (the connection dropped or the app was updated). The file can still be read below.",
+      "reloadPage": "Reload the page"
+    },
+    "conflict": {
+      "title": "Save conflict",
+      "body": "{{path}} changed on the server since you opened it. Choose which version to keep.",
+      "deletedOnServer": "This file was deleted on the server.",
+      "loading": "Loading the server version…",
+      "loadFailed": "The server version could not be read.",
+      "diff": "Show differences",
+      "hideDiff": "Hide differences",
+      "reload": "Load the server version",
+      "overwrite": "Overwrite with my version",
+      "reloadConfirm": "Your changes in this tab will be discarded.",
+      "diffLabel": "Server version (left) and your version (right)",
+      "cancel": "Decide later",
+      "notText": "The server's version is not text (a binary or too large file), so it can neither be shown nor loaded into the editor.",
+      "retry": "Read again"
+    },
+    "unsaved": {
+      "title": "Unsaved changes",
+      "body": "{{path}} has unsaved changes. Discard them?",
+      "leaveBody": "Some files have unsaved changes. Leave the workspace and discard them?",
+      "discard": "Discard changes",
+      "stay": "Go back"
+    },
+    "create": {
+      "titleFile": "New file",
+      "titleFolder": "New folder",
+      "path": "Path from the project root",
+      "submit": "Create",
+      "cancel": "Cancel",
+      "failed": "{{path}} could not be created.",
+      "exists": "That path already exists, or the same request is still being processed.",
+      "unknownOutcome": "It is not certain whether the path was created; the explorer is read again to check."
+    },
+    "remove": {
+      "title": "Delete file",
+      "body": "Delete {{path}} from the workspace? This cannot be undone from this screen.",
+      "submit": "Delete",
+      "cancel": "Cancel",
+      "failed": "{{path}} could not be deleted.",
+      "changed": "The file changed on the server since it was opened; open it again before deleting it.",
+      "unknownOutcome": "It is not certain whether the file was deleted; the explorer is read again to check.",
+      "unsaved": "The unsaved changes in this file's tab are lost too."
+    },
+    "search": {
+      "title": "Search",
+      "q": "Search",
+      "mode": "Mode",
+      "text": "Text",
+      "symbol": "Symbol",
+      "glob": "Path filter (glob)",
+      "regex": "Regex",
+      "ignoreCase": "Ignore case",
+      "kind": "Symbol kind",
+      "submit": "Search",
+      "empty": "No results.",
+      "truncated": "Results were cut: narrow the search to see them all.",
+      "skipped": "{{count}} files with unreadable names were skipped.",
+      "notIndexed": "The project is not indexed yet, so symbol search has no results.",
+      "indexTruncated": "The symbol index is incomplete: the project is past the index limits.",
+      "indexedAt": "Index from {{time}}",
+      "openHit": "Open {{path}} line {{line}}",
+      "error": {
+        "regex_unsupported": "This regex is not supported (backreferences or {m,n}).",
+        "regex": "The regex is not valid.",
+        "timeout": "The search took too long; narrow it with a glob or more specific text."
+      }
+    },
+    "chat": {
+      "title": "Chat",
+      "body": "Chat with agents comes with the task flow. It is not available yet."
+    },
+    "bottom": {
+      "terminal": "Terminal",
+      "tests": "Tests",
+      "body": "Sandbox run output comes with the test runner. It is not available yet."
+    },
+    "repo": {
+      "repository_not_ready": "The project's repository is not ready yet (for example, still importing).",
+      "repository_missing": "The project's repository folder was not found on the server.",
+      "project_archived": "This project is archived; files can only be read.",
+      "project_not_active": "This project is not active; files cannot be changed.",
+      "repository_error": "The project's repository has a problem on the server; files cannot be read or changed."
+    },
+    "projectStale": "The project could not be refreshed; what is shown may be out of date.",
+    "retry": "Try again",
+    "repoChangedWhileOpen": "Open tabs stay; copy any unsaved changes before leaving the page."
   }
 }

@@ -1518,3 +1518,76 @@ Tidak ditutup (alasan):
 - **CI security-scan @ afbcfbc:** gitleaks, pip-audit, npm audit, Semgrep, dan Trivy semuanya lulus.
 
 - **DI1 INFO (syarat masuk, mengikat):** `project_views` (publik, `services/projects.py`) membangun view tanpa menyaring visibilitas. Setiap pemanggil baru wajib membaca barisnya di bawah `visible_projects_filter`. Kedua pemanggil sekarang sudah begitu [Pasti]. Pertahanan berlapis (membuang baris dengan izin kosong) ditunda ke perubahan berikutnya di file itu, karena perubahan apa pun di sana memerlukan delta review lagi.
+
+### WP-2.2a — layar IDE: explorer, editor multi-tab, simpan dengan cek versi, panel cari (FR-026, FR-027, FR-029, FR-030, FR-032, FR-020/021 layar; AC-03)
+
+Spec: `docs/superpowers/specs/2026-11-04-wp-2.2-ide-design.md`. Plan: `docs/superpowers/plans/2026-11-04-wp-2.2a-ide-editor.md`. Konflik #71: chat pindah ke WP-3.2, terminal ke WP-4.1, simpan eksplisit (bukan autosave). WP ini tidak bertanda 🔒 (tidak ada perubahan backend); isi repo diperlakukan sebagai data tidak tepercaya.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Frontend `format:check`, `lint`, `lint:guards`, `typecheck` @ da30a94 | bersih |
+| Frontend `npm test` @ da30a94 | **400 passed** (29 file; +55 test baru: klien workspace 7, reducer tab 12, bahasa Monaco 6, `CodeEditor` dengan Monaco palsu 3, editor gagal dimuat 1, layar workspace 26; route map diperbarui untuk layar workspace yang nyata) |
+| `npx vite build` @ da30a94 | sukses. `WorkspacePage` 38,1 kB (gzip 10,8 kB); Monaco di chunk sendiri (`CodeEditor` 1,25 MB, `editor.api` 2,7 MB); 5 worker sebagai file terpisah (`editor`, `css`, `html`, `json`, `ts`). Chunk `index` 718,7 kB vs 709,1 kB di `main` (0 referensi Monaco) |
+| `npm audit --omit=dev --audit-level=high` | 0 vulnerabilities |
+| Live check @ ff29eca dan diulang @ da30a94 (build produksi lewat `vite preview` + uvicorn + DB uji `kodekantor_test_rev`; CSP Caddyfile disuntikkan ke dokumen) | buat file → ketik di Monaco → Ctrl+S → isi server sama; token sintaks tampil; 0 link aktif (`links: false`). Tab B menyimpan lebih dulu, tab A menyimpan → dialog konflik, server tetap berisi versi B. Diff Monaco tampil di dialog. "Timpa" memakai sha yang baru dibaca → server berisi versi A. Cari teks → hit → editor ke baris 2. Worker `editor.worker` berjalan dari origin sendiri. Console: hanya 409 dari konflik (sengaja); 0 pelanggaran CSP |
+| Lebar 390 px | sebelum perbaikan scroll horizontal 426 px; setelah panel ditumpuk di bawah `lg`: 32 px (46 px dengan editor terbuka). Sisanya dari shell (sidebar `w-60` tetap, konten ±150 px), temuan WP-2.1e yang sama |
+
+Temuan live check yang ditutup di WP ini:
+- **Import worker Monaco tidak ter-resolve** (`monaco-editor/esm/vs/...?worker`; `exports` paket memetakan `./*` ke `./esm/vs/*.js`). `typecheck` tidak menangkapnya karena `vite/client` mendeklarasikan `*?worker`. Sekarang memakai subpath yang diekspor (`monaco-editor/editor/editor.worker`, `monaco-editor/language/<x>/<x>.worker`); `vite build` membuktikannya.
+- **Monaco ada di chunk route**, sehingga navigasi ke workspace menunggu beberapa MB. Editor dan diff sekarang `React.lazy` (`lazyEditor.tsx`): explorer, tab, dan panel cari tampil lebih dulu.
+- **Ctrl+S tepat sesudah ketikan mengirim teks sebelum ketikan itu.** Handler membaca tab dari ref yang baru diperbarui sesudah render. Ref sekarang menjalankan reducer murni yang sama saat dispatch. Test regresi `saves the text on screen when Ctrl+S lands before the last keystroke has rendered` merah sebelum perbaikan (`x = 1\n` terkirim, seharusnya `x = 1\n!`).
+- **Ukuran di explorer basi sesudah simpan** (file baru tetap "0 byte"). Simpan sekarang membaca ulang folder induk; test memeriksa folder dibaca dua kali.
+- **Pelanggaran CSP `script-src eval` di setiap pemuatan halaman**, sudah ada sejak WP-1.4a: Zod v4 mencoba `new Function` saat schema dibuat. `z.config({ jitless: true })` di `src/lib/zodConfig.ts` diimpor pertama oleh `main.tsx`. Parsing tidak berubah karena Zod memang jatuh ke jalur tanpa JIT.
+- **Peringatan React Router `HydrateFallback`** saat halaman dibuka langsung di URL workspace: route lazy diberi `hydrateFallbackElement` (state loading).
+
+Pengecualian dependensi: `monaco-editor` 0.57.0 mem-pin `dompurify` 3.4.15 yang punya advisory critical (GHSA-p98j-92pf-mc4p dan empat lainnya). `overrides` npm mem-pin `dompurify` 3.4.17. Versi ini dirilis 12 Okt 2026: lewat tanggal `exclude-newer` 2026-10-10, tetapi umurnya sudah lebih dari dua minggu. Preseden: pengecualian umur per paket certifi (backend) dan EX-01. Override dicabut saat Monaco versi berikutnya mem-pin `dompurify` ≥ 3.4.17.
+
+#### Review WP-2.2a @ ff29eca
+
+Hasil awal:
+- `kk-frontend-reviewer`: 0 BLOCK, 10 SHOULD, 6 NIT. Verdict: tahan merge sampai S1, S2, S4, S5, dan S7 ditutup.
+- `kk-silent-failure-hunter`: 3 HIGH, 8 MEDIUM, 8 LOW.
+
+Penutupan dibagi dalam dua commit:
+- c74f1bd: simpan, konflik, siklus hidup halaman, Monaco.
+- da30a94: explorer dan pencarian.
+
+Setiap perbaikan yang punya test regresi dibuktikan dengan mutan: perbaikannya dibalik, lalu test itu dipastikan merah. Total 11 mutan, semuanya merah.
+- M1–M5: tulis ganda, error refresh, `key`, folder leluhur, versi server non-teks.
+- S4: model ditimpa `value`.
+- C1–C5: folder kosong vs terpotong, penanda Git basi, "tidak ada hasil", kirim ulang pencarian, sebab error folder.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| frontend S1 + silent M1: "Timpa" bisa dua kali (PUT kedua konflik dengan PUT pertama), "Muat versi server" saat simpan masih berjalan | `write` menolak tab yang sedang `saving`; tombol dialog nonaktif selama simpan | `writes once when Overwrite is pressed twice…` (2 PUT, bukan 3) |
+| frontend S2: gagal timpa tersembunyi di balik modal | dialog menampilkan alasan gagal dan ID permintaan | test yang sama |
+| silent H2: versi server biner/terlalu besar tampil sebagai teks kosong, bisa dimuat ke editor lalu ditimpa | state `notText`: tidak ada diff dan tidak ada muat ulang; "Timpa" tetap tersedia dengan penjelasan | `never offers to load a server version that is not text…` |
+| silent M2: semua gagal simpan menjadi "gagal" generik | `SaveError {code, requestId}`: `unknown_outcome` (jawaban tidak sampai, mungkin tersimpan), alasan repository (`project_archived` …), `forbidden`, `not_found`, `rate_limited` | `says when a save may have been written, and why the server refused one` |
+| frontend S4 + silent M8: efek sinkron menimpa ketikan yang belum dirender | `setValue` hanya untuk versi baru (`openId:revision`, naik saat buka/muat ulang); di antaranya Monaco sumber kebenaran | `CodeEditor.test.tsx` (Monaco palsu): ketikan "abc" tetap saat render membawa "ab" |
+| frontend S5: jawaban simpan yang terlambat menimpa tab yang dibuka ulang | setiap jawaban membawa `openId`; jawaban untuk pembukaan lama diabaikan | `ignores a late answer when the tab was closed and the file opened again` |
+| frontend S7 + silent M7: tab project A terbawa ke project B | `<Workspace key={projectId}>` | `starts empty in another project's workspace…` (project B sudah di cache) |
+| silent H1: refresh project gagal melepas workspace dan teks yang belum disimpan | halaman error hanya bila belum ada data; setelah itu banner + coba lagi. Repository yang berhenti siap saat tab terbuka: banner, dan simpan dinonaktifkan | `keeps the open tabs and their unsaved text when the project cannot be read again` |
+| silent H3: chunk Monaco gagal → halaman error route | loader sendiri + error boundary lokal: alert, isi file tetap terbaca, tombol muat ulang halaman. Bagian "teks hilang" tidak dapat terjadi: edit butuh editor yang sudah dimuat, dan modulnya lalu di-cache untuk semua editor dan diff [Kemungkinan Besar] | `lazyEditor.test.tsx` |
+| frontend S3 + silent L6: `revealLine` ikut pindah tab; hit yang sama tidak bisa diklik ulang | permintaan `{path, line, nonce}`, diterapkan sekali dan hanya di file-nya; buka dari explorer menghapus permintaan lama | `CodeEditor.test.tsx` |
+| frontend S6 + silent M5: folder baru di path bersarang tidak muncul | invalidasi semua folder leluhur | `reads every folder above a new path again…` |
+| frontend S8 + silent M4/M6/L5: error explorer, buka file, dan baca versi server generik tanpa ulang | `workspaceErrorText`: alasan repository atau state layar (izin ditolak, tidak ditemukan …), ID permintaan, tombol coba lagi. Refresh gagal mempertahankan entri yang sudah terbaca. Penanda Git disembunyikan bila status tidak bisa dibaca ulang | `says why the tree could not be read…`, `drops Git markers it can no longer confirm`, `says why a file could not be opened` |
+| silent M3: "kosong"/"tidak ada hasil" untuk jawaban terpotong | hanya untuk jawaban utuh (tidak terpotong, tanpa file dilewati, indeks lengkap, mode simbol dengan indeks) | `never calls a cut-off folder with no entries empty`, `says no results only for a whole answer…` |
+| frontend N3 + silent L6: kirim ulang pencarian sama memakai cache; kueri kosong diam | percobaan masuk kunci query; tombol cari nonaktif tanpa teks | test pencarian yang sama |
+| frontend S9: model bocor saat keluar workspace; akhir baris campuran berubah diam-diam | `disposeProjectModels` saat unmount; tab memberi catatan bila CRLF dan LF bercampur | `CodeEditor.test.tsx`, test reducer `notes a file whose line endings are mixed…` |
+| frontend S10: `role=tab` di dalam `div` bersama tombol tutup | file terbuka menjadi daftar tombol dengan `aria-current`; tab panel kanan memakai `aria-controls`, panel berlabel, dan tombol panah | test layar memakai peran baru |
+| frontend N2 (bagian sha basi) + N5 + silent L1/L2: hapus/buat tanpa sebab yang jelas | hapus: peringatan perubahan yang belum disimpan, `VERSION_CONFLICT` → "file berubah di server". Buat: 409 tanpa alasan → "sudah ada, atau permintaan yang sama masih diproses" (backend `AlreadyExists` tidak punya `reason`). Keduanya menyebut hasil tidak pasti bila tidak ada jawaban, dengan ID permintaan; explorer dibaca ulang juga sesudah gagal | `warns that deleting a file drops its unsaved text…` |
+| frontend N4: tidak ada test untuk edit saat `saving`/`conflict` | test reducer | `keeps the status while saving or in conflict…` |
+| silent L7: sha di jawaban PUT tidak divalidasi seketat GET | satu `Sha256Schema` untuk GET, PUT, dan detail 409 | review kode |
+
+Tidak ditutup (alasan):
+- **frontend N1** (Ctrl+S saat simpan berjalan diabaikan): status tetap jujur. Sesudah jawaban datang, tab menunjukkan "Belum disimpan" bila ada ketikan baru. Antrean simpan menambah state tanpa mencegah klaim palsu.
+- **frontend N2** (hapus file yang tidak dibuka memakai sha yang baru dibaca): pengguna mengonfirmasi lewat nama dan tidak pernah melihat isinya. Sha hanya menjaga jeda antara baca dan hapus. File yang terbuka memakai sha tab.
+- **frontend N3** (kunci hit `path:line` bisa bentrok): tidak terjadi. `git grep -n` memberi satu record per baris (kolom = kecocokan pertama, `adapter.py`); hit simbol membawa nama simbol.
+- **frontend N5** (fallback hanya di muat pertama): pada navigasi di dalam aplikasi React Router menahan layar sebelumnya sampai chunk 38 kB selesai dimuat.
+- **frontend S10** (explorer tanpa `role=tree`): daftar bersarang dengan tombol `aria-expanded` adalah pola disclosure yang valid. `role=tree` mewajibkan model keyboard penuh dan tidak dikerjakan setengah jalan.
+- **silent L3** (`write` diam bila tidak boleh menulis): tombol Simpan dan Ulang tidak tampil tanpa izin. Editor hanya-baca memberi catatan. Status project atau repository yang berubah tampil di banner.
+- **silent L4** (buang perubahan saat simpan berjalan): yang sedang dikirim adalah teks yang diminta disimpan. Yang dibuang hanya ketikan sesudahnya, dan dialog mengatakan begitu.
+- **silent L8** (`disposeModel` no-op sebelum Monaco dimuat): benar menurut invarian. Invarian ditulis di `lazyEditor.tsx`.
+
+Usulan untuk backend (pemilik WP-2.1c, belum dikerjakan): `AlreadyExists` (`POST /files` untuk path yang sudah ada) adalah 409 `CONFLICT` tanpa `details.reason`. Bentuknya sama dengan 409 dari idempotency store ("permintaan dengan key ini masih berjalan"), sehingga UI hanya bisa menyebut keduanya. `details: [{reason: "path_exists"}]` akan membuatnya tegas tanpa mengubah status code.
+

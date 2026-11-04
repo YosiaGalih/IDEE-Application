@@ -393,6 +393,11 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - **Usulan:** API_CONTRACTS §3 dan §11 mencantumkan `failed_queue`, `project_name`, `meta.unavailable`, dan bentuk `period`.
     - **Review WP-2.1e:** layar dan klien mengikuti `meta.unavailable`, dan jawaban yang mencantumkan suatu bagian tetapi tetap mengirim datanya ditolak. `AgentRunSummary` divalidasi menurut §11. Biaya hanya tampil bersama `cost_status`. Usulan: §3 menyatakan bahwa bagian yang tercantum di `meta.unavailable` berisi daftar kosong dan nilai null.
 
+71. **Layar IDE (WP-2.2).** Spec: `docs/superpowers/specs/2026-11-04-wp-2.2-ide-design.md`.
+    - **Chat dan terminal pindah WP:** WBS WP-2.2 memuat chat (FR-033–040) dan terminal read-only (FR-077–083), tetapi backend keduanya belum ada (conversations, task, SSE task: WP-3.1/3.2; API run sandbox: WP-4.1). Keputusan Lead, dengan prinsip #63: chat dibangun bersama WP-3.2, terminal bersama WP-4.1. WP-2.2 menjadi 2.2a (explorer + editor + cari) dan 2.2b (panel git).
+    - **Simpan eksplisit:** tanpa autosave. Konflik `VERSION_CONFLICT` diselesaikan lewat dialog (lihat perbedaan / muat versi server / timpa dengan sha server yang baru dibaca).
+    - **Dependensi WBS di luar mandat:** WP-SEC-01 (prasyarat WP-4.3/G4) bergantung pada WP-INT-03 (ports, handler approval) dan WP-INT-05 (redaksi). Keduanya tidak termasuk mandat "P2, P3, P4". Perlu keputusan PO sebelum P4: masukkan keduanya ke mandat, atau kurangi syarat SEC-01.
+
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
 - Versi Node.js.
