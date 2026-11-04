@@ -31,7 +31,7 @@ from sqlalchemy import case, delete, func, insert, select, update
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.gitops.adapter import GitTarget
-from app.gitops.errors import GitInputError
+from app.gitops.errors import GitError, GitInputError
 from app.models.projects import Project, RepoIndexEntry, Repository
 from app.services import index_lock
 from app.services.job_queue import JobQueue
@@ -53,6 +53,9 @@ PATH_MAX_CHARS = 1000  # repo_index_entries.path varchar(1000)
 SYMBOL_OUTPUT_MAX = 64 * 1024 * 1024
 INDEX_GIT_TIMEOUT_S = 300.0
 INSERT_BATCH = 2_000
+MAX_SYMBOL_MATCHES = 2 * MAX_SYMBOLS  # parsed grep matches, cross-language noise included
+INDEX_DEADLINE_S = 15 * 60.0  # [Menebak] the whole run, inside the worker's 20 min time limit
+MAX_ROUNDS = 3  # one run plus the rounds that requests asked for meanwhile
 SIZE_MAX = 2**31 - 1  # size_bytes is an int column
 INDEX_REQUESTS_PER_HOUR = 10  # [Menebak]
 
@@ -96,11 +99,18 @@ async def request_index(
         for _ in range(2):  # the holder may expire between the two calls
             if await index_lock.acquire(env.redis, project_id, job_id):
                 break
-            if (held := await index_lock.holder(env.redis, project_id)) is not None:
+            # A job holds the lock; it is asked for one more round, since it may have read HEAD already.
+            if (held := await index_lock.reuse(env.redis, project_id)) is not None:
                 return IndexRequest(uuid.UUID(held), reused=True)
         else:
             raise _unavailable()
-    except RedisError as exc:
+    except BaseException as exc:
+        # The SET may have landed although its reply did not (timeout, cancel): free a lock this request may
+        # hold, or later requests reuse a job that never runs until the lock expires (silent-failure M1).
+        with contextlib.suppress(Exception):
+            await index_lock.release(env.redis, project_id, job_id)
+        if not isinstance(exc, Exception) or isinstance(exc, AppError):
+            raise
         logger.error(
             "project_index_lock_unavailable", project_id=str(project_id), error_type=type(exc).__name__
         )
@@ -146,6 +156,7 @@ async def index_soon(env: IndexEnv, project_id: uuid.UUID, user_id: uuid.UUID, *
             project_id=str(project_id),
             trigger=trigger,
             error_type=type(exc).__name__,
+            exc_info=not isinstance(exc, AppError),
         )
 
 
@@ -169,7 +180,7 @@ async def run_index(
     if env.redis is None:
         raise RuntimeError("the index job needs Redis for its lock")
     try:
-        held = await index_lock.refresh(env.redis, project_id, job_id)
+        held = await index_lock.begin_round(env.redis, project_id, job_id)
     except RedisError as exc:
         # Ownership unknown: running could overlap a newer job. Do nothing; the lock expires.
         logger.error(
@@ -179,8 +190,27 @@ async def run_index(
     if not held:
         logger.info("project_index_superseded", project_id=str(project_id), job_id=str(job_id))
         return "skipped"
+    outcome: Outcome = "skipped"
+    rounds = 0
     try:
-        return await _index(env.projects, project_id, user_id, trigger)
+        async with asyncio.timeout(INDEX_DEADLINE_S):
+            while True:
+                rounds += 1
+                outcome = await _index(env.projects, project_id, user_id, trigger)
+                # A request that came in meanwhile asked for one more round (the lock stays ours for it).
+                if rounds >= MAX_ROUNDS or not await index_lock.finish(env.redis, project_id, job_id):
+                    break
+                if not await index_lock.begin_round(env.redis, project_id, job_id):
+                    break
+    except TimeoutError:
+        # Inside a git command or a DB write: both stop (git killed, transaction rolled back).
+        logger.error("project_index_deadline", project_id=str(project_id), job_id=str(job_id))
+        await _audit_error(env.projects, project_id, user_id, trigger, "time_limit")
+        outcome = "error"
+    except RedisError as exc:
+        logger.error(
+            "project_index_lock_unavailable", project_id=str(project_id), error_type=type(exc).__name__
+        )
     finally:
         try:
             await index_lock.release(env.redis, project_id, job_id)
@@ -188,6 +218,7 @@ async def run_index(
             logger.error(
                 "project_index_lock_not_released", project_id=str(project_id), error_type=type(exc).__name__
             )
+    return outcome
 
 
 async def _index(env: ProjectEnv, project_id: uuid.UUID, user_id: uuid.UUID, trigger: Trigger) -> Outcome:
@@ -207,15 +238,21 @@ async def _index(env: ProjectEnv, project_id: uuid.UUID, user_id: uuid.UUID, tri
         return "error"
     target = GitTarget(root)
     try:
-        head = await env.git.current_commit(target)
-        if head is not None and head == repository.index_commit:
+        # Strict: None only for a branch with no commit yet. A HEAD git cannot read is an error, never an
+        # empty index (silent-failure H1).
+        head = await env.git.head_commit(target)
+        if head is None and repository.index_commit is not None:
+            raise GitError("head_unreadable")  # the indexed branch lost its commits: not a state to index
+        if head is not None and head == repository.index_commit and not repository.index_truncated:
             return (
                 "unchanged" if await _mark_unchanged(env, project_id, user_id, trigger, head) else "skipped"
             )
         collected = await _collect(env, target, head)
     except Exception as exc:
         reason = _reason(exc)
-        if not isinstance(exc, AppError):
+        if isinstance(exc, AppError):
+            logger.error("project_index_git_failed", project_id=str(project_id), reason=reason)
+        else:
             logger.exception("project_index_git_failed", project_id=str(project_id))
         await _audit_error(env, project_id, user_id, trigger, reason)
         return "error"
@@ -241,6 +278,7 @@ async def _collect(env: ProjectEnv, target: GitTarget, head: str | None) -> _Col
         only_matching=True,
         timeout_s=INDEX_GIT_TIMEOUT_S,
         max_output=SYMBOL_OUTPUT_MAX,
+        max_matches=MAX_SYMBOL_MATCHES,
     )
     truncated = listing.truncated or found.truncated
     skipped = listing.skipped_paths  # paths left out; grep's count is of matches in those same files
@@ -339,7 +377,7 @@ async def _replace(
         await session.execute(
             update(Repository)
             .where(Repository.project_id == project_id)
-            .values(index_commit=head, last_indexed_at=func.now())
+            .values(index_commit=head, last_indexed_at=func.now(), index_truncated=collected.truncated)
         )
         await _audit(
             env,

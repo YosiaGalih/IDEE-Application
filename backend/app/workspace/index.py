@@ -142,7 +142,8 @@ _RULES = (
         rf"func\s+(?:\([^)]*\)\s*)?(?P<name>{_ID})",
         "function",
     ),
-    _rule("go", f"type{_S}+{_ID}", rf"type\s+(?P<name>{_ID})", "type"),
+    # "type X = Y" (alias): git prints the longest match, the TypeScript "type X =" pattern; accept the "=".
+    _rule("go", f"type{_S}+{_ID}", rf"type\s+(?P<name>{_ID})(?:\s*=)?", "type"),
     _rule(
         "rust",
         f"{_S}*(pub([(][^)]*[)])?{_S}+)?((async|const|unsafe){_S}+)*fn{_S}+{_ID}",

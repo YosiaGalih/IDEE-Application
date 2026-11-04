@@ -1,4 +1,5 @@
-"""repo_index_entries: the files and symbols of a project's indexed commit (DATA_MODEL M04/M16, WP-2.1d)
+"""repo_index_entries: the files and symbols of a project's indexed commit (DATA_MODEL M04/M16, WP-2.1d);
+repositories.index_truncated: whether that index stopped at a limit (conflict #69)
 
 Revision ID: 0005_repo_index_entries
 Revises: 0004_repositories
@@ -30,7 +31,7 @@ def upgrade() -> None:
         sa.Column("line", sa.Integer(), nullable=True),
         sa.Column("language", sa.String(length=40), nullable=True),
         sa.Column("size_bytes", sa.Integer(), nullable=True),
-        sa.Column("sha256", sa.String(length=64), nullable=True),
+        sa.Column("sha256", sa.CHAR(length=64), nullable=True),
         sa.Column("commit", sa.String(length=64), nullable=False),
         sa.CheckConstraint("kind IN ('file', 'symbol')", name=op.f("ck_repo_index_entries_kind")),
         sa.ForeignKeyConstraint(
@@ -43,9 +44,14 @@ def upgrade() -> None:
     )
     op.create_index("ix_repo_index_entries_project_id_kind", "repo_index_entries", ["project_id", "kind"])
     op.create_index("ix_repo_index_entries_project_id_symbol", "repo_index_entries", ["project_id", "symbol"])
+    op.add_column(
+        "repositories",
+        sa.Column("index_truncated", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+    )
 
 
 def downgrade() -> None:
+    op.drop_column("repositories", "index_truncated")
     op.drop_index("ix_repo_index_entries_project_id_symbol", table_name="repo_index_entries")
     op.drop_index("ix_repo_index_entries_project_id_kind", table_name="repo_index_entries")
     op.drop_table("repo_index_entries")

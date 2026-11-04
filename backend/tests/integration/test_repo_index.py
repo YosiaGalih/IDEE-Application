@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from pathlib import Path
@@ -455,3 +456,163 @@ async def audit_rows(engine: AsyncEngine, project_id: uuid.UUID) -> list[tuple[s
             .order_by(AuditEvent.id)
         )
         return [(result, metadata) for result, metadata in rows]
+
+
+# --- review round (silent-failure H1/H2/M1/M2, backend S3/S4/N6) --------------------------------------------
+
+
+async def test_an_unreadable_head_keeps_the_index_and_is_an_error(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    project_id, repo = await project_with_code(owner, workspace_root)
+    env = index_env(app, workspace_root)
+    await run_job(env, project_id, owner_id)
+    before = await entries(engine, project_id)
+    indexed = (await repository_row(engine, project_id)).last_indexed_at
+    branch = git(repo, "symbolic-ref", "HEAD")
+    (repo / ".git" / branch).write_text("1" * 40 + "\n")  # the branch names a commit that is not there
+    assert await run_job(env, project_id, owner_id) == "error"
+    assert await entries(engine, project_id) == before
+    assert (await repository_row(engine, project_id)).last_indexed_at == indexed
+    assert (await audit_rows(engine, project_id))[-1] == (
+        "error",
+        {"reason": "head_unreadable", "trigger": "user"},
+    )
+
+
+async def test_a_truncated_index_is_flagged_and_rebuilt(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, _ = await project_with_code(owner, workspace_root)
+    env = index_env(app, workspace_root)
+    monkeypatch.setattr(repo_index, "MAX_FILES", 1)
+    assert await run_job(env, project_id, owner_id) == "indexed"
+    assert (await repository_row(engine, project_id)).index_truncated is True
+    assert await run_job(env, project_id, owner_id) == "indexed"  # never "unchanged" over a partial index
+    monkeypatch.setattr(repo_index, "MAX_FILES", 50_000)
+    assert await run_job(env, project_id, owner_id) == "indexed"
+    assert (await repository_row(engine, project_id)).index_truncated is False
+    assert await run_job(env, project_id, owner_id) == "unchanged"
+
+
+async def test_a_request_while_the_job_runs_gets_another_round(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backend S4: a job that already read HEAD must not answer for a commit made after it read."""
+    project_id, repo = await project_with_code(owner, workspace_root)
+    env = index_env(app, workspace_root)
+    request = await repo_index.request_index(env, project_id, owner_id, trigger="user")
+    list_files = GitAdapter.list_files
+    rounds: list[int] = []
+
+    async def commit_meanwhile(self: GitAdapter, *args: Any, **kwargs: Any) -> Any:
+        listing = await list_files(self, *args, **kwargs)
+        if not rounds:  # the user commits and asks again while the first round runs
+            (repo / "later.py").write_text("def later():\n    pass\n")
+            git(repo, "add", "later.py")
+            git(repo, "-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "-q", "-m", "later")
+            again = await repo_index.request_index(env, project_id, owner_id, trigger="user")
+            assert (again.job_id, again.reused) == (request.job_id, True)
+        rounds.append(1)
+        return listing
+
+    monkeypatch.setattr(GitAdapter, "list_files", commit_meanwhile)
+    outcome = await repo_index.run_index(
+        env, project_id=project_id, job_id=request.job_id, user_id=owner_id, trigger="user"
+    )
+    assert (outcome, len(rounds)) == ("indexed", 2)
+    assert (await repository_row(engine, project_id)).index_commit == git(repo, "rev-parse", "HEAD")
+    assert "later" in {symbol for _, _, symbol, _ in await entries(engine, project_id)}
+    assert await index_lock.holder(app.state.dependencies.redis, project_id) is None
+
+
+async def test_a_job_past_its_deadline_is_audited_and_frees_the_lock(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, _ = await project_with_code(owner, workspace_root)
+    monkeypatch.setattr(repo_index, "INDEX_DEADLINE_S", 0.2)
+
+    async def stuck(*_: object, **__: object) -> object:
+        await asyncio.sleep(30)
+        raise AssertionError("not reached")
+
+    monkeypatch.setattr(GitAdapter, "grep", stuck)
+    assert await run_job(index_env(app, workspace_root), project_id, owner_id) == "error"
+    assert (await audit_rows(engine, project_id))[-1] == (
+        "error",
+        {"reason": "time_limit", "trigger": "user"},
+    )
+    assert await index_lock.holder(app.state.dependencies.redis, project_id) is None
+
+
+async def test_a_lock_set_whose_answer_was_lost_is_freed(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silent-failure M1: the SET reached Redis, its reply did not; no ghost job may hold the lock."""
+    from redis.exceptions import TimeoutError as RedisTimeout
+
+    project_id, _ = await project_with_code(owner, workspace_root)
+    redis = app.state.dependencies.redis
+    await redis.delete(index_lock.lock_key(project_id))
+    acquire = index_lock.acquire
+
+    async def lost_reply(*args: Any) -> bool:
+        await acquire(*args)
+        raise RedisTimeout("reply lost")
+
+    monkeypatch.setattr(index_lock, "acquire", lost_reply)
+    with pytest.raises(AppError) as raised:
+        await repo_index.request_index(index_env(app, workspace_root), project_id, owner_id, trigger="user")
+    assert raised.value.http_status == 503
+    assert await index_lock.holder(redis, project_id) is None
+
+
+async def test_a_failure_inside_the_swap_keeps_the_old_index(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backend N6: the DELETE and INSERTs roll back with the audit write that failed after them."""
+    project_id, repo = await project_with_code(owner, workspace_root)
+    env = index_env(app, workspace_root)
+    await run_job(env, project_id, owner_id)
+    before = await entries(engine, project_id)
+    (repo / "b.py").write_text("def b():\n    pass\n")
+    git(repo, "add", "b.py")
+    git(repo, "-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "-q", "-m", "b")
+    write = AuditWriter.write
+
+    async def failing(self: AuditWriter, session: Any, **fields: Any) -> int:
+        if fields.get("result") == "success":
+            raise RuntimeError("audit store down")
+        return await write(self, session, **fields)
+
+    monkeypatch.setattr(AuditWriter, "write", failing)
+    assert await run_job(env, project_id, owner_id) == "error"
+    assert await entries(engine, project_id) == before

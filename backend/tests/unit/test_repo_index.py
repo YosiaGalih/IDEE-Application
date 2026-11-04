@@ -26,6 +26,7 @@ DEFINITIONS = [
     ("a.go", "func main", Symbol("main", "function")),
     ("a.go", "func (s *Srv) Serve", Symbol("Serve", "function")),
     ("a.go", "type Config", Symbol("Config", "type")),
+    ("a.go", "type Alias =", Symbol("Alias", "type")),  # git prints the longest match: the TS "type X =" one
     ("a.rs", "pub(crate) struct Cfg", Symbol("Cfg", "struct")),
     ("a.rs", "pub async fn serve", Symbol("serve", "function")),
     ("a.rs", "fn main", Symbol("main", "function")),

@@ -7,7 +7,9 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -72,6 +74,8 @@ class Repository(UUIDPrimaryKey, Timestamps, Base):
     sync_state: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'ready'"))
     index_commit: Mapped[str | None] = mapped_column(String(64))
     last_indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The index of index_commit stopped at a limit (WP-2.1d): partial, rebuilt on the next request.
+    index_truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     error: Mapped[str | None] = mapped_column(Text)
 
 
@@ -97,7 +101,7 @@ class RepoIndexEntry(Base):
     line: Mapped[int | None] = mapped_column(Integer)
     language: Mapped[str | None] = mapped_column(String(40))
     size_bytes: Mapped[int | None] = mapped_column(Integer)
-    sha256: Mapped[str | None] = mapped_column(String(64))
+    sha256: Mapped[str | None] = mapped_column(CHAR(64))
     commit: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
