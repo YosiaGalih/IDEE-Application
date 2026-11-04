@@ -40,7 +40,13 @@ export const routes: RouteObject[] = [
           { path: "projects", element: <ProjectsPage /> },
           { path: "projects/new", element: <NewProjectPage /> },
           { path: "projects/:projectId/import", element: <ImportArchivePage /> },
-          { path: "projects/:projectId/workspace", element: page("workspace") },
+          {
+            path: "projects/:projectId/workspace",
+            // Monaco is large: it loads with this screen only.
+            lazy: async () => ({
+              Component: (await import("@/features/workspace/WorkspacePage")).WorkspacePage,
+            }),
+          },
           { path: "projects/:projectId/tasks", element: page("tasks") },
           { path: "projects/:projectId/preview", element: page("preview") },
           { path: "projects/:projectId/testing", element: page("testing") },

@@ -408,5 +408,137 @@
       "partial": "sebagian (belum semua dihargai)",
       "actual": "aktual"
     }
+  },
+  "workspace": {
+    "back": "Kembali ke project",
+    "branch": "Branch {{name}}",
+    "layout": {
+      "main": "Workspace",
+      "right": "Panel kanan",
+      "bottom": "Panel bawah",
+      "showBottom": "Tampilkan panel bawah",
+      "hideBottom": "Sembunyikan panel bawah"
+    },
+    "explorer": {
+      "title": "Explorer",
+      "newFile": "File baru",
+      "newFolder": "Folder baru",
+      "deleteOf": "Hapus {{name}}",
+      "expandOf": "Buka folder {{name}}",
+      "collapseOf": "Tutup folder {{name}}",
+      "openOf": "Buka file {{name}}",
+      "truncated": "Isi folder ini terpotong; tidak semua entri ditampilkan.",
+      "gitUnavailable": "Status git tidak dapat dibaca, jadi penanda perubahan tidak ditampilkan.",
+      "empty": "Folder ini kosong.",
+      "loadFailed": "Folder tidak dapat dimuat."
+    },
+    "git": {
+      "added": "Ditambah",
+      "modified": "Diubah",
+      "deleted": "Dihapus",
+      "untracked": "Belum dilacak",
+      "conflicted": "Konflik"
+    },
+    "editor": {
+      "empty": "Pilih file di explorer untuk membukanya.",
+      "save": "Simpan",
+      "saveOf": "Simpan {{name}}",
+      "closeOf": "Tutup tab {{name}}",
+      "editorOf": "Editor {{name}}",
+      "readOnly": "Hanya baca: kamu tidak punya izin mengubah file di project ini.",
+      "status": {
+        "saved": "Tersimpan",
+        "dirty": "Belum disimpan",
+        "saving": "Menyimpan…",
+        "failed": "Gagal disimpan",
+        "conflict": "Konflik"
+      },
+      "failed": {
+        "not_found": "File tidak ada lagi di server.",
+        "forbidden": "Kamu tidak punya izin menyimpan file ini.",
+        "generic": "Penyimpanan gagal. Perubahanmu masih ada di tab ini.",
+        "retry": "Coba simpan lagi"
+      },
+      "binary": "File biner tidak ditampilkan di editor.",
+      "tooLarge": "File terlalu besar untuk dibuka di editor.",
+      "size": "Ukuran",
+      "sha": "SHA-256",
+      "openFailed": "File {{path}} tidak dapat dibuka."
+    },
+    "conflict": {
+      "title": "Konflik penyimpanan",
+      "body": "File {{path}} berubah di server sejak kamu membukanya. Pilih versi yang dipakai.",
+      "deletedOnServer": "File ini sudah dihapus di server.",
+      "loading": "Memuat versi server…",
+      "loadFailed": "Versi server tidak dapat dibaca.",
+      "diff": "Lihat perbedaan",
+      "hideDiff": "Sembunyikan perbedaan",
+      "reload": "Muat versi server",
+      "overwrite": "Timpa dengan versi saya",
+      "reloadConfirm": "Perubahanmu di tab ini akan dibuang.",
+      "diffLabel": "Versi server (kiri) dan versi kamu (kanan)",
+      "cancel": "Putuskan nanti"
+    },
+    "unsaved": {
+      "title": "Perubahan belum disimpan",
+      "body": "{{path}} punya perubahan yang belum disimpan. Buang perubahan itu?",
+      "leaveBody": "Ada file dengan perubahan yang belum disimpan. Tinggalkan workspace dan buang perubahan itu?",
+      "discard": "Buang perubahan",
+      "stay": "Kembali"
+    },
+    "create": {
+      "titleFile": "File baru",
+      "titleFolder": "Folder baru",
+      "path": "Path dari root project",
+      "submit": "Buat",
+      "cancel": "Batal",
+      "failed": "Tidak dapat membuat {{path}}."
+    },
+    "remove": {
+      "title": "Hapus file",
+      "body": "Hapus {{path}} dari workspace? Tindakan ini tidak bisa dibatalkan dari layar ini.",
+      "submit": "Hapus",
+      "cancel": "Batal",
+      "failed": "Tidak dapat menghapus {{path}}."
+    },
+    "search": {
+      "title": "Cari",
+      "q": "Cari",
+      "mode": "Mode",
+      "text": "Teks",
+      "symbol": "Simbol",
+      "glob": "Filter path (glob)",
+      "regex": "Regex",
+      "ignoreCase": "Abaikan huruf besar/kecil",
+      "kind": "Jenis simbol",
+      "submit": "Cari",
+      "empty": "Tidak ada hasil.",
+      "truncated": "Hasil dipotong: persempit pencarian untuk melihat semuanya.",
+      "skipped": "{{count}} file dengan nama yang tidak dapat dibaca dilewati.",
+      "notIndexed": "Project belum diindeks, jadi pencarian simbol belum bisa memberi hasil.",
+      "indexTruncated": "Indeks simbol tidak lengkap: project melewati batas indeks.",
+      "indexedAt": "Indeks dari {{time}}",
+      "openHit": "Buka {{path}} baris {{line}}",
+      "error": {
+        "regex_unsupported": "Regex ini tidak didukung (backreference atau {m,n}).",
+        "regex": "Regex tidak valid.",
+        "timeout": "Pencarian terlalu lama; persempit dengan glob atau teks yang lebih spesifik."
+      }
+    },
+    "chat": {
+      "title": "Chat",
+      "body": "Chat dengan agent tersedia bersama alur task. Saat ini belum dapat dipakai."
+    },
+    "bottom": {
+      "terminal": "Terminal",
+      "tests": "Tests",
+      "body": "Output run sandbox tersedia bersama test runner. Saat ini belum dapat dipakai."
+    },
+    "repo": {
+      "repository_not_ready": "Repository project belum siap (misalnya masih diimpor).",
+      "repository_missing": "Folder repository project tidak ditemukan di server.",
+      "project_archived": "Project ini diarsipkan; file hanya bisa dibaca.",
+      "project_not_active": "Project ini tidak aktif; file tidak bisa diubah."
+    }
   }
 }

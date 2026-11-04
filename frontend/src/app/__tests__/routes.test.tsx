@@ -4,8 +4,8 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { createMemoryRouter, RouterProvider, type RouteObject } from "react-router";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { dashboardData, dashboardMeta } from "@/__tests__/dashboardFixtures";
-import { API, renderApp, signedIn, signedOut, user } from "@/__tests__/harness";
+import { dashboardData, dashboardMeta, project } from "@/__tests__/dashboardFixtures";
+import { API, ok, renderApp, signedIn, signedOut, user } from "@/__tests__/harness";
 import { ApiError } from "@/api/errors";
 import { routes } from "@/app/routes";
 import en from "@/i18n/locales/en.json";
@@ -16,10 +16,23 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
+const WORKSPACE = `${API}/projects/p1`;
+/** The workspace screen asks for its project, the top of its tree and the Git status. */
+const workspaceAnswers = [
+  http.get(WORKSPACE, () => ok(project())),
+  http.get(`${WORKSPACE}/tree`, () =>
+    HttpResponse.json({ request_id: "r-1", status: "completed", data: [], meta: { truncated: false } }),
+  ),
+  http.get(`${WORKSPACE}/git/status`, () =>
+    ok({ branch: "main", head: "c".repeat(40), clean: true, changes: [] }),
+  ),
+];
+
 /** Signed in: the session guard lets the app shell through. `/` is the dashboard, which asks for its data. */
 function renderAt(path: string) {
   server.use(
     signedIn(),
+    ...workspaceAnswers,
     http.get(`${API}/dashboard`, () =>
       HttpResponse.json({
         request_id: "r-1",
@@ -86,7 +99,7 @@ describe("route map (ARCHITECTURE §3.1b)", () => {
   it.each([
     ["/", id.dashboard.greeting.replace("{{name}}", user.display_name)],
     ["/projects/p1/tasks", id.screens.tasks],
-    ["/projects/p1/workspace", id.screens.workspace],
+    ["/projects/p1/workspace", project().name],
     ["/tasks/t1/acceptance", id.screens.acceptance],
     ["/settings/audit", id.screens.audit],
   ])("%s renders its screen inside the app shell", async (path, title) => {

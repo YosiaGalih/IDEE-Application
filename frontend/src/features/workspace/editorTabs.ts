@@ -15,6 +15,8 @@ export type Tab = {
   savedContent: string;
   sha: string;
   language: string | null;
+  /** Bytes on the server, for a binary or too large file shown as metadata. */
+  size?: number | undefined;
   status: TabStatus;
   /** The text a save in flight is writing. */
   saving?: string | undefined;
@@ -28,7 +30,15 @@ export type TabsState = { tabs: Tab[]; active: string | null };
 export const initialTabs: TabsState = { tabs: [], active: null };
 
 export type TabsAction =
-  | { type: "opened"; path: string; kind: TabKind; content: string; sha: string; language: string | null }
+  | {
+      type: "opened";
+      path: string;
+      kind: TabKind;
+      content: string;
+      sha: string;
+      language: string | null;
+      size?: number | undefined;
+    }
   | { type: "activated"; path: string }
   | { type: "edited"; path: string; content: string }
   | { type: "saveStarted"; path: string; content: string }
@@ -59,6 +69,7 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
         savedContent: action.content,
         sha: action.sha,
         language: action.language,
+        size: action.size,
         status: "saved",
       };
       return { tabs: [...state.tabs, tab], active: action.path };
