@@ -42,6 +42,8 @@ from app.gitops.errors import GitError, GitInputError
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 TASK_BRANCH_PREFIX = "kk/task-"
 WORKSPACE_TEMP_PATTERN = ".kk-tmp-*"  # app.workspace.fs.TEMP_PREFIX; gitops must not import workspace
+SANDBOX_ARTIFACTS_PATTERN = "/.kk/"  # sandbox artefacts never enter git (SECURITY_MODEL §4)
+_EXCLUDE_PATTERNS = (WORKSPACE_TEMP_PATTERN, SANDBOX_ARTIFACTS_PATTERN)
 STDERR_KEEP = 2048
 _CHUNK = 64 * 1024
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
@@ -174,7 +176,7 @@ _MESSAGE_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # log() se
 
 
 def _message(message: str) -> str:
-    if not 1 <= len(message) <= 5000 or _MESSAGE_FORBIDDEN.search(message):
+    if not 1 <= len(message) <= 5000 or not message.strip() or _MESSAGE_FORBIDDEN.search(message):
         raise GitInputError("message")
     return message
 
@@ -539,11 +541,126 @@ class GitAdapter:
         return sha
 
     async def commit_all(self, target: GitTarget, message: str, author: Author) -> str | None:
-        """Stage everything and commit; ``None`` when there is nothing to commit."""
+        """Stage everything (but ``.kk``) and commit; ``None`` when there is nothing to commit."""
+        return await self.commit(target, message, author)
+
+    async def commit(
+        self,
+        target: GitTarget,
+        message: str,
+        author: Author,
+        *,
+        paths: list[str] | None = None,
+        exclude: tuple[str, ...] = (".kk",),
+    ) -> str | None:
+        """Stage ``paths`` (everything when ``None``), unstage ``exclude``, and commit; ``None`` when nothing
+        is staged. Paths are literal pathspecs (``GIT_LITERAL_PATHSPECS``), never options or magic.
+
+        ``exclude`` defaults to ``.kk``: sandbox artefacts never enter git (SECURITY_MODEL §4), not even
+        when an imported archive already tracked them (their index entries go back to HEAD's).
+        """
         _message(message)
         _author(author)
+        if paths is not None and not paths:
+            raise GitInputError("path")
+        selected = [_pathspec(path) for path in paths] if paths is not None else []
+        excluded = [_pathspec(path) for path in exclude]
         git_dir, tree = await self._adirs(target)
-        await self._run(["add", "-A"], git_dir=git_dir, work_tree=tree, cwd=tree)
+        if target.worktree is None:
+            await asyncio.to_thread(_ensure_excludes, git_dir)
+        before = await self.current_commit(target)
+        born = before is not None
+        try:
+            # The commit holds exactly what this call stages: whatever an earlier, failed run left in the
+            # index is put back to HEAD first.
+            await self._reset_index(git_dir, tree, born=born)
+            await self._run(["add", "-A", "--", *selected], git_dir=git_dir, work_tree=tree, cwd=tree)
+            for path in excluded:
+                await self._unstage(git_dir, tree, path, born=born)
+            staged = await self._run(
+                ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                check=False,
+            )
+            if staged.returncode == 0:
+                return None
+            await self._run(
+                ["commit", "-q", "--no-verify", "-m", message],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                env=_identity_env(author, self.committer),
+            )
+        except BaseException as exc:
+            if _killed_git(exc):
+                await asyncio.to_thread(_remove_index_lock, git_dir)
+            if not isinstance(exc, Exception):
+                raise  # a cancel goes up at once; the next commit puts the index back first
+            landed = await self._landed(target, git_dir, tree, before, exc, message=message, author=author)
+            if landed is not None:
+                return landed
+            await self._reset_after_failure(git_dir, tree, born=born)
+            raise
+        return await self.current_commit(target)
+
+    async def commit_files(self, target: GitTarget, commit: str) -> list[str]:
+        """The paths a commit changed (evidence for the audit trail)."""
+        if not _SHA.fullmatch(commit):
+            raise GitInputError("ref")
+        git_dir, tree = await self._adirs(target)
+        result = await self._run(
+            ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", commit],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+        )
+        return [name for name in result.stdout.decode("utf-8", "replace").split("\0") if name]
+
+    async def _landed(
+        self,
+        target: GitTarget,
+        git_dir: Path,
+        tree: Path,
+        before: str | None,
+        error: Exception,
+        *,
+        message: str,
+        author: Author,
+    ) -> str | None:
+        """The new HEAD when a failed commit step still wrote this commit (git stopped after the ref), else
+        ``None`` and the original error stands. Evidence over claims: a moved HEAD answers only when it is
+        provably this commit (parent ``before``, this author, this message), never another writer's."""
+        reason = getattr(error, "reason", None)
+        try:
+            after = await self.current_commit(target)
+            if after is None or after == before:
+                return None
+            shown = await self._run(
+                ["log", "-1", "--format=%P%x00%ae%x00%B", after, "--"],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+            )
+        except Exception:
+            logger.exception("git_head_unknown_after_failure", reason=reason)
+            return None
+        parents, email, body = [*shown.stdout.decode("utf-8", "replace").split("\0", 2), "", ""][:3]
+        mine = (
+            parents.split() == ([before] if before is not None else [])
+            and email == author.email
+            and body.split() == message.split()  # git trims and collapses the message's whitespace
+        )
+        if not mine:
+            # Another writer moved HEAD: callers must serialise writers of one index (the workspace lock).
+            logger.error("git_head_moved_by_another_writer", reason=reason)
+            return None
+        logger.warning("git_commit_landed_despite_error", reason=reason)
+        return after
+
+    async def _reset_index(self, git_dir: Path, tree: Path, *, born: bool) -> None:
+        """Put the whole index back to HEAD (empty before the first commit); no-op when nothing is staged."""
         staged = await self._run(
             ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
             git_dir=git_dir,
@@ -552,15 +669,34 @@ class GitAdapter:
             check=False,
         )
         if staged.returncode == 0:
-            return None
-        await self._run(
-            ["commit", "-q", "--no-verify", "-m", message],
-            git_dir=git_dir,
-            work_tree=tree,
-            cwd=tree,
-            env=_identity_env(author, self.committer),
-        )
-        return await self.current_commit(target)
+            return
+        # ``rm --cached`` refuses an entry that differs from both the file and HEAD; ``read-tree`` does not.
+        command = ["restore", "--staged", "--", "."] if born else ["read-tree", "--empty"]
+        await self._run(command, git_dir=git_dir, work_tree=tree, cwd=tree)
+
+    async def _reset_after_failure(self, git_dir: Path, tree: Path, *, born: bool) -> None:
+        """Leave nothing staged by a failed commit. A failure here is logged, not raised over the commit's own
+        error: the next commit resets the index before it stages anything."""
+        try:
+            await self._reset_index(git_dir, tree, born=born)
+        except BaseException as exc:
+            if _killed_git(exc):
+                await asyncio.to_thread(_remove_index_lock, git_dir)
+            if not isinstance(exc, Exception):
+                raise
+            logger.warning("git_index_reset_failed", reason=getattr(exc, "reason", type(exc).__name__))
+
+    async def _unstage(self, git_dir: Path, tree: Path, path: str, *, born: bool) -> None:
+        """Put ``path``'s index entries back to HEAD (none at all before the first commit). Nothing to do
+        when the index has none: ``restore`` would fail on a pathspec that matches nothing."""
+        listed = await self._run(["ls-files", "-z", "--", path], git_dir=git_dir, work_tree=tree, cwd=tree)
+        if not listed.stdout:
+            return
+        if born:
+            command = ["restore", "--staged", "--", path]
+        else:
+            command = ["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", path]
+        await self._run(command, git_dir=git_dir, work_tree=tree, cwd=tree)
 
     async def create_worktree(self, repo: Path, path: Path, branch: str, base: str) -> GitTarget:
         """A worktree on a new ``branch`` from ``base`` (ADR-016: ``kk/task-<8hex>``)."""
@@ -668,14 +804,31 @@ def _gitfile_points_at(gitfile: str, registered: Path) -> bool:
 
 
 def _ensure_excludes(git_dir: Path) -> None:
-    """Keep the workspace's own temp files out of every commit (``info/exclude`` covers all worktrees)."""
+    """Keep the workspace's temp files and the sandbox's ``.kk/`` out of every commit, and out of status
+    (``info/exclude`` covers all worktrees)."""
     exclude = git_dir / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     current = exclude.read_text() if exclude.exists() else ""
-    if WORKSPACE_TEMP_PATTERN not in current.splitlines():
+    missing = [pattern for pattern in _EXCLUDE_PATTERNS if pattern not in current.splitlines()]
+    if missing:
         separator = "" if current.endswith("\n") or not current else "\n"
         with exclude.open("a") as handle:
-            handle.write(f"{separator}{WORKSPACE_TEMP_PATTERN}\n")
+            handle.write(separator + "".join(f"{pattern}\n" for pattern in missing))
+
+
+def _killed_git(exc: BaseException) -> bool:
+    """``_run`` kills git (SIGKILL) on a timeout, past the output cap, and on a cancel: an ``index.lock`` git
+    held is left behind, and every later commit fails until it is gone. Callers serialise writers of one index
+    (the workspace lock), so that lock is ours to remove."""
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    return isinstance(exc, GitError) and exc.reason in ("timeout", "output_too_large")
+
+
+def _remove_index_lock(git_dir: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        (git_dir / "index.lock").unlink()
+        logger.error("git_index_lock_removed", git_dir=git_dir.name)
 
 
 async def _kill(proc: asyncio.subprocess.Process) -> None:

@@ -1275,3 +1275,91 @@ Tidak ditutup:
   - INFO-1: mutan `_has_outcome` fail-closed tidak terdeteksi test. Kebijakannya "duplikat lebih baik daripada hasil hilang".
   - INFO-2: job yang disalip dan sapu unggahan baru yang membaca bersamaan masih bisa menghasilkan dua hasil (duplikat, bukan hilang).
 
+
+### WP-2.1c (🔒 path/git) — API workspace dan git (FR-019, FR-028, FR-029, FR-031, FR-032, FR-113, FR-115, FR-117, FR-118; AC-03/AC-09 bagian API)
+
+Spec: `docs/superpowers/specs/2026-11-02-wp-2.1c-workspace-git-api-design.md`. Plan: `docs/superpowers/plans/2026-11-02-wp-2.1c-workspace-git-api.md`. Hanya backend; layar IDE tetap WP-2.2.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Backend `ruff check .`, `ruff format --check .`, `pyright`, `lint-imports` | bersih; 0 error; 3 kontrak dipertahankan |
+| Backend `pytest -q` (PostgreSQL 16 + Redis 7 lokal) | implementasi: **1540 passed, 1 skipped**; setelah putaran review: **1568 passed, 1 skipped**; setelah delta AG-13: **1580 passed, 1 skipped**; setelah delta AG-13 kedua: **1585 passed, 1 skipped** |
+| Mutan | implementasi: 6 (Task 3) + 3 (Task 5; mutan "tanpa kunci" selamat dari test balapan, lalu dibunuh test baru `test_a_commit_waits_for_a_write_in_progress`). Putaran review: 13 mutan, semuanya merah. Delta AG-13: 13 mutan, semuanya merah. Delta AG-13 kedua: 6 mutan, semuanya merah |
+| Syarat masuk AG-13 dari WP-2.1b | dipenuhi (konfirmasi AG-13 @ 6cabb4f): tidak ada penulis `sync_state` baru, tidak ada yang menghapus `repo/` |
+| CI @ 6cabb4f (implementasi) | 9/9 hijau |
+| CI @ 2bab00c (putaran review) | 9/9 hijau |
+| CI @ 3e5f1c7 (delta AG-13 kedua, head kode) | 9/9 hijau |
+| CI @ b733ecc (delta AG-13) | 9/9 hijau (`backend-lint`, `backend-types`, `backend-test`, `frontend`, `sandbox-test`, `sandbox-isolation`, `infra-config`, `security-scan`, `clean-install`) |
+
+#### Review WP-2.1c @ 6cabb4f: `kk-backend-reviewer` (**BLOCK**: 1 BLOCK, 6 SHOULD, 7 NIT), `kk-silent-failure-hunter` (1 HIGH, 6 MEDIUM, 8 LOW), AG-13 (**SIGNED OFF 🔒** @ 6cabb4f: 4 LOW, 8 INFO)
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| backend BLOCK + silent F1 (HIGH) + AG-13 F1: commit gagal meninggalkan index ter-stage; commit `paths` berikutnya membawa file yang tidak dipilih | `GitAdapter.commit` mengembalikan index ke HEAD sebelum `add` dan setelah kegagalan apa pun (`restore --staged`/`rm --cached`, tanpa `reset`; guard FR-118 tetap); pesan kosong ditolak | `test_a_stale_staged_file_never_rides_a_paths_commit`, `test_a_failed_commit_leaves_nothing_staged`, `test_a_paths_commit_holds_only_its_paths_after_a_failure`, `test_a_failed_add_leaves_nothing_for_the_next_commit` (P11 AG-13); mutan → merah |
+| silent F4 + AG-13 I3: git yang dibunuh timeout meninggalkan `index.lock`, semua commit berikutnya gagal | adapter menghapus `index.lock` setelah ia sendiri membunuh git (di bawah kunci workspace); log error. @ 2bab00c baru sebagian (hanya timeout, di luar reset awal); lengkap di delta AG-13 (L1, di bawah) | `test_a_timeout_leaves_no_index_lock`; mutan → merah |
+| silent F5 + backend S6 + silent L5: `.kk/...` yang dipilih hilang diam-diam; status/diff menampilkan `.kk` yang tidak bisa di-commit | 422 `path_excluded`; `/.kk/` di `info/exclude`; service menyaring `.kk` dari status dan diff | `test_selected_kk_paths_are_refused`, `test_status_and_diff_hide_kk`, `test_kk_is_ignored_by_status`, `test_the_first_commit_never_stages_kk` (cabang repo tanpa commit, M4) |
+| silent F3: 409 sementara (busy, timeout git) disimpan idempotency 24 jam | jawaban dengan `Retry-After` tidak disimpan; `WorkspaceBusy` dan `GitError("timeout")` membawa `Retry-After` | `test_a_busy_workspace_answer_is_not_kept_for_the_key`; mutan → merah |
+| silent F6 + backend S5 + silent L7: `exclusive()` memarkir thread executor selama menunggu; cancel lambat | `flock` non-blocking dipoll dari event loop (`asyncio.sleep`); pembukaan file kunci dipakai bersama `_locked` | `test_exclusive_waiters_do_not_park_threads` (40 penunggu, `to_thread` lain tetap < 1 s), `test_exclusive_cancel_is_prompt_and_leaks_nothing`, `test_exclusive_gives_up_with_busy_and_stays_usable`, `test_exclusive_releases_when_the_body_fails` (M15/M16) |
+| silent F7 + L8: `open_repo` menyamarkan status | `error` → `repository_error` + kode; baris hilang → 500 + log; `.git` hilang atau symlink → `repository_missing` + log error; status non-arsip → `project_not_active` | `test_a_failed_import_is_reported_as_an_error`, `test_a_symlinked_git_dir_is_a_missing_repository`; mutan → merah |
+| silent F2 + backend NIT: audit sukses bisa hilang | penulisan audit di-shield (tahan cancel; @ 2bab00c jendela antara commit dan audit masih terbuka, ditutup di delta AG-13 M1); `PatchRollbackFailed` diaudit `result=error` + path; `git.commit` mencatat file yang benar-benar di-commit (`diff-tree`) | `test_a_patch_that_cannot_be_rolled_back_is_on_the_record`, `test_commit_files_lists_what_the_commit_holds`, ekspektasi audit commit |
+| backend S1 + AG-13 F2: branch `kk` memblokir `kk/task-*`; `refs/heads/x` membuat ref aneh | `kk`, `kk/...`, `refs/...`, `HEAD` → 422 | `test_reserved_branch_names`; mutan → merah |
+| backend S2 + silent L2 + AG-13 I7: `POST /files` pada file yang ada → `VERSION_CONFLICT` | dipetakan ke `CONFLICT` (file atau folder) | `test_post_on_an_existing_file_is_a_conflict` |
+| backend S3: tree terpotong di 500, bukan `MAX_TREE_ENTRIES` | `max_entries=fs.MAX_TREE_ENTRIES` | `test_tree_lists_more_than_500_entries` (600 entri); mutan → merah |
+| backend S4 + AG-13 F4: celah test | arsip untuk `git/branch`/`git/commit`, prasyarat tulis pada upload belum siap, field tak dikenal → 422, path T2 lewat body/patch/tree (P4) | `test_git_writes_on_an_archived_project_are_refused`, `test_writes_need_a_ready_repository`, `test_unknown_body_fields_are_refused`, `test_paths_in_bodies_never_leave_the_repository` |
+| silent L1 + AG-13 F3: `paths` raksasa → `OSError E2BIG` → 500 | maks 500 path, 128 KiB total, `min_length=1` → 422 | `test_too_many_path_bytes_are_422` |
+| backend NIT: `?ref=` dan `?path=` kosong | berarti root/main | `test_empty_ref_and_tree_path_mean_the_root` |
+| backend NIT: `from_ref` diterima selain alias `from`; test idempotency di file git | hanya alias `from`; test dipindah ke `test_workspace_api.py` | review kode |
+
+Tidak ditutup (alasan):
+- **silent L3:** `commit()` mengembalikan `None` bila `current_commit` gagal setelah commit sukses (kemungkinan sangat kecil; butuh `HEAD` rusak).
+- **silent L4:** HEAD rusak menjadi `log: []`/diff terhadap pohon kosong. Kode WP-1.2, baru terjangkau lewat HTTP; `status` sudah gagal keras.
+- **Penunggu kunci tulis (`_write_file`) masih memarkir thread** sampai `LOCK_WAIT_S`. Desain WP-1.2; berdampak hanya bila ≥ ukuran pool penyimpanan bersamaan di satu project. Tindak lanjut: pindahkan tulis ke pola `exclusive()`.
+- **backend NIT (Lead):** batas body 10 MiB hanya untuk request ber-`Idempotency-Key`; PUT 40 MiB tanpa key dibaca penuh sebelum 413. Usulan: batas di middleware untuk semua mutasi, atau di Caddy.
+- **backend NIT / AG-13 I6 (Lead):** nama test di TEST_STRATEGY §AC-03 dan SECURITY_MODEL T9 tidak sama dengan test yang ada; dua file test security baru belum terdaftar.
+- **AG-13 I2:** `git/diff` meng-hash file untracked ke `/tmp` di setiap request (reader bisa memicu). Ikut WP rate limit/kuota.
+- **AG-13 I4:** `.kk/` di `repo/` bisa ditulis user lewat `PUT`. WP yang membaca `.kk/junit.xml` dari mount `repo/` wajib mengosongkannya dulu.
+- **AG-13 I5:** commit tanpa `paths` ikut men-stage `.env`/kunci yang ditolak `USER_WRITE` (sama dengan commit import). Diputuskan sebelum push remote (FR-119/120).
+- **Penyapu folder yatim** (project terhapus, sisa `uploads/` di project `ready`, INFO I3 WP-2.1b): menghapus data adalah T9, butuh desain sendiri; tindak lanjut terpisah.
+- **Perubahan `commit_all` ke import/template:** `.kk/` dari arsip kini tidak ter-commit (file tetap di disk). Dikonfirmasi AG-13 (delta @ 2bab00c, I-c); `sub/.kk/` bersarang tetap ter-commit, sesuai desain (pola di-anchor ke root).
+
+#### Delta AG-13 @ 2bab00c: **SIGNED OFF 🔒** (1 MEDIUM, 2 LOW, 5 INFO); semua MEDIUM/LOW dan dua INFO ditutup
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| **M1 (MEDIUM, T10, regresi):** commit sudah di git tetapi tanpa audit `git.commit` dan klien mendapat 409. Penyebabnya `commit_files` melewati batas output 16 MiB atau timeout, `git commit` dihentikan setelah ref ditulis, atau request dibatalkan di antara commit dan audit | (1) `_record_commit`: kegagalan daftar file dicatat `files: null` + `files_error`, event tetap ditulis, request 201; (2) `GitAdapter.commit`: bila langkah commit gagal tetapi HEAD maju, sha baru dikembalikan (log warning `git_commit_landed_despite_error`); (3) setiap tulis service (simpan, buat, hapus, patch, branch, commit) beserta audit-nya berjalan sebagai satu task yang tidak berhenti bila request dibatalkan (`_to_the_end`); commit mengambil kunci workspace di dalam task itu | `tests/security/test_workspace_audit.py`: `test_a_commit_whose_file_list_is_too_large_is_still_audited` (`max_output` 128 nyata), `test_a_commit_git_reported_as_stopped_is_still_audited`, `test_a_commit_cancelled_after_it_landed_is_still_audited`, `test_a_save_cancelled_after_it_reached_the_disk_is_still_audited`; `test_a_commit_that_landed_is_returned_though_git_was_stopped`; `test_a_cancelled_commit_keeps_the_lock_until_git_ends`; mutan (tanpa tangkap, tanpa shield, kunci di luar task, simpan tanpa `_to_the_end`, `_landed` selalu `None`) → merah |
+| **L1 (LOW, T9):** `index.lock` yatim setelah reset awal kena timeout, setelah output melewati batas, atau setelah cancel | reset awal dipindah ke dalam `try`; `_killed_git` (timeout, `output_too_large`, `CancelledError`) memicu penghapusan lock, juga di reset setelah kegagalan; cancel langsung naik tanpa menjalankan git lagi | `test_every_kill_leaves_no_index_lock[restore-timeout]`, `[add-output_too_large]`, `test_a_cancelled_commit_leaves_no_index_lock`; 4 mutan → merah |
+| **L2 (LOW):** `exclusive()` membocorkan fd file kunci bila di-cancel saat file dibuka di thread | pembukaan di-shield; saat cancel, callback menutup fd yang dikembalikan thread | `test_exclusive_cancel_while_opening_the_lock_file_leaks_no_fd` (3 cancel, jumlah fd `/proc/self/fd` sama); mutan → merah |
+| **I-a:** task audit yang di-shield tanpa referensi kuat; exception-nya hilang setelah cancel | `_RUNNING` memegang task sampai selesai; kegagalan task yang tidak lagi ditunggu → log error `workspace_write_failed_after_cancel` | `test_a_write_that_fails_after_the_request_was_cancelled_is_logged`; mutan → merah |
+| **I-d:** reset index repo tanpa commit (`rm --cached -r`) ditolak bila isi ter-stage berbeda dari file dan HEAD | `read-tree --empty` | `test_an_unborn_index_that_differs_from_the_file_is_reset`; mutan → merah |
+
+#### Delta AG-13 @ b733ecc: **SIGNED OFF 🔒** (2 LOW, 5 INFO); kelima temuan delta sebelumnya dikonfirmasi tertutup (12 test baru merah terhadap kode 2bab00c), kedua LOW ditutup
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| **LOW: `_landed` menganggap setiap HEAD yang maju sebagai commit ini** (R-04, laten: belum ada pemanggil yang melanggar aturan satu penulis). Probe: merge penulis lain dikembalikan sebagai commit user, `mine.txt` tidak ter-commit di mana pun | HEAD baru hanya diterima bila parent = HEAD sebelumnya (tanpa parent untuk commit pertama), email author sama, dan pesan sama (whitespace dinormalisasi); selain itu error asli + log error `git_head_moved_by_another_writer` | `test_a_head_moved_by_another_writer_is_not_taken_as_this_commit[another_author / another_message / same_identity_other_parent]`, satu kasus per bukti; 4 mutan → merah |
+| **LOW: `_RUNNING` tidak dikuras saat shutdown; log tanpa konteks** (T10; nyata bila `--timeout-graceful-shutdown` dipasang) | `drain_writes(30 s)` dipanggil lifespan setelah `drain_cleanups`, sebelum `dependencies.aclose()`; task diberi nama `<aksi> <project_id>` dan nama itu ikut di setiap log task yang tidak lagi ditunggu | `test_shutdown_waits_for_writes_still_running`, `test_the_app_drains_writes_at_shutdown`; 2 mutan → merah |
+
+INFO delta kedua: I-2 (penumpukan tulis), I-3 (TOCTOU otorisasi), dan I-5 (aman menghapus `index.lock` saat cancel, untuk semua pemanggil sekarang) tidak membutuhkan perubahan. I-1 dan I-4 masuk "Tidak ditutup" di bawah.
+
+Tidak ditutup dari delta kedua (alasan):
+- **I-1:** idempotency membebaskan key saat request di-cancel walau tulisnya tetap berjalan; retry dengan key yang sama dijalankan lagi. Efek ganda tetap dicegah `expected_sha256`, `AlreadyExists`, `branch_exists`, `nothing_to_commit`; commit tanpa `paths` bisa membawa perubahan yang muncul belakangan. Jalur cancel ini tidak terpicu oleh disconnect di uvicorn [Kemungkinan Besar, AG-13].
+- **I-4:** bila `rev-parse`/`log` di `_landed` sendiri gagal tepat setelah `git commit` yang sudah menulis ref dihentikan, hasilnya 409 tanpa audit (dua kegagalan berurutan).
+
+#### Delta AG-13 @ 3e5f1c7: **SIGNED OFF 🔒** (0 CRITICAL/HIGH/MEDIUM/LOW, 4 INFO baru); kedua LOW @ b733ecc dikonfirmasi tertutup
+
+Bukti AG-13:
+- probe merge asing kini ditolak (`git_head_moved_by_another_writer`, error asli naik);
+- matriks HEAD asing ditolak semua: merge, orphan, root commit, `.mailmap`;
+- commit sendiri tetap diterima untuk spasi, CRLF, baris `#`, NBSP, dan pesan 5000 karakter;
+- urutan lifespan asli: `drain_writes` lalu `aclose`;
+- 5 test baru merah terhadap b733ecc;
+- suite penuh: 1585 passed, 1 skipped.
+
+| INFO | Keputusan |
+|---|---|
+| **I-8:** urutan `drain_writes` sebelum `aclose()` tidak dikunci test (mutan "drain setelah aclose" selamat) | **ditutup** (hanya test): `test_the_app_drains_writes_at_shutdown` mencatat urutan `["drain_writes", "aclose"]`; mutan itu kini merah |
+| **I-6:** `_landed` tidak bisa membedakan commit asing dengan email, pesan, dan parent yang sama | tidak ditutup: butuh dua pelanggaran sekaligus (aturan satu penulis dan identitas+pesan identik). **Syarat masuk** WP pemanggil `merge_branch`/commit worktree pertama: tambahkan bukti keempat "index sama dengan tree commit" (`diff --cached --quiet <sha>`) bersama pemanggil itu |
+| **I-7:** git membuang karakter "crud" di ujung email (`;`, `,`, `\`, kutip), sehingga commit sendiri yang mendarat ditolak → 409 tanpa audit | tidak ditutup: arahnya aman (bukan sukses palsu) dan butuh dua kondisi langka (email semacam itu dan git dihentikan tepat setelah ref ditulis). Usulan (Lead): perketat validasi email user (`services/users.py` hanya memeriksa `@`), atau bandingkan email lewat `git var GIT_AUTHOR_IDENT` |
+| **I-9:** grace drain (30 s + 30 s) lebih panjang dari `stop_grace_period` default Docker (10 s); sinyal kedua melewati lifespan | risiko sisa, tidak ditutup di WP ini (infra). Usulan (Lead): `stop_grace_period` service `api` ≥ grace drain di `infra/compose.yml`; penutupan penuh butuh outbox audit |
+
+Dibawa ke WP berikutnya (AG-13 I-b, syarat masuk): penghapusan `index.lock` dan reset index mengandaikan satu penulis per index. Pemanggil baru `GitAdapter.commit` di worktree task dan `merge_branch` di `repo/` (WP-3.x, merge queue) **wajib** memegang `Workspace(root).exclusive()`. I-e (I2, I5, I6) tetap di daftar "Tidak ditutup" di atas; I4 [Kemungkinan Besar] sudah dimitigasi desain sandbox (artefak di mount terpisah, `repo/` read-only), dikonfirmasi saat pembaca evidence dibuat.

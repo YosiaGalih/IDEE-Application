@@ -42,7 +42,11 @@ class WorkspaceBusy(AppError):
 
     def __init__(self) -> None:
         super().__init__(
-            "CONFLICT", "The workspace is busy; retry", http_status=409, details=[{"reason": "busy"}]
+            "CONFLICT",
+            "The workspace is busy; retry",
+            http_status=409,
+            details=[{"reason": "busy"}],
+            headers={"Retry-After": "1"},  # transient: the idempotency middleware frees the key
         )
 
 

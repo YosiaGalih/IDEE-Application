@@ -37,7 +37,7 @@ import secrets
 import stat
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
@@ -145,6 +145,16 @@ class Current:
     sha256: str | None  # None when larger than WRITE_LIMIT: it cannot be version-checked
     mode: int
     size: int
+
+
+def _close_opened(opening: asyncio.Future[int]) -> None:
+    """Close the lock file that a cancelled ``exclusive()`` opened after it stopped waiting (no lock held)."""
+    if opening.cancelled():
+        return
+    if (error := opening.exception()) is not None:
+        logger.warning("workspace_lock_open_failed_after_cancel", error=type(error).__name__)
+        return
+    os.close(opening.result())
 
 
 def _bad_request(message: str) -> AppError:
@@ -329,6 +339,53 @@ class Workspace:
         max_entries = min(max(max_entries, 1), MAX_TREE_ENTRIES)
         return await asyncio.to_thread(self._tree, rel, access, depth, max_entries)
 
+    @contextlib.asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        """Hold the workspace lock (the one every write takes) while the caller runs something that must see
+        one consistent tree, e.g. ``git add`` + ``commit``. ``WorkspaceBusy`` after ``LOCK_WAIT_S``.
+
+        The wait polls a non-blocking ``flock`` from the event loop: a waiter holds no executor thread (the
+        lock holder and every other project keep the pool), and a cancel takes effect at once.
+        """
+        opening = asyncio.ensure_future(asyncio.to_thread(self._lock_fd))
+        try:
+            lock_fd = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            opening.add_done_callback(_close_opened)  # the thread still opens the file: close what it returns
+            raise
+        try:
+            deadline = time.monotonic() + LOCK_WAIT_S
+            delay = 0.005
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise WorkspaceBusy() from None
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 0.1)
+            yield
+        finally:
+            os.close(lock_fd)  # releases the lock
+
+    def _lock_fd(self) -> int:
+        fd, real = open_root(self.root)
+        try:
+            return self._open_lock_file(real)
+        finally:
+            os.close(fd)
+
+    def _open_lock_file(self, real: str) -> int:
+        """The lock file for the root at ``real`` (one per root, outside it), opened, not yet locked."""
+        os.makedirs(self.lock_dir, mode=0o700, exist_ok=True)
+        name = hashlib.sha256(os.fsencode(real)).hexdigest()[:32] + ".lock"
+        dir_fd = os.open(self.lock_dir, _DIR_FLAGS)
+        try:
+            return os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+
     async def disk_usage(self) -> int:
         """Bytes in regular files under the root, symlinks not followed (quota input, ADR-005)."""
         return await asyncio.to_thread(self._disk_usage)
@@ -354,15 +411,7 @@ class Workspace:
 
     @contextlib.contextmanager
     def _locked(self, real: str) -> Iterator[None]:
-        os.makedirs(self.lock_dir, mode=0o700, exist_ok=True)
-        name = hashlib.sha256(os.fsencode(real)).hexdigest()[:32] + ".lock"
-        dir_fd = os.open(self.lock_dir, _DIR_FLAGS)
-        try:
-            lock_fd = os.open(
-                name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd
-            )
-        finally:
-            os.close(dir_fd)
+        lock_fd = self._open_lock_file(real)
         try:
             deadline = time.monotonic() + LOCK_WAIT_S
             delay = 0.005

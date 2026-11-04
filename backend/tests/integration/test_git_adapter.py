@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from app.gitops.adapter import Author, GitAdapter, GitTarget
-from app.gitops.errors import GitError
+from app.gitops.errors import GitError, GitInputError
 
 ME = Author("Dev", "dev@example.test")
 
@@ -331,3 +331,256 @@ async def test_init_missing_folder(tmp_path: Path, git: GitAdapter) -> None:
     with pytest.raises(GitError) as caught:
         await git.init(tmp_path / "nope", "main")
     assert caught.value.reason == "not_found"
+
+
+# --- WP-2.1c: commit selected paths, never .kk --------------------------------------------------------------
+
+
+def raw_git(repo: GitTarget, *args: str) -> str:
+    import subprocess  # test helper only: the product runs git through the adapter
+
+    return subprocess.run(  # noqa: S603 - fixed argv, test helper
+        ["git", "--git-dir", str(repo.repo / ".git"), "--work-tree", str(repo.repo), *args],  # noqa: S607
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+async def test_commit_only_the_given_paths(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    write(repo.repo / "b.txt", "b\n")
+    sha = await git.commit(repo, "only a", ME, paths=["a.txt"])
+    assert sha is not None
+    assert raw_git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["a.txt"]
+    assert "b.txt" in raw_git(repo, "status", "--porcelain")
+
+
+async def test_commit_never_stages_kk_even_when_tracked(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / ".kk" / "old.xml", "<old/>\n")
+    raw_git(repo, "add", "-f", ".kk/old.xml")
+    raw_git(repo, "-c", "user.name=x", "-c", "user.email=x@example.test", "commit", "-q", "-m", "tracked kk")
+    write(repo.repo / ".kk" / "old.xml", "<changed/>\n")
+    write(repo.repo / ".kk" / "new.xml", "<new/>\n")
+    write(repo.repo / "x.py", "print(1)\n")
+    sha = await git.commit(repo, "code only", ME)
+    assert sha is not None
+    assert raw_git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["x.py"]
+
+
+async def test_commit_with_only_kk_changes_is_nothing(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / ".kk" / "junit.xml", "<testsuite/>\n")
+    assert await git.commit(repo, "nothing", ME) is None
+
+
+# --- WP-2.1c review round: index hygiene, .kk, timeouts, evidence -------------------------------------------
+
+
+async def test_a_stale_staged_file_never_rides_a_paths_commit(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    write(repo.repo / "b.txt", "secret\n")
+    raw_git(repo, "add", "b.txt")  # left staged by an earlier, failed run
+    await git.commit(repo, "only a", ME, paths=["a.txt"])
+    assert raw_git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["a.txt"]
+    assert raw_git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_a_failed_commit_leaves_nothing_staged(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+
+    async def failing(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "commit":
+            raise GitError("commit_failed")
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", failing)
+    with pytest.raises(GitError):
+        await git.commit(repo, "fails", ME)
+    monkeypatch.undo()
+    assert raw_git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_a_blank_commit_message_is_refused(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    with pytest.raises(GitInputError):
+        await git.commit(repo, "   \n", ME)
+    assert raw_git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_the_first_commit_never_stages_kk(tmp_path: Path, git: GitAdapter) -> None:
+    root = tmp_path / "fresh"
+    root.mkdir()
+    await git.init(root, "main")
+    write(root / ".kk" / "junit.xml", "<x/>\n")
+    write(root / "a.py", "print(1)\n")
+    target = GitTarget(root)
+    assert await git.commit(target, "first", ME) is not None
+    assert raw_git(target, "show", "--name-only", "--format=", "HEAD").splitlines() == ["a.py"]
+
+
+async def test_kk_is_ignored_by_status(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / ".kk" / "junit.xml", "<x/>\n")
+    await git.commit(repo, "nothing", ME)  # writes info/exclude
+    status = await git.status(repo)
+    assert status.clean and status.changes == []
+
+
+async def test_a_timeout_leaves_no_index_lock(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+    lock = repo.repo / ".git" / "index.lock"
+
+    async def killed(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "add":
+            lock.write_text("")  # what a git killed mid-add leaves behind
+            raise GitError("timeout")
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", killed)
+    with pytest.raises(GitError):
+        await git.commit(repo, "slow", ME)
+    monkeypatch.undo()
+    assert not lock.exists()
+    assert await git.commit(repo, "recovered", ME) is not None
+
+
+@pytest.mark.parametrize(("step", "reason"), [("restore", "timeout"), ("add", "output_too_large")])
+async def test_every_kill_leaves_no_index_lock(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch, step: str, reason: str
+) -> None:
+    """AG-13 L1: the first reset is a git run too, and an output cap kills git like a timeout does."""
+    write(repo.repo / "a.txt", "a\n")
+    raw_git(repo, "add", "a.txt")  # left staged by an earlier run: the first reset has work to do
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+    lock = repo.repo / ".git" / "index.lock"
+
+    async def killed(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == step:
+            lock.write_text("")
+            raise GitError(reason)
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", killed)
+    with pytest.raises(GitError):
+        await git.commit(repo, "killed", ME)
+    monkeypatch.undo()
+    assert not lock.exists()
+    assert await git.commit(repo, "recovered", ME) is not None
+
+
+async def test_a_cancelled_commit_leaves_no_index_lock(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AG-13 L1: ``_run`` kills git on a cancel too; the lock it held must not block every later commit."""
+    write(repo.repo / "a.txt", "a\n")
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+    lock = repo.repo / ".git" / "index.lock"
+    holding = asyncio.Event()
+
+    async def hangs(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "add":
+            lock.write_text("")  # git holds the index lock ...
+            holding.set()
+            await asyncio.sleep(30)  # ... until the cancel kills it
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", hangs)
+    committing = asyncio.create_task(git.commit(repo, "cancelled", ME))
+    await asyncio.wait_for(holding.wait(), 5)
+    committing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await committing
+    monkeypatch.undo()
+    assert not lock.exists()
+    assert await git.commit(repo, "recovered", ME) is not None
+
+
+async def test_a_commit_that_landed_is_returned_though_git_was_stopped(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AG-13 M1: git killed after it wrote the ref; HEAD moved, so the commit exists and is the answer."""
+    write(repo.repo / "a.txt", "a\n")
+    before = await git.current_commit(repo)
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+
+    async def stopped(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        result = await run(self, args, **kwargs)  # type: ignore[arg-type]
+        if args[0] == "commit":
+            raise GitError("timeout")
+        return result
+
+    monkeypatch.setattr(GitAdapter, "_run", stopped)
+    sha = await git.commit(repo, "landed", ME)
+    monkeypatch.undo()
+    assert sha is not None and sha != before
+    assert sha == await git.current_commit(repo)
+    assert await git.commit_files(repo, sha) == ["a.txt"]
+
+
+@pytest.mark.parametrize("foreign", ["another_author", "another_message", "same_identity_other_parent"])
+async def test_a_head_moved_by_another_writer_is_not_taken_as_this_commit(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch, foreign: str
+) -> None:
+    """AG-13 delta2 LOW: only a commit proven to be this one (parent, author, message) answers a failure."""
+    write(repo.repo / "mine.txt", "mine\n")
+    before = await git.current_commit(repo)
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+
+    def move_head() -> str:
+        # Each case breaks exactly one of the three proofs: author, message, parent.
+        if foreign == "another_author":
+            raw_git(repo, "-c", "user.name=Other", "-c", "user.email=other@example.test",
+                    "commit", "-q", "--allow-empty", "-m", "mine")  # fmt: skip
+        elif foreign == "another_message":
+            raw_git(repo, "-c", f"user.name={ME.name}", "-c", f"user.email={ME.email}",
+                    "commit", "-q", "--allow-empty", "-m", "foreign")  # fmt: skip
+        else:  # our author and message, but not on top of ``before``
+            tree = raw_git(repo, "write-tree")
+            orphan = raw_git(repo, "-c", f"user.name={ME.name}", "-c", f"user.email={ME.email}",
+                             "commit-tree", tree, "-m", "mine")  # fmt: skip
+            raw_git(repo, "update-ref", "HEAD", orphan)
+        return raw_git(repo, "rev-parse", "HEAD")
+
+    moved: list[str] = []
+
+    async def killed(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "add":
+            moved.append(move_head())  # another writer commits while our git is being killed
+            raise GitError("timeout")
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", killed)
+    with pytest.raises(GitError) as raised:
+        await git.commit(repo, "mine", ME)
+    monkeypatch.undo()
+    assert raised.value.reason == "timeout"  # the original error stands
+    assert moved and moved[0] != before
+    assert "mine.txt" not in raw_git(repo, "ls-tree", "-r", "--name-only", "HEAD").split()
+
+
+async def test_an_unborn_index_that_differs_from_the_file_is_reset(tmp_path: Path, git: GitAdapter) -> None:
+    """AG-13 I-d: ``rm --cached`` refuses an entry that differs from both the file and HEAD."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    await git.init(root, "main")
+    target = GitTarget(root)
+    write(root / "a.txt", "staged\n")
+    raw_git(target, "add", "a.txt")
+    write(root / "a.txt", "edited after staging\n")
+    write(root / "b.txt", "b\n")
+    sha = await git.commit(target, "first", ME, paths=["b.txt"])
+    assert sha is not None
+    assert await git.commit_files(target, sha) == ["b.txt"]
+
+
+async def test_commit_files_lists_what_the_commit_holds(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "a.txt", "a\n")
+    write(repo.repo / "d" / "b.txt", "b\n")
+    sha = await git.commit(repo, "two", ME)
+    assert sha is not None
+    assert await git.commit_files(repo, sha) == ["a.txt", "d/b.txt"]

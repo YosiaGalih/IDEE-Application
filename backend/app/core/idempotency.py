@@ -16,8 +16,8 @@
 - Status, content type, body and a small allowlist of safe headers are replayed; ``Set-Cookie`` never is.
 
 **What is not stored**
-- 5xx responses and transient rejections (401, 403, 408, 422, 425, 429) are not stored; the key is freed
-  so the client can retry.
+- 5xx responses, transient rejections (401, 403, 408, 422, 425, 429) and any answer carrying
+  ``Retry-After`` (e.g. 409 "workspace busy") are not stored; the key is freed so the client can retry.
 - A success whose body is too large to keep is recorded as "executed": a retry gets 409, never a second
   execution.
 
@@ -219,6 +219,7 @@ class IdempotencyMiddleware:
         identity: SessionIdentity,
     ) -> None:
         status = 500
+        retry_later = False  # the answer carries Retry-After: a transient refusal, never stored
         kept_headers: list[list[str]] = []
         chunks: list[bytes] = []
         size = 0
@@ -233,11 +234,12 @@ class IdempotencyMiddleware:
             return await receive()
 
         async def capture(message: Message) -> None:
-            nonlocal status, size
+            nonlocal status, size, retry_later
             if message["type"] == "http.response.start":
                 status = message["status"]
                 for name, value in message.get("headers", []):
                     lowered = name.lower()
+                    retry_later = retry_later or lowered == b"retry-after"
                     if lowered == b"content-type" or lowered in _REPLAYED_HEADERS:
                         kept_headers.append([lowered.decode("latin-1"), value.decode("latin-1")])
             elif message["type"] == "http.response.body":
@@ -256,9 +258,9 @@ class IdempotencyMiddleware:
             refresher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await refresher
-            if not handled or status >= 500 or status in _UNSTORED_STATUSES:
+            if not handled or status >= 500 or status in _UNSTORED_STATUSES or retry_later:
                 await self._release(redis_key, owner)
-        if status >= 500 or status in _UNSTORED_STATUSES:
+        if status >= 500 or status in _UNSTORED_STATUSES or retry_later:
             return
 
         record: dict[str, Any] = {"owner": owner, "fingerprint": fingerprint, "user": identity.user_id}
