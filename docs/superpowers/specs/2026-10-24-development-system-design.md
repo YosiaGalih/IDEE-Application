@@ -391,6 +391,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - **Ditunda ke WP-3.1:** quick create task dinonaktifkan, dan aksi antrean (resume/retry/putuskan approval) hanya **Buka**, sampai API task dan approval ada.
     - **Beda dengan mockup:** mockup screen-02 memuat kartu keenam "Dalam antrean", yang tidak ada di kontrak, jadi tidak dibuat.
     - **Usulan:** API_CONTRACTS §3 dan §11 mencantumkan `failed_queue`, `project_name`, `meta.unavailable`, dan bentuk `period`.
+    - **Review WP-2.1e:** layar dan klien mengikuti `meta.unavailable`, dan jawaban yang mencantumkan suatu bagian tetapi tetap mengirim datanya ditolak. `AgentRunSummary` divalidasi menurut §11. Biaya hanya tampil bersama `cost_status`. Usulan: §3 menyatakan bahwa bagian yang tercantum di `meta.unavailable` berisi daftar kosong dan nilai null.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

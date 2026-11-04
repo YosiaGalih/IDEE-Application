@@ -1473,3 +1473,42 @@ Spec: `docs/superpowers/specs/2026-11-04-wp-2.1e-dashboard-design.md`. Plan: `do
 | Layar (Playwright, Vite + API lokal) | 1440 px dan 820 px sesuai mockup sejauh datanya ada. 390 px: dashboard tidak menambah scroll horizontal (32 px, sama dengan `/projects`; sumbernya shell WP-1.4a yang sidebar-nya selalu `w-60`) |
 
 Temuan di luar cakupan: shell aplikasi (`components/layout/Sidebar.tsx`, `w-60` di semua lebar) membuat setiap layar hanya punya ±150 px di ponsel 390 px. Usulan: sidebar yang bisa dilipat di bawah breakpoint `md` (WP-1.4 lanjutan).
+
+#### Review WP-2.1e @ 16dd334/b2a7e02
+
+Hasil awal:
+- `kk-backend-reviewer`: **APPROVE** (0 BLOCK, 2 SHOULD, 4 NIT).
+- `kk-frontend-reviewer`: **APPROVE with changes** (0 BLOCK, 3 SHOULD, 4 NIT).
+- `kk-silent-failure-hunter`: 2 HIGH, 4 MEDIUM, 6 LOW.
+- AG-13: **SIGNED OFF 🔒 @ b2a7e02** (0 CRITICAL–LOW, 6 INFO). 11 mutan scope/snapshot yang valid semuanya merah; probe HTTP: `recent_projects` = `GET /projects?page_size=5`; probe XSS bersih; 200 ribu task → 8 statement, 121 ms.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| silent H1 + frontend SHOULD 1: angka usage bisa tampil tanpa label | biaya hanya tampil bersama statusnya (`estimasi`/`sebagian`/`aktual`) dan sebagai mata uang; token yang terhitung tampil sebagai angka; biaya yang statusnya `unavailable` selalu "tidak tersedia" | `shows recorded usage with how it was obtained…`, `never prints a cost whose status says it is unknown` |
+| silent H2 + frontend SHOULD 2: `meta.unavailable` dibaca lalu diabaikan | aktivitas agent dan usage mengikuti `meta.unavailable`. `AgentRunSummary` divalidasi. Jawaban yang menyebut bagian tidak tersedia tetapi tetap mengirim datanya ditolak (`bad_response`) | `lists agent runs once they are recorded…`; `refuses an answer that contradicts itself` ×3; mutan `isUnavailable={true}` → merah |
+| silent M1: project dengan repository rusak tampil hijau "Aktif" | badge status dari `project.status`; badge repository bermasalah atau sedang diimpor | `shows a project whose repository has a problem as such` |
+| silent M2 + frontend NIT: filter mengklaim "tidak ada yang cocok" untuk antrean yang belum dimuat | label "…yang ditampilkan"; bila ada item yang belum dimuat, teks menyebut jumlah yang ditampilkan dan jumlah sisanya | `never says nothing matches about queue items it did not load` |
+| silent M3: `waiting_approval` turunan dari status | label metrik "Task menunggu persetujuan"; tetap dicatat di #70 sampai tabel approval ada (WP-3.1) | teks UI |
+| silent M4 + frontend NIT: undangan project pertama menyembunyikan antrean | undangan hanya bila semua metrik 0, antrean kosong, dan tidak ada daftar | `keeps the attention queue when the only project is archived` |
+| silent L1: `active or 0` | `scalar_one()` | review kode |
+| backend SHOULD 1: `recent_projects` dari sesi lain | dibaca di snapshot yang sama; pemeriksaan disk (`project_views`, diekstrak dari `list_projects`) dijalankan sesudahnya | `test_counts_and_lists_come_from_one_snapshot` (project diarsipkan dan task ditambah di tengah baca → tetap konsisten); `test_recent_projects_are_the_first_page_of_the_project_list` |
+| backend SHOULD 2: test snapshot hanya dua query, tanpa jalur error | test perilaku di atas, plus `test_a_failed_read_leaves_the_pooled_connection_clean` | mutan `READ COMMITTED` → 2 test merah |
+| backend NIT 1: tie `updated_at` jatuh ke UUID acak | urut `updated_at desc, created_at desc, id` | `test_ties_in_updated_at_order_by_creation` |
+| frontend SHOULD 3: assertion lemah | nilai metrik berbeda per kartu, dicek persis per label; 403 tanpa tombol ulang; filter tanpa beda huruf besar/kecil dan lewat slug | `DashboardPage.test.tsx` (17 test) |
+| AG-13 I1: dashboard mengandaikan setiap role punya `task:read` | test invarian yang merah bila ada role tanpa `task:read` | `test_every_role_that_sees_a_project_may_read_its_tasks` |
+| AG-13 I6: probe konten berbahaya belum menjadi test | menjadi test | `renders titles, names and reasons as text, never as markup` |
+
+Tidak ditutup (alasan):
+- **backend NIT 2** (route mengimpor `_respond`, `EnvDep`, `ProjectOut` dari `routes/projects.py`): pola yang sama sudah dipakai `routes/repository.py`. Memindahkannya ke modul bersama lebih baik dikerjakan sekali untuk semua route.
+- **backend NIT 3–4, silent L2:** antrean berisi `waiting_approval` sesuai FR-010. `current_period` memakai jam saat itu; selisihnya hanya di detik pergantian bulan.
+- **silent L3:** `agent_activity` tetap berupa daftar sesuai kontrak; layar dan klien memakai `meta.unavailable`.
+- **silent L5** (tanpa `statement_timeout` khusus): error tetap diteruskan dan layar menampilkan state error. Batas waktu ikut konfigurasi DB.
+- **silent L6** (status yang tidak dikenal menggagalkan dashboard): sengaja ketat; status di luar kontrak adalah bug yang harus terlihat.
+- **AG-13 I3:** belum ada index `tasks(project_id, updated_at)`; dipertimbangkan saat volume task naik (WP-3.1).
+- **AG-13 I4, I5:** pemiliknya Lead (bukti T6 di SECURITY_MODEL/TEST_STRATEGY, batas org untuk tier L).
+
+**Syarat masuk WP berikutnya (AG-13, mengikat):**
+- **WP-3.1 dan setiap perubahan RBAC (I1):** role tanpa `task:read` harus disertai filter izin per project di dashboard. Test invarian di atas memaksa keputusan itu.
+- **WP-3.1 (I2):** putuskan apakah `tasks.title` diredaksi saat ditulis. `status_reason` sudah diredaksi, `title` belum; judul buatan agent bisa memuat secret.
+
+Delta AG-13 untuk perubahan backend sesudah b2a7e02: menyusul.
