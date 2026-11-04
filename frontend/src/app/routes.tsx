@@ -1,5 +1,6 @@
 import type { RouteObject } from "react-router";
 import { AppLayout } from "@/components/layout/AppLayout";
+import { StateView } from "@/components/ui/StateView";
 import { ForgotPasswordPage } from "@/features/auth/ForgotPasswordPage";
 import { LoginPage } from "@/features/auth/LoginPage";
 import { RequireSession } from "@/features/auth/RequireSession";
@@ -42,10 +43,12 @@ export const routes: RouteObject[] = [
           { path: "projects/:projectId/import", element: <ImportArchivePage /> },
           {
             path: "projects/:projectId/workspace",
-            // Monaco is large: it loads with this screen only.
+            // Loaded on first use; Monaco is a further chunk inside it (lazyEditor.tsx).
             lazy: async () => ({
               Component: (await import("@/features/workspace/WorkspacePage")).WorkspacePage,
             }),
+            // A page opened on this URL waits for the chunk before its first render.
+            hydrateFallbackElement: <StateView state="loading" />,
           },
           { path: "projects/:projectId/tasks", element: page("tasks") },
           { path: "projects/:projectId/preview", element: page("preview") },

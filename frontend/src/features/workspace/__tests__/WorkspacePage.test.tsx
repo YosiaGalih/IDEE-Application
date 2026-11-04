@@ -17,19 +17,30 @@ vi.mock("@/features/workspace/CodeEditor", () => ({
     onChange: (value: string) => void;
     onSave: () => void;
   }) => (
-    <textarea
-      aria-label={props.ariaLabel}
-      value={props.value}
-      readOnly={props.isReadOnly}
-      data-reveal-line={props.revealLine ?? ""}
-      onChange={(event) => props.onChange(event.target.value)}
-      onKeyDown={(event) => {
-        if ((event.ctrlKey || event.metaKey) && event.key === "s") {
-          event.preventDefault();
+    <>
+      <textarea
+        aria-label={props.ariaLabel}
+        value={props.value}
+        readOnly={props.isReadOnly}
+        data-reveal-line={props.revealLine ?? ""}
+        onChange={(event) => props.onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key === "s") {
+            event.preventDefault();
+            props.onSave();
+          }
+        }}
+      />
+      {/* Monaco can deliver a keystroke and Ctrl+S before React renders the keystroke. */}
+      <button
+        type="button"
+        aria-label={`type-then-save ${props.ariaLabel}`}
+        onClick={() => {
+          props.onChange(`${props.value}!`);
           props.onSave();
-        }
-      }}
-    />
+        }}
+      />
+    </>
   ),
   DiffView: (props: { original: string; modified: string }) => (
     <div data-testid="diff">{`${props.original}|${props.modified}`}</div>
@@ -86,7 +97,11 @@ type Options = {
 };
 
 function backend({ permissions = WRITE_PERMS, files = {}, put, gitFails = false, tree }: Options = {}) {
-  const state = { puts: [] as { path: string; body: unknown }[], fileReads: [] as string[] };
+  const state = {
+    puts: [] as { path: string; body: unknown }[],
+    fileReads: [] as string[],
+    treeReads: [] as string[],
+  };
   const trees = tree ?? {
     ".": {
       entries: [
@@ -102,6 +117,7 @@ function backend({ permissions = WRITE_PERMS, files = {}, put, gitFails = false,
     http.get(`${API}/projects/${PROJECT}`, () => ok(projectFixture({ permissions }))),
     http.get(`${BASE}/tree`, ({ request }) => {
       const path = new URL(request.url).searchParams.get("path") ?? ".";
+      state.treeReads.push(path);
       const folder = trees[path] ?? { entries: [] };
       return ok(folder.entries, { truncated: folder.truncated ?? false });
     }),
@@ -180,6 +196,8 @@ describe("WorkspacePage", () => {
     await waitFor(() => expect(state.puts).toHaveLength(1));
     expect(state.puts[0]).toEqual({ path: "app.py", body: { content: "x = 2\n", expected_sha256: SHA_1 } });
     expect(await screen.findAllByText(id.workspace.editor.status.saved)).not.toHaveLength(0);
+    // The explorer re-reads the folder, so the size it shows is the saved file's.
+    await waitFor(() => expect(state.treeReads.filter((path) => path === ".")).toHaveLength(2));
     // The next save uses the sha the server returned.
     fireEvent.change(editor, { target: { value: "x = 3\n" } });
     await userEvent.click(
@@ -187,6 +205,18 @@ describe("WorkspacePage", () => {
     );
     await waitFor(() => expect(state.puts).toHaveLength(2));
     expect(state.puts[1]?.body).toEqual({ content: "x = 3\n", expected_sha256: SHA_2 });
+  });
+
+  it("saves the text on screen when Ctrl+S lands before the last keystroke has rendered", async () => {
+    const state = backend({ files: { "app.py": textFile("app.py", "x = 1\n") } });
+    renderApp(`/projects/${PROJECT}/workspace`);
+    await openFromExplorer("app.py");
+    await editorOf("app.py");
+    const label = id.workspace.editor.editorOf.replace("{{name}}", "app.py");
+    await userEvent.click(screen.getByRole("button", { name: `type-then-save ${label}` }));
+    await waitFor(() => expect(state.puts).toHaveLength(1));
+    expect(state.puts[0]?.body).toEqual({ content: "x = 1\n!", expected_sha256: SHA_1 });
+    expect(await screen.findAllByText(id.workspace.editor.status.saved)).not.toHaveLength(0);
   });
 
   it("never overwrites on a conflict: the user reloads, or overwrites against the sha just read", async () => {

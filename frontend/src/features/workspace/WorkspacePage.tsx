@@ -19,7 +19,7 @@ import { PROJECTS_PATH } from "@/lib/paths";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { ConflictDialog } from "./ConflictDialog";
 import { EditorArea } from "./EditorArea";
-import { initialTabs, isDirty, tabsReducer } from "./editorTabs";
+import { initialTabs, isDirty, tabsReducer, type TabsAction } from "./editorTabs";
 import { Explorer } from "./Explorer";
 import { disposeModel } from "./lazyEditor";
 import { SearchPanel } from "./SearchPanel";
@@ -84,11 +84,14 @@ type WorkspaceProps = { projectId: string; name: string; branch: string; status:
 function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [state, dispatch] = useReducer(tabsReducer, initialTabs);
+  const [state, dispatchToReact] = useReducer(tabsReducer, initialTabs);
+  // Handlers read the tabs from this ref, which runs the same pure reducer at dispatch time: Monaco can
+  // deliver Ctrl+S before React renders the last keystroke, and the save must send what is on screen.
   const stateRef = useRef(state);
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
+  const dispatch = useCallback((action: TabsAction) => {
+    stateRef.current = tabsReducer(stateRef.current, action);
+    dispatchToReact(action);
+  }, []);
   const [revealLine, setRevealLine] = useState<number | null>(null);
   const [openError, setOpenError] = useState<string | null>(null);
   const [conflictPath, setConflictPath] = useState<string | null>(null);
@@ -147,7 +150,7 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
         setOpenError(path);
       }
     },
-    [projectId],
+    [dispatch, projectId],
   );
 
   const write = useCallback(
@@ -160,7 +163,7 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
         const saved = await putFile(projectId, path, content, expectedSha);
         dispatch({ type: "saveSucceeded", path, content, sha: saved.sha256 });
         setConflictPath(null);
-        void queryClient.invalidateQueries({ queryKey: gitStatusKey(projectId) });
+        refreshAround(path); // the explorer's size and Git badge follow the save
       } catch (error) {
         if (error instanceof VersionConflict) {
           // Never resolved here: the user decides in the dialog (a second conflict opens it again).
@@ -172,7 +175,7 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
         }
       }
     },
-    [canWrite, projectId, queryClient],
+    [canWrite, dispatch, projectId, refreshAround],
   );
 
   const save = useCallback(
@@ -204,7 +207,7 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
 
   const conflictTab = state.tabs.find((tab) => tab.path === conflictPath) ?? null;
   return (
-    <div className="-m-6 flex h-[calc(100vh-4rem)] min-h-[32rem] flex-col">
+    <div className="-m-6 flex min-h-[32rem] flex-col lg:h-[calc(100vh-4rem)]">
       <header className="flex flex-wrap items-center gap-3 border-b border-line bg-surface px-4 py-2">
         <Link
           to={PROJECTS_PATH}
@@ -229,7 +232,7 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
           {t("workspace.editor.openFailed", { path: openError })}
         </p>
       ) : null}
-      <div className="grid min-h-0 flex-1 grid-cols-[16rem_minmax(0,1fr)_20rem]">
+      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[16rem_minmax(0,1fr)_20rem]">
         <Explorer
           projectId={projectId}
           canWrite={canWrite}
@@ -252,7 +255,7 @@ function Workspace({ projectId, name, branch, status, canWrite }: WorkspaceProps
         />
         <aside
           aria-label={t("workspace.layout.right")}
-          className="flex min-h-0 flex-col border-l border-line bg-surface"
+          className="flex min-h-0 flex-col border-t border-line bg-surface lg:border-t-0 lg:border-l"
         >
           <div role="tablist" className="flex border-b border-line">
             {RIGHT_TABS.map((key) => (
