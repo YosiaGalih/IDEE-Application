@@ -20,22 +20,25 @@ import contextlib
 import uuid
 from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import case, delete, func, insert, select, update
 
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.gitops.adapter import GitTarget
+from app.gitops.errors import GitInputError
 from app.models.projects import Project, RepoIndexEntry, Repository
 from app.services import index_lock
 from app.services.job_queue import JobQueue
 from app.services.projects import Actor, ProjectEnv, enforce_rate, repo_path
 from app.services.workspace_api import SANDBOX_DIR, open_repo
-from app.workspace.index import SYMBOL_PATTERNS, classify, language_for
+from app.workspace.index import SYMBOL_PATTERNS, check_glob, classify, glob_matches, language_for, preview
+from app.workspace.policy import Access, Policy
 
 logger = get_logger(__name__)
 
@@ -52,6 +55,13 @@ INDEX_GIT_TIMEOUT_S = 300.0
 INSERT_BATCH = 2_000
 SIZE_MAX = 2**31 - 1  # size_bytes is an int column
 INDEX_REQUESTS_PER_HOUR = 10  # [Menebak]
+
+# Search (spec Goals 7-9).
+SEARCH_LIMIT_MAX = 200  # API_CONTRACTS §3 "maks 200"
+TEXT_TIMEOUT_S = 10.0  # [Menebak] git is killed past this: a pathological regex costs at most this much
+TEXT_OUTPUT_MAX = 4 * 1024 * 1024
+TEXT_SEARCHES_PER_MINUTE = 60  # [Menebak] each text search starts one git process
+SYMBOL_CANDIDATES = 5_000
 
 
 @dataclass
@@ -424,3 +434,166 @@ def _reason(exc: BaseException) -> str:
 
 def _is_git_dir(path: Path) -> bool:
     return path.is_dir() and not path.is_symlink()
+
+
+# --- search -------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    path: str
+    line: int
+    preview: str
+    symbol: str | None = None
+    kind: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    hits: list[SearchHit]
+    truncated: bool  # more matched than returned (limit, output cap, candidate cap)
+    index_commit: str | None  # symbol mode: the commit the hits come from
+    indexed_at: datetime | None
+
+
+def _invalid(field: str, message: str, reason: str | None = None) -> AppError:
+    detail: dict[str, Any] = {"loc": ["query", field], "msg": message}
+    if reason is not None:
+        detail["reason"] = reason
+    return AppError("VALIDATION_ERROR", "Input did not pass validation", http_status=422, details=[detail])
+
+
+async def search(
+    env: ProjectEnv,
+    actor: Actor,
+    project_id: uuid.UUID,
+    *,
+    q: str,
+    mode: Literal["text", "symbol"],
+    glob: str | None,
+    regex: bool,
+    ignore_case: bool,
+    kind: str | None,
+    limit: int,
+    access: Access = Access.USER_READ,
+) -> SearchResult:
+    """FR-020 (text: the working tree as it is now) and FR-021 (symbols: the index). Hits in paths the
+    ``access`` may not read are dropped (FR-020 denylist; ``.agentignore`` for agents), as are ``.kk/``."""
+    if glob is not None:
+        try:
+            check_glob(glob)
+        except ValueError as exc:
+            raise _invalid("glob", str(exc)) from None
+    limit = min(max(limit, 1), SEARCH_LIMIT_MAX)
+    repo = await open_repo(env, actor, project_id, "workspace:read", write=False)
+    policy = await repo.workspace.policy(access)
+    if mode == "text":
+        await enforce_rate(
+            env,
+            actor,
+            scope="search_text",
+            limit=TEXT_SEARCHES_PER_MINUTE,
+            window_s=60,
+            message="Too many searches; retry later",
+        )
+        return await _search_text(env, repo.target, policy, access, q, glob, regex, ignore_case, limit)
+    return await _search_symbols(env, project_id, policy, access, q, glob, kind, limit)
+
+
+def _visible(path: str, glob: str | None, policy: Policy, access: Access) -> bool:
+    if _excluded(path):
+        return False
+    if glob is not None and not glob_matches(glob, path):
+        return False
+    return not policy.denied(PurePosixPath(path).parts, access)
+
+
+async def _search_text(
+    env: ProjectEnv,
+    target: GitTarget,
+    policy: Policy,
+    access: Access,
+    q: str,
+    glob: str | None,
+    regex: bool,
+    ignore_case: bool,
+    limit: int,
+) -> SearchResult:
+    try:
+        found = await env.git.grep(
+            target,
+            [q],
+            commit=None,
+            fixed=not regex,
+            ignore_case=ignore_case,
+            only_matching=False,
+            timeout_s=TEXT_TIMEOUT_S,
+            max_output=TEXT_OUTPUT_MAX,
+        )
+    except GitInputError as exc:
+        if exc.reason == "regex":
+            raise _invalid("q", "not a valid POSIX extended regular expression", "invalid_regex") from None
+        raise
+    hits: list[SearchHit] = []
+    truncated = found.truncated
+    for match in found.matches:
+        if not _visible(match.path, glob, policy, access):
+            continue
+        if len(hits) >= limit:
+            truncated = True
+            break
+        hits.append(SearchHit(match.path, match.line, preview(match.text, match.column)))
+    return SearchResult(hits, truncated, None, None)
+
+
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def _search_symbols(
+    env: ProjectEnv,
+    project_id: uuid.UUID,
+    policy: Policy,
+    access: Access,
+    q: str,
+    glob: str | None,
+    kind: str | None,
+    limit: int,
+) -> SearchResult:
+    needle = q.lower()
+    pattern = _like_escape(needle)
+    name = func.lower(RepoIndexEntry.symbol)
+    query = (
+        select(RepoIndexEntry.path, RepoIndexEntry.line, RepoIndexEntry.symbol, RepoIndexEntry.symbol_kind)
+        .where(
+            RepoIndexEntry.project_id == project_id,
+            RepoIndexEntry.kind == "symbol",
+            name.like(f"%{pattern}%", escape="\\"),
+        )
+        .order_by(
+            case((name == needle, 0), (name.like(f"{pattern}%", escape="\\"), 1), else_=2),
+            RepoIndexEntry.path,
+            RepoIndexEntry.line,
+        )
+        .limit(SYMBOL_CANDIDATES)
+    )
+    if kind is not None:
+        query = query.where(RepoIndexEntry.symbol_kind == kind)
+    async with env.sessions() as session:
+        rows = (await session.execute(query)).all()
+        repository = await session.scalar(select(Repository).where(Repository.project_id == project_id))
+    hits: list[SearchHit] = []
+    truncated = len(rows) >= SYMBOL_CANDIDATES
+    for path, line, symbol, symbol_kind in rows:
+        if not _visible(path, glob, policy, access):
+            continue
+        if len(hits) >= limit:
+            truncated = True
+            break
+        hits.append(SearchHit(path, line or 0, f"{symbol_kind} {symbol}", symbol, symbol_kind))
+    return SearchResult(
+        hits,
+        truncated,
+        repository.index_commit if repository is not None else None,
+        repository.last_indexed_at if repository is not None else None,
+    )

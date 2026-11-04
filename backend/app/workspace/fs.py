@@ -339,6 +339,20 @@ class Workspace:
         max_entries = min(max(max_entries, 1), MAX_TREE_ENTRIES)
         return await asyncio.to_thread(self._tree, rel, access, depth, max_entries)
 
+    async def policy(self, access: Access) -> Policy:
+        """The project's access policy (built-in denials + ``.agentignore``), for callers that filter paths
+        git listed, e.g. search results (WP-2.1d). An invalid ``.agentignore`` denies agent access
+        (``PathViolation``), as every other agent read does."""
+        access = _require(access, _READS)
+        return await asyncio.to_thread(self._load_policy, access)
+
+    def _load_policy(self, access: Access) -> Policy:
+        root_fd, _ = open_root(self.root)
+        try:
+            return self._policy(root_fd, access)
+        finally:
+            os.close(root_fd)
+
     @contextlib.asynccontextmanager
     async def exclusive(self) -> AsyncIterator[None]:
         """Hold the workspace lock (the one every write takes) while the caller runs something that must see

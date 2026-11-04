@@ -17,10 +17,10 @@ from app.core.config import load_settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
-from app.services.job_queue import IMPORT_TASK, INDEX_TASK
+from app.services.job_queue import IMPORT_TASK, INDEX_TASK, CeleryJobQueue
 from app.services.project_imports import ImportEnv, ImportRetry, run_import
 from app.services.projects import ProjectEnv
-from app.services.repo_index import IndexEnv, Trigger, run_index
+from app.services.repo_index import IndexEnv, Trigger, index_soon, run_index
 
 # A job runs well inside its lock (import_lock.LOCK_TTL_S, 45 min): its archive and lock never outlive it.
 IMPORT_TIME_LIMIT_S = 40 * 60
@@ -66,7 +66,14 @@ async def run_import_job(
             redis=redis,
         )
         env = ImportEnv(projects=projects_env, redis=redis)
-        return await run_import(env, project_id=project_id, job_id=job_id, user_id=user_id, filename=filename)
+        outcome = await run_import(
+            env, project_id=project_id, job_id=job_id, user_id=user_id, filename=filename
+        )
+        if outcome == "ready":
+            # UC-02: import, then index. Best effort: the import's outcome is already decided.
+            jobs = CeleryJobQueue(settings.redis_url)
+            await index_soon(IndexEnv(projects_env, redis, jobs), project_id, user_id, trigger="import")
+        return outcome
     finally:
         await redis.aclose()
         await engine.dispose()
