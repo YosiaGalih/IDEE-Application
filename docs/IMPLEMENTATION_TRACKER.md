@@ -1589,3 +1589,5 @@ Tidak ditutup (alasan):
 - **silent L4** (buang perubahan saat simpan berjalan): yang sedang dikirim adalah teks yang diminta disimpan. Yang dibuang hanya ketikan sesudahnya, dan dialog mengatakan begitu.
 - **silent L8** (`disposeModel` no-op sebelum Monaco dimuat): benar menurut invarian. Invarian ditulis di `lazyEditor.tsx`.
 
+Usulan untuk backend (pemilik WP-2.1c, belum dikerjakan): `AlreadyExists` (`POST /files` untuk path yang sudah ada) adalah 409 `CONFLICT` tanpa `details.reason`. Bentuknya sama dengan 409 dari idempotency store ("permintaan dengan key ini masih berjalan"), sehingga UI hanya bisa menyebut keduanya. `details: [{reason: "path_exists"}]` akan membuatnya tegas tanpa mengubah status code.
+
