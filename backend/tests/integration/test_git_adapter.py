@@ -584,3 +584,204 @@ async def test_commit_files_lists_what_the_commit_holds(git: GitAdapter, repo: G
     sha = await git.commit(repo, "two", ME)
     assert sha is not None
     assert await git.commit_files(repo, sha) == ["a.txt", "d/b.txt"]
+
+
+# --- WP-2.1d: list a commit's files, grep a tree or a commit ----------------------------------------------
+
+
+async def test_list_files_lists_blobs_of_a_commit(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "src" / "app.py", "print('x')\n")
+    os.symlink("f.txt", repo.repo / "link")
+    sha = await git.commit(repo, "files", ME)
+    assert sha is not None
+    listing = await git.list_files(repo, sha)
+    assert (listing.truncated, listing.skipped_paths) == (False, 0)
+    assert {(f.path, f.size) for f in listing.files} == {("f.txt", 6), ("keep.md", 5), ("src/app.py", 11)}
+
+
+async def test_list_files_counts_paths_that_are_not_utf8(git: GitAdapter, repo: GitTarget) -> None:
+    (repo.repo / os.fsdecode(b"\xff.txt")).write_text("x\n")
+    sha = await git.commit(repo, "latin-1 name", ME)
+    assert sha is not None
+    listing = await git.list_files(repo, sha)
+    assert listing.skipped_paths == 1
+    assert "f.txt" in {f.path for f in listing.files}
+
+
+async def test_grep_finds_text_in_the_working_tree_including_untracked(
+    git: GitAdapter, repo: GitTarget
+) -> None:
+    write(repo.repo / "new.txt", "one\nsay Hello there\n")
+    result = await git.grep(repo, ["Hello"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [(m.path, m.line, m.column, m.text) for m in result.matches] == [
+        ("new.txt", 2, 5, "say Hello there")
+    ]
+    assert not result.truncated
+
+
+async def test_grep_is_literal_unless_regex(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "x.txt", "axb\n")
+    literal = await git.grep(repo, ["a.b"], commit=None, fixed=True, ignore_case=False,
+                             only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    regex = await git.grep(repo, ["a.b"], commit=None, fixed=False, ignore_case=False,
+                           only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert literal.matches == []
+    assert [m.path for m in regex.matches] == ["x.txt"]
+
+
+async def test_grep_ignore_case(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "x.txt", "MiXeD\n")
+    result = await git.grep(repo, ["mixed"], commit=None, fixed=True, ignore_case=True,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [m.text for m in result.matches] == ["MiXeD"]
+
+
+async def test_grep_on_a_commit_reads_the_tree_not_the_files(git: GitAdapter, repo: GitTarget) -> None:
+    head = await git.current_commit(repo)
+    assert head is not None
+    write(repo.repo / "f.txt", "changed on disk\n")
+    result = await git.grep(repo, ["b"], commit=head, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [(m.path, m.line, m.column, m.text) for m in result.matches] == [("f.txt", 2, None, "b")]
+
+
+async def test_grep_only_matching_prints_the_match(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "big.js", "function   huge" + "x" * (1 << 20) + "\n")
+    sha = await git.commit(repo, "big", ME)
+    assert sha is not None
+    pattern = "^function[[:space:]]+[a-z]{4}"
+    result = await git.grep(repo, [pattern], commit=sha, fixed=False, ignore_case=False,
+                            only_matching=True, timeout_s=10, max_output=1 << 16)  # fmt: skip
+    assert [m.text for m in result.matches] == ["function   huge"]
+
+
+async def test_grep_no_match_is_empty(git: GitAdapter, repo: GitTarget) -> None:
+    result = await git.grep(repo, ["nowhere-to-be-found"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert (result.matches, result.truncated, result.skipped_paths) == ([], False, 0)
+
+
+async def test_grep_invalid_regex_is_an_input_error(git: GitAdapter, repo: GitTarget) -> None:
+    with pytest.raises(GitInputError) as raised:
+        await git.grep(repo, ["("], commit=None, fixed=False, ignore_case=False,
+                       only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert raised.value.reason == "regex"
+
+
+async def test_grep_paths_with_colons_and_spaces(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "we:ird" / "a b.txt", "needle\n")
+    result = await git.grep(repo, ["needle"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [m.path for m in result.matches] == ["we:ird/a b.txt"]
+
+
+async def test_grep_skips_paths_that_are_not_utf8(git: GitAdapter, repo: GitTarget) -> None:
+    (repo.repo / os.fsdecode(b"\xff.txt")).write_text("needle\n")
+    write(repo.repo / "ok.txt", "needle\n")
+    result = await git.grep(repo, ["needle"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert [m.path for m in result.matches] == ["ok.txt"]
+    assert result.skipped_paths == 1
+
+
+async def test_grep_output_cap_truncates(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "many.txt", "needle line\n" * 100)
+    result = await git.grep(repo, ["needle"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=200)  # fmt: skip
+    assert result.truncated
+    assert 0 < len(result.matches) < 100
+    assert all(m.text == "needle line" for m in result.matches)  # no partial record
+
+
+async def test_grep_timeout_is_a_git_error(git: GitAdapter, repo: GitTarget) -> None:
+    for index in range(200):
+        write(repo.repo / f"d{index}" / "f.txt", "needle\n" * 50)
+    with pytest.raises(GitError) as raised:
+        await git.grep(repo, ["(n|e)*d"], commit=None, fixed=False, ignore_case=False,
+                       only_matching=False, timeout_s=0.001, max_output=1 << 20)  # fmt: skip
+    assert raised.value.reason == "timeout"
+
+
+# --- WP-2.1d review round -----------------------------------------------------------------------------------
+
+
+async def test_head_commit_is_none_only_for_an_unborn_branch(
+    tmp_path: Path, git: GitAdapter, repo: GitTarget
+) -> None:
+    """Silent-failure H1: a HEAD git cannot read is an error, never "no commit yet"."""
+    assert await git.head_commit(repo) == await git.current_commit(repo)
+    unborn = tmp_path / "unborn"
+    unborn.mkdir()
+    await git.init(unborn, "main")
+    assert await git.head_commit(GitTarget(unborn)) is None
+    (repo.repo / ".git" / "refs" / "heads" / "main").write_text("1" * 40 + "\n")  # a commit that is not there
+    with pytest.raises(GitError) as raised:
+        await git.head_commit(repo)
+    assert raised.value.reason == "head_unreadable"
+
+
+async def test_grep_ignores_case_beyond_ascii(git: GitAdapter, repo: GitTarget) -> None:
+    """Backend S1: git runs grep in a UTF-8 locale, so -i and "." work on non-ASCII letters."""
+    write(repo.repo / "u.txt", "Ünïcode café\n")
+    for pattern, fixed in (("ünïcode", True), ("CAFÉ", True), ("caf.$", False)):
+        result = await git.grep(repo, [pattern], commit=None, fixed=fixed, ignore_case=True,
+                                only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+        assert [m.path for m in result.matches] == ["u.txt"], pattern
+
+
+async def test_grep_column_counts_characters(git: GitAdapter, repo: GitTarget) -> None:
+    """Backend N2: git reports a byte column; the API speaks characters."""
+    write(repo.repo / "u.txt", "Ünïcode café\n")
+    result = await git.grep(repo, ["café"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    [match] = result.matches
+    assert match.column == 9 and match.text[match.column - 1 :].startswith("café")
+
+
+async def test_grep_max_matches_truncates(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "many.txt", "needle\n" * 50)
+    result = await git.grep(repo, ["needle"], commit=None, fixed=True, ignore_case=False, only_matching=False,
+                            timeout_s=10, max_output=1 << 20, max_matches=10)  # fmt: skip
+    assert (len(result.matches), result.truncated) == (10, True)
+
+
+async def test_a_cut_output_returns_promptly_every_time(git: GitAdapter, repo: GitTarget) -> None:
+    """AG-13 L2: after the output cap git is killed; its unread pipe must not hold wait() until the timeout.
+    Before the fix about one call in eight at a 4 MiB cap waited the whole timeout."""
+    for index in range(200):
+        write(repo.repo / f"d{index}.txt", "the quick brown fox jumps over the lazy dog e e e\n" * 2000)
+    for _ in range(16):
+        started = time.monotonic()
+        result = await git.grep(repo, ["e"], commit=None, fixed=True, ignore_case=False,
+                                only_matching=False, timeout_s=8, max_output=4 << 20)  # fmt: skip
+        assert result.truncated
+        assert time.monotonic() - started < 3
+
+
+async def test_grep_parses_off_the_event_loop(git: GitAdapter, repo: GitTarget) -> None:
+    """AG-13 M2: a large output (the index job reads up to 64 MiB) is parsed in a thread."""
+    for index in range(200):
+        write(repo.repo / f"p{index}.txt", "e e e e\n" * 4000)
+    grep = asyncio.ensure_future(
+        git.grep(
+            repo,
+            ["e"],
+            commit=None,
+            fixed=True,
+            ignore_case=False,
+            only_matching=False,
+            timeout_s=30,
+            max_output=16 << 20,
+        )
+    )
+    gaps: list[float] = []
+    last = time.monotonic()
+    while not grep.done():
+        await asyncio.sleep(0.005)
+        now = time.monotonic()
+        gaps.append(now - last)
+        last = now
+    result = await grep
+    assert len(result.matches) > 300_000
+    assert max(gaps) < 0.5

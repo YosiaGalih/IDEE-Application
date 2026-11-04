@@ -375,6 +375,14 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - Alasannya: middleware idempotency tidak menyimpan 408 (§1 "respons transien"), sehingga retry dengan key yang sama berjalan lagi. Jawaban 400 akan tersimpan 24 jam dan memutar ulang penolakan untuk unggahan yang sebenarnya sah.
     - Usulan perubahan kontrak: tambahkan baris `408 | BAD_REQUEST` (atau kode baru `REQUEST_TIMEOUT`) di §1. Keputusan Lead.
 
+69. **Indeks dan pencarian (WP-2.1d).** Spec: `docs/superpowers/specs/2026-11-04-wp-2.1d-index-search-design.md`.
+    - `GET /projects/{id}/search`: API_CONTRACTS §3 hanya punya `q`, `mode`, `glob`. FR-020 meminta literal **dan** regex serta batas hasil, dan TOOL_CATALOG `repo.search_text` punya `regex`/`max_results`. Ditambahkan `regex`, `ignore_case`, `kind` (mode symbol), dan `limit` (≤ 200), plus `meta: {truncated, index_commit, indexed_at}`. Regex = POSIX ERE. Usulan: §3 mencantumkan parameter ini.
+    - `repo_index_entries.sha256` diisi null: ls-tree hanya memberi id objek git, bukan sha256 isi. Usulan: kolom tetap nullable sampai ada pemakai (v2.1).
+    - `repositories.sync_state = indexing` tidak dipakai: job indeks tidak menulis status repository, supaya IDE tetap bisa dipakai selama indeks berjalan dan sesuai syarat masuk AG-13 dari WP-2.1b. Usulan: Lead memutuskan apakah nilai `indexing` dihapus dari DATA_MODEL atau dicadangkan untuk v2.1.
+    - Indeks = isi commit HEAD, bukan working tree; cari teks = working tree. Kegagalan indeks hanya tercatat di audit `project.index result=error` dan log, karena `Project.repository` tidak punya field status indeks. Usulan: Lead menilai perlu tidaknya `repository.index_error`.
+    - `POST /index` saat job berjalan → 202 dengan `job_id` yang sedang berjalan (`meta.reused`), bukan 409.
+    - **Review WP-2.1d:** `repositories.index_truncated` (boolean, default false) ditambahkan, belum ada di DATA_MODEL: indeks yang berhenti di batas harus terlihat dan dibangun ulang (temuan silent-failure H2). Pencarian menambah `meta.skipped`, `meta.index_truncated`, 422 `regex_unsupported` (backreference dan `{m,n}`), serta 429 untuk pencarian teks yang masih berjalan. Usulan: DATA_MODEL dan API_CONTRACTS §3 mencantumkannya.
+
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
 - Versi Node.js.

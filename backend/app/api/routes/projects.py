@@ -20,7 +20,7 @@ from app.api.deps import AuditDep, CurrentActor, LimiterDep, dependencies, requi
 from app.core.context import REQUEST_ID_HEADER
 from app.core.errors import envelope, request_id_of
 from app.models.projects import Repository
-from app.services import projects
+from app.services import projects, repo_index
 from app.services.projects import Actor, ProjectEnv, ProjectView
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -280,6 +280,15 @@ async def create_project(
         source=source,
         default_branch=body.default_branch,
     )
+    if isinstance(source, projects.BlankSource | projects.TemplateSource):
+        # UC-02: a new repository is indexed right away. Best effort: the create already succeeded.
+        deps = dependencies(request)
+        await repo_index.index_soon(
+            repo_index.IndexEnv(projects=env, redis=deps.redis, jobs=deps.jobs),
+            view.project.id,
+            actor.user_id,
+            trigger="create",
+        )
     data = ProjectOut.of(view).model_dump(mode="json")
     return _respond(request, data, status_code=201, headers={"Location": f"/api/v1/projects/{data['id']}"})
 

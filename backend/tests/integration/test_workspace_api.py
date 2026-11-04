@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -30,6 +31,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     owner_id,
     workspace_root,
 )
+from tests.integration.test_projects import git as git_raw
 
 
 async def blank(client: httpx.AsyncClient, name: str = "Kode") -> dict[str, Any]:
@@ -489,3 +491,25 @@ async def test_a_retried_write_with_the_same_key_runs_once(
     assert (first.status_code, again.status_code) == (200, 200)
     assert again.headers.get("idempotent-replay") == "true"
     assert again.json()["data"] == first.json()["data"]
+
+
+async def test_search_text_and_symbol(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    """TEST_STRATEGY AC-03: the IDE searches text (working tree) and symbols (index)."""
+    from tests.integration.test_repo_index import index_env, project_with_code, run_job
+
+    project_id, repo = await project_with_code(owner, workspace_root)
+    (repo / "src" / "app.py").write_text("def greet():\n    return 'hi'\n")
+    git_raw(repo, "add", "src/app.py")
+    git_raw(repo, "-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "-q", "-m", "greet")
+    assert await run_job(index_env(app, workspace_root), project_id, owner_id) == "indexed"
+    text = await owner.get(f"{PROJECTS}/{project_id}/search?q=greet")
+    assert text.json()["data"] == [{"path": "src/app.py", "line": 1, "preview": "def greet():"}]
+    symbol = await owner.get(f"{PROJECTS}/{project_id}/search?q=gre&mode=symbol")
+    assert symbol.json()["data"] == [
+        {"path": "src/app.py", "line": 1, "preview": "function greet", "symbol": "greet", "kind": "function"}
+    ]

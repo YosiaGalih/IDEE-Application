@@ -36,6 +36,7 @@ from app.services.projects import Actor, ProjectEnv, authorize, commit_author, r
 from app.workspace import fs
 from app.workspace.errors import AlreadyExists, PatchRollbackFailed, PathViolation, VersionConflict
 from app.workspace.fs import FileChange, TreeResult, Workspace
+from app.workspace.index import language_for
 from app.workspace.policy import Access
 
 logger = get_logger(__name__)
@@ -44,52 +45,6 @@ AUDIT_PATHS_MAX = 100  # paths listed in one event; the count is always exact
 SANDBOX_DIR = ".kk"  # sandbox artefacts (SECURITY_MODEL §4): never committed, hidden from status and diff
 
 _TASK_REF = re.compile(r"task:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-
-# Monaco language ids by extension (FR-027); unknown → None (plain text).
-_LANGUAGES = {
-    ".py": "python",
-    ".pyi": "python",
-    ".js": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".jsx": "javascript",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".java": "java",
-    ".go": "go",
-    ".rs": "rust",
-    ".rb": "ruby",
-    ".php": "php",
-    ".cs": "csharp",
-    ".kt": "kotlin",
-    ".swift": "swift",
-    ".c": "c",
-    ".h": "c",
-    ".cpp": "cpp",
-    ".hpp": "cpp",
-    ".html": "html",
-    ".htm": "html",
-    ".css": "css",
-    ".scss": "scss",
-    ".json": "json",
-    ".yaml": "yaml",
-    ".yml": "yaml",
-    ".toml": "toml",
-    ".md": "markdown",
-    ".sh": "shell",
-    ".sql": "sql",
-    ".xml": "xml",
-    ".txt": "plaintext",
-}
-_LANGUAGE_NAMES = {"Dockerfile": "dockerfile", "Makefile": "makefile"}
-
-
-def language_for(path: str) -> str | None:
-    """The editor language for ``path`` (by name, then extension), ``None`` when unknown."""
-    name = PurePosixPath(path).name
-    if name in _LANGUAGE_NAMES:
-        return _LANGUAGE_NAMES[name]
-    return _LANGUAGES.get(PurePosixPath(name).suffix.lower())
 
 
 def _reason(error: AppError) -> str | None:

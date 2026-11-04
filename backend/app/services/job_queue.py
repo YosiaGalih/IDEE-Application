@@ -14,6 +14,7 @@ from typing import Protocol
 from celery import Celery
 
 IMPORT_TASK = "app.worker.platform_jobs.import_archive"
+INDEX_TASK = "app.worker.platform_jobs.index_repository"
 QUEUE = "ide"  # platform_jobs run in worker-ide (IMPLEMENTATION_DESIGN_V2 §2)
 SEND_TIMEOUT_S = 10.0
 
@@ -23,6 +24,12 @@ class JobQueue(Protocol):
         self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID, filename: str
     ) -> None:
         """Hand the import to a worker; raise if it was not handed over."""
+        ...
+
+    async def enqueue_index(
+        self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID, trigger: str
+    ) -> None:
+        """Hand an index run to a worker (WP-2.1d); raise if it was not handed over."""
         ...
 
 
@@ -55,3 +62,15 @@ class CeleryJobQueue:
         }
         async with asyncio.timeout(SEND_TIMEOUT_S):
             await asyncio.to_thread(self._celery.send_task, IMPORT_TASK, kwargs=kwargs, queue=QUEUE)
+
+    async def enqueue_index(
+        self, *, project_id: uuid.UUID, job_id: uuid.UUID, user_id: uuid.UUID, trigger: str
+    ) -> None:
+        kwargs = {
+            "project_id": str(project_id),
+            "job_id": str(job_id),
+            "user_id": str(user_id),
+            "trigger": trigger,
+        }
+        async with asyncio.timeout(SEND_TIMEOUT_S):
+            await asyncio.to_thread(self._celery.send_task, INDEX_TASK, kwargs=kwargs, queue=QUEUE)

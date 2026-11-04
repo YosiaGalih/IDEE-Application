@@ -47,6 +47,8 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("GET", "/api/v1/projects/{id}/git/log", None),
     ("POST", "/api/v1/projects/{id}/git/branch", {"name": "matrix"}),
     ("POST", "/api/v1/projects/{id}/git/commit", {"message": "matrix"}),
+    ("POST", "/api/v1/projects/{id}/index", None),
+    ("GET", "/api/v1/projects/{id}/search?q=x", None),
 ]
 FILE = "README.md"  # exists in every blank project
 WRITES = {
@@ -60,6 +62,7 @@ WRITES = {
     ("POST", "/api/v1/projects/{id}/patches"),
     ("POST", "/api/v1/projects/{id}/git/branch"),
     ("POST", "/api/v1/projects/{id}/git/commit"),
+    ("POST", "/api/v1/projects/{id}/index"),
 }
 
 
@@ -140,7 +143,7 @@ def project_routes(app: FastAPI) -> dict[tuple[str, str], APIRoute]:
 
 def test_every_project_route_is_in_the_matrix(app: FastAPI) -> None:
     listed = {
-        (method, path.replace("{id}", "{project_id}").replace("{path}", "{path:path}"))
+        (method, path.split("?")[0].replace("{id}", "{project_id}").replace("{path}", "{path:path}"))
         for method, path, _ in ENDPOINTS
     }
     assert set(project_routes(app)) == listed

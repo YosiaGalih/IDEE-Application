@@ -5,6 +5,7 @@ USER_STATUSES = ("active", "disabled")
 PROJECT_STATUSES = ("active", "archived", "deleting_pending_approval", "deleted")
 REPOSITORY_PROVIDERS = ("local", "template", "upload", "git_https")
 REPOSITORY_SYNC_STATES = ("ready", "importing", "indexing", "error")
+INDEX_ENTRY_KINDS = ("file", "symbol")  # repo_index_entries.kind (WP-2.1d)
 # ARCHITECTURE §5.1 (with ADR-006, ADR-021). Only workflow.states.transition writes tasks.status.
 TASK_STATUSES = (
     "draft",
