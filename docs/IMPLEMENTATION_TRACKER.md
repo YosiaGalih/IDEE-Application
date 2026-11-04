@@ -1511,4 +1511,10 @@ Tidak ditutup (alasan):
 - **WP-3.1 dan setiap perubahan RBAC (I1):** role tanpa `task:read` harus disertai filter izin per project di dashboard. Test invarian di atas memaksa keputusan itu.
 - **WP-3.1 (I2):** putuskan apakah `tasks.title` diredaksi saat ditulis. `status_reason` sudah diredaksi, `title` belum; judul buatan agent bisa memuat secret.
 
-Delta AG-13 untuk perubahan backend sesudah b2a7e02: menyusul.
+**Delta AG-13 @ e109e6e (kode dcfd06d): SIGNED OFF 🔒** (0 CRITICAL–LOW, 1 INFO baru).
+- **Probe P4 (HTTP):** project terbaru di dashboard sama persis (JSON) dengan `GET /projects?page_size=5` untuk owner, user ber-grant, dan role global. Kasus yang dicoba: project deleted/archived/`deleting_pending_approval` yang di-grant, project aktif tanpa grant, tie `updated_at`, dan project ke-6 yang terpotong limit.
+- **Mutan D1–D8:** semuanya merah, termasuk kebocoran pool yang hanya terjadi di jalur gagal (`test_a_failed_read_leaves_the_pooled_connection_clean`) dan pembacaan di luar snapshot (`test_counts_and_lists_come_from_one_snapshot`).
+- **Biaya:** 7 statement per dashboard (sebelumnya 8), 141 ms pada 200 ribu task.
+- **CI security-scan @ afbcfbc:** gitleaks, pip-audit, npm audit, Semgrep, dan Trivy semuanya lulus.
+
+- **DI1 INFO (syarat masuk, mengikat):** `project_views` (publik, `services/projects.py`) membangun view tanpa menyaring visibilitas. Setiap pemanggil baru wajib membaca barisnya di bawah `visible_projects_filter`. Kedua pemanggil sekarang sudah begitu [Pasti]. Pertahanan berlapis (membuang baris dengan izin kosong) ditunda ke perubahan berikutnya di file itu, karena perubahan apa pun di sana memerlukan delta review lagi.
