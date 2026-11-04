@@ -808,6 +808,15 @@ async def list_projects(
     async with env.sessions() as session:
         total = await session.scalar(select(func.count()).select_from(Project).where(*conditions)) or 0
         rows = (await session.execute(statement)).all()
+    items = await project_views(env, actor, [(project, repository) for project, repository in rows])
+    return ProjectPage(items=items, page=page, page_size=page_size, total=total)
+
+
+async def project_views(
+    env: ProjectEnv, actor: Actor, rows: list[tuple[Project, Repository | None]]
+) -> list[ProjectView]:
+    """List rows as the screens show them: with the actor's permissions and what a look at the disk finds
+    (a missing repository, an import that stalled). Rows read in any session; the checks run after it."""
     ready = [
         project.id
         for project, repository in rows
@@ -821,13 +830,12 @@ async def list_projects(
             return "repository_missing"
         return "import_incomplete" if project_id in stalled else None
 
-    items = [
+    return [
         ProjectView(
             project, repository, permissions_for(actor, project), None, repository_problem=problem(project.id)
         )
         for project, repository in rows
     ]
-    return ProjectPage(items=items, page=page, page_size=page_size, total=total)
 
 
 @functools.cache

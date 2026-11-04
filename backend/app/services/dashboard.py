@@ -15,9 +15,9 @@ from datetime import UTC, datetime
 from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.projects import Project
+from app.models.projects import Project, Repository
 from app.models.tasks import Task
-from app.services.projects import Actor, ProjectEnv, ProjectView, list_projects, visible_projects_filter
+from app.services.projects import Actor, ProjectEnv, ProjectView, project_views, visible_projects_filter
 
 RECENT_PROJECTS = 5
 RECENT_TASKS = 10
@@ -93,7 +93,8 @@ async def _summaries(
         select(*_SUMMARY_COLUMNS)
         .join(Project, Project.id == Task.project_id)
         .where(visible, *where)
-        .order_by(Task.updated_at.desc(), Task.id)
+        # Tasks touched in one transaction share updated_at: the newer one first (backend review NIT 1).
+        .order_by(Task.updated_at.desc(), Task.created_at.desc(), Task.id)
         .limit(limit)
     )
     return [TaskSummaryView(*row) for row in (await session.execute(statement)).all()]
@@ -106,9 +107,11 @@ async def load_dashboard(env: ProjectEnv, actor: Actor, *, now: datetime | None 
         await session.connection(
             execution_options={"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
         )
-        active = await session.scalar(
-            select(func.count()).select_from(Project).where(visible, Project.status == "active")
-        )
+        active = (
+            await session.execute(
+                select(func.count()).select_from(Project).where(visible, Project.status == "active")
+            )
+        ).scalar_one()
         counted = await session.execute(
             select(Task.status, func.count())
             .join(Project, Project.id == Task.project_id)
@@ -120,11 +123,22 @@ async def load_dashboard(env: ProjectEnv, actor: Actor, *, now: datetime | None 
         failed_queue = await _summaries(
             session, visible, Task.status.in_(ATTENTION_STATUSES), limit=FAILED_QUEUE
         )
-    # The project list reads in its own session (it also checks repositories on disk): it may be a moment
-    # newer than the counts, which a dashboard can live with.
-    recent_projects = await list_projects(env, actor, status="active", page_size=RECENT_PROJECTS)
+        # The same rows and order as GET /projects (status active), read in this snapshot (backend SHOULD 1).
+        project_rows = (
+            await session.execute(
+                select(Project, Repository)
+                .outerjoin(Repository, Repository.project_id == Project.id)
+                .where(visible, Project.status == "active")
+                .order_by(Project.updated_at.desc(), Project.id)
+                .limit(RECENT_PROJECTS)
+            )
+        ).all()
+    # The look at the disk (missing repository, stalled import) needs no transaction.
+    recent_projects = await project_views(
+        env, actor, [(project, repository) for project, repository in project_rows]
+    )
     metrics = {
-        "active_projects": active or 0,
+        "active_projects": active,
         "running_tasks": sum(by_status.get(status, 0) for status in RUNNING_STATUSES),
         "completed_tasks": by_status.get("completed", 0),
         "failed_tasks": by_status.get("failed", 0),
@@ -132,7 +146,7 @@ async def load_dashboard(env: ProjectEnv, actor: Actor, *, now: datetime | None 
     }
     return Dashboard(
         metrics=metrics,
-        recent_projects=list(recent_projects.items),
+        recent_projects=recent_projects,
         recent_tasks=recent_tasks,
         failed_queue=failed_queue,
         failed_queue_total=sum(by_status.get(status, 0) for status in ATTENTION_STATUSES),

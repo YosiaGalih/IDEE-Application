@@ -315,3 +315,24 @@ describe("DashboardPage", () => {
     await waitFor(() => expect(screen.queryByText(id.dashboard.empty.title)).toBeNull());
   });
 });
+
+describe("DashboardPage with hostile content", () => {
+  it("renders titles, names and reasons as text, never as markup (AG-13 I6)", async () => {
+    const payload =
+      '<img src=x onerror="document.body.dataset.pwned=1"><script>document.body.dataset.pwned=2</script>';
+    const data = dashboardData();
+    data.recent_tasks = [task({ title: payload, project_name: payload, status_reason: payload })];
+    data.failed_queue = [task({ title: payload, project_name: payload, status_reason: payload })];
+    const shown = project({ name: payload });
+    data.recent_projects = [
+      { ...shown, repository: { ...shown.repository, sync_state: "error", error: payload } },
+    ];
+    backend(() => answer(data));
+    renderApp("/");
+    const queue = await screen.findByRole("region", { name: id.dashboard.queue.title });
+    expect(within(queue).getAllByText(payload).length).toBeGreaterThan(0);
+    expect(document.querySelectorAll("main script")).toHaveLength(0);
+    expect(document.querySelectorAll('main img[src="x"]')).toHaveLength(0);
+    expect(document.body.dataset.pwned).toBeUndefined();
+  });
+});

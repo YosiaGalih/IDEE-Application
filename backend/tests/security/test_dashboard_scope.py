@@ -194,3 +194,24 @@ async def test_a_grant_on_a_deleted_project_counts_nothing(
     assert (carl["projects"], carl["tasks"], carl["queue"]) == (set(), set(), set())
     alice = await seen(await people["client"]("alice"))  # nor for its owner
     assert str(people["tasks"]["alice_main"]) not in alice["tasks"] | alice["queue"]
+
+
+def test_every_role_that_sees_a_project_may_read_its_tasks() -> None:
+    """AG-13 I1: the dashboard lists the tasks of every visible project without checking task:read, which is
+    right only while every role holds it. A role without task:read must make this test fail first."""
+    from app.core.rbac import ROLE_PERMISSIONS
+
+    assert all("task:read" in permissions for permissions in ROLE_PERMISSIONS.values())
+
+
+async def test_recent_projects_are_the_first_page_of_the_project_list(
+    people: dict[str, Any], engine: AsyncEngine
+) -> None:
+    """The dashboard reads its recent projects in its own snapshot: the rows and their order must still be the
+    ones GET /projects?page_size=5 returns, for an owner and for a granted user."""
+    await grant(engine, people["ids"]["bob"], "readonly", f"project:{people['projects']['alice_main']}")
+    for name in ("alice", "bob"):
+        client = await people["client"](name)
+        listed = (await client.get("/api/v1/projects", params={"page_size": 5})).json()["data"]
+        shown = (await client.get(DASHBOARD)).json()["data"]["recent_projects"]
+        assert shown == listed

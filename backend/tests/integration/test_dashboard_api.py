@@ -261,3 +261,98 @@ async def test_the_dashboard_reads_in_a_read_only_snapshot(
     actor = projects.Actor(owner_id, "o@example.test", "O", (RoleGrant("owner", "global"),))
     await dashboard.load_dashboard(env, actor)
     assert seen == [("on", "repeatable read"), ("on", "repeatable read")]
+
+
+async def test_counts_and_lists_come_from_one_snapshot(
+    owner_id: uuid.UUID,  # noqa: F811
+    engine: AsyncEngine,
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    """Backend review SHOULD 1/2: writes that land while the dashboard reads never make a count disagree with
+    a list. Another request adds a failed task and archives a project after the counts were taken."""
+    from app.core.rbac import RoleGrant
+    from app.gitops.adapter import GitAdapter
+    from app.services import dashboard, projects
+
+    kept = await add_project(engine, owner_id, "Satu")
+    shelved = await add_project(engine, owner_id, "Dua")
+    await add_task(engine, kept, owner_id, "failed", "Lama", minutes_ago=5)
+    summaries = dashboard._summaries  # pyright: ignore[reportPrivateUsage]
+    late: list[uuid.UUID] = []
+
+    async def meanwhile(session: Any, *args: Any, **kwargs: Any) -> Any:
+        if not late:
+            late.append(await add_task(engine, kept, owner_id, "failed", "Baru"))
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE projects SET status = 'archived' WHERE id = :id"), {"id": shelved}
+                )
+        return await summaries(session, *args, **kwargs)
+
+    monkeypatch.setattr(dashboard, "_summaries", meanwhile)
+    env = projects.ProjectEnv(make_sessionmaker(engine), AUDIT, GitAdapter(), tmp_path)
+    actor = projects.Actor(owner_id, "o@example.test", "O", (RoleGrant("owner", "global"),))
+    board = await dashboard.load_dashboard(env, actor)
+    assert late  # the concurrent write did happen
+    assert (board.metrics["failed_tasks"], board.failed_queue_total) == (1, 1)
+    assert [summary.title for summary in board.failed_queue] == ["Lama"]
+    assert [summary.title for summary in board.recent_tasks] == ["Lama"]
+    assert board.metrics["active_projects"] == 2
+    assert {view.project.id for view in board.recent_projects} == {kept, shelved}
+
+
+async def test_a_failed_read_leaves_the_pooled_connection_clean(
+    owner_id: uuid.UUID,  # noqa: F811
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.rbac import RoleGrant
+    from app.gitops.adapter import GitAdapter
+    from app.services import dashboard, projects
+    from tests.conftest import make_test_env
+
+    async def broken(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("query failed")
+
+    monkeypatch.setattr(dashboard, "_summaries", broken)
+    single = create_async_engine(make_test_env()["DATABASE_URL"], pool_size=1, max_overflow=0)
+    try:
+        sessions = make_sessionmaker(single)
+        env = projects.ProjectEnv(sessions, AUDIT, GitAdapter(), tmp_path)
+        actor = projects.Actor(owner_id, "o@example.test", "O", (RoleGrant("owner", "global"),))
+        try:
+            await dashboard.load_dashboard(env, actor)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the failure must reach the caller")
+        async with sessions() as session:
+            after = (await session.execute(text("SHOW transaction_read_only"))).scalar_one()
+            level = (await session.execute(text("SHOW transaction_isolation"))).scalar_one()
+        assert (after, level) == ("off", "read committed")
+    finally:
+        await single.dispose()
+
+
+async def test_ties_in_updated_at_order_by_creation(
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    """Backend NIT 1: tasks touched in one transaction share updated_at; the newer task comes first."""
+    project_id = await add_project(engine, owner_id, "Seri")
+    first = await add_task(engine, project_id, owner_id, "failed", "Pertama")
+    second = await add_task(engine, project_id, owner_id, "failed", "Kedua")
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE tasks SET updated_at = '2026-11-04T08:00:00Z'"))
+        await conn.execute(
+            text("UPDATE tasks SET created_at = '2026-11-04T07:00:00Z' WHERE id = :id"), {"id": first}
+        )
+        await conn.execute(
+            text("UPDATE tasks SET created_at = '2026-11-04T07:30:00Z' WHERE id = :id"), {"id": second}
+        )
+    data, _, _ = await board(owner)
+    assert [task["title"] for task in data["failed_queue"]] == ["Kedua", "Pertama"]
