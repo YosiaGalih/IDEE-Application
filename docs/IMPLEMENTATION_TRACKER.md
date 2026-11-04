@@ -1457,3 +1457,19 @@ Tidak ditutup (alasan):
   - I3 (git yatim) praktis tertutup, karena tenggat 15 menit lebih pendek dari `time_limit` 20 menit.
 - **D7 INFO:** cancel melepas slot saat parse di thread masih berjalan. Jalur ini tidak terpicu oleh disconnect di uvicorn.
 - **Catatan versi:** `show-ref --exists` butuh git ≥ 2.43; image memakai git Debian trixie [Kemungkinan Besar 2.47]. Pada git yang lebih lama, branch unborn gagal tertutup sebagai `head_unreadable`.
+
+### WP-2.1e (🔒 scope lintas project) — dashboard (FR-007–011; AC-01, AC-16)
+
+Spec: `docs/superpowers/specs/2026-11-04-wp-2.1e-dashboard-design.md`. Plan: `docs/superpowers/plans/2026-11-04-wp-2.1e-dashboard.md`. Konflik #70: `failed_queue`, `project_name`, `meta.unavailable`, `usage.period`, status approval dari `tasks.status`. Backend `GET /dashboard` dan layar `/` ada dalam satu PR (konflik #63).
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Backend `ruff check .`, `ruff format --check .`, `pyright`, `lint-imports` | bersih; 0 error; 3 kontrak dipertahankan |
+| Backend `pytest -q` (PostgreSQL 16 + Redis 7 lokal) @ 19b8e9e | **1753 passed, 1 skipped** (+14 test baru) |
+| Frontend `format:check`, `lint`, `lint:guards`, `typecheck`, `npm test`, `vite build` @ 16dd334 | bersih; **333 passed**; build sukses |
+| Mutan scope (AC-01) | buang syarat `deleted` dari `visible_projects_filter` → 2 test merah; buang syarat grant → 3 test merah |
+| Mutan snapshot | buang `postgresql_readonly` → `test_the_dashboard_reads_in_a_read_only_snapshot` merah. Snapshot tidak bocor ke sesi berikutnya pada pool satu koneksi (`test_the_read_only_snapshot_stays_in_its_session`) |
+| Live check (uvicorn + DB uji `kodekantor_test_rev`) | login 200 → create project 201 → task digerakkan ke `failed` lewat `transition` → `GET /dashboard` 200, `Cache-Control: no-store`, `metrics.failed_tasks = 1`, `failed_queue` = task itu dengan `status_reason "tests failed"`, `usage.cost_status = "unavailable"`, `meta = {unavailable: [agent_activity, usage], failed_queue_total: 1}`; tanpa sesi → 401 |
+| Layar (Playwright, Vite + API lokal) | 1440 px dan 820 px sesuai mockup sejauh datanya ada. 390 px: dashboard tidak menambah scroll horizontal (32 px, sama dengan `/projects`; sumbernya shell WP-1.4a yang sidebar-nya selalu `w-60`) |
+
+Temuan di luar cakupan: shell aplikasi (`components/layout/Sidebar.tsx`, `w-60` di semua lebar) membuat setiap layar hanya punya ±150 px di ponsel 390 px. Usulan: sidebar yang bisa dilipat di bawah breakpoint `md` (WP-1.4 lanjutan).
