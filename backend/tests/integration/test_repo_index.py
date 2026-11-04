@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -62,3 +63,29 @@ async def test_index_entries_go_with_their_project(engine: AsyncEngine, owner_id
             text("SELECT count(*) FROM repo_index_entries WHERE project_id = :id"), {"id": project_id}
         )
     assert left == 0
+
+
+async def test_symbol_patterns_find_every_language_through_git(tmp_path: Path) -> None:
+    """``SYMBOL_PATTERNS`` (ERE, run by git) and ``classify`` (Python) agree on every sample definition."""
+    from app.gitops.adapter import Author, GitAdapter, GitTarget
+    from app.workspace.index import SYMBOL_PATTERNS, classify
+    from tests.unit.test_repo_index import DEFINITIONS
+
+    git = GitAdapter()
+    root = tmp_path / "repo"
+    root.mkdir()
+    await git.init(root, "main")
+    by_file: dict[str, list[str]] = {}
+    for path, sample, _ in DEFINITIONS:
+        by_file.setdefault(path, []).append(sample)
+    for path, lines in by_file.items():
+        (root / path).write_text("\n".join(["// filler", *lines, ""]))
+    (root / "not_js.py").write_text("function f() {}\n")
+    target = GitTarget(root)
+    sha = await git.commit(target, "samples", Author("Dev", "dev@example.test"))
+    assert sha is not None
+    result = await git.grep(target, list(SYMBOL_PATTERNS), commit=sha, fixed=False, ignore_case=False,
+                            only_matching=True, timeout_s=30, max_output=1 << 20)  # fmt: skip
+    found = {(m.path, classify(m.path, m.text)) for m in result.matches}
+    found.discard(("not_js.py", None))
+    assert found == {(path, expected) for path, _, expected in DEFINITIONS}
