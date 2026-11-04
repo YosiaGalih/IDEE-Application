@@ -616,3 +616,18 @@ async def test_a_failure_inside_the_swap_keeps_the_old_index(
     monkeypatch.setattr(AuditWriter, "write", failing)
     assert await run_job(env, project_id, owner_id) == "error"
     assert await entries(engine, project_id) == before
+
+
+async def test_an_unreadable_head_is_an_error_even_before_the_first_index(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    """Silent-failure H1 without the second guard: nothing indexed yet, only the strict HEAD read can tell."""
+    project_id, repo = await project_with_code(owner, workspace_root)
+    branch = git(repo, "symbolic-ref", "HEAD")
+    (repo / ".git" / branch).write_text("1" * 40 + "\n")
+    assert await run_job(index_env(app, workspace_root), project_id, owner_id) == "error"
+    assert (await repository_row(engine, project_id)).last_indexed_at is None

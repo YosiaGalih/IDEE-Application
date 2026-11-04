@@ -62,8 +62,10 @@ INDEX_REQUESTS_PER_HOUR = 10  # [Menebak]
 # Search (spec Goals 7-9).
 SEARCH_LIMIT_MAX = 200  # API_CONTRACTS §3 "maks 200"
 TEXT_TIMEOUT_S = 10.0  # [Menebak] git is killed past this: a pathological regex costs at most this much
-TEXT_OUTPUT_MAX = 4 * 1024 * 1024
+TEXT_OUTPUT_MAX = 1024 * 1024  # AG-13 M2: parse and filter time scale with it
 TEXT_SEARCHES_PER_MINUTE = 60  # [Menebak] each text search starts one git process
+MAX_TEXT_SEARCHES = 2  # [Menebak] git greps running at once in this process (AG-13 M1); the rest is 429
+SYMBOL_SEARCHES_PER_MINUTE = 120  # [Menebak] each symbol search scans the project's symbols (AG-13 L3)
 SYMBOL_CANDIDATES = 5_000
 
 
@@ -492,6 +494,49 @@ class SearchResult:
     truncated: bool  # more matched than returned (limit, output cap, candidate cap)
     index_commit: str | None  # symbol mode: the commit the hits come from
     indexed_at: datetime | None
+    skipped: int = 0  # text mode: hits in files whose names are not UTF-8, left out (silent-failure M4)
+    index_truncated: bool | None = None  # symbol mode: the index itself stopped at a limit (H2)
+
+
+# Text searches running now, in this process and per user (AG-13 M1). Plain counters: the event loop is single
+# threaded, and checking then counting has no await in between, so a full slot answers 429 and never queues.
+_text_running: dict[uuid.UUID, int] = {}
+
+
+def _busy() -> AppError:
+    return AppError(
+        "RATE_LIMITED",
+        "Another search is still running; retry",
+        http_status=429,
+        headers={"Retry-After": "1"},
+    )
+
+
+@contextlib.contextmanager
+def _text_slot(user_id: uuid.UUID) -> Any:
+    if user_id in _text_running or sum(_text_running.values()) >= MAX_TEXT_SEARCHES:
+        raise _busy()
+    _text_running[user_id] = 1
+    try:
+        yield
+    finally:
+        _text_running.pop(user_id, None)
+
+
+def check_regex(q: str) -> None:
+    """Refuse what makes git's (glibc) ERE explode (AG-13 M1): backreferences (``\\1``..``\\9``, exponential
+    matching) and bounded repetition (``{m,n}``, compiled to gigabytes when nested). ``\\{`` stays a plain
+    brace. Everything else runs inside git, killed at the timeout."""
+    escaped = False
+    for char in q:
+        if escaped:
+            if char in "123456789":
+                raise _invalid("q", "backreferences are not supported", "regex_unsupported")
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "{":
+            raise _invalid("q", "bounded repetition {m,n} is not supported", "regex_unsupported")
 
 
 def _invalid(field: str, message: str, reason: str | None = None) -> AppError:
@@ -522,6 +567,8 @@ async def search(
             check_glob(glob)
         except ValueError as exc:
             raise _invalid("glob", str(exc)) from None
+    if mode == "text" and regex:
+        check_regex(q)
     limit = min(max(limit, 1), SEARCH_LIMIT_MAX)
     repo = await open_repo(env, actor, project_id, "workspace:read", write=False)
     policy = await repo.workspace.policy(access)
@@ -534,7 +581,16 @@ async def search(
             window_s=60,
             message="Too many searches; retry later",
         )
-        return await _search_text(env, repo.target, policy, access, q, glob, regex, ignore_case, limit)
+        with _text_slot(actor.user_id):
+            return await _search_text(env, repo.target, policy, access, q, glob, regex, ignore_case, limit)
+    await enforce_rate(
+        env,
+        actor,
+        scope="search_symbol",
+        limit=SYMBOL_SEARCHES_PER_MINUTE,
+        window_s=60,
+        message="Too many searches; retry later",
+    )
     return await _search_symbols(env, project_id, policy, access, q, glob, kind, limit)
 
 
@@ -567,21 +623,26 @@ async def _search_text(
             only_matching=False,
             timeout_s=TEXT_TIMEOUT_S,
             max_output=TEXT_OUTPUT_MAX,
+            threads=1,  # one CPU per search, not one per host CPU (AG-13 M1)
         )
     except GitInputError as exc:
         if exc.reason == "regex":
             raise _invalid("q", "not a valid POSIX extended regular expression", "invalid_regex") from None
         raise
-    hits: list[SearchHit] = []
-    truncated = found.truncated
-    for match in found.matches:
-        if not _visible(match.path, glob, policy, access):
-            continue
-        if len(hits) >= limit:
-            truncated = True
-            break
-        hits.append(SearchHit(match.path, match.line, preview(match.text, match.column)))
-    return SearchResult(hits, truncated, None, None)
+
+    def keep() -> tuple[list[SearchHit], bool]:
+        hits: list[SearchHit] = []
+        for match in found.matches:
+            if not _visible(match.path, glob, policy, access):
+                continue
+            if len(hits) >= limit:
+                return hits, True
+            hits.append(SearchHit(match.path, match.line, preview(match.text, match.column)))
+        return hits, found.truncated
+
+    # Filtering tens of thousands of matches (glob, policy) is CPU work: off the event loop (AG-13 M2).
+    hits, truncated = await asyncio.to_thread(keep)
+    return SearchResult(hits, truncated, None, None, skipped=found.skipped_paths)
 
 
 def _like_escape(text: str) -> str:
@@ -613,16 +674,19 @@ async def _search_symbols(
             RepoIndexEntry.path,
             RepoIndexEntry.line,
         )
-        .limit(SYMBOL_CANDIDATES)
+        .limit(SYMBOL_CANDIDATES + 1)  # one more than kept: "truncated" only when more exist (backend N4)
     )
     if kind is not None:
         query = query.where(RepoIndexEntry.symbol_kind == kind)
     async with env.sessions() as session:
-        rows = (await session.execute(query)).all()
+        # One snapshot for the hits and the commit they are reported under: an index swapped in between the
+        # two reads must not label old hits with the new commit (backend N4).
+        await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
         repository = await session.scalar(select(Repository).where(Repository.project_id == project_id))
+        rows = (await session.execute(query)).all()
     hits: list[SearchHit] = []
-    truncated = len(rows) >= SYMBOL_CANDIDATES
-    for path, line, symbol, symbol_kind in rows:
+    truncated = len(rows) > SYMBOL_CANDIDATES
+    for path, line, symbol, symbol_kind in rows[:SYMBOL_CANDIDATES]:
         if not _visible(path, glob, policy, access):
             continue
         if len(hits) >= limit:
@@ -634,4 +698,5 @@ async def _search_symbols(
         truncated,
         repository.index_commit if repository is not None else None,
         repository.last_indexed_at if repository is not None else None,
+        index_truncated=repository.index_truncated if repository is not None else None,
     )

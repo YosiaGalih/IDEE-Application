@@ -162,9 +162,14 @@ async def test_long_lines_get_a_short_preview(
     workspace_root: Path,  # noqa: F811
 ) -> None:
     project = await blank(owner)
-    (repo_of(workspace_root, project) / "min.js").write_text("x" * 2_000_000 + "NEEDLE" + "y" * 1000 + "\n")
+    repo = repo_of(workspace_root, project)
+    (repo / "min.js").write_text("x" * 500_000 + "NEEDLE" + "y" * 1000 + "\n")
     [hit] = (await owner.get(search_url(project["id"], q="NEEDLE"))).json()["data"]
     assert len(hit["preview"]) <= 200 and "NEEDLE" in hit["preview"]
+    # A line longer than the output cap cannot be shown; the answer says it is incomplete.
+    (repo / "min.js").write_text("x" * 2_000_000 + "NEEDLE\n")
+    body = (await owner.get(search_url(project["id"], q="NEEDLE"))).json()
+    assert (body["data"], body["meta"]["truncated"]) == ([], True)
 
 
 async def test_post_index_is_202_and_reuses_a_running_job(
@@ -180,6 +185,7 @@ async def test_post_index_is_202_and_reuses_a_running_job(
     assert (first.status_code, second.status_code) == (202, 202), first.text
     assert first.json()["data"]["job_id"] == second.json()["data"]["job_id"]
     assert (first.json()["meta"]["reused"], second.json()["meta"]["reused"]) == (False, True)
+    assert first.json()["status"] == "accepted"  # API_CONTRACTS §1: asynchronous work (backend S2)
     assert [call[3] for call in queue.calls] == ["user"]
 
 
@@ -262,3 +268,69 @@ async def test_an_import_requests_an_index(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert outcome == "ready"
     assert asked == [(project_id, user_id, "import")]
+
+
+async def test_text_search_reports_paths_it_could_not_name(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    """Silent-failure M4: a hit in a file whose name is not UTF-8 is not shown, and the answer says so."""
+    import os
+
+    project = await blank(owner)
+    repo = repo_of(workspace_root, project)
+    (repo / os.fsdecode(b"\xff.txt")).write_text("needle\n")
+    (repo / "ok.txt").write_text("needle\n")
+    body = (await owner.get(search_url(project["id"], q="needle"))).json()
+    assert [hit["path"] for hit in body["data"]] == ["ok.txt"]
+    assert body["meta"]["skipped"] == 1
+
+
+async def test_a_tab_is_a_valid_query_character(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    project = await blank(owner)
+    (repo_of(workspace_root, project) / "t.txt").write_text("key\tvalue\n")
+    response = await owner.get(f"{PROJECTS}/{project['id']}/search", params={"q": "key\tvalue"})
+    assert response.status_code == 200 and [hit["path"] for hit in response.json()["data"]] == ["t.txt"]
+
+
+async def test_symbol_searches_are_rate_limited(
+    owner: httpx.AsyncClient,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AG-13 L3: each symbol search scans the project's symbols."""
+    monkeypatch.setattr(repo_index, "SYMBOL_SEARCHES_PER_MINUTE", 2)
+    project = await blank(owner)
+    codes = [(await owner.get(search_url(project["id"], q="x", mode="symbol"))).status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+
+
+async def test_symbol_truncated_only_when_more_exist(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backend N4: exactly SYMBOL_CANDIDATES rows is not "truncated"."""
+    project_id, _ = await indexed(app, owner, workspace_root, owner_id)
+    monkeypatch.setattr(repo_index, "SYMBOL_CANDIDATES", 1)
+    one = (await owner.get(search_url(project_id, q="main", mode="symbol"))).json()
+    assert (len(one["data"]), one["meta"]["truncated"]) == (1, False)
+
+
+async def test_symbol_search_says_when_the_index_is_partial(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silent-failure H2: a partial index is visible to the caller."""
+    project_id, _ = await project_with_code(owner, workspace_root)
+    monkeypatch.setattr(repo_index, "MAX_FILES", 1)
+    await run_job(index_env(app, workspace_root), project_id, owner_id)
+    meta = (await owner.get(search_url(project_id, q="main", mode="symbol"))).json()["meta"]
+    assert meta["index_truncated"] is True

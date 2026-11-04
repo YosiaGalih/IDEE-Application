@@ -757,3 +757,31 @@ async def test_a_cut_output_returns_promptly_every_time(git: GitAdapter, repo: G
                                 only_matching=False, timeout_s=8, max_output=4 << 20)  # fmt: skip
         assert result.truncated
         assert time.monotonic() - started < 3
+
+
+async def test_grep_parses_off_the_event_loop(git: GitAdapter, repo: GitTarget) -> None:
+    """AG-13 M2: a large output (the index job reads up to 64 MiB) is parsed in a thread."""
+    for index in range(200):
+        write(repo.repo / f"p{index}.txt", "e e e e\n" * 4000)
+    grep = asyncio.ensure_future(
+        git.grep(
+            repo,
+            ["e"],
+            commit=None,
+            fixed=True,
+            ignore_case=False,
+            only_matching=False,
+            timeout_s=30,
+            max_output=16 << 20,
+        )
+    )
+    gaps: list[float] = []
+    last = time.monotonic()
+    while not grep.done():
+        await asyncio.sleep(0.005)
+        now = time.monotonic()
+        gaps.append(now - last)
+        last = now
+    result = await grep
+    assert len(result.matches) > 300_000
+    assert max(gaps) < 0.5

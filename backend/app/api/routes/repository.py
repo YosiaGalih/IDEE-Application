@@ -23,7 +23,9 @@ router = APIRouter(prefix="/projects", tags=["repository"])
 WorkspaceReader = Annotated[Actor, Depends(require_project_permission("workspace:read"))]
 WorkspaceWriter = Annotated[Actor, Depends(require_project_permission("workspace:write"))]
 
-# No control characters: git takes the pattern as one argument line (spec Goal 7).
+# The pattern is one argv line: no NUL and no line breaks (spec Goal 7); a tab is a fine thing to search for.
+_PATTERN = r"^[^\x00\n\r]*$"
+# Globs never contain control characters (check_glob refuses them too).
 _NO_CONTROL = r"^[^\x00-\x1f\x7f]*$"
 
 
@@ -37,7 +39,13 @@ async def post_index(
     request: Request, project_id: uuid.UUID, actor: WorkspaceWriter, env: EnvDep
 ) -> JSONResponse:
     queued = await repo_index.index_by_user(index_env(request, env), actor, project_id)
-    return _respond(request, {"job_id": str(queued.job_id)}, status_code=202, meta={"reused": queued.reused})
+    return _respond(
+        request,
+        {"job_id": str(queued.job_id)},
+        status_code=202,
+        status="accepted",
+        meta={"reused": queued.reused},
+    )
 
 
 @router.get("/{project_id}/search")
@@ -46,7 +54,7 @@ async def get_search(
     project_id: uuid.UUID,
     actor: WorkspaceReader,
     env: EnvDep,
-    q: Annotated[str, Query(min_length=1, max_length=500, pattern=_NO_CONTROL)],
+    q: Annotated[str, Query(min_length=1, max_length=500, pattern=_PATTERN)],
     mode: Literal["text", "symbol"] = "text",
     glob: Annotated[str | None, Query(min_length=1, max_length=256, pattern=_NO_CONTROL)] = None,
     regex: bool = False,
@@ -68,7 +76,10 @@ async def get_search(
     )
     hits = [{key: value for key, value in asdict(hit).items() if value is not None} for hit in result.hits]
     meta: dict[str, object] = {"truncated": result.truncated}
-    if mode == "symbol":
+    if mode == "text":
+        meta["skipped"] = result.skipped
+    else:
         meta["index_commit"] = result.index_commit
         meta["indexed_at"] = result.indexed_at.isoformat() if result.indexed_at is not None else None
+        meta["index_truncated"] = result.index_truncated
     return _respond(request, hits, meta=meta)

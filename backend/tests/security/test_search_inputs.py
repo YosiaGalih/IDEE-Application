@@ -81,38 +81,112 @@ async def test_git_dir_is_never_searched(
     assert response.status_code == 200 and response.json()["data"] == []
 
 
-async def test_pathological_regex_is_bounded(
-    app: FastAPI,  # noqa: F811
+async def _loop_gaps(until: asyncio.Future[Any]) -> list[float]:
+    """Gaps between ticks of a 5 ms ticker while ``until`` runs: a blocked event loop shows as a long gap."""
+    gaps: list[float] = []
+    last = time.monotonic()
+    while not until.done():
+        await asyncio.sleep(0.005)
+        now = time.monotonic()
+        gaps.append(now - last)
+        last = now
+    return gaps
+
+
+@pytest.mark.parametrize(
+    "pattern", ["(a*)\\1*b", "(a|aa)*\\1b", "((a{1,100}){1,100}){1,100}", "a{2}", "x\\9"]
+)
+async def test_regex_features_that_explode_are_refused(
+    owner: httpx.AsyncClient,  # noqa: F811
+    pattern: str,
+) -> None:
+    """AG-13 M1: backreferences (exponential matching) and bounded repetition (glibc compiles it to GBs)
+    never reach git."""
+    project = await blank(owner)
+    response = await search(owner, project, q=pattern, regex="true")
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"][0]["reason"] == "regex_unsupported"
+
+
+async def test_an_escaped_brace_is_a_plain_character(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    project = await blank(owner)
+    (repo_of(workspace_root, project) / "b.txt").write_text("x{y}\n")
+    response = await search(owner, project, q="x\\{y", regex="true")
+    assert response.status_code == 200 and [hit["path"] for hit in response.json()["data"]] == ["b.txt"]
+
+
+async def test_a_text_search_past_its_timeout_is_409_and_never_blocks_the_loop(
     owner: httpx.AsyncClient,  # noqa: F811
     workspace_root: Path,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The regex runs in git, which is killed at the timeout; the event loop keeps answering meanwhile."""
-    monkeypatch.setattr(repo_index, "TEXT_TIMEOUT_S", 1.0)
+    """AG-13 L1: the timeout path, through HTTP, with the event loop measured by a ticker."""
+    monkeypatch.setattr(repo_index, "TEXT_TIMEOUT_S", 0.001)
     project = await blank(owner)
     repo = repo_of(workspace_root, project)
     for index in range(40):
         (repo / f"a{index}.txt").write_text("a" * 50_000 + "\n")
-    health = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
-    started = time.monotonic()
-    answered: list[float] = []
+    request = asyncio.ensure_future(search(owner, project, q="a+b", regex="true"))
+    gaps = await _loop_gaps(request)
+    response = await request
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["details"][0]["reason"] == "timeout"
+    assert response.headers["Retry-After"] == "5"
+    assert max(gaps, default=0) < 0.5
 
-    async def ping() -> None:
-        while time.monotonic() - started < 1.5:
-            sent = time.monotonic()
-            assert (await health.get("/api/v1/health/live")).status_code == 200
-            answered.append(time.monotonic() - sent)
-            await asyncio.sleep(0.05)
 
+async def test_a_large_search_output_never_blocks_the_loop(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AG-13 M2: parsing and filtering a capped output (many matches) runs off the event loop. The cap is
+    raised here so that work on the loop would show far above scheduling noise."""
+    monkeypatch.setattr(repo_index, "TEXT_OUTPUT_MAX", 8 << 20)
+    project = await blank(owner)
+    repo = repo_of(workspace_root, project)
+    for index in range(300):
+        (repo / f"m{index}.txt").write_text("e e e e e e e e\n" * 2000)
+    request = asyncio.ensure_future(search(owner, project, q="e", glob="*.nomatch"))
+    gaps = await _loop_gaps(request)
+    response = await request
+    assert response.status_code == 200, response.text
+    assert response.json()["meta"]["truncated"] is True  # the output cap was reached
+    assert max(gaps, default=0) < 0.5
+
+
+async def test_text_searches_run_one_at_a_time_per_user(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AG-13 M1: one git grep per user at a time, two per process; the rest is 429, never a queue."""
+    from app.gitops.adapter import GitAdapter
+
+    project = await blank(owner)
+    started, release = asyncio.Event(), asyncio.Event()
+    grep = GitAdapter.grep
+
+    async def held(self: GitAdapter, *args: Any, **kwargs: Any) -> Any:
+        started.set()
+        await release.wait()
+        return await grep(self, *args, **kwargs)
+
+    monkeypatch.setattr(GitAdapter, "grep", held)
+    first = asyncio.ensure_future(search(owner, project, q="x"))
+    await asyncio.wait_for(started.wait(), 10)
     try:
-        response, _ = await asyncio.gather(search(owner, project, q="(a*)*(a*)*(a*)*b", regex="true"), ping())
+        second = await asyncio.wait_for(search(owner, project, q="y"), 5)  # never queued behind the first
     finally:
-        await health.aclose()
-    assert time.monotonic() - started < 5
-    assert response.status_code in {200, 409}, response.text
-    if response.status_code == 409:
-        assert response.json()["error"]["details"][0]["reason"] == "timeout"
-    assert answered and max(answered) < 0.5  # the loop never waited on the regex
+        release.set()
+    assert second.status_code == 429 and second.headers["Retry-After"] == "1"
+    assert (await first).status_code == 200
+    assert (await search(owner, project, q="z")).status_code == 200  # the slot is free again
+    monkeypatch.setattr(repo_index, "MAX_TEXT_SEARCHES", 0)
+    assert (await search(owner, project, q="z")).status_code == 429
 
 
 async def test_agent_read_drops_denied_paths(
