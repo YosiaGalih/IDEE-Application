@@ -425,6 +425,28 @@ class GitAdapter:
         )
         return result.stdout.decode().strip() if result.returncode == 0 else None
 
+    async def head_commit(self, target: GitTarget) -> str | None:
+        """HEAD's commit, strictly: ``None`` only for a branch with no commit yet (unborn). A HEAD git cannot
+        resolve (a ref to a missing object, a broken repository) is ``GitError("head_unreadable")``, never
+        "no commit": callers that act on "no commit" (the index job empties the index) must not see it."""
+        sha = await self.current_commit(target)
+        if sha is not None:
+            return sha
+        git_dir, tree = await self._adirs(target)
+        ref = await self._run(
+            ["symbolic-ref", "-q", "HEAD"], git_dir=git_dir, work_tree=tree, cwd=tree, check=False
+        )
+        name = ref.stdout.decode("utf-8", "replace").strip()
+        if ref.returncode != 0 or not name.startswith("refs/heads/"):
+            raise GitError("head_unreadable")
+        # --exists: 0 the ref exists (yet HEAD did not resolve: broken), 2 it does not (unborn), else error.
+        exists = await self._run(
+            ["show-ref", "--exists", name], git_dir=git_dir, work_tree=tree, cwd=tree, check=False
+        )
+        if exists.returncode != 2:
+            raise GitError("head_unreadable")
+        return None
+
     async def status(self, target: GitTarget) -> GitStatus:
         git_dir, tree = await self._adirs(target)
         result = await self._run(
@@ -609,6 +631,8 @@ class GitAdapter:
         only_matching: bool,
         timeout_s: float,
         max_output: int,
+        max_matches: int | None = None,
+        threads: int | None = None,
     ) -> GrepResult:
         """``git grep`` over the working tree with untracked files (``commit=None``: ignored files and
         ``.git`` are never read, symlinks are not followed) or over ``commit``'s tree. Patterns follow ``-e``
@@ -620,6 +644,8 @@ class GitAdapter:
             raise GitInputError("ref")
         git_dir, tree = await self._adirs(target)
         args = ["grep", "-z", "-n", "-I", "--no-color", "-F" if fixed else "-E"]
+        if threads is not None:
+            args.append(f"--threads={threads}")
         if ignore_case:
             args.append("-i")
         if only_matching:
@@ -634,6 +660,8 @@ class GitAdapter:
             git_dir=git_dir,
             work_tree=tree,
             cwd=tree,
+            # UTF-8 (built into glibc): -i and "." then work on non-ASCII text; messages stay untranslated.
+            env={"LC_ALL": "C.UTF-8"},
             check=False,
             truncate=True,
             timeout_s=timeout_s,
@@ -645,11 +673,14 @@ class GitAdapter:
                 raise GitInputError("regex")
             self._log_failure("grep", result, tree)
             raise GitError("grep_failed")
-        return _parse_grep(
+        # Parsing a few MiB of output is CPU work: off the event loop (AG-13 M2, WP-2.1d).
+        return await asyncio.to_thread(
+            _parse_grep,
             result.stdout,
             prefix=f"{commit}:".encode() if commit is not None else b"",
             with_column=commit is None,
             truncated=result.truncated,
+            max_matches=max_matches,
         )
 
     # --- write ---------------------------------------------------------------------------------------------
@@ -910,7 +941,9 @@ class GitAdapter:
         raise GitError("merge_failed")
 
 
-def _parse_grep(data: bytes, *, prefix: bytes, with_column: bool, truncated: bool) -> GrepResult:
+def _parse_grep(
+    data: bytes, *, prefix: bytes, with_column: bool, truncated: bool, max_matches: int | None = None
+) -> GrepResult:
     """``git grep -z -n [--column]`` output, one record per match: ``<prefix><path>\\0<line>\\0`` then
     ``[<column>\\0]<text>\\n``. Paths are printed verbatim (they may hold ``:``, spaces, even newlines), so
     records are read field by field. A record cut by the output cap is dropped."""
@@ -919,6 +952,9 @@ def _parse_grep(data: bytes, *, prefix: bytes, with_column: bool, truncated: boo
     position = 0
     fields = 3 if with_column else 2
     while position < len(data):
+        if max_matches is not None and len(matches) >= max_matches:
+            truncated = True
+            break
         parts: list[bytes] = []
         for _ in range(fields):
             end = data.find(b"\0", position)
@@ -935,10 +971,16 @@ def _parse_grep(data: bytes, *, prefix: bytes, with_column: bool, truncated: boo
         try:
             path = raw_path.decode("utf-8")
             line = int(parts[1])
-            column = int(parts[2]) if with_column else None
+            byte_column = int(parts[2]) if with_column else None
         except (UnicodeDecodeError, ValueError):
             skipped += 1
             continue
+        # git counts bytes; the API counts characters (the column of the first match, 1-based).
+        column = (
+            len(text_bytes[: byte_column - 1].decode("utf-8", "replace")) + 1
+            if byte_column is not None
+            else None
+        )
         matches.append(GrepMatch(path, line, column, text_bytes.decode("utf-8", "replace")))
     return GrepResult(matches, truncated, skipped)
 
@@ -988,4 +1030,11 @@ def _remove_index_lock(git_dir: Path) -> None:
 async def _kill(proc: asyncio.subprocess.Process) -> None:
     with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGKILL)
+    # A reader that stopped early (output cap) may leave the stdout transport paused: then the pipe's EOF is
+    # never read and wait() blocks until the caller's timeout (AG-13 L2, WP-2.1d). Drain what is left; the
+    # process group is dead, so EOF comes at once.
+    if proc.stdout is not None:
+        with contextlib.suppress(Exception):
+            while await proc.stdout.read(_CHUNK):
+                pass
     await proc.wait()

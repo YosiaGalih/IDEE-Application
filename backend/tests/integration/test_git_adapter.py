@@ -701,3 +701,59 @@ async def test_grep_timeout_is_a_git_error(git: GitAdapter, repo: GitTarget) -> 
         await git.grep(repo, ["(n|e)*d"], commit=None, fixed=False, ignore_case=False,
                        only_matching=False, timeout_s=0.001, max_output=1 << 20)  # fmt: skip
     assert raised.value.reason == "timeout"
+
+
+# --- WP-2.1d review round -----------------------------------------------------------------------------------
+
+
+async def test_head_commit_is_none_only_for_an_unborn_branch(
+    tmp_path: Path, git: GitAdapter, repo: GitTarget
+) -> None:
+    """Silent-failure H1: a HEAD git cannot read is an error, never "no commit yet"."""
+    assert await git.head_commit(repo) == await git.current_commit(repo)
+    unborn = tmp_path / "unborn"
+    unborn.mkdir()
+    await git.init(unborn, "main")
+    assert await git.head_commit(GitTarget(unborn)) is None
+    (repo.repo / ".git" / "refs" / "heads" / "main").write_text("1" * 40 + "\n")  # a commit that is not there
+    with pytest.raises(GitError) as raised:
+        await git.head_commit(repo)
+    assert raised.value.reason == "head_unreadable"
+
+
+async def test_grep_ignores_case_beyond_ascii(git: GitAdapter, repo: GitTarget) -> None:
+    """Backend S1: git runs grep in a UTF-8 locale, so -i and "." work on non-ASCII letters."""
+    write(repo.repo / "u.txt", "Ünïcode café\n")
+    for pattern, fixed in (("ünïcode", True), ("CAFÉ", True), ("caf.$", False)):
+        result = await git.grep(repo, [pattern], commit=None, fixed=fixed, ignore_case=True,
+                                only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+        assert [m.path for m in result.matches] == ["u.txt"], pattern
+
+
+async def test_grep_column_counts_characters(git: GitAdapter, repo: GitTarget) -> None:
+    """Backend N2: git reports a byte column; the API speaks characters."""
+    write(repo.repo / "u.txt", "Ünïcode café\n")
+    result = await git.grep(repo, ["café"], commit=None, fixed=True, ignore_case=False,
+                            only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    [match] = result.matches
+    assert match.column == 9 and match.text[match.column - 1 :].startswith("café")
+
+
+async def test_grep_max_matches_truncates(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "many.txt", "needle\n" * 50)
+    result = await git.grep(repo, ["needle"], commit=None, fixed=True, ignore_case=False, only_matching=False,
+                            timeout_s=10, max_output=1 << 20, max_matches=10)  # fmt: skip
+    assert (len(result.matches), result.truncated) == (10, True)
+
+
+async def test_a_cut_output_returns_promptly_every_time(git: GitAdapter, repo: GitTarget) -> None:
+    """AG-13 L2: after the output cap git is killed; its unread pipe must not hold wait() until the timeout.
+    Before the fix about one call in eight at a 4 MiB cap waited the whole timeout."""
+    for index in range(200):
+        write(repo.repo / f"d{index}.txt", "the quick brown fox jumps over the lazy dog e e e\n" * 2000)
+    for _ in range(16):
+        started = time.monotonic()
+        result = await git.grep(repo, ["e"], commit=None, fixed=True, ignore_case=False,
+                                only_matching=False, timeout_s=8, max_output=4 << 20)  # fmt: skip
+        assert result.truncated
+        assert time.monotonic() - started < 3
