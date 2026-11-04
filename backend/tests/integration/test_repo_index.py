@@ -540,6 +540,39 @@ async def test_a_request_while_the_job_runs_gets_another_round(
     assert await index_lock.holder(app.state.dependencies.redis, project_id) is None
 
 
+async def test_a_request_in_the_last_round_is_handed_to_a_new_job(
+    app: FastAPI,  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AG-13 D2: a request answered ``reused`` during the last round is served by a new job, never dropped."""
+    monkeypatch.setattr(repo_index, "MAX_ROUNDS", 1)
+    project_id, _ = await project_with_code(owner, workspace_root)
+    queue = IndexQueue()
+    env = index_env(app, workspace_root, queue)
+    request = await repo_index.request_index(env, project_id, owner_id, trigger="user")
+    list_files = GitAdapter.list_files
+
+    async def asked_meanwhile(self: GitAdapter, *args: Any, **kwargs: Any) -> Any:
+        again = await repo_index.request_index(env, project_id, owner_id, trigger="user")
+        assert (again.job_id, again.reused) == (request.job_id, True)
+        return await list_files(self, *args, **kwargs)
+
+    monkeypatch.setattr(GitAdapter, "list_files", asked_meanwhile)
+    queued = len(queue.calls)
+    outcome = await repo_index.run_index(
+        env, project_id=project_id, job_id=request.job_id, user_id=owner_id, trigger="user"
+    )
+    assert outcome == "indexed"
+    assert len(queue.calls) == queued + 1  # the hand-over
+    handed_to, follow_up, user, trigger = queue.calls[-1]
+    assert (handed_to, user, trigger) == (project_id, owner_id, "user")
+    assert follow_up != request.job_id
+    assert await index_lock.holder(app.state.dependencies.redis, project_id) == str(follow_up)
+
+
 async def test_a_job_past_its_deadline_is_audited_and_frees_the_lock(
     app: FastAPI,  # noqa: F811
     owner: httpx.AsyncClient,  # noqa: F811

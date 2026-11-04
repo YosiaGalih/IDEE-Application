@@ -107,7 +107,7 @@ async def run_index_job(
             workspace_root=Path(settings.workspace_root),
             redis=redis,
         )
-        env = IndexEnv(projects=projects_env, redis=redis)
+        env = IndexEnv(projects=projects_env, redis=redis, jobs=CeleryJobQueue(settings.redis_url))
         return await run_index(env, project_id=project_id, job_id=job_id, user_id=user_id, trigger=trigger)
     finally:
         await redis.aclose()

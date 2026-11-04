@@ -73,7 +73,7 @@ SYMBOL_CANDIDATES = 5_000
 class IndexEnv:
     projects: ProjectEnv
     redis: Redis | None
-    jobs: JobQueue | None = None  # None in the worker, which runs index jobs and never queues them
+    jobs: JobQueue | None = None  # the worker queues one only to hand over a last-round request
 
 
 @dataclass(frozen=True)
@@ -194,13 +194,18 @@ async def run_index(
         return "skipped"
     outcome: Outcome = "skipped"
     rounds = 0
+    hand_over = False
     try:
         async with asyncio.timeout(INDEX_DEADLINE_S):
             while True:
                 rounds += 1
                 outcome = await _index(env.projects, project_id, user_id, trigger)
                 # A request that came in meanwhile asked for one more round (the lock stays ours for it).
-                if rounds >= MAX_ROUNDS or not await index_lock.finish(env.redis, project_id, job_id):
+                if not await index_lock.finish(env.redis, project_id, job_id):
+                    break
+                if rounds >= MAX_ROUNDS:
+                    # That request was answered with this job: a new job serves it (AG-13 D2).
+                    hand_over = True
                     break
                 if not await index_lock.begin_round(env.redis, project_id, job_id):
                     break
@@ -220,6 +225,8 @@ async def run_index(
             logger.error(
                 "project_index_lock_not_released", project_id=str(project_id), error_type=type(exc).__name__
             )
+    if hand_over:
+        await index_soon(env, project_id, user_id, trigger=trigger)  # logged when it fails
     return outcome
 
 

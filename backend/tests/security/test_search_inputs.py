@@ -189,6 +189,29 @@ async def test_text_searches_run_one_at_a_time_per_user(
     assert (await search(owner, project, q="z")).status_code == 429
 
 
+async def test_a_text_search_runs_git_on_one_thread(
+    owner: httpx.AsyncClient,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AG-13 D4: ``--threads=1`` (one CPU per search, M1) is pinned on the argv git actually gets."""
+    from app.gitops.adapter import GitAdapter
+
+    project = await blank(owner)
+    argvs: list[list[str]] = []
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+
+    async def recorded(self: GitAdapter, args: list[str], **kwargs: Any) -> Any:
+        argvs.append(list(args))
+        return await run(self, args, **kwargs)
+
+    monkeypatch.setattr(GitAdapter, "_run", recorded)
+    for regex in ("false", "true"):
+        assert (await search(owner, project, q="needle", regex=regex)).status_code == 200
+    greps = [argv for argv in argvs if argv[:1] == ["grep"]]
+    assert len(greps) == 2
+    assert all("--threads=1" in argv and argv[-3:] == ["-e", "needle", "--"] for argv in greps)
+
+
 async def test_agent_read_drops_denied_paths(
     app: FastAPI,  # noqa: F811
     owner: httpx.AsyncClient,  # noqa: F811
