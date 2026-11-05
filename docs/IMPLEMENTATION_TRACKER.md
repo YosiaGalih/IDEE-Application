@@ -1643,3 +1643,53 @@ Tidak ditutup (alasan):
 - **frontend NIT** (`step` log tidak di-reset, label tombol Git, `from` basi, deskripsi dialog): perilakunya benar dan sudah diberi komentar. Daftar branch dibaca ulang setiap kali branch dibuat. Live check: 0 peringatan Radix.
 - **Live check, kosmetik:** tombol "Pilih semua/Kosongkan" terbungkus ke baris baru di kolom 16 rem. Fungsinya tidak terganggu.
 
+
+### Bukti gate G2 — Exit Phase 2 (keputusan PO)
+
+Kriteria WBS: "User dapat membuka project dan view/edit file dengan uji otorisasi". Bukti yang diminta: "Test cross-project + demo". Bagian ini menyiapkan bukti. **Keputusan G2 ada di tangan PO** (CLAUDE.md: agent menyiapkan bukti dan berhenti di gate). Mandat PO "jalankan P2, P3 dan P4" mengizinkan P3 dimulai sebelum keputusan ini.
+
+Isi Phase 2 yang sudah di `main` (d3f4440):
+
+| WP | PR | Catatan |
+|---|---|---|
+| WP-2.1a projects core | #10 | otorisasi berscope project |
+| WP-2.1b import arsip 🔒 | #11 | AG-13 signed off (tracker WP-2.1b) |
+| WP-2.1c API workspace dan git 🔒 | #12 | AG-13 signed off (tracker WP-2.1c) |
+| WP-2.1d indeks dan pencarian 🔒 | #13 | AG-13 signed off + delta |
+| WP-2.1e dashboard 🔒 | #14 | AG-13 signed off @ b2a7e02 + delta e109e6e |
+| WP-2.2a layar IDE (explorer, editor, simpan dengan cek versi, cari) | #15 | review frontend + silent-failure ditutup |
+| WP-2.2b panel git | #16 | review frontend + silent-failure ditutup |
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Test cross-project (`backend/tests/security/test_cross_project.py`) | **117 test**, matriks setiap route `/projects/{id}`: user lain → 404, reader berscope bisa membaca tetapi tidak menulis, project terhapus → 404 bahkan untuk owner, tanpa sesi → 401, write tanpa CSRF ditolak, role global dihitung hanya di project yang di-grant. Bersama test scope/path/input terkait (dashboard, path workspace, input git, input search): **159 test**. Seluruh `tests/security`: **322 test** |
+| Backend `pytest -q` @ d3f4440 (PostgreSQL 16 + Redis 7 lokal) | sedang dijalankan; hasilnya ditulis di commit berikutnya |
+| Frontend `npm test` @ d3f4440 | **442 passed** (33 file); layar P2 (`features/workspace`, `features/projects`, route map): 160 |
+| CI `main` @ d3f4440 (merge PR #16) | 9/9 hijau pada head PR yang sama (4bdab34), termasuk `security-scan` |
+
+Demo otorisasi (HTTP nyata ke uvicorn + DB uji `kodekantor_test_rev`; cookie sesi, CSRF, `Idempotency-Key`). Tiga pengguna dipakai: owner project, `intruder` tanpa grant, dan `reader` dengan role `readonly` berscope project. Keduanya dibuat lewat jalur yang sama dengan helper test.
+
+| Pengguna | `GET /projects` memuat project | `GET /projects/{id}` | `GET /tree` | `GET /files/README.md` | `PUT /files/README.md` | `GET /git/status` | `POST /git/commit` |
+|---|---|---|---|---|---|---|---|
+| owner | ya | 200 | 200 | 200 | 200 | 200 | 201 |
+| intruder (tanpa grant) | tidak | 404 | 404 | 404 | 404 | 404 | 404 |
+| reader (readonly di project) | ya | 200 | 200 | 200 | 403 FORBIDDEN | 200 | 403 FORBIDDEN |
+| tanpa sesi | – | 401 | – | 401 | – | – | – |
+
+Sesudah demo, isi README.md hanya memuat edit owner. Edit intruder dan reader tidak ada, dan commit terbaru (8adb929) adalah milik owner.
+
+Demo layar (Playwright atas build produksi lewat `vite preview`, CSP Caddyfile disuntikkan; tracker WP-2.2a dan WP-2.2b):
+- buka project → explorer → buka file di Monaco → edit → Ctrl+S → isi server sama;
+- dua tab menyimpan berurutan → dialog konflik, tidak menimpa diam-diam → diff → timpa dengan sha yang baru dibaca;
+- cari → hit membuka file di barisnya;
+- panel git: diff, commit 1 file dari daftar, log, buat branch;
+- console tanpa pelanggaran CSP.
+
+Hal terbuka yang relevan untuk keputusan G2:
+- G0 dan G1 belum diputuskan PO. Bukti G1 (WP-1.6) belum disiapkan.
+- U4: sign-off formal AG-13 untuk WP-1.2 dan WP-1.3 dari sesi terpisah masih utang.
+- Shell aplikasi belum responsif di ponsel (sidebar selalu `w-60`; tracker WP-2.1e).
+- Usulan backend `details.reason` untuk "path sudah ada" (tracker WP-2.2a).
+- Konflik #71: WP-SEC-01 bergantung pada WP-INT-03/05, yang berada di luar mandat. Perlu keputusan sebelum P4.
+
+**Status G2: bukti siap, menunggu keputusan PO.**
