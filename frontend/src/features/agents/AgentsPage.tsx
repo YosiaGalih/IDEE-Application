@@ -7,6 +7,7 @@ import {
   AGENT_MODES,
   AGENT_STATUSES,
   type Agent,
+  type AgentGroup,
   type AgentMode,
   type AgentStatus,
 } from "@/api/agents";
@@ -34,9 +35,11 @@ export function AgentsPage() {
   const agents = useAgents();
   const [mode, setMode] = useState<AgentMode | null>(null);
   const [status, setStatus] = useState<AgentStatus | "">("");
+  const [group, setGroup] = useState<AgentGroup | "">("");
   const [query, setQuery] = useState("");
   const searchId = useId();
   const statusId = useId();
+  const groupId = useId();
 
   let body: React.ReactNode;
   if (agents.isPending) {
@@ -56,6 +59,7 @@ export function AgentsPage() {
       (agent) =>
         (mode === null || agent.mvp_mode === mode) &&
         (status === "" || agent.status === status) &&
+        (group === "" || agent.group === group) &&
         (needle === "" || matches(agent, needle)),
     );
     // Derived from the data, never asserted: one agent able to approve turns the statement into a warning.
@@ -113,6 +117,22 @@ export function AgentsPage() {
               {AGENT_STATUSES.map((value) => (
                 <option key={value} value={value}>
                   {t(`agents.status.${value}`)}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex flex-col gap-1">
+            <Label htmlFor={groupId}>{t("agents.filters.group")}</Label>
+            <select
+              id={groupId}
+              value={group}
+              onChange={(event) => setGroup(event.target.value as AgentGroup | "")}
+              className="h-9 rounded-md border border-line bg-surface px-2 text-sm"
+            >
+              <option value="">{t("agents.filters.anyGroup")}</option>
+              {AGENT_GROUPS.map((value) => (
+                <option key={value} value={value}>
+                  {t(`agents.groups.${value}`)}
                 </option>
               ))}
             </select>

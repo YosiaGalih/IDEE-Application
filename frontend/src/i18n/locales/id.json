@@ -661,7 +661,9 @@
       "status": "Status",
       "anyStatus": "Semua status",
       "search": "Cari nama, ID, atau tool",
-      "searchPlaceholder": "mis. B14 atau git.commit_task"
+      "searchPlaceholder": "mis. B14 atau git.commit_task",
+      "group": "Grup",
+      "anyGroup": "Semua grup"
     },
     "modes": {
       "llm": "LLM",
@@ -765,7 +767,11 @@
       "statRuns": "Jumlah run",
       "statSuccess": "Tingkat berhasil",
       "statDuration": "Durasi rata-rata",
-      "notAvailable": "Tidak tersedia"
+      "notAvailable": "Tidak tersedia",
+      "contractPlanned": "{{name}} (direncanakan)",
+      "toolQuota": "Kuota tool",
+      "quotaValue_one": "{{count}} panggilan",
+      "quotaValue_other": "{{count}} panggilan"
     }
   }
 }

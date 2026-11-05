@@ -36,6 +36,7 @@ export function agent(overrides: Partial<Agent> = {}): Agent {
     access_note: "Read-only.",
     target_mode: null,
     phase: null,
+    contract_status: null,
     status: "not_ready",
     status_reasons: ["runtime_unavailable", "provider_readiness_unknown", "tools_unavailable"],
     ...overrides,
@@ -118,9 +119,10 @@ export function run(overrides: Partial<AgentRun> = {}): AgentRun {
   };
 }
 
+/** API §6: the agent's own fields plus its runs and statistics, one flat object. */
 export function detail(overrides: Partial<AgentDetail> = {}): AgentDetail {
   return {
-    agent: agent(),
+    ...agent(),
     recent_runs: [],
     stats: { runs: 0, success_rate: null, avg_duration_ms: null },
     ...overrides,

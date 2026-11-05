@@ -90,6 +90,8 @@ export const AgentSchema = z.object({
   access_note: z.string(),
   target_mode: z.string().nullable(),
   phase: z.string().nullable(),
+  /** "planned": the contract names belong to a planned agent and do not exist yet. */
+  contract_status: z.literal("planned").nullable(),
   status: z.enum(AGENT_STATUSES),
   status_reasons: z.array(z.enum(STATUS_REASONS)),
 });
@@ -146,8 +148,8 @@ export const AgentRunSchema = z.object({
 });
 export type AgentRun = z.infer<typeof AgentRunSchema>;
 
-export const AgentDetailSchema = z.object({
-  agent: AgentSchema,
+/** API §6: `AgentProfile + {recent_runs, stats}`, one flat object. */
+export const AgentDetailSchema = AgentSchema.extend({
   recent_runs: z.array(AgentRunSchema),
   stats: z.object({
     runs: z.number().int().nonnegative(),

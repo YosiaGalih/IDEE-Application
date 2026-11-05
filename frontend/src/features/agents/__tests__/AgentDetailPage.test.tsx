@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agent, detail, run } from "@/__tests__/agentFixtures";
+import { detail, run } from "@/__tests__/agentFixtures";
 import { API, deferred, fail, renderApp, signedIn } from "@/__tests__/harness";
 import type { AgentDetail } from "@/api/agents";
 import id from "@/i18n/locales/id.json";
@@ -75,19 +75,61 @@ describe("AgentDetailPage", () => {
     const runs = await screen.findByRole("table", { name: id.agents.detail.runs });
     expect(within(runs).getByText(id.agents.runStatus.succeeded)).toBeInTheDocument();
     expect(within(runs).getByText(id.agents.runStatus.failed)).toBeInTheDocument();
+    expect(within(runs).getAllByTestId("run-status-icon")).toHaveLength(2); // text + icon, never text alone
     expect(screen.getByText("50%")).toBeInTheDocument();
+  });
+
+  it("marks unavailable tools with an icon as well as words", async () => {
+    backend();
+    renderApp("/agents/A02");
+    await loaded();
+    const tools = screen.getByRole("list", { name: id.agents.detail.tools });
+    expect(within(tools).getAllByTestId("tool-unavailable-icon")).toHaveLength(2);
+  });
+
+  it("does not show a planned agent's contracts as if they existed", async () => {
+    backend(() =>
+      detailAnswer(
+        detail({
+          mvp_mode: "planned",
+          status: "planned",
+          contract_status: "planned",
+          input_contract: "SecurityScanInput",
+          output_contract: "SecurityScanOutput",
+        }),
+      ),
+    );
+    renderApp("/agents/A02");
+    await loaded();
+    expect(
+      screen.getByText(id.agents.detail.contractPlanned.replace("{{name}}", "SecurityScanInput")),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("SecurityScanInput", { selector: "code" })).toBeNull();
+  });
+
+  it("lists the tool quota when the registry sets one", async () => {
+    backend(() =>
+      detailAnswer(
+        detail({ limits: { max_iterations: 8, timeout_seconds: 300, tool_quota: { "repo.read_file": 20 } } }),
+      ),
+    );
+    renderApp("/agents/A02");
+    await loaded();
+    const quota = screen.getByLabelText(id.agents.detail.toolQuota);
+    expect(within(quota).getByText("repo.read_file")).toBeInTheDocument();
+    expect(
+      within(quota).getByText(id.agents.detail.quotaValue_other.replace("{{count}}", "20")),
+    ).toBeInTheDocument();
   });
 
   it("names the runtime of a profile agent", async () => {
     backend(() =>
       detailAnswer(
         detail({
-          agent: agent({
-            agent_id: "A01",
-            name: "Intent Classifier",
-            mvp_mode: "profile",
-            runtime_agent: "A02",
-          }),
+          agent_id: "A01",
+          name: "Intent Classifier",
+          mvp_mode: "profile",
+          runtime_agent: "A02",
         }),
       ),
     );

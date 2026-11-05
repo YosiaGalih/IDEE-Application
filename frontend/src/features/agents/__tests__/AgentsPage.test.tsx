@@ -61,7 +61,7 @@ describe("AgentsPage", () => {
     expect(card("Requirement Analyst")).toHaveAttribute("href", "/agents/A02");
   });
 
-  it("filters by mode chip, status and search", async () => {
+  it("filters by mode chip, status, group and search", async () => {
     backend();
     renderApp("/agents");
     await loaded();
@@ -73,6 +73,10 @@ describe("AgentsPage", () => {
     expect(card("Release Manager")).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: /Git Operator/ })).not.toBeInTheDocument();
     await userEvent.selectOptions(screen.getByLabelText(id.agents.filters.status), "");
+    await userEvent.selectOptions(screen.getByLabelText(id.agents.filters.group), "git_collaboration");
+    expect(card("Git Operator")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Requirement Analyst/ })).not.toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText(id.agents.filters.group), "");
     await userEvent.type(screen.getByLabelText(id.agents.filters.search), "git.commit");
     expect(card("Git Operator")).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: /Intent Classifier/ })).not.toBeInTheDocument();

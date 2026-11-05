@@ -1,4 +1,4 @@
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Hourglass } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link, useParams } from "react-router";
 import { PERMISSION_FIELDS, type Agent, type AgentDetail } from "@/api/agents";
@@ -10,14 +10,14 @@ import { Card, CardTitle } from "@/components/ui/Card";
 import { StateView } from "@/components/ui/StateView";
 import { AGENTS_PATH, taskPath } from "@/lib/paths";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
-import { AgentStatusBadge, reasonsText } from "./agentStatus";
+import { AgentStatusBadge, RunStatusBadge, reasonsText } from "./agentStatus";
 
 /** `/agents/:agentId`: what one agent is for, what it may touch, and its recent runs (FR-044–046). */
 export function AgentDetailPage() {
   const { t } = useTranslation();
   const { agentId = "" } = useParams();
   const query = useAgent(agentId);
-  useDocumentTitle(query.data ? `${query.data.agent.name} · ${t("screens.agents")}` : t("screens.agents"));
+  useDocumentTitle(query.data ? `${query.data.name} · ${t("screens.agents")}` : t("screens.agents"));
 
   let body: React.ReactNode;
   if (query.isPending) {
@@ -45,9 +45,8 @@ export function AgentDetailPage() {
   );
 }
 
-function Detail({ detail }: { detail: AgentDetail }) {
+function Detail({ detail: agent }: { detail: AgentDetail }) {
   const { t } = useTranslation();
-  const { agent } = detail;
   const reasons = reasonsText(t, agent);
   return (
     <div className="flex flex-col gap-4">
@@ -92,17 +91,22 @@ function Detail({ detail }: { detail: AgentDetail }) {
             <dt className="text-fg-muted">{t("agents.detail.modelTier")}</dt>
             <dd>{t(`agents.tiers.${agent.model_tier}`, { defaultValue: agent.model_tier })}</dd>
             <dt className="text-fg-muted">{t("agents.detail.input")}</dt>
-            <dd>{agent.input_contract ? <code>{agent.input_contract}</code> : t("agents.detail.none")}</dd>
+            <dd>
+              <Contract name={agent.input_contract} planned={agent.contract_status === "planned"} />
+            </dd>
             <dt className="text-fg-muted">{t("agents.detail.output")}</dt>
-            <dd>{agent.output_contract ? <code>{agent.output_contract}</code> : t("agents.detail.none")}</dd>
+            <dd>
+              <Contract name={agent.output_contract} planned={agent.contract_status === "planned"} />
+            </dd>
           </dl>
+          {agent.limits.tool_quota ? <ToolQuota quota={agent.limits.tool_quota} /> : null}
           <h3 className="mt-4 text-sm font-semibold text-fg">{t("agents.detail.triggers")}</h3>
           <TokenList values={agent.triggers} />
           <h3 className="mt-4 text-sm font-semibold text-fg">{t("agents.detail.capabilities")}</h3>
           <TokenList values={agent.capabilities} />
         </Card>
       </div>
-      <Runs detail={detail} />
+      <Runs detail={agent} />
     </div>
   );
 }
@@ -149,6 +153,32 @@ function Permissions({ agent }: { agent: Agent }) {
   );
 }
 
+/** A planned agent's contract names do not exist yet: say so instead of showing them as live. */
+function Contract({ name, planned }: { name: string | null; planned: boolean }) {
+  const { t } = useTranslation();
+  if (name === null) return <>{t("agents.detail.none")}</>;
+  return planned ? <>{t("agents.detail.contractPlanned", { name })}</> : <code>{name}</code>;
+}
+
+function ToolQuota({ quota }: { quota: Record<string, number> }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <h3 className="mt-4 text-sm font-semibold text-fg">{t("agents.detail.toolQuota")}</h3>
+      <dl aria-label={t("agents.detail.toolQuota")} className="mt-1 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+        {Object.entries(quota).map(([tool, count]) => (
+          <div key={tool} className="contents">
+            <dt>
+              <code>{tool}</code>
+            </dt>
+            <dd>{t("agents.detail.quotaValue", { count })}</dd>
+          </div>
+        ))}
+      </dl>
+    </>
+  );
+}
+
 function Tools({ agent }: { agent: Agent }) {
   const { t } = useTranslation();
   if (agent.tools.length === 0)
@@ -159,7 +189,12 @@ function Tools({ agent }: { agent: Agent }) {
       {agent.tools.map((tool) => (
         <li key={tool} className="flex items-center gap-2">
           <code>{tool}</code>
-          {unavailable.has(tool) ? <Badge tone="warning">{t("agents.detail.toolUnavailable")}</Badge> : null}
+          {unavailable.has(tool) ? (
+            <Badge tone="warning">
+              <Hourglass aria-hidden="true" data-testid="tool-unavailable-icon" className="size-3.5" />
+              {t("agents.detail.toolUnavailable")}
+            </Badge>
+          ) : null}
         </li>
       ))}
     </ul>
@@ -171,6 +206,10 @@ function Runs({ detail }: { detail: AgentDetail }) {
   const { recent_runs: runs, stats } = detail;
   const percent = new Intl.NumberFormat(i18n.language, { style: "percent", maximumFractionDigits: 0 });
   const seconds = new Intl.NumberFormat(i18n.language, { maximumFractionDigits: 1 });
+  const duration = (ms: number | null) =>
+    ms === null
+      ? t("agents.detail.notAvailable")
+      : t("agents.detail.durationValue", { seconds: seconds.format(ms / 1000) });
   const when = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeStyle: "short" });
   const titleId = "agent-runs-title";
   return (
@@ -192,11 +231,7 @@ function Runs({ detail }: { detail: AgentDetail }) {
         </div>
         <div>
           <dt className="text-fg-muted">{t("agents.detail.statDuration")}</dt>
-          <dd>
-            {stats.avg_duration_ms === null
-              ? t("agents.detail.notAvailable")
-              : t("agents.detail.durationValue", { seconds: seconds.format(stats.avg_duration_ms / 1000) })}
-          </dd>
+          <dd>{duration(stats.avg_duration_ms)}</dd>
         </div>
       </dl>
       {runs.length === 0 ? (
@@ -228,12 +263,10 @@ function Runs({ detail }: { detail: AgentDetail }) {
                     <code>{run.task_id.slice(0, 8)}</code>
                   </Link>
                 </td>
-                <td className="py-1">{t(`agents.runStatus.${run.status}`)}</td>
                 <td className="py-1">
-                  {run.duration_ms === null
-                    ? t("agents.detail.notAvailable")
-                    : t("agents.detail.durationValue", { seconds: seconds.format(run.duration_ms / 1000) })}
+                  <RunStatusBadge status={run.status} />
                 </td>
+                <td className="py-1">{duration(run.duration_ms)}</td>
               </tr>
             ))}
           </tbody>

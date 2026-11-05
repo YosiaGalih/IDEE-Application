@@ -661,7 +661,9 @@
       "status": "Status",
       "anyStatus": "Any status",
       "search": "Search name, ID or tool",
-      "searchPlaceholder": "e.g. B14 or git.commit_task"
+      "searchPlaceholder": "e.g. B14 or git.commit_task",
+      "group": "Group",
+      "anyGroup": "Any group"
     },
     "modes": {
       "llm": "LLM",
@@ -765,7 +767,11 @@
       "statRuns": "Runs",
       "statSuccess": "Success rate",
       "statDuration": "Average duration",
-      "notAvailable": "Not available"
+      "notAvailable": "Not available",
+      "contractPlanned": "{{name}} (planned)",
+      "toolQuota": "Tool quota",
+      "quotaValue_one": "{{count}} call",
+      "quotaValue_other": "{{count}} calls"
     }
   }
 }
