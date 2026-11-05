@@ -1591,3 +1591,23 @@ Tidak ditutup (alasan):
 
 Usulan untuk backend (pemilik WP-2.1c, belum dikerjakan): `AlreadyExists` (`POST /files` untuk path yang sudah ada) adalah 409 `CONFLICT` tanpa `details.reason`. Bentuknya sama dengan 409 dari idempotency store ("permintaan dengan key ini masih berjalan"), sehingga UI hanya bisa menyebut keduanya. `details: [{reason: "path_exists"}]` akan membuatnya tegas tanpa mengubah status code.
 
+
+### WP-2.2b — panel git di workspace: perubahan, diff, commit, branch, log (FR-113, FR-115 bagian layar; FR-118; AC-09 bagian diff)
+
+Spec: `docs/superpowers/specs/2026-11-05-wp-2.2b-git-panel-design.md`. Plan: `docs/superpowers/plans/2026-11-05-wp-2.2b-git-panel.md`. Hanya frontend; API dari WP-2.1c. Tidak bertanda 🔒.
+
+Keputusan Lead:
+- Kolom kiri berganti antara Explorer dan Git. Kedua tampilan tetap ter-mount (`hidden`). Branch dan log baru dibaca setelah tampilan Git pertama kali dibuka.
+- Diff ditampilkan di dialog lebar sebagai baris unified dengan nomor baris. Monaco tidak dipakai karena API memberi hunk, bukan isi file utuh.
+- Commit selalu dengan `paths` eksplisit, tidak pernah `null`. File tercentang saat pertama kali muncul di daftar; pilihan user dipertahankan selama file itu tetap terdaftar.
+- Satu `Idempotency-Key` per isi permintaan. Key yang sama dipakai hanya untuk mengulang permintaan yang hasilnya tidak pasti.
+- Buat branch hanya membuat ref, tanpa checkout (FR-118). Stage/unstage, discard, dan checkout menunggu v2.1 M26.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Frontend `format:check`, `lint`, `lint:guards`, `typecheck` @ ec63f8e | bersih |
+| Frontend `npm test` @ ec63f8e | **432 passed** (33 file; +32 test baru: klien git 6, pilihan commit 5, tampilan diff 6, panel git 13, toggle workspace 2) |
+| `npx vite build` | sukses; `WorkspacePage` 59,0 kB (gzip 15,2 kB); Monaco tetap di chunk sendiri |
+| `npm audit --omit=dev --audit-level=high` | 0 vulnerabilities |
+| Mutan K1–K8 | semuanya merah: commit semua file terdaftar, key baru setiap kali, tanpa cek nama cadangan, tampilan tersembunyi tidak di-mount, tab belum tersimpan tidak diteruskan, diff terpotong disebut kosong, log tanpa batas, `nothing_to_commit` sebagai gagal |
+| Live check @ ec63f8e (build produksi lewat `vite preview` + uvicorn + DB uji `kodekantor_test_rev`; CSP Caddyfile disuntikkan ke dokumen) | README.md diedit lalu disimpan; file baru dibuat. Tombol Git: "Git, 9 perubahan". Diff README.md di dialog memuat baris baru. Commit 1 dari 9 file → "Commit aab37b0 dibuat." Log (UI dan API) memuat commit itu. README.md keluar dari daftar perubahan; file baru tetap belum di-commit. Branch `live-…` dibuat di aab37b0 dan working tree tetap di `main`. `kk/curang` ditolak di UI tanpa request. Console: 0 masalah, 0 pelanggaran CSP |
