@@ -83,6 +83,9 @@ async def test_approve_deletes_and_the_project_is_gone(owner: httpx.AsyncClient)
     assert (await owner.get(f"{PROJECTS}/{project_id}")).status_code == 404
     listed = (await owner.get(PROJECTS, params={"status": "all"})).json()["data"]
     assert project_id not in {p["id"] for p in listed}
+    # Its approvals leave the history with it (spec 3.1c2 Lead 1: project_name always exists when listed).
+    history = (await owner.get(APPROVALS, params={"status": "all"})).json()["data"]
+    assert approval["id"] not in {a["id"] for a in history}  # type: ignore[index]
 
 
 async def test_reject_restores(owner: httpx.AsyncClient) -> None:  # noqa: F811
