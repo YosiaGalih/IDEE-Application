@@ -1956,3 +1956,70 @@ Sumbu spec: 12 temuan (2 kurang, 2 tidak diminta, 2 salah, 6 drift dokumen). Sum
 | penilaian, tidak diubah | CHECK `ck_projects_deleted_at` tanpa `NOT VALID`/`VALIDATE`: tabel `projects` kecil (satu baris per project) dan migrasi di-backfill lebih dulu. `_now()` di 4 modul: satu baris, tanpa modul bersama yang cocok di lapisan ini. `audit_project`: pembungkus publik agar `_audit` tetap privat. `sessions` + `audit` berpasangan: worker tidak punya `ProjectEnv`. Status sebagai `str`: mengikuti CHECK + enum tuple di seluruh model. Dua aktor sistem (`system:approval_handlers` untuk event `approval.*`, `approval:<id>` untuk event project dan pembatalan task): yang kedua menunjuk approval mana yang menghapus project. `dict[str, object]` di helper test | — |
 
 Mutan code-review (satu perubahan per run, dipulihkan; skrip scratchpad): R1 `delete_failed` pada kegagalan pertama, R2 semua jenis bisa diminta, R3 `expires_at` NULL tidak pernah bisa dikonsumsi, R4 `approval.consumed` diaudit pada project, R5 fallback membuka project sebagai `active`: semua `RED`.
+
+### WP-3.1c2 (layar persetujuan dan hapus project) — `/approvals`, badge tertunda, aksi "Hapus" di `/projects` (FR-063, FR-067 layar; AC-13 layar)
+
+Spec: `docs/superpowers/specs/2026-11-05-wp-3.1c-approvals-design.md` ("Goals 3.1c2", "Keputusan Lead 3.1c2"). Plan: `docs/superpowers/plans/2026-11-05-wp-3.1c2-approvals-screen.md`. Branch ditumpuk di atas WP-3.1c1 (d8ca0be).
+
+Keputusan Lead (rinci di spec):
+- `project_name` ditambahkan pada respons `Approval` (dilaporkan di #72).
+- Tertunda dikelompokkan per project (satu halaman 200, bila lebih ada teks "menampilkan n dari m").
+- Kartu: payload sebagai teks JSON, hash pendek + lengkap di dialog, risiko sebagai teks.
+- Dialog keputusan: mengirim `payload_hash` milik approval yang ditampilkan. "Dihapus" hanya diklaim bila status `consumed` dan handler berhasil.
+- Riwayat: filter status, 20 per halaman.
+- Badge: polling 30 detik, disembunyikan bila 0 atau gagal.
+- "Hapus" di baris `/projects` dengan konfirmasi.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Frontend `format:check`, `lint`, `lint:guards`, `typecheck` @ 65c44c3 | bersih |
+| Frontend `npm test` @ 65c44c3 | [Pasti] `529 passed` (40 file). Sebelum WP: 477. Test baru: klien approval 5, badge 4, aktivitas pengguna 3, teks keputusan 19, layar persetujuan 23, hapus project di `/projects` 5. Fixture shell `pendingApprovals()` di 13 file test |
+| `npx vite build`, `npm audit --omit=dev --audit-level=high` | sukses; 0 vulnerabilities |
+| Backend (`project_name`) @ 3bf02fb | ruff/format/pyright `0 errors`/lint-imports `3 kept`; `test_approvals_api.py` + `tests/security/test_approvals.py` + `test_cross_project.py` + `test_project_delete.py`: `177 passed` (sendirian) |
+| Mutan frontend (satu per run, dipulihkan) | badge tidak menautkan, "Hapus" tanpa cek `project:delete`, klik ganda hapus, klik ganda keputusan: semua `RED`. Mutan klik ganda hapus awalnya `SURVIVED` (jawaban server datang sebelum klik kedua); test diperbaiki dengan menahan jawaban, lalu `RED` |
+| Live check @ 384e697, diulang @ 5d4f6c0 (build produksi lewat `vite preview` + uvicorn + DB `kodekantor_test_rev` dimigrasi ke 0007; CSP Caddyfile disuntikkan) | [Pasti] Alur: dua permintaan hapus dari `/projects` → badge "2" (nama tautan "Persetujuan, 2 tertunda") → "Tertunda (2)" per project. Project bernama `<b>Hapus</b> …` tampil sebagai teks (0 elemen `<b>`). Tolak dengan catatan dua baris → project kembali `active`. Setujui → dialog menampilkan hash 64 karakter → "Project … dihapus." → `GET /projects/{id}` 404. Riwayat menampilkan penolakan dengan catatannya. 0 pelanggaran CSP; satu-satunya error konsol adalah 404 dari probe skrip itu sendiri |
+| Lebar 390 px | 32 px scroll horizontal dari shell (sidebar `w-60` tetap; di luar cakupan, HANDOFF) |
+
+Temuan live check yang ditutup di WP ini:
+- **Ringkasan berbahasa Inggris di UI Indonesia.** `summary` server untuk `project_delete` adalah konstanta Inggris. Kartu dan dialog kini menyusun ringkasan dari payload (yang diikat hash) dalam bahasa layar. Jenis aksi yang belum dikenal tetap memakai `summary` server dan nama jenis mentah (5d4f6c0, test `shows an action type it does not know as it is`).
+- **Teks panjang keluar dari kotak `Alert` di 390 px.** Badan `Alert` kini `min-w-0 break-words` (komponen bersama).
+- **`Intl.DateTimeFormat` dengan `dateStyle` + `timeZoneName` melempar `TypeError`** (seluruh layar jatuh ke halaman galat). Ditemukan oleh test layar sebelum commit. Kini `timeStyle: "long"`, yang sudah memuat zona waktu.
+
+Catatan:
+- Approval milik project yang sudah dihapus ikut hilang dari riwayat, karena project dan approval-nya tidak terlihat lagi (keputusan 3.1c1). Jejaknya tetap ada di audit (`approval.decided`, `approval.consumed`, `project.deleted`). Dilaporkan di #72.
+- Jumlah kunci i18n yang bertipe melewati ±600. `useTranslation()["t"]` dengan union kunci (`ArchiveImport.uploadErrorText`) membuat tsc gagal ("excessively deep"). Fungsi itu kini memakai `TFunction` i18next seperti `importText.ts`. Pola yang sama dipakai di modul teks baru.
+
+#### Review WP-3.1c2 @ 5d4f6c0
+
+Hasil awal:
+- `kk-backend-reviewer` (delta `project_name`): APPROVE, 0 blocker/should, 3 nit.
+- `kk-frontend-reviewer`: 0 blocker, 3 should, 4 nit.
+- `kk-silent-failure-hunter`: 0 HIGH, 1 MEDIUM, 9 LOW.
+- `kk-security-reviewer` (AG-13): **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH, 1 MEDIUM, 2 LOW, 7 INFO.
+
+| Temuan | Penutupan (0a30d9b, 65c44c3) | Bukti |
+|---|---|---|
+| AG-13 M1: badge polling 30 dtk menahan sesi melewati idle timeout (setiap GET memajukan `last_seen_at`) | polling hanya selama ada input dalam 10 menit (`src/lib/userActivity.ts`); sekali baca susulan saat pengguna kembali | `userActivity.test.ts` (3), `Sidebar.test.tsx::polls only while the page is in use` (mutan K2 `RED`) |
+| AG-13 L1: karakter bidi/zero-width di payload tampil apa adanya | `revealHidden` di payload dan ringkasan (`\uXXXX`); baris baru dan tab tetap | `approvalText.test.ts`, `shows hidden characters in a payload as escapes` (K3 `RED`) |
+| AG-13 L2: belum ada test bahwa hash tetap terikat saat daftar berubah di bawah dialog | test ditambah | `decides on the approval it was opened with, even when the list changes under it` |
+| frontend S1 + silent MEDIUM + AG-13 I7: dialog bisa ditutup saat permintaan berjalan, hasil hilang | Batal nonaktif, Escape/klik luar diabaikan selama mengirim (dua dialog) | `stays open while the decision is in flight`, `keeps the delete dialog open while the request is in flight` (K1, K6 `RED`) |
+| frontend S2: test 403/404/422 keputusan, 403 daftar, fokus | ditambah | `explains %s on a decision` ×3, `shows the permission state when the list itself is refused`, fokus h1 diperiksa |
+| frontend S3 + silent L10: polling gagal mengganti kartu dengan galat | kartu tetap; banner "gagal dimuat ulang" + coba lagi | `keeps the cards and says the list is stale when a later read fails` (K4 `RED`) |
+| silent L2/L3 + frontend nit: hasil non-hapus dan status tak terduga diklaim berhasil/berjalan | setiap status dipetakan; selain itu "hasil belum jelas, muat ulang" | `approvalText.test.ts` (11 kasus hasil; K5 `RED`) |
+| silent L4: alasan 409 tak dikenal → "sudah diputuskan" | "tidak dapat diputuskan sekarang, muat ulang" | `approvalText.test.ts` |
+| silent L5: semua 422 → "catatan tidak valid" | hanya bila `loc` berakhir `note`; selain itu teks galat umum | `approvalText.test.ts` |
+| silent L8: label halaman riwayat memakai halaman filter baru dengan meta lama | memakai `meta.page` | — |
+| frontend nit: `reasonOf` ganda | `errorReason` di `lib/describeError.ts` | — |
+| backend nit: tidak ada test bahwa approval project terhapus hilang dari riwayat | assertion di `test_approve_deletes_and_the_project_is_gone` | `1 passed` (0a30d9b) |
+| backend nit: rujukan #72 | #72 butir 3.1c2 | — |
+| AG-13 I4: spec menyebut keputusan tanpa Idempotency-Key | teks spec diperbaiki (klien selalu mengirim key; keamanan dari 409) | — |
+| Diterima, tidak diubah | silent L6: tombol tetap nonaktif sesudah hasil tak diketahui (mengirim ulang hanya bisa 409/404; teks menyuruh muat ulang). silent L7: 404 sesudah keputusan bila project di-purge di antara commit dan baca (purge 7 hari; FK CASCADE). silent L9: badge disembunyikan saat galat (Keputusan Lead 6; layar `/approvals` menampilkan galatnya). frontend nit: riwayat `all` tanpa polling (dimuat ulang lewat invalidasi dan fokus). frontend nit: pengumuman hasil memakai pola `/projects` (fokus h1 + `role=status`). AG-13 I2: "7 hari" di teks i18n menduplikasi `PURGE_AFTER`. AG-13 I5: `requested_by` tampil sebagai `user:<uuid>`; nama tampilan butuh lookup user di backend → WP berikutnya. AG-13 I6: polling memuat semua baris tertunda di Python (tier S, baris kedaluwarsa) | — |
+
+Mutan putaran review (satu per run, dipulihkan): K1 dialog keputusan bisa ditutup saat mengirim, K2 badge polling saat idle, K3 karakter tersembunyi tidak diungkap, K4 galat muat ulang mengganti kartu, K5 status tak dikenal diklaim "berjalan", K6 dialog hapus bisa ditutup saat mengirim: semua `RED`.
+
+**Sign-off AG-13:** SIGNED OFF WITH CONDITIONS @ 5d4f6c0. Status syarat:
+- **C1:** CI hijau di head PR untuk `test_approvals_api.py` (termasuk assertion `project_name`). Bukti lokal: `177 passed` @ 3bf02fb dan `1 passed` @ 0a30d9b. CI menyusul saat PR dibuka.
+- **C2 (M1):** ditutup di WP ini (65c44c3) dengan test.
+- **C3 (L1):** ditutup di WP ini (65c44c3), sebelum jenis aksi lain dapat diminta.
+- **C4 (L2):** test ditambah (65c44c3).
+
