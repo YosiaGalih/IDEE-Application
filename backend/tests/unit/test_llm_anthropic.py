@@ -45,7 +45,7 @@ HELLO = sse(message_start(), *text_block(0, "Hel", "lo"), *message_end("end_turn
 
 
 def provider(fake: FakeAnthropic) -> AnthropicClaudeProvider:
-    return AnthropicClaudeProvider("sk-ant-api03-test", http_client=fake.client())
+    return AnthropicClaudeProvider("sk-ant-api03-test", transport=fake.transport())
 
 
 async def call(fake: FakeAnthropic, req: LLMRequest = REQ, **kwargs):  # type: ignore[no-untyped-def]
@@ -380,7 +380,7 @@ async def test_ping_events_are_ignored() -> None:
 
 
 def test_provider_repr_hides_the_key() -> None:
-    adapter = AnthropicClaudeProvider("sk-ant-api03-secret-value", http_client=httpx2.AsyncClient())
+    adapter = AnthropicClaudeProvider("sk-ant-api03-secret-value")
     assert "secret-value" not in repr(adapter)
     assert adapter.name == "anthropic"
 
@@ -476,3 +476,40 @@ async def test_text_handler_failure_propagates_unchanged() -> None:
     with pytest.raises(RuntimeError, match="event bus down"):
         await asyncio.wait_for(call(held(stream), on_text_delta=on_delta), 5)
     assert stream.closed
+
+
+async def test_a_redirect_is_not_followed() -> None:
+    # Following it would send X-Api-Key and the prompt to whatever host the Location names (AG-13 M1).
+    fake = FakeAnthropic(
+        lambda _: httpx2.Response(307, headers={"location": "https://collector.example/v1/messages"})
+    )
+    error = await failure(fake)
+    assert len(fake.requests) == 1
+    assert error.kind == "bad_request"
+    assert error.status_code == 307
+    assert error.vendor_type == "redirect"
+
+
+@pytest.mark.parametrize("bad", ["x" * 65, "bad type\nInjected: 1", "<script>", ""])
+async def test_vendor_error_type_is_bounded(bad: str) -> None:
+    error = await failure(FakeAnthropic(lambda _: error_response(400, bad)))
+    assert error.vendor_type == "unrecognised"
+    assert bad not in str(error) or bad == ""
+
+
+async def test_vendor_stop_reason_is_bounded() -> None:
+    body = sse(message_start(), *text_block(0, "x"), *message_end("y" * 200))
+    error = await failure(FakeAnthropic(lambda _: stream_response(body)))
+    assert error.kind == "malformed"
+    assert error.vendor_type == "unrecognised"
+
+
+@pytest.mark.parametrize("request_id", ["r" * 129, "req 1", "req;x=1", "../etc"])
+async def test_odd_request_ids_are_dropped(request_id: str) -> None:
+    response = await call(FakeAnthropic(lambda _: stream_response(HELLO, request_id=request_id)))
+    assert response.request_id is None
+
+
+async def test_a_long_plain_request_id_is_kept() -> None:
+    response = await call(FakeAnthropic(lambda _: stream_response(HELLO, request_id="req_" + "a" * 124)))
+    assert response.request_id == "req_" + "a" * 124

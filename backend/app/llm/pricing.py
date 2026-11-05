@@ -91,8 +91,10 @@ class PricingTable(BaseModel):
     models: Mapping[str, ModelPrice]
 
     def estimate(self, model: str, usage: Usage | None, *, partial: bool) -> CostEstimate:
-        """``partial`` must be stated: True for an attempt that failed or was cancelled after it started,
-        whose usage is a lower bound (output seen so far)."""
+        """``partial`` must be stated: True for an attempt that failed or was cancelled after it started.
+        Its usage is a lower bound only: the provider reports the output count at the end of the stream, so
+        a cut attempt may show 1 output token for thousands billed (AG-13 M2; the budget allows for it, 3.1f).
+        """
         price = self.models.get(model)
         if price is None or usage is None:
             return CostEstimate(None, "unavailable", self.version)

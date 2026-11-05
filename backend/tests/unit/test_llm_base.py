@@ -85,3 +85,12 @@ def test_usage_rejects_negative_counts(field: str) -> None:
     counts = {"input_tokens": 1, "output_tokens": 1, field: -1}
     with pytest.raises(ValueError, match="token"):
         Usage(**counts)
+
+
+def test_request_repr_hides_the_prompt() -> None:
+    from app.llm.base import LLMRequest, Message
+
+    req = LLMRequest(model="m", system="SYSTEM-SECRET", messages=(Message("user", "USER-SECRET"),))
+    assert "SYSTEM-SECRET" not in repr(req)
+    assert "USER-SECRET" not in repr(req)
+    assert "m" in repr(req)

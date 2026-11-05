@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -115,10 +116,18 @@ class AnthropicClaudeProvider:
     name = "anthropic"
 
     def __init__(
-        self, api_key: str, *, base_url: str | None = None, http_client: httpx2.AsyncClient | None = None
+        self, api_key: str, *, base_url: str | None = None, transport: httpx2.AsyncBaseTransport | None = None
     ):
+        # The SDK's default client follows redirects, and a cross-origin redirect keeps X-Api-Key and the body
+        # (AG-13 M1). This client never follows one. ``transport`` is the test seam; the client is the same.
+        options: dict[str, Any] = {"follow_redirects": False}
+        if transport is not None:
+            options["transport"] = transport
         self._client = anthropic.AsyncAnthropic(
-            api_key=api_key, base_url=base_url, max_retries=0, http_client=http_client
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=0,
+            http_client=anthropic.DefaultAsyncHttpxClient(**options),
         )
 
     def __repr__(self) -> str:
@@ -172,7 +181,7 @@ class AnthropicClaudeProvider:
     ) -> tuple[tuple[TextBlock | ToolUseBlock, ...], StopReason]:
         try:
             stream = await self._client.messages.create(**_params(req), stream=True, timeout=req.timeout_s)
-            progress.request_id = stream.response.headers.get("request-id")
+            progress.request_id = _request_id(stream.response.headers.get("request-id"))
             async with stream:
                 async for event in stream:
                     await _apply(event, progress, on_text_delta)
@@ -266,7 +275,7 @@ async def _apply(event: Any, progress: _Progress, on_text_delta: TextDeltaHandle
         elif block.type == "tool_use":
             progress.blocks[event.index] = _Block("tool_use", tool_id=block.id, tool_name=block.name)
         else:  # thinking, server tools, …: never requested by this adapter
-            raise progress.error("malformed", vendor_type=f"block:{block.type}")
+            raise progress.error("malformed", vendor_type=f"block:{_vendor(block.type)}")
     elif kind == "content_block_delta":
         target = progress.blocks.get(event.index)
         delta = event.delta
@@ -280,7 +289,7 @@ async def _apply(event: Any, progress: _Progress, on_text_delta: TextDeltaHandle
         elif target is not None and target.kind == "tool_use" and delta.type == "input_json_delta":
             target.parts.append(delta.partial_json)
         else:
-            raise progress.error("malformed", vendor_type=f"delta:{delta.type}")
+            raise progress.error("malformed", vendor_type=f"delta:{_vendor(delta.type)}")
     elif kind == "message_delta":
         progress.stop_reason = event.delta.stop_reason
         usage = event.usage
@@ -308,7 +317,7 @@ def _finish(progress: _Progress) -> tuple[tuple[TextBlock | ToolUseBlock, ...], 
     if stop in _STOP_ERRORS:
         raise progress.error(_STOP_ERRORS[stop], vendor_type=stop)
     if stop not in _STOP_OK:
-        raise progress.error("malformed", vendor_type=stop)
+        raise progress.error("malformed", vendor_type=_vendor(stop))
     content: list[TextBlock | ToolUseBlock] = []
     for index in sorted(progress.blocks):
         block = progress.blocks[index]
@@ -328,12 +337,16 @@ def _finish(progress: _Progress) -> tuple[tuple[TextBlock | ToolUseBlock, ...], 
 def _status_error(exc: anthropic.APIStatusError, progress: _Progress) -> LLMError:
     body = exc.body
     error = body.get("error") if isinstance(body, dict) else None
-    vendor_type = error.get("type") if isinstance(error, dict) else None
-    vendor_type = vendor_type if isinstance(vendor_type, str) else None
-    request_id = exc.response.headers.get("request-id") or progress.request_id
-    if exc.status_code < 400:  # an error event inside a 200 stream
+    raw_type = error.get("type") if isinstance(error, dict) else None
+    vendor_type = _vendor(raw_type) if isinstance(raw_type, str) else None
+    request_id = _request_id(exc.response.headers.get("request-id")) or progress.request_id
+    if exc.status_code < 300:  # an error event inside a 200 stream
         kind = _STREAM_ERRORS.get(vendor_type or "", "transient")
         return progress.error(kind, vendor_type=vendor_type, request_id=request_id)
+    if exc.status_code < 400:  # never followed: see __init__
+        return progress.error(
+            "bad_request", status_code=exc.status_code, vendor_type="redirect", request_id=request_id
+        )
     return progress.error(
         _kind_for_status(exc.status_code),
         status_code=exc.status_code,
@@ -341,6 +354,19 @@ def _status_error(exc: anthropic.APIStatusError, progress: _Progress) -> LLMErro
         request_id=request_id,
         retry_after_s=_retry_after(exc.response.headers.get("retry-after")),
     )
+
+
+_VENDOR_TEXT = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _vendor(value: str) -> str:
+    """Vendor-chosen names (error types, stop reasons) end up in messages, logs and the ledger: bounded."""
+    return value if _VENDOR_TEXT.fullmatch(value) else "unrecognised"
+
+
+def _request_id(value: str | None) -> str | None:
+    return value if value is not None and _REQUEST_ID.fullmatch(value) else None
 
 
 def _kind_for_status(status: int) -> ErrorKind:

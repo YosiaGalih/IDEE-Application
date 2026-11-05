@@ -54,14 +54,14 @@ def anthropic_answering_like_generic(req: LLMRequest) -> LLMProvider:
         stop = "tool_use"
     body = sse(message_start(), *blocks, *message_end(stop))
     return AnthropicClaudeProvider(
-        "sk-ant-api03-x", http_client=FakeAnthropic(lambda _: stream_response(body)).client()
+        "sk-ant-api03-x", transport=FakeAnthropic(lambda _: stream_response(body)).transport()
     )
 
 
 def anthropic_failing(_: LLMRequest) -> LLMProvider:
     return AnthropicClaudeProvider(
         "sk-ant-api03-x",
-        http_client=FakeAnthropic(lambda _: error_response(529, "overloaded_error")).client(),
+        transport=FakeAnthropic(lambda _: error_response(529, "overloaded_error")).transport(),
     )
 
 

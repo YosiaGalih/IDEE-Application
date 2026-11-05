@@ -51,7 +51,7 @@ def debug_logging():  # type: ignore[no-untyped-def]
 async def test_debug_logging_leaks_no_prompt_or_key(debug_logging, capsys) -> None:  # type: ignore[no-untyped-def]
     body = sse(message_start(), *text_block(0, "fine"), *message_end("end_turn"))
     fake = FakeAnthropic(lambda _: stream_response(body), lambda _: error_response(500, "api_error"))
-    provider = AnthropicClaudeProvider(KEY, http_client=fake.client())
+    provider = AnthropicClaudeProvider(KEY, transport=fake.transport())
     await provider.create_message(REQ)
     with pytest.raises(LLMError):
         await provider.create_message(REQ)
@@ -68,7 +68,7 @@ async def test_error_text_repr_and_traceback_carry_no_secret() -> None:
     # A 400 whose body echoes the prompt and the key, as some proxies and error pages do.
     echo = f"bad request: {PROMPT_MARKER} {KEY}"
     fake = FakeAnthropic(lambda _: error_response(400, "invalid_request_error", message=echo))
-    provider = AnthropicClaudeProvider(KEY, http_client=fake.client())
+    provider = AnthropicClaudeProvider(KEY, transport=fake.transport())
     with pytest.raises(LLMError) as raised:
         await provider.create_message(REQ)
     error = raised.value
@@ -94,3 +94,11 @@ def test_only_the_adapter_imports_the_vendor_sdk() -> None:
             if any(name.split(".")[0] in VENDOR_MODULES for name in names):
                 offenders.append(str(path.relative_to(APP)))
     assert sorted(set(offenders)) == ["llm/anthropic_provider.py"]
+
+
+def test_every_root_handler_drops_vendor_debug(debug_logging) -> None:  # type: ignore[no-untyped-def]
+    from app.core.logging import QuietVendorFilter
+
+    handlers = logging.getLogger().handlers
+    assert handlers
+    assert all(any(isinstance(f, QuietVendorFilter) for f in h.filters) for h in handlers)

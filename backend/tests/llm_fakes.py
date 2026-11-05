@@ -144,8 +144,8 @@ class FakeAnthropic:
             response = await response
         return response
 
-    def client(self) -> httpx2.AsyncClient:
-        return httpx2.AsyncClient(transport=httpx2.MockTransport(self))
+    def transport(self) -> httpx2.MockTransport:
+        return httpx2.MockTransport(self)
 
     def body(self, index: int = -1) -> dict[str, Any]:
         return json.loads(self.requests[index].content)

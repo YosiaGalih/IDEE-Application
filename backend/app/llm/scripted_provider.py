@@ -2,7 +2,7 @@
 
 The scenario comes from ``req.metadata["scenario"]`` (default ``generic``); the script within it from
 ``req.metadata["agent_id"]``. Every request is kept in ``requests`` so leak tests can inspect what would have
-been sent to a provider (SECURITY_MODEL T5).
+been sent to a provider (SECURITY_MODEL T5) when ``record_requests`` is on.
 """
 
 from __future__ import annotations
@@ -26,10 +26,12 @@ class ScriptedProvider:
         *,
         default_scenario: str = "generic",
         delta_size: int = 16,
+        record_requests: bool = False,
     ) -> None:
         self._scenarios = scenarios
         self._default_scenario = default_scenario
         self._delta_size = delta_size
+        self._record_requests = record_requests  # tests only: a demo worker must not keep every prompt
         self.requests: list[LLMRequest] = []
 
     async def create_message(
@@ -40,7 +42,8 @@ class ScriptedProvider:
         cancel: CancelToken | None = None,
     ) -> LLMResponse:
         started = time.monotonic()
-        self.requests.append(req)
+        if self._record_requests:
+            self.requests.append(req)
         if cancel is not None and cancel.cancelled:
             raise LLMError("cancelled")
         name = req.metadata.get("scenario", self._default_scenario)

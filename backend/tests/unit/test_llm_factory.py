@@ -36,7 +36,7 @@ async def test_anthropic_uses_the_configured_key_and_base_url() -> None:
     fake = FakeAnthropic(
         lambda _: stream_response(sse(message_start(), *text_block(0, "x"), *message_end("end_turn")))
     )
-    provider = build_provider(settings, http_client=fake.client())
+    provider = build_provider(settings, transport=fake.transport())
     assert isinstance(provider, AnthropicClaudeProvider)
     await provider.create_message(LLMRequest(model="m", system="s", messages=(Message("user", "hi"),)))
     sent = fake.requests[0]

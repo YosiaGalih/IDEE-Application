@@ -45,7 +45,9 @@ def request(*history: Message, scenario: str = "two-turns", agent_id: str = "A02
 
 
 def provider() -> ScriptedProvider:
-    return ScriptedProvider({**SCENARIOS, "two-turns": TWO_TURNS, "long": LONG}, delta_size=8)
+    return ScriptedProvider(
+        {**SCENARIOS, "two-turns": TWO_TURNS, "long": LONG}, delta_size=8, record_requests=True
+    )
 
 
 async def test_turn_is_derived_from_history_not_from_state() -> None:
@@ -166,3 +168,9 @@ async def test_turn_function_receives_the_request() -> None:
     scripted = ScriptedProvider({"echo": Scenario(name="echo", default=(echo,))})
     response = await scripted.create_message(request(scenario="echo", tools=(READ, SUBMIT)))
     assert response.content == (TextBlock("2 tools"),)
+
+
+async def test_requests_are_not_kept_unless_asked() -> None:
+    scripted = ScriptedProvider()
+    await scripted.create_message(request(scenario="generic"))
+    assert scripted.requests == []  # prompts are not held in memory by a long-running demo worker

@@ -75,8 +75,8 @@ class Usage:
 @dataclass(frozen=True, slots=True)
 class LLMRequest:
     model: str
-    system: str
-    messages: tuple[Message, ...]
+    system: str = field(repr=False)  # the prompt never reaches a log line through repr (AG-13 I1)
+    messages: tuple[Message, ...] = field(repr=False)
     tools: tuple[ToolDef, ...] = ()
     max_tokens: int = 8192
     # KodeKantor-side context (task_id, agent_id, agent_run_id, scenario); never sent to the provider.
