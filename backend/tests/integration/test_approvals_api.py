@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.models.approvals import Approval
@@ -231,6 +231,24 @@ async def test_rename_racing_a_decision_never_deletes_the_renamed_project(
         assert shown["status"] == "deleting_pending_approval"
 
 
+async def waiting_on_a_lock(engine: AsyncEngine, timeout_s: float = 5.0) -> bool:
+    """True once another backend of this database waits on a lock (AG-13 LOW-D: proof, not a sleep)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        async with engine.connect() as probe:
+            waiting = await probe.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                    "AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()"
+                )
+            )
+        if waiting:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
 async def test_a_decision_waits_for_a_concurrent_change(
     owner: httpx.AsyncClient,  # noqa: F811
     engine: AsyncEngine,
@@ -243,8 +261,8 @@ async def test_a_decision_waits_for_a_concurrent_change(
         transaction = await conn.begin()
         await conn.execute(select(Approval.id).where(Approval.id == approval_id).with_for_update())
         decision = asyncio.create_task(decide(owner, approval))  # type: ignore[arg-type]
-        await asyncio.sleep(0.3)
-        assert not decision.done()  # held by the lock
+        assert await waiting_on_a_lock(engine), "the decision never waited on the row lock"
+        assert not decision.done()
         await conn.execute(update(Approval).where(Approval.id == approval_id).values(status="rejected"))
         await transaction.commit()
     response = await decision
