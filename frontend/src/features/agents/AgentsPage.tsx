@@ -64,23 +64,25 @@ export function AgentsPage() {
       <div className="flex flex-col gap-5">
         <p className="text-sm text-fg-muted">
           {t("agents.subtitle", {
-            total: all.length,
+            count: all.length,
             ready: counts.status.ready,
             notReady: counts.status.not_ready,
+            disabled: counts.status.disabled,
             planned: counts.status.planned,
           })}
         </p>
-        {approvers === 0 ? (
-          <p className="flex items-center gap-2 text-sm text-status-success">
-            <ShieldCheck aria-hidden="true" className="size-4" />
-            {t("agents.approvalStatement")}
-          </p>
-        ) : (
+        {approvers > 0 ? (
           <p role="alert" className="flex items-center gap-2 text-sm font-medium text-status-danger">
             <ShieldAlert aria-hidden="true" className="size-4" />
             {t("agents.approvalWarning", { count: approvers })}
           </p>
-        )}
+        ) : all.length > 0 ? (
+          // An empty catalog proves nothing about approvals, so it gets no statement.
+          <p className="flex items-center gap-2 text-sm text-status-success">
+            <ShieldCheck aria-hidden="true" className="size-4" />
+            {t("agents.approvalStatement")}
+          </p>
+        ) : null}
         <div role="group" aria-label={t("agents.filters.label")} className="flex flex-wrap items-end gap-3">
           <div className="flex flex-wrap gap-2">
             <ModeChip

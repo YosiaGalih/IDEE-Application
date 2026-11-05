@@ -110,19 +110,26 @@ export type AgentCounts = z.infer<typeof AgentListMetaSchema>["counts"];
 
 export type AgentList = { agents: Agent[]; counts: AgentCounts };
 
+const sum = (counts: Record<string, number>) => Object.values(counts).reduce((a, b) => a + b, 0);
+
+/** The chips and cards must tell the same story: every count adds up to the rows actually sent. */
+function listProblem(rows: number, meta: z.infer<typeof AgentListMetaSchema>): string | null {
+  if (meta.total !== rows) return `Agent list total ${meta.total} does not match ${rows} agents`;
+  if (sum(meta.counts.mode) !== rows || sum(meta.counts.status) !== rows) {
+    return `Agent list counts do not add up to ${rows} agents`;
+  }
+  return null;
+}
+
 /** `GET /agents`: the whole catalog (it is bounded); filtering happens on the page. */
 export async function getAgents(signal?: AbortSignal): Promise<AgentList> {
   const result = await apiRequest("/agents", { schema: z.array(AgentSchema), ...(signal ? { signal } : {}) });
+  const bad = (message: string) =>
+    new ApiError({ kind: "bad_response", message, requestId: result.requestId });
   const meta = AgentListMetaSchema.safeParse(result.meta);
-  if (!meta.success || meta.data.total !== result.data.length) {
-    throw new ApiError({
-      kind: "bad_response",
-      message: meta.success
-        ? `Agent list total ${meta.data.total} does not match ${result.data.length} agents`
-        : `Agent list meta does not match the expected shape: ${meta.error.message}`,
-      requestId: result.requestId,
-    });
-  }
+  if (!meta.success) throw bad(`Agent list meta does not match the expected shape: ${meta.error.message}`);
+  const problem = listProblem(result.data.length, meta.data);
+  if (problem !== null) throw bad(problem);
   return { agents: result.data, counts: meta.data.counts };
 }
 

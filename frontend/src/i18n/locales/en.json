@@ -649,7 +649,8 @@
     }
   },
   "agents": {
-    "subtitle": "{{total}} agents registered · {{ready}} ready · {{notReady}} not ready · {{planned}} planned",
+    "subtitle_one": "{{count}} agent registered · {{ready}} ready · {{notReady}} not ready · {{disabled}} disabled · {{planned}} planned",
+    "subtitle_other": "{{count}} agents registered · {{ready}} ready · {{notReady}} not ready · {{disabled}} disabled · {{planned}} planned",
     "approvalStatement": "No agent can grant an approval.",
     "approvalWarning_one": "{{count}} agent is recorded as able to grant approvals. Check the registry.",
     "approvalWarning_other": "{{count}} agents are recorded as able to grant approvals. Check the registry.",
@@ -702,8 +703,7 @@
       "body": "Change the filters or the search."
     },
     "card": {
-      "priority": "Priority {{priority}}",
-      "mode": "Mode {{mode}}"
+      "priority": "Priority {{priority}}"
     },
     "runStatus": {
       "running": "Running",
@@ -747,7 +747,6 @@
       "seconds_one": "{{count}} second",
       "seconds_other": "{{count}} seconds",
       "modelTier": "Model tier",
-      "contracts": "Contracts",
       "input": "Input",
       "output": "Output",
       "none": "None",

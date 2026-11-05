@@ -649,7 +649,8 @@
     }
   },
   "agents": {
-    "subtitle": "{{total}} agent terdaftar · {{ready}} siap · {{notReady}} belum siap · {{planned}} direncanakan",
+    "subtitle_one": "{{count}} agent terdaftar · {{ready}} siap · {{notReady}} belum siap · {{disabled}} nonaktif · {{planned}} direncanakan",
+    "subtitle_other": "{{count}} agent terdaftar · {{ready}} siap · {{notReady}} belum siap · {{disabled}} nonaktif · {{planned}} direncanakan",
     "approvalStatement": "Tidak ada agent yang dapat memberi persetujuan.",
     "approvalWarning_one": "{{count}} agent tercatat dapat memberi persetujuan. Periksa registry.",
     "approvalWarning_other": "{{count}} agent tercatat dapat memberi persetujuan. Periksa registry.",
@@ -702,8 +703,7 @@
       "body": "Ubah filter atau kata pencarian."
     },
     "card": {
-      "priority": "Prioritas {{priority}}",
-      "mode": "Mode {{mode}}"
+      "priority": "Prioritas {{priority}}"
     },
     "runStatus": {
       "running": "Berjalan",
@@ -747,7 +747,6 @@
       "seconds_one": "{{count}} detik",
       "seconds_other": "{{count}} detik",
       "modelTier": "Tier model",
-      "contracts": "Kontrak",
       "input": "Input",
       "output": "Output",
       "none": "Tidak ada",

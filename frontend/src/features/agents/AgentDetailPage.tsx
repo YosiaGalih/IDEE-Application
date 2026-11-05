@@ -28,6 +28,7 @@ export function AgentDetailPage() {
         state={uxStateForError(query.error)}
         requestId={query.error instanceof ApiError ? query.error.requestId : null}
         onAction={() => void query.refetch()}
+        titleAs="h1"
       />
     );
   } else {
@@ -176,7 +177,7 @@ function Runs({ detail }: { detail: AgentDetail }) {
     <Card>
       <CardTitle id={titleId}>{t("agents.detail.runs")}</CardTitle>
       <p className="mt-1 text-xs text-fg-muted">{t("agents.detail.runsScope")}</p>
-      <dl className="mt-3 grid grid-cols-3 gap-2 text-sm">
+      <dl aria-label={t("agents.detail.stats")} className="mt-3 grid grid-cols-3 gap-2 text-sm">
         <div>
           <dt className="text-fg-muted">{t("agents.detail.statRuns")}</dt>
           <dd>{stats.runs}</dd>

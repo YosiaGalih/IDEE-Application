@@ -1,9 +1,10 @@
 import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agent, detail, run } from "@/__tests__/agentFixtures";
-import { API, fail, renderApp, signedIn } from "@/__tests__/harness";
+import { API, deferred, fail, renderApp, signedIn } from "@/__tests__/harness";
 import type { AgentDetail } from "@/api/agents";
 import id from "@/i18n/locales/id.json";
 
@@ -12,22 +13,29 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
-function backend(answer: AgentDetail | (() => Response) = detail()) {
+const detailAnswer = (data: AgentDetail = detail()) =>
+  HttpResponse.json({ request_id: "r-a-01", status: "completed", data });
+
+/** Each GET /agents/:id is answered by `respond`; `calls()` says how many arrived. */
+function backend(respond: () => Response | Promise<Response> = () => detailAnswer()) {
+  let calls = 0;
   server.use(
     signedIn(),
-    http.get(`${API}/agents/:agentId`, () =>
-      typeof answer === "function"
-        ? answer()
-        : HttpResponse.json({ request_id: "r-a-01", status: "completed", data: answer }),
-    ),
+    http.get(`${API}/agents/:agentId`, () => {
+      calls += 1;
+      return respond();
+    }),
   );
+  return { calls: () => calls };
 }
+
+const loaded = () => screen.findByRole("heading", { level: 1, name: /Requirement Analyst/ });
 
 describe("AgentDetailPage", () => {
   it("lists permissions, tools with unavailable marks, limits and contracts", async () => {
     backend();
     renderApp("/agents/A02");
-    expect(await screen.findByRole("heading", { level: 1, name: /Requirement Analyst/ })).toBeInTheDocument();
+    expect(await loaded()).toBeInTheDocument();
     const permissions = screen.getByRole("table", { name: id.agents.detail.permissions });
     expect(
       within(permissions).getByRole("row", {
@@ -52,14 +60,16 @@ describe("AgentDetailPage", () => {
   });
 
   it("shows recent runs and the statistics", async () => {
-    backend(
-      detail({
-        recent_runs: [
-          run(),
-          run({ id: "44444444-4444-4444-8444-444444444444", status: "failed", duration_ms: 2500 }),
-        ],
-        stats: { runs: 2, success_rate: 0.5, avg_duration_ms: 2000 },
-      }),
+    backend(() =>
+      detailAnswer(
+        detail({
+          recent_runs: [
+            run(),
+            run({ id: "44444444-4444-4444-8444-444444444444", status: "failed", duration_ms: 2500 }),
+          ],
+          stats: { runs: 2, success_rate: 0.5, avg_duration_ms: 2000 },
+        }),
+      ),
     );
     renderApp("/agents/A02");
     const runs = await screen.findByRole("table", { name: id.agents.detail.runs });
@@ -69,15 +79,17 @@ describe("AgentDetailPage", () => {
   });
 
   it("names the runtime of a profile agent", async () => {
-    backend(
-      detail({
-        agent: agent({
-          agent_id: "A01",
-          name: "Intent Classifier",
-          mvp_mode: "profile",
-          runtime_agent: "A02",
+    backend(() =>
+      detailAnswer(
+        detail({
+          agent: agent({
+            agent_id: "A01",
+            name: "Intent Classifier",
+            mvp_mode: "profile",
+            runtime_agent: "A02",
+          }),
         }),
-      }),
+      ),
     );
     renderApp("/agents/A01");
     expect(
@@ -85,10 +97,53 @@ describe("AgentDetailPage", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows not found for an unknown agent", async () => {
+  it("shows not found for an unknown agent, as the page heading", async () => {
     backend(() => fail(404, "NOT_FOUND", "Not found"));
     renderApp("/agents/Z99");
-    expect(await screen.findByText(id.states.not_found.title)).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { level: 1, name: id.states.not_found.title }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an error with the request id, and a retry that asks again", async () => {
+    let healthy = false;
+    const api = backend(() => (healthy ? detailAnswer() : fail(500, "INTERNAL", "boom")));
+    renderApp("/agents/A02");
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByRole("heading", { level: 1, name: id.states.error.title })).toBeInTheDocument();
+    expect(alert).toHaveTextContent(id.common.requestId.replace("{{id}}", "r-err-0001"));
+    const failedCalls = api.calls();
+    healthy = true;
+    await userEvent.click(within(alert).getByRole("button", { name: id.states.error.action }));
+    await loaded();
+    expect(api.calls()).toBe(failedCalls + 1);
+  });
+
+  it("shows a loading state until the agent arrives", async () => {
+    const wait = deferred();
+    backend(async () => {
+      await wait.gate;
+      return detailAnswer();
+    });
+    renderApp("/agents/A02");
+    expect(await screen.findByRole("status", { busy: true })).toBeInTheDocument();
+    wait.release();
+    await loaded();
+  });
+
+  it("shows the permission state, without a retry, when the server refuses", async () => {
+    backend(() => fail(403, "FORBIDDEN"));
+    renderApp("/agents/A02");
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(id.states.permission_denied.title);
+    expect(within(alert).queryByRole("button")).toBeNull();
+  });
+
+  it("names the run statistics", async () => {
+    backend();
+    renderApp("/agents/A02");
+    await loaded();
+    expect(screen.getByLabelText(id.agents.detail.stats)).toBeInTheDocument();
   });
 
   it("rejects a run with an unknown status", async () => {
