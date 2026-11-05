@@ -5,6 +5,8 @@
 - ``recover``: one recovery sweep.
 - ``grant-runtime-role --role NAME``: privileges of the runtime DB role, run by the deployment after every
   migration (``app.core.db_roles``).
+- ``seed-agents``: validate the agent registry (``AGENT_REGISTRY_PATH``) and sync it to ``agent_profiles``
+  (FR-041; the API also syncs at start).
 """
 
 from __future__ import annotations
@@ -13,12 +15,15 @@ import argparse
 import asyncio
 import getpass
 import sys
+from pathlib import Path
 
+from app.agents.registry import RegistryError, load_registry
 from app.core.audit import AuditWriter
 from app.core.config import ConfigError, load_settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.db_roles import InvalidRoleName, grant_runtime_role
 from app.core.redaction import Redactor
+from app.services.agents import sync_registry
 from app.services.users import EmailTakenError, OwnerExistsError, create_owner
 
 
@@ -64,6 +69,23 @@ async def _grant_runtime_role(role: str) -> int:
     return 0
 
 
+async def _seed_agents() -> int:
+    settings = load_settings()
+    registry = load_registry(Path(settings.agent_registry_path))
+    engine = make_engine(settings.database_url)
+    try:
+        async with make_sessionmaker(engine)() as session:
+            result = await sync_registry(session, registry, AuditWriter(Redactor(settings.secret_values())))
+            await session.commit()
+    finally:
+        await engine.dispose()
+    print(
+        f"agent registry synced: inserted={result.inserted} updated={result.updated} "
+        f"retired={result.retired} unchanged={result.unchanged}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -76,7 +98,19 @@ def main(argv: list[str] | None = None) -> int:
         "grant-runtime-role", help="privileges of the runtime DB role (after migrations)"
     )
     grant.add_argument("--role", required=True)
+    commands.add_parser("seed-agents", help="validate the agent registry and sync it to the database")
     args = parser.parse_args(argv)
+    if args.command == "seed-agents":
+        try:
+            return asyncio.run(_seed_agents())
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except RegistryError as exc:
+            print("agent registry invalid:", file=sys.stderr)
+            for problem in exc.problems:
+                print(f"  - {problem}", file=sys.stderr)
+            return 1
     if args.command == "grant-runtime-role":
         try:
             return asyncio.run(_grant_runtime_role(args.role))
