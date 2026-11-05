@@ -232,6 +232,7 @@ describe("WorkspacePage", () => {
     expect(
       screen.getByRole("button", { name: id.workspace.explorer.openOf.replace("{{name}}", "app.py") }),
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: id.workspace.gitPanel.view.gitError })).toBeInTheDocument();
   });
 
   it("opens a file once, saves it with the sha it was read at, and says saved only after the server agreed", async () => {

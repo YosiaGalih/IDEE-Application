@@ -1,7 +1,8 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { CircleDot, GitBranch, GitCommitHorizontal } from "lucide-react";
-import { useId, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useId, useMemo, useState, type FormEvent } from "react";
 import { useTranslation } from "react-i18next";
+import { ApiError } from "@/api/errors";
 import { commitChanges } from "@/api/git";
 import { branchesKey, gitLogKey, gitStatusKey, useGitStatus } from "@/api/hooks/useWorkspace";
 import type { GitStatus } from "@/api/workspace";
@@ -24,7 +25,8 @@ import { GitDiffDialog } from "./GitDiffDialog";
 import { GitLog } from "./GitLog";
 import { useRetryKey } from "./retryKey";
 
-const MESSAGE_MAX = 5000; // the API's limit (routes/git.py NewCommit)
+const MESSAGE_MAX = 5000; // the API's limits (routes/git.py NewCommit)
+const PATHS_MAX = 500;
 
 type Props = {
   projectId: string;
@@ -51,10 +53,15 @@ function GitPanelBody({
   isActive = true,
 }: Omit<Props, "canRead">) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   // Shared with the explorer's markers; branches and the log wait until the view is first opened.
   const status = useGitStatus(projectId);
   const [wasShown, setWasShown] = useState(isActive);
   if (isActive && !wasShown) setWasShown(true);
+  useEffect(() => {
+    // Opening the view reads the status again: the list must not be one read before files changed.
+    if (isActive) void queryClient.invalidateQueries({ queryKey: gitStatusKey(projectId) });
+  }, [isActive, projectId, queryClient]);
   // undefined: no dialog; null: the whole working tree; a path: that file.
   const [diffPath, setDiffPath] = useState<string | null | undefined>(undefined);
   const failure = status.isError ? workspaceErrorText(t, status.error) : null;
@@ -83,6 +90,7 @@ function GitPanelBody({
           status={status.data}
           canCommit={canCommit}
           unsavedPaths={unsavedPaths}
+          isVisible={isActive}
           onShowDiff={setDiffPath}
         />
       ) : null}
@@ -108,20 +116,25 @@ type ChangesProps = {
   status: GitStatus;
   canCommit: boolean;
   unsavedPaths: string[];
+  /** The Git view is shown: a file appearing now stays unticked (commitSelection). */
+  isVisible: boolean;
   onShowDiff: (path: string | null) => void;
 };
 
-function Changes({ projectId, status, canCommit, unsavedPaths, onShowDiff }: ChangesProps) {
+function Changes({ projectId, status, canCommit, unsavedPaths, isVisible, onShowDiff }: ChangesProps) {
   const { t } = useTranslation();
   const listed = useMemo(() => status.changes.map((change) => change.path), [status.changes]);
   const listedKey = listed.join("\0");
-  const [selection, setSelection] = useState<Selection>(() => reconcileSelection(emptySelection, listed));
+  const [selection, setSelection] = useState<Selection>(() =>
+    reconcileSelection(emptySelection, listed, { tickNew: true }),
+  );
   const [selectionKey, setSelectionKey] = useState(listedKey);
   if (listedKey !== selectionKey) {
-    // A new list (read again, or after a save): new files are ticked, the user's choices stay.
+    // A new list (read again, or after a save): the user's choices stay; see commitSelection for new files.
     setSelectionKey(listedKey);
-    setSelection(reconcileSelection(selection, listed));
+    setSelection(reconcileSelection(selection, listed, { tickNew: !isVisible }));
   }
+  const fresh = listed.filter((path) => selection.fresh.has(path));
   return (
     <section aria-labelledby={`${projectId}-changes`} className="flex flex-col gap-2 px-3">
       <h2 id={`${projectId}-changes`} className="text-xs font-semibold uppercase tracking-wide text-fg-muted">
@@ -137,6 +150,11 @@ function Changes({ projectId, status, canCommit, unsavedPaths, onShowDiff }: Cha
         <p className="text-fg-muted">{t("workspace.gitPanel.clean")}</p>
       ) : (
         <>
+          {fresh.length > 0 ? (
+            <p role="status" className="text-xs text-status-warning">
+              {t("workspace.gitPanel.fresh", { count: fresh.length, paths: fresh.join(", ") })}
+            </p>
+          ) : null}
           <ul className="flex flex-col">
             {status.changes.map((change) => (
               <li key={change.path} className="flex items-center gap-2 py-0.5">
@@ -167,16 +185,19 @@ function Changes({ projectId, status, canCommit, unsavedPaths, onShowDiff }: Cha
           <Button variant="secondary" size="sm" className="self-start" onClick={() => onShowDiff(null)}>
             {t("workspace.gitPanel.showAllDiff")}
           </Button>
-          {canCommit ? (
-            <CommitForm
-              projectId={projectId}
-              paths={pickedPaths(selection, listed)}
-              unsavedPaths={unsavedPaths}
-              onAll={(on) => setSelection((current) => setAll(current, listed, on))}
-            />
-          ) : null}
         </>
       )}
+      {/* Mounted also when the tree is clean: the answer to a commit that took the last change stays. */}
+      {canCommit ? (
+        <CommitForm
+          projectId={projectId}
+          paths={pickedPaths(selection, listed)}
+          isClean={status.clean}
+          context={`${status.head ?? ""}\0${listedKey}`}
+          unsavedPaths={unsavedPaths}
+          onAll={(on) => setSelection((current) => setAll(current, listed, on))}
+        />
+      ) : null}
     </section>
   );
 }
@@ -185,16 +206,20 @@ type CommitResult =
   | { kind: "done"; sha: string }
   | { kind: "nothing" }
   | { kind: "unknown" }
+  | { kind: "invalid"; requestId: string | null }
   | { kind: "failed"; text: string; requestId: string | null };
 
 type CommitFormProps = {
   projectId: string;
   paths: string[];
+  isClean: boolean;
+  /** The repository state the request is made against (HEAD and the listed changes): see useRetryKey. */
+  context: string;
   unsavedPaths: string[];
   onAll: (on: boolean) => void;
 };
 
-function CommitForm({ projectId, paths, unsavedPaths, onAll }: CommitFormProps) {
+function CommitForm({ projectId, paths, isClean, context, unsavedPaths, onAll }: CommitFormProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const messageId = useId();
@@ -203,24 +228,29 @@ function CommitForm({ projectId, paths, unsavedPaths, onAll }: CommitFormProps) 
   const [isBusy, setIsBusy] = useState(false);
   const [result, setResult] = useState<CommitResult | null>(null);
   const isTooLong = message.length > MESSAGE_MAX;
-  const canSubmit = message.trim() !== "" && !isTooLong && paths.length > 0 && !isBusy;
+  const isTooMany = paths.length > PATHS_MAX;
+  const canSubmit =
+    message.trim() !== "" && !isTooLong && paths.length > 0 && !isTooMany && !isBusy && !isClean;
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!canSubmit) return;
     const body = JSON.stringify({ message, paths });
-    const key = retry.keyFor(body);
+    const key = retry.keyFor(body, context);
     setIsBusy(true);
     setResult(null);
     try {
       const { commit } = await commitChanges(projectId, { message, paths }, key);
-      retry.settle(body, key, null);
+      retry.settle(body, context, key, null);
       setResult({ kind: "done", sha: commit.slice(0, 7) });
       setMessage("");
     } catch (error) {
-      retry.settle(body, key, error);
+      retry.settle(body, context, key, error);
       if (reasonOf(error) === "nothing_to_commit") setResult({ kind: "nothing" });
       else if (isOutcomeUnknown(error)) setResult({ kind: "unknown" });
+      // 422 (pydantic: message, paths, .kk) or 400 BAD_REQUEST (the adapter refused a path or the message).
+      else if (error instanceof ApiError && (error.status === 422 || error.code === "BAD_REQUEST"))
+        setResult({ kind: "invalid", requestId: error.requestId });
       else setResult({ kind: "failed", ...workspaceErrorText(t, error) });
     } finally {
       setIsBusy(false);
@@ -231,6 +261,7 @@ function CommitForm({ projectId, paths, unsavedPaths, onAll }: CommitFormProps) 
     }
   };
 
+  if (isClean) return <CommitResultText result={result} />;
   return (
     <form
       onSubmit={(event) => void handleSubmit(event)}
@@ -259,6 +290,11 @@ function CommitForm({ projectId, paths, unsavedPaths, onAll }: CommitFormProps) 
       {isTooLong ? (
         <p role="alert" className="text-xs text-status-danger">
           {t("workspace.gitPanel.commit.tooLong")}
+        </p>
+      ) : null}
+      {isTooMany ? (
+        <p role="alert" className="text-xs text-status-danger">
+          {t("workspace.gitPanel.commit.tooMany")}
         </p>
       ) : null}
       {unsavedPaths.length > 0 ? (
@@ -297,6 +333,15 @@ function CommitResultText({ result }: { result: CommitResult | null }) {
     return (
       <p role="alert" className="text-xs text-status-warning">
         {t("workspace.gitPanel.commit.unknownOutcome")}
+      </p>
+    );
+  if (result.kind === "invalid")
+    return (
+      <p role="alert" className="text-xs text-status-danger">
+        {t("workspace.gitPanel.commit.invalid")}
+        {result.requestId ? (
+          <span className="ml-1 font-mono">{t("common.requestId", { id: result.requestId })}</span>
+        ) : null}
       </p>
     );
   return (

@@ -1,6 +1,8 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useGitLog } from "@/api/hooks/useWorkspace";
+import type { LogEntry } from "@/api/git";
+import { gitLogKey, useGitLog } from "@/api/hooks/useWorkspace";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { workspaceErrorText } from "../workspaceErrors";
@@ -11,13 +13,20 @@ const LIMITS = [20, 50, 100, 200] as const;
 export function GitLog({ projectId }: { projectId: string }) {
   const { t, i18n } = useTranslation();
   const headingId = useId();
+  const queryClient = useQueryClient();
+  // The step stays after a commit: the log is read again at the length the user asked for.
   const [step, setStep] = useState(0);
   const limit = LIMITS[step] ?? 20;
   const log = useGitLog(projectId, limit);
   const failure = log.isError ? workspaceErrorText(t, log.error) : null;
   const format = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeStyle: "short" });
-  const entries = log.data ?? [];
-  const isFull = entries.length >= limit;
+  // A failed "load more" keeps the shorter list already read, and says it could not be read further.
+  const shorter =
+    step > 0 ? queryClient.getQueryData<LogEntry[]>([...gitLogKey(projectId), LIMITS[step - 1]]) : undefined;
+  const entries = log.data ?? (log.isError ? (shorter ?? []) : []);
+  // While the longer list loads, the shorter one is shown: neither "more" nor the limit can be told yet.
+  const isLoadingMore = log.isPlaceholderData;
+  const isFull = !isLoadingMore && log.data !== undefined && log.data.length >= limit;
   const isLast = step === LIMITS.length - 1;
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-2 border-t border-line px-3 pt-3">
@@ -27,7 +36,8 @@ export function GitLog({ projectId }: { projectId: string }) {
       {log.isPending ? <Spinner /> : null}
       {failure ? (
         <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-status-danger">
-          {t("workspace.gitPanel.log.loadFailed")} {failure.text}
+          {t(entries.length > 0 ? "workspace.gitPanel.log.stale" : "workspace.gitPanel.log.loadFailed")}{" "}
+          {failure.text}
           <Button variant="ghost" size="sm" className="h-6 px-1" onClick={() => void log.refetch()}>
             {t("workspace.retry")}
           </Button>
@@ -55,6 +65,12 @@ export function GitLog({ projectId }: { projectId: string }) {
             </li>
           ))}
         </ol>
+      ) : null}
+      {isLoadingMore ? (
+        <p role="status" className="flex items-center gap-2 text-xs text-fg-muted">
+          <Spinner />
+          {t("workspace.gitPanel.log.loadingMore")}
+        </p>
       ) : null}
       {isFull && !isLast ? (
         <Button

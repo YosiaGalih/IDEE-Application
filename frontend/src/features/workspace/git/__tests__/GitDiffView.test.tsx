@@ -90,6 +90,11 @@ describe("GitDiffView", () => {
     expect(screen.getByText(text.binary)).toBeInTheDocument();
   });
 
+  it("says when a file changed without content to show", () => {
+    render(<GitDiffView diff={diff([file({ path: "run.sh", additions: 0, deletions: 0, hunks: [] })])} />);
+    expect(screen.getByText(text.noHunks)).toBeInTheDocument();
+  });
+
   it("never calls a cut diff empty", () => {
     render(<GitDiffView diff={diff([], { truncated: true })} />);
     expect(screen.getByText(text.truncated)).toBeInTheDocument();

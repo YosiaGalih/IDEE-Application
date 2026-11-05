@@ -320,7 +320,11 @@ function Workspace({ projectId, project, refreshError, onRefresh }: WorkspacePro
               type="button"
               aria-pressed={leftView === "git"}
               aria-label={
-                changeCount > 0 ? t("workspace.gitPanel.view.gitCount", { count: changeCount }) : undefined
+                gitStatus.isError
+                  ? t("workspace.gitPanel.view.gitError")
+                  : changeCount > 0
+                    ? t("workspace.gitPanel.view.gitCount", { count: changeCount })
+                    : undefined
               }
               onClick={() => setLeftView("git")}
               className={cn(
@@ -329,7 +333,9 @@ function Workspace({ projectId, project, refreshError, onRefresh }: WorkspacePro
               )}
             >
               {t("workspace.gitPanel.view.git")}
-              {changeCount > 0 ? (
+              {gitStatus.isError ? (
+                <AlertTriangle aria-hidden="true" className="size-3.5 text-status-danger" />
+              ) : changeCount > 0 ? (
                 <span aria-hidden="true" className="rounded-full border border-line px-1.5 text-[0.65rem]">
                   {changeCount}
                 </span>

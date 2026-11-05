@@ -15,11 +15,15 @@ import { useRetryKey } from "./retryKey";
 
 type Props = { projectId: string; canBranch: boolean; currentBranch: string | null };
 
+const NAME_MAX = 255; // routes/git.py NewBranch
+
 type BranchResult =
   | { kind: "done"; name: string; head: string }
   | { kind: "reserved" }
+  | { kind: "tooLong" }
   | { kind: "exists" }
-  | { kind: "invalid" }
+  | { kind: "invalid"; requestId: string | null }
+  | { kind: "invalidFrom"; requestId: string | null }
   | { kind: "unknown" }
   | { kind: "failed"; text: string; requestId: string | null };
 
@@ -37,7 +41,8 @@ export function GitBranches({ projectId, canBranch, currentBranch }: Props) {
       {branches.isPending ? <Spinner /> : null}
       {failure ? (
         <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-status-danger">
-          {t("workspace.gitPanel.branch.loadFailed")} {failure.text}
+          {t(branches.data ? "workspace.gitPanel.branch.stale" : "workspace.gitPanel.branch.loadFailed")}{" "}
+          {failure.text}
           <Button variant="ghost" size="sm" className="h-6 px-1" onClick={() => void branches.refetch()}>
             {t("workspace.retry")}
           </Button>
@@ -103,20 +108,26 @@ function BranchForm({
       setResult({ kind: "reserved" });
       return;
     }
+    if (clean.length > NAME_MAX) {
+      setResult({ kind: "tooLong" });
+      return;
+    }
     const request = { name: clean, from: from === "" ? null : from };
     const body = JSON.stringify(request);
-    const key = retry.keyFor(body);
+    // The branches as listed now: once the branch exists, a request is a new one (useRetryKey).
+    const context = names.join("\0");
+    const key = retry.keyFor(body, context);
     setIsBusy(true);
     setResult(null);
     try {
       const created = await createBranch(projectId, request, key);
-      retry.settle(body, key, null);
+      retry.settle(body, context, key, null);
       setResult({ kind: "done", name: created.name, head: created.head.slice(0, 7) });
       setName("");
     } catch (error) {
-      retry.settle(body, key, error);
-      if (reasonOf(error) === "branch_exists") setResult({ kind: "exists" });
-      else if (error instanceof ApiError && error.status === 422) setResult({ kind: "invalid" });
+      retry.settle(body, context, key, error);
+      const refused = refusalOf(error);
+      if (refused) setResult(refused);
       else if (isOutcomeUnknown(error)) setResult({ kind: "unknown" });
       else setResult({ kind: "failed", ...workspaceErrorText(t, error) });
     } finally {
@@ -173,11 +184,26 @@ function BranchResultText({
   if (result.kind === "done")
     return (
       <p role="status" className="text-xs text-status-success">
-        {t("workspace.gitPanel.branch.done", {
-          name: result.name,
-          head: result.head,
-          current: currentBranch ?? "",
-        })}
+        {currentBranch
+          ? t("workspace.gitPanel.branch.done", {
+              name: result.name,
+              head: result.head,
+              current: currentBranch,
+            })
+          : t("workspace.gitPanel.branch.doneNoCurrent", { name: result.name, head: result.head })}
+      </p>
+    );
+  if (result.kind === "invalid" || result.kind === "invalidFrom")
+    return (
+      <p role="alert" className="text-xs text-status-danger">
+        {t(
+          result.kind === "invalid"
+            ? "workspace.gitPanel.branch.invalid"
+            : "workspace.gitPanel.branch.invalidFrom",
+        )}
+        {result.requestId ? (
+          <span className="ml-1 font-mono">{t("common.requestId", { id: result.requestId })}</span>
+        ) : null}
       </p>
     );
   if (result.kind === "failed")
@@ -191,13 +217,43 @@ function BranchResultText({
     );
   const key = {
     reserved: "workspace.gitPanel.branch.reserved",
+    tooLong: "workspace.gitPanel.branch.tooLong",
     exists: "workspace.gitPanel.branch.exists",
-    invalid: "workspace.gitPanel.branch.invalid",
     unknown: "workspace.gitPanel.branch.unknownOutcome",
   } as const;
   return (
     <p role="alert" className="text-xs text-status-danger">
       {t(key[result.kind])}
     </p>
+  );
+}
+
+/**
+ * The backend's answers that are about the input (2.1c), told apart by what they are about:
+ * - the name: 400 `reason: "branch"`, 422 on `body.name` (pydantic or a reserved name);
+ * - the starting point: 400 `reason: "ref"`, 409 `GIT_ERROR reason: "unknown_ref"`, 422 on `body.from`;
+ * - 409 `reason: "branch_exists"`.
+ */
+function refusalOf(error: unknown): BranchResult | null {
+  if (!(error instanceof ApiError)) return null;
+  const reason = reasonOf(error);
+  const requestId = error.requestId;
+  if (reason === "branch_exists") return { kind: "exists" };
+  if (reason === "ref" || reason === "unknown_ref" || (error.status === 422 && isAboutFrom(error)))
+    return { kind: "invalidFrom", requestId };
+  if (reason === "branch" || error.status === 422) return { kind: "invalid", requestId };
+  return null;
+}
+
+/** A 422 that names the starting point (`from`), not the new branch's name. */
+function isAboutFrom(error: ApiError): boolean {
+  if (!Array.isArray(error.details)) return false;
+  return (error.details as unknown[]).some(
+    (detail) =>
+      typeof detail === "object" &&
+      detail !== null &&
+      "loc" in detail &&
+      Array.isArray(detail.loc) &&
+      (detail.loc as unknown[]).includes("from"),
   );
 }

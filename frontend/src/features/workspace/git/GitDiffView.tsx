@@ -60,8 +60,11 @@ function FileDiff({ file }: { file: DiffFile }) {
       </header>
       {file.is_binary ? (
         <p className="px-3 py-2 text-xs text-fg-muted">{t("workspace.gitPanel.diff.binary")}</p>
+      ) : file.hunks.length === 0 ? (
+        <p className="px-3 py-2 text-xs text-fg-muted">{t("workspace.gitPanel.diff.noHunks")}</p>
       ) : (
-        file.hunks.map((hunk) => <Hunk key={hunk.header} hunk={hunk} />)
+        // Hunk headers carry their ranges, but two equal ones must not share a key.
+        file.hunks.map((hunk, index) => <Hunk key={`${index}:${hunk.header}`} hunk={hunk} />)
       )}
     </section>
   );
@@ -78,7 +81,7 @@ function Hunk({ hunk }: { hunk: DiffHunk }) {
             <th scope="col">{t("workspace.gitPanel.diff.oldLine")}</th>
             <th scope="col">{t("workspace.gitPanel.diff.newLine")}</th>
             <th scope="col">{t("workspace.gitPanel.diff.sign")}</th>
-            <th scope="col">{t("workspace.gitPanel.diff.titleAll")}</th>
+            <th scope="col">{t("workspace.gitPanel.diff.content")}</th>
           </tr>
         </thead>
         <tbody>

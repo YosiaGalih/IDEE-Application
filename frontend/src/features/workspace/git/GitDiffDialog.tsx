@@ -26,7 +26,8 @@ export function GitDiffDialog({ projectId, path, onClose }: Props) {
         {diff.isPending ? <StateView state="loading" /> : null}
         {failure ? (
           <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-status-danger">
-            {t("workspace.gitPanel.diff.loadFailed")} {failure.text}
+            {t(diff.data ? "workspace.gitPanel.diff.stale" : "workspace.gitPanel.diff.loadFailed")}{" "}
+            {failure.text}
             {failure.requestId ? (
               <span className="font-mono text-xs">{t("common.requestId", { id: failure.requestId })}</span>
             ) : null}

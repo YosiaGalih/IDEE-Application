@@ -562,7 +562,8 @@
       "view": {
         "explorer": "Explorer",
         "git": "Git",
-        "gitCount": "Git, {{count}} changes"
+        "gitCount": "Git, {{count}} changes",
+        "gitError": "Git, the status could not be read"
       },
       "head": "Branch {{branch}} · {{head}}",
       "noCommit": "This repository has no commit yet.",
@@ -582,10 +583,12 @@
         "submit": "Commit",
         "done": "Commit {{sha}} created.",
         "nothing": "Nothing to commit: the selected files are the same as in the last commit.",
-        "unknownOutcome": "It is not certain whether the commit was created; the status and log are read again. Retrying sends the same request, so it does not commit twice.",
+        "unknownOutcome": "It is not certain whether the commit was created; the status and log are read again. Retrying with the same message and selection, while the change list has not changed, sends the same request, so it does not commit twice.",
         "failed": "The commit failed.",
         "unsaved": "{{count}} files are not saved, so the commit uses what is saved on the server: {{paths}}",
-        "tooLong": "The message can be at most 5000 characters."
+        "tooLong": "The message can be at most 5000 characters.",
+        "tooMany": "At most 500 files per commit; select fewer.",
+        "invalid": "The server refused this commit: the message or the file list is not valid."
       },
       "branch": {
         "title": "Branches",
@@ -602,14 +605,20 @@
         "invalid": "Git does not accept that branch name.",
         "unknownOutcome": "It is not certain whether the branch was created; the branch list is read again.",
         "failed": "The branch could not be created.",
-        "loadFailed": "The branch list could not be read."
+        "loadFailed": "The branch list could not be read.",
+        "invalidFrom": "Git does not know that starting point.",
+        "tooLong": "A branch name can be at most 255 characters.",
+        "doneNoCurrent": "Branch {{name}} created at {{head}}. The working tree does not move; switching branches is not available yet.",
+        "stale": "The branch list could not be read again; what is shown may be out of date."
       },
       "log": {
         "title": "Log",
         "empty": "No commit yet.",
         "more": "Load more",
         "limit": "The limit of {{count}} commits is reached; older commits are not shown.",
-        "loadFailed": "The log could not be read."
+        "loadFailed": "The log could not be read.",
+        "stale": "The log could not be read again; what is shown may be out of date.",
+        "loadingMore": "Loading more commits…"
       },
       "diff": {
         "titleOf": "Changes in {{path}}",
@@ -631,8 +640,12 @@
         "added": "added",
         "removed": "removed",
         "close": "Close",
-        "loadFailed": "The diff could not be read."
-      }
+        "loadFailed": "The diff could not be read.",
+        "stale": "The diff could not be read again; what is shown may be out of date.",
+        "noHunks": "No content change to show (for example, only the file mode changed).",
+        "content": "Line content"
+      },
+      "fresh": "{{count}} new files appeared and are not selected: {{paths}}"
     }
   }
 }
