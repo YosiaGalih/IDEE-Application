@@ -1605,9 +1605,41 @@ Keputusan Lead:
 
 | Pemeriksaan | Hasil aktual |
 |---|---|
-| Frontend `format:check`, `lint`, `lint:guards`, `typecheck` @ ec63f8e | bersih |
-| Frontend `npm test` @ ec63f8e | **432 passed** (33 file; +32 test baru: klien git 6, pilihan commit 5, tampilan diff 6, panel git 13, toggle workspace 2) |
-| `npx vite build` | sukses; `WorkspacePage` 59,0 kB (gzip 15,2 kB); Monaco tetap di chunk sendiri |
+| Frontend `format:check`, `lint`, `lint:guards`, `typecheck` @ c5daed0 | bersih |
+| Frontend `npm test` @ c5daed0 | **442 passed** (33 file; +42 test baru: klien git 6, pilihan commit 6, tampilan diff 7, panel git 21, toggle workspace 2) |
+| `npx vite build` @ c5daed0 | sukses; `WorkspacePage` 61,6 kB (gzip 15,8 kB); Monaco tetap di chunk sendiri |
 | `npm audit --omit=dev --audit-level=high` | 0 vulnerabilities |
 | Mutan K1–K8 | semuanya merah: commit semua file terdaftar, key baru setiap kali, tanpa cek nama cadangan, tampilan tersembunyi tidak di-mount, tab belum tersimpan tidak diteruskan, diff terpotong disebut kosong, log tanpa batas, `nothing_to_commit` sebagai gagal |
-| Live check @ ec63f8e (build produksi lewat `vite preview` + uvicorn + DB uji `kodekantor_test_rev`; CSP Caddyfile disuntikkan ke dokumen) | README.md diedit lalu disimpan; file baru dibuat. Tombol Git: "Git, 9 perubahan". Diff README.md di dialog memuat baris baru. Commit 1 dari 9 file → "Commit aab37b0 dibuat." Log (UI dan API) memuat commit itu. README.md keluar dari daftar perubahan; file baru tetap belum di-commit. Branch `live-…` dibuat di aab37b0 dan working tree tetap di `main`. `kk/curang` ditolak di UI tanpa request. Console: 0 masalah, 0 pelanggaran CSP |
+| Live check @ ec63f8e, diulang @ c5daed0 (build produksi lewat `vite preview` + uvicorn + DB uji `kodekantor_test_rev`; CSP Caddyfile disuntikkan ke dokumen) | README.md diedit lalu disimpan; file baru dibuat. Tombol Git: "Git, 9 perubahan". Diff README.md di dialog memuat baris baru. Commit 1 dari 9 file → "Commit aab37b0 dibuat." Log (UI dan API) memuat commit itu. README.md keluar dari daftar perubahan; file baru tetap belum di-commit. Branch `live-…` dibuat di aab37b0 dan working tree tetap di `main`. `kk/curang` ditolak di UI tanpa request. Console: 0 masalah, 0 pelanggaran CSP |
+
+CI `security-scan` merah sejak b22f1c5, commit yang hanya berisi docs. Penyebabnya advisory baru, bukan diff WP ini: CVE-2026-109518 pada `apt`/`libapt-pkg7.0` 3.0.3 di image Debian `backend`, `sandbox-manager`, `sandbox-node`, dan `sandbox-python`. Perbaikannya 3.0.4 dan sudah ada di arsip. `main` memakai image yang sama.
+
+Perbaikan dimasukkan ke PR ini (3d448e9): setiap image meng-upgrade kedua paket di langkah `RUN` yang sudah ada, tanpa pin revisi (DL3008), seperti `git` di image backend. Image tidak dapat dibangun di sini karena proxy memblokir arsip Debian, jadi CI yang membuktikannya. Komentar di PR #16 mencatat hal yang sama.
+
+#### Review WP-2.2b @ ec63f8e
+
+Hasil awal:
+- `kk-frontend-reviewer`: WARN (0 BLOCK, 3 SHOULD, 6 NIT).
+- `kk-silent-failure-hunter`: 0 HIGH, 4 MEDIUM, 2 LOW-MEDIUM, 6 LOW.
+
+Penutupan di c5daed0. Setiap perbaikan dibuktikan dengan mutan: perbaikannya dibalik, lalu test-nya dipastikan merah. Mutan R1–R11 semuanya merah. R9 sempat lolos karena test-nya memakai QueryClient baru; test itu ditulis ulang dengan satu client, lalu merah.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| frontend S1 + silent SF2: hasil commit hilang bila commit itu mengambil perubahan terakhir (form unmount saat `clean`) | form commit tetap ter-mount; saat bersih hanya hasilnya yang tampil | `keeps the commit's answer when the commit took the last change` (R1) |
+| frontend S2 + silent SF1/SF7: key yang disimpan setelah hasil tidak pasti bisa memutar ulang commit lama ("Commit <sha lama> dibuat" untuk edit baru) | key hanya dipakai ulang untuk isi yang sama terhadap HEAD dan daftar perubahan yang sama (branch: daftar branch yang sama). Teks hasil tidak pasti menyebut syarat itu | `never reuses a kept key once the repository moved on` (R2), `retries an unknown commit with the same key…` |
+| silent SF3: file yang muncul saat user melihat daftar langsung tercentang, sehingga bisa ikut commit tanpa terlihat | file yang muncul saat tampilan terlihat tidak tercentang dan disebut namanya. Yang muncul saat tersembunyi tercentang. Keputusan Lead 5 di spec direvisi | test pilihan commit (6); `commits only the files that are listed and ticked` (R3) |
+| frontend S3: lebih dari 500 path → error generik | tombol nonaktif disertai teks batas; 422 dan 400 `BAD_REQUEST` pada commit punya teks sendiri dengan ID permintaan | `refuses more files than one commit may take…` (R4), `says the server refused the commit's input…` (R5) |
+| silent SF6 + SF9: setiap 422 branch disebut "nama ditolak"; teks berhasil dengan branch aktif kosong | penolakan dibedakan: nama (400 `branch`, 422 pada name) atau titik awal (400 `ref`, 409 `unknown_ref`, 422 pada from). Nama di atas 255 karakter ditolak tanpa request. Teks tanpa branch aktif bila branch-nya tidak diketahui | `tells a refused starting point from a refused name` (R6), `does not name a current branch it does not know` (R7) |
+| silent SF4 + SF5: error status tidak terlihat di tombol Git; data basi tampil sebagai terkini; status tidak dibaca ulang saat tampilan dibuka | tombol Git: "Git, status tidak dapat dibaca" + ikon. Branch, log, dan diff menyebut "mungkin sudah tidak terbaru". Membuka tampilan Git membaca ulang status | `keeps the explorer when git status cannot be read…` (R11), `reads the status again each time the view is opened` (R9) |
+| silent SF8: "muat lebih banyak" gagal menghapus log; tombol hilang saat memuat | daftar pendek yang sudah terbaca tetap tampil bersama teks basi; "Memuat commit lain…" tampil selama memuat | `keeps the commits it read when loading more fails…` (R8) |
+| silent SF12: file tanpa hunk tampil tanpa keterangan | "Tidak ada perubahan isi yang dapat ditampilkan" | `says when a file changed without content to show` (R10) |
+| frontend NIT: header kolom isi memakai judul dialog; kunci hunk bisa bentrok | kunci `diff.content`; kunci hunk `${index}:${header}` | review kode |
+
+Tidak ditutup (alasan):
+- **silent SF10** (gagal mengambil token CSRF dianggap "hasil tidak pasti"): terlalu hati-hati, tidak menyesatkan ke arah berbahaya. Mengulang memakai key yang sama dan aman.
+- **silent SF11** (`void handleSubmit`): `catch` hanya memanggil fungsi teks murni. Bila fungsi itu melempar error, `finally` tetap mengembalikan tombol.
+- **silent SF8 bagian "tepat 20/50/100/200 commit"**: API tidak memberi total, jadi daftar yang pas di batas tidak bisa dibedakan dari daftar yang terpotong. Teks batas hanya muncul di 200.
+- **frontend NIT** (`step` log tidak di-reset, label tombol Git, `from` basi, deskripsi dialog): perilakunya benar dan sudah diberi komentar. Daftar branch dibaca ulang setiap kali branch dibuat. Live check: 0 peringatan Radix.
+- **Live check, kosmetik:** tombol "Pilih semua/Kosongkan" terbungkus ke baris baru di kolom 16 rem. Fungsinya tidak terganggu.
+
