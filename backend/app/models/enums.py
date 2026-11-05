@@ -37,3 +37,26 @@ TASK_STEPS = (
 )
 TASK_PRIORITIES = ("low", "normal", "high")
 DEPENDENCY_TYPES = ("blocks", "relates")
+# Agents (DATA_MODEL M07, WP-3.1b). Values mirror the registry schema 2 (app/agents/registry.py).
+AGENT_GROUPS = (
+    "planning_intent",
+    "software_development",
+    "testing_debugging",
+    "quality_security",
+    "git_collaboration",
+    "devops_operations",
+    "documentation_knowledge",
+    "specialized_engineering",
+    "orchestration",
+    "ai_assistant",
+    "integrations",
+    "portfolio",
+)
+AGENT_MODES = ("llm", "profile", "tool", "planned")
+AGENT_TARGET_MODES = ("llm", "profile", "tool")
+AGENT_PRIORITIES = ("P0", "P1", "P2")
+MODEL_TIERS = ("fast", "default", "complex")
+# ADR-025: approval_required is a run status of its own, not "failed" with a message.
+AGENT_RUN_STATUSES = ("running", "succeeded", "failed", "cancelled", "budget_exceeded", "approval_required")
+# ADR-025: "actual" is reserved for provider-reported costs.
+COST_STATUSES = ("estimated", "partial", "actual", "unavailable")
