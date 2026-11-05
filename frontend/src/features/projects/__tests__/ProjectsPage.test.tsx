@@ -1,8 +1,9 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { http } from "msw";
+import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { approval } from "@/__tests__/approvalFixtures";
 import { API, deferred, fail, ok, okPage, pendingApprovals, renderApp, signedIn } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
 
@@ -66,6 +67,30 @@ function backend(rows: () => unknown[] | Response) {
   );
   return state;
 }
+
+/** `DELETE /projects/{id}` answered by `respond`; records each call. */
+function deletes(respond: () => Response | Promise<Response> = () => accepted()) {
+  const calls: string[] = [];
+  server.use(
+    http.delete(`${API}/projects/:id`, ({ params }) => {
+      calls.push(String(params.id));
+      return respond();
+    }),
+  );
+  return calls;
+}
+const accepted = () =>
+  HttpResponse.json(
+    {
+      request_id: "r-del-0001",
+      status: "accepted",
+      data: {
+        approval: approval({ project_id: project().id, project_name: "Kalkulator" }),
+        project: project({ status: "deleting_pending_approval" }),
+      },
+    },
+    { status: 202 },
+  );
 
 describe("ProjectsPage", () => {
   it("shows loading, then the projects with name link, stack and status as text", async () => {
@@ -324,5 +349,84 @@ describe("ProjectsPage", () => {
     expect(await screen.findByRole("alert", undefined, { timeout: 4000 })).toHaveTextContent(
       id.states.provider_degraded.title,
     );
+  });
+  it("offers delete only with project:delete on an active or archived project", async () => {
+    backend(() => [
+      project(),
+      project({
+        id: "7a2c1d3e-0a4b-4c5d-8e9f-0a1b2c3d4e60",
+        name: "Tanpa hak",
+        slug: "tanpa-hak",
+        permissions: ["project:read", "project:write"],
+      }),
+    ]);
+    renderApp("/projects");
+    await screen.findByRole("link", { name: "Kalkulator" });
+    expect(
+      screen.getByRole("button", { name: id.projects.delete.actionOf.replace("{{name}}", "Kalkulator") }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: id.projects.delete.actionOf.replace("{{name}}", "Tanpa hak") }),
+    ).toBeNull();
+  });
+
+  it("asks for confirmation, sends one delete request and points to the approval", async () => {
+    backend(() => [project()]);
+    const { gate, release } = deferred(); // the answer waits: the second click lands while the first is sent
+    const calls = deletes(async () => {
+      await gate;
+      return accepted();
+    });
+    renderApp("/projects");
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: id.projects.delete.actionOf.replace("{{name}}", "Kalkulator"),
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(id.projects.delete.explain)).toBeInTheDocument();
+    await userEvent.dblClick(within(dialog).getByRole("button", { name: id.projects.delete.confirm }));
+    release();
+    const done = await screen.findByText(id.projects.delete.requested.replace("{{name}}", "Kalkulator"));
+    expect(calls).toEqual([project().id]);
+    expect(screen.getByRole("link", { name: id.projects.delete.openApprovals })).toHaveAttribute(
+      "href",
+      "/approvals",
+    );
+    expect(done).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("says why when the delete cannot be requested (a deletion that keeps failing)", async () => {
+    backend(() => [project()]);
+    deletes(() =>
+      HttpResponse.json(
+        {
+          request_id: "r-del-0409",
+          status: "failed",
+          error: { code: "INVALID_TRANSITION", message: "x", details: [{ reason: "delete_failed" }] },
+        },
+        { status: 409 },
+      ),
+    );
+    renderApp("/projects");
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: id.projects.delete.actionOf.replace("{{name}}", "Kalkulator"),
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.click(within(dialog).getByRole("button", { name: id.projects.delete.confirm }));
+    expect(await within(dialog).findByText(id.projects.delete.failedBefore)).toBeInTheDocument();
+  });
+
+  it("links a project waiting for its delete approval to /approvals", async () => {
+    backend(() => [project({ status: "deleting_pending_approval" })]);
+    renderApp("/projects?status=all");
+    const badge = await screen.findByRole("link", { name: id.projects.status.deleting_pending_approval });
+    expect(badge).toHaveAttribute("href", "/approvals");
+    expect(
+      screen.queryByRole("button", { name: id.projects.delete.actionOf.replace("{{name}}", "Kalkulator") }),
+    ).toBeNull();
   });
 });

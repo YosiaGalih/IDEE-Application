@@ -7,6 +7,7 @@ import {
   Loader2,
   Plus,
   Search,
+  Trash2,
   Upload,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -25,8 +26,9 @@ import { Label } from "@/components/ui/Label";
 import { StateView } from "@/components/ui/StateView";
 import { cn } from "@/lib/cn";
 import { describeError } from "@/lib/describeError";
-import { importPath, NEW_PROJECT_PATH, workspacePath } from "@/lib/paths";
+import { APPROVALS_PATH, importPath, NEW_PROJECT_PATH, workspacePath } from "@/lib/paths";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
+import { DeleteProjectDialog } from "./DeleteProjectDialog";
 import { importErrorText, isImportError } from "./importText";
 import { ProjectStatusBadge } from "./ProjectStatusBadge";
 
@@ -58,6 +60,8 @@ export function ProjectsPage() {
     setDraft(filter.q);
   }
   const [announcement, setAnnouncement] = useState<string | null>(null);
+  const [toDelete, setToDelete] = useState<Project | null>(null);
+  const [deleteRequested, setDeleteRequested] = useState<string | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const projects = useProjects(filter);
   const archive = useSetProjectArchived();
@@ -100,6 +104,7 @@ export function ProjectsPage() {
   const handleArchive = (project: Project) => {
     const archived = project.status === "active";
     setAnnouncement(null);
+    setDeleteRequested(null);
     archive.mutate(
       { projectId: project.id, archived },
       {
@@ -183,6 +188,9 @@ export function ProjectsPage() {
               const canWrite = project.permissions.includes("project:write");
               const canToggle = canWrite && (project.status === "active" || project.status === "archived");
               const isArchived = project.status === "archived";
+              const canDelete =
+                project.permissions.includes("project:delete") &&
+                (project.status === "active" || project.status === "archived");
               return (
                 <tr key={project.id} className="border-b border-line last:border-0">
                   <td className="px-4 py-3">
@@ -236,6 +244,21 @@ export function ProjectsPage() {
                           <Archive aria-hidden="true" className="size-4" />
                         )}
                         {t(isArchived ? "projects.unarchive" : "projects.archive")}
+                      </Button>
+                    ) : null}
+                    {canDelete ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={t("projects.delete.actionOf", { name: project.name })}
+                        onClick={() => {
+                          setAnnouncement(null);
+                          setDeleteRequested(null);
+                          setToDelete(project);
+                        }}
+                      >
+                        <Trash2 aria-hidden="true" className="size-4" />
+                        {t("projects.delete.action")}
                       </Button>
                     ) : null}
                   </td>
@@ -338,7 +361,27 @@ export function ProjectsPage() {
         />
       ) : null}
       {announcement ? <Alert tone="success">{announcement}</Alert> : null}
+      {deleteRequested ? (
+        <Alert tone="success">
+          {t("projects.delete.requested", { name: deleteRequested })}{" "}
+          <Link to={APPROVALS_PATH} className="font-medium underline">
+            {t("projects.delete.openApprovals")}
+          </Link>
+        </Alert>
+      ) : null}
       {body}
+      {toDelete ? (
+        <DeleteProjectDialog
+          key={toDelete.id}
+          project={toDelete}
+          onClose={() => setToDelete(null)}
+          onRequested={(requested) => {
+            setToDelete(null);
+            setDeleteRequested(requested.name);
+            headingRef.current?.focus(); // the row leaves this filter: its status changed
+          }}
+        />
+      ) : null}
     </div>
   );
 }

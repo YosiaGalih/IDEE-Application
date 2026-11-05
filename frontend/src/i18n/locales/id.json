@@ -334,6 +334,19 @@
       "runningHere": "Impor arsip untuk project ini sedang berjalan.",
       "openList": "Buka daftar project",
       "stalled": "Unggahan terhenti sebelum selesai. Coba lagi."
+    },
+    "delete": {
+      "action": "Hapus",
+      "actionOf": "Hapus {{name}}",
+      "title": "Hapus project {{name}}?",
+      "explain": "Penghapusan butuh persetujuan di halaman Persetujuan. Sampai disetujui, project tetap ada. Sesudah disetujui, task terbuka dibatalkan dan workspace disimpan 7 hari, lalu dihapus permanen.",
+      "confirm": "Minta hapus",
+      "cancel": "Batal",
+      "requested": "Permintaan hapus {{name}} dibuat dan menunggu persetujuan.",
+      "openApprovals": "Buka Persetujuan",
+      "failedBefore": "Penghapusan project ini sudah disetujui tetapi terus gagal. Operator perlu menanganinya (RUNBOOK §10.7).",
+      "notDeletable": "Project ini tidak dapat dihapus dalam statusnya sekarang.",
+      "outcomeUnknown": "Jawaban tidak sampai; permintaan mungkin sudah dibuat. Muat ulang daftar untuk melihat statusnya."
     }
   },
   "dashboard": {

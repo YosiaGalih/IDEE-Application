@@ -334,6 +334,19 @@
       "runningHere": "An archive import for this project is running.",
       "openList": "Open the project list",
       "stalled": "The upload stopped before it finished. Try again."
+    },
+    "delete": {
+      "action": "Delete",
+      "actionOf": "Delete {{name}}",
+      "title": "Delete project {{name}}?",
+      "explain": "Deleting needs approval on the Approvals page. Until it is approved, the project stays. Once approved, open tasks are cancelled and the workspace is kept for 7 days, then removed for good.",
+      "confirm": "Request delete",
+      "cancel": "Cancel",
+      "requested": "Delete request for {{name}} created; it waits for approval.",
+      "openApprovals": "Open Approvals",
+      "failedBefore": "This project's deletion was approved but keeps failing. An operator needs to handle it (RUNBOOK §10.7).",
+      "notDeletable": "This project cannot be deleted in its current status.",
+      "outcomeUnknown": "No answer came back; the request may already exist. Reload the list to see its status."
     }
   },
   "dashboard": {
