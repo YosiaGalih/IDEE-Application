@@ -5,13 +5,24 @@ import { http } from "msw";
 import { setupServer } from "msw/node";
 import type { RouteObject } from "react-router";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { API, deferred, fail, me, ok, renderApp, signedIn, signedOut, user } from "@/__tests__/harness";
+import {
+  API,
+  deferred,
+  fail,
+  me,
+  ok,
+  pendingApprovals,
+  renderApp,
+  signedIn,
+  signedOut,
+  user,
+} from "@/__tests__/harness";
 import { apiRequest } from "@/api/client";
 import { routes } from "@/app/routes";
 import id from "@/i18n/locales/id.json";
 import { z } from "zod";
 
-const server = setupServer();
+const server = setupServer(pendingApprovals());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());

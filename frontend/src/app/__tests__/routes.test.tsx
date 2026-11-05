@@ -5,13 +5,13 @@ import { setupServer } from "msw/node";
 import { createMemoryRouter, RouterProvider, type RouteObject } from "react-router";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { dashboardData, dashboardMeta, project } from "@/__tests__/dashboardFixtures";
-import { API, ok, renderApp, signedIn, signedOut, user } from "@/__tests__/harness";
+import { API, ok, pendingApprovals, renderApp, signedIn, signedOut, user } from "@/__tests__/harness";
 import { ApiError } from "@/api/errors";
 import { routes } from "@/app/routes";
 import en from "@/i18n/locales/en.json";
 import id from "@/i18n/locales/id.json";
 
-const server = setupServer();
+const server = setupServer(pendingApprovals());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());

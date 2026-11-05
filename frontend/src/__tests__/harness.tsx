@@ -36,6 +36,11 @@ export const fail = (status: number, code: string, message = "refused", headers?
   );
 
 export const signedIn = () => http.get(`${API}/auth/me`, () => ok(me));
+/**
+ * `GET /approvals` (any filter) with nothing pending: the navigation badge asks on every shell screen
+ * (spec WP-3.1c2 Lead 8). Register it with `setupServer(pendingApprovals())` so it survives `resetHandlers`.
+ */
+export const pendingApprovals = (total = 0) => http.get(`${API}/approvals`, () => okPage([], { total }));
 export const signedOut = () =>
   http.get(`${API}/auth/me`, () => fail(401, "UNAUTHENTICATED", "Authentication required"));
 

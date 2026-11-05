@@ -4,10 +4,10 @@ import { http } from "msw";
 import { setupServer } from "msw/node";
 import { HttpResponse } from "msw";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { API, fail, me, ok, renderApp, user } from "@/__tests__/harness";
+import { API, fail, me, ok, pendingApprovals, renderApp, user } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
 
-const server = setupServer();
+const server = setupServer(pendingApprovals());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());

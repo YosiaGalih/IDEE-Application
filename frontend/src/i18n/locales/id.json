@@ -12,7 +12,9 @@
     "projects": "Project",
     "agents": "AI Agents",
     "approvals": "Persetujuan",
-    "settings": "Pengaturan"
+    "settings": "Pengaturan",
+    "pendingCount_one": ", {{count}} tertunda",
+    "pendingCount_other": ", {{count}} tertunda"
   },
   "screens": {
     "dashboard": "Dashboard",

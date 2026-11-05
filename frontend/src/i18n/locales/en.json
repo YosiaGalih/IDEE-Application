@@ -12,7 +12,9 @@
     "projects": "Projects",
     "agents": "AI agents",
     "approvals": "Approvals",
-    "settings": "Settings"
+    "settings": "Settings",
+    "pendingCount_one": ", {{count}} pending",
+    "pendingCount_other": ", {{count}} pending"
   },
   "screens": {
     "dashboard": "Dashboard",

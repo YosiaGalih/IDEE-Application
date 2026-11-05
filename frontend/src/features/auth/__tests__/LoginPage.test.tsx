@@ -3,12 +3,12 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { API, deferred, fail, me, ok, renderApp, user } from "@/__tests__/harness";
+import { API, deferred, fail, me, ok, pendingApprovals, renderApp, user } from "@/__tests__/harness";
 import { meQueryKey } from "@/api/hooks/useMe";
 import { routes } from "@/app/routes";
 import id from "@/i18n/locales/id.json";
 
-const server = setupServer();
+const server = setupServer(pendingApprovals());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
