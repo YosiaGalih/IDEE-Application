@@ -11,7 +11,13 @@ ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
     NPM_CONFIG_AUDIT=false \
     NPM_CONFIG_OFFLINE=true
 
-RUN groupadd --gid 10001 sandbox \
+# apt and libapt-pkg7.0 are upgraded to the archive's current revision: the base digest carries apt 3.0.3
+# (CVE-2026-109518, fixed in 3.0.4). Not pinned (DL3008), as for git: the archive serves only the latest.
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends apt libapt-pkg7.0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 sandbox \
     && useradd --uid 10001 --gid 10001 --home-dir /home/sandbox --no-create-home --shell /usr/sbin/nologin sandbox \
     && mkdir -p /workspace /home/sandbox \
     && chown 10001:10001 /home/sandbox \
