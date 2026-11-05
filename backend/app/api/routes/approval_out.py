@@ -12,10 +12,12 @@ from app.services.approvals import ApprovalView
 
 
 class ApprovalOut(BaseModel):
-    """``Approval`` (API §8) + ``consumed_at``, ``handler_status`` and ``can_decide`` for the caller."""
+    """``Approval`` (API §8) + ``project_name``, ``consumed_at``, ``handler_status`` and ``can_decide``
+    for the caller (spec WP-3.1c Lead 16, 3.1c2 Lead 1)."""
 
     id: uuid.UUID
     project_id: uuid.UUID
+    project_name: str
     task_id: uuid.UUID | None
     action_type: str
     risk_level: int
@@ -39,6 +41,7 @@ class ApprovalOut(BaseModel):
         return cls(
             id=a.id,
             project_id=a.project_id,
+            project_name=view.project_name,
             task_id=a.task_id,
             action_type=a.action_type,
             risk_level=a.risk_level,

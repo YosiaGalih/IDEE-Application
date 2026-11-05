@@ -69,6 +69,7 @@ async def test_delete_returns_202_with_approval_and_project(owner: httpx.AsyncCl
     assert approval["payload"] == {"project_id": project_id, "name": "Doomed", "previous_status": "active"}
     assert approval["can_decide"] is True  # the single owner may decide their own request (§11.1)
     assert approval["handler_status"] == "pending" and approval["consumed_at"] is None
+    assert approval["project_name"] == "Doomed"  # spec 3.1c2 Lead 1: the screen groups by project
 
 
 async def test_approve_deletes_and_the_project_is_gone(owner: httpx.AsyncClient) -> None:  # noqa: F811
@@ -78,6 +79,7 @@ async def test_approve_deletes_and_the_project_is_gone(owner: httpx.AsyncClient)
     assert response.status_code == 200, response.text
     decided = response.json()["data"]
     assert (decided["status"], decided["handler_status"]) == ("consumed", "succeeded")
+    assert decided["project_name"] == "Doomed"  # still known after the delete ran
     assert (await owner.get(f"{PROJECTS}/{project_id}")).status_code == 404
     listed = (await owner.get(PROJECTS, params={"status": "all"})).json()["data"]
     assert project_id not in {p["id"] for p in listed}
@@ -88,6 +90,8 @@ async def test_reject_restores(owner: httpx.AsyncClient) -> None:  # noqa: F811
     approval = (await request_delete(owner, project_id))["approval"]
     response = await decide(owner, approval, "reject", note="keep it")  # type: ignore[arg-type]
     assert response.json()["data"]["status"] == "rejected"
+    shown = (await owner.get(f"{APPROVALS}/{approval['id']}")).json()["data"]  # type: ignore[index]
+    assert shown["project_name"] == "Doomed"
     assert (await owner.get(f"{PROJECTS}/{project_id}")).json()["data"]["status"] == "active"
 
 
@@ -101,6 +105,7 @@ async def test_pending_list_and_history(owner: httpx.AsyncClient) -> None:  # no
     assert [a["payload"]["name"] for a in pending["data"]] == ["Two"] and pending["meta"]["total"] == 1
     history = (await owner.get(APPROVALS, params={"status": "all"})).json()["data"]
     assert {a["payload"]["name"] for a in history} == {"One", "Two"}
+    assert {(a["payload"]["name"], a["project_name"]) for a in history} == {("One", "One"), ("Two", "Two")}
     rejected = (await owner.get(APPROVALS, params={"status": "rejected", "project_id": first})).json()["data"]
     assert [a["id"] for a in rejected] == [one["id"]]  # type: ignore[index]
 
@@ -112,6 +117,8 @@ async def test_superseded_filter(owner: httpx.AsyncClient) -> None:  # noqa: F81
     assert renamed.status_code == 200, renamed.text
     superseded = (await owner.get(APPROVALS, params={"status": "superseded"})).json()["data"]
     assert [a["id"] for a in superseded] == [old["id"]]  # type: ignore[index]
+    # project_name is the project's name now; the payload keeps the name that was reviewed.
+    assert (superseded[0]["project_name"], superseded[0]["payload"]["name"]) == ("Renamed", "Doomed")
 
 
 @pytest.mark.parametrize("status", ["approved", "rejected", "consumed", "superseded", "expired"])

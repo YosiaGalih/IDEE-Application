@@ -34,6 +34,7 @@ Decision = Literal["approve", "reject"]
 class ApprovalView:
     approval: Approval
     can_decide: bool
+    project_name: str  # the project's name now (the payload keeps the name that was reviewed)
 
 
 def _now(now: datetime | None) -> datetime:
@@ -54,8 +55,10 @@ def can_decide(approval: Approval, permissions: frozenset[str], at: datetime) ->
     )
 
 
-def view_of(approval: Approval, permissions: frozenset[str], *, now: datetime | None = None) -> ApprovalView:
-    return ApprovalView(approval, can_decide(approval, permissions, _now(now)))
+def view_of(
+    approval: Approval, project: Project, permissions: frozenset[str], *, now: datetime | None = None
+) -> ApprovalView:
+    return ApprovalView(approval, can_decide(approval, permissions, _now(now)), project.name)
 
 
 async def list_approvals(
@@ -82,7 +85,7 @@ async def list_approvals(
     async with env.sessions() as session:
         if status == "pending":  # few by nature; decidability is per row, so filter, then page
             rows = (await session.execute(query.order_by(Approval.expires_at, Approval.id))).all()
-            views = [view_of(a, permissions_for(actor, p), now=at) for a, p in rows]
+            views = [view_of(a, p, permissions_for(actor, p), now=at) for a, p in rows]
             decidable = [view for view in views if view.can_decide]
             start = (page - 1) * page_size
             return decidable[start : start + page_size], len(decidable)
@@ -94,16 +97,16 @@ async def list_approvals(
                 .limit(page_size)
             )
         ).all()
-    return [view_of(a, permissions_for(actor, p), now=at) for a, p in rows], total
+    return [view_of(a, p, permissions_for(actor, p), now=at) for a, p in rows], total
 
 
 async def _visible(
     session: AsyncSession, actor: Actor, approval_id: uuid.UUID, *, lock: bool
-) -> tuple[Approval, frozenset[str]]:
+) -> tuple[Approval, Project, frozenset[str]]:
     approval = await session.get(Approval, approval_id)
     project = await session.get(Project, approval.project_id) if approval is not None else None
     permissions = permissions_for(actor, project) if project is not None else frozenset()
-    if approval is None or "project:read" not in permissions:
+    if approval is None or project is None or "project:read" not in permissions:
         raise not_found()  # out of scope reads as unknown (§1)
     if lock:
         # Only after the scope check, so a stranger never holds (or waits on) a lock on someone else's row.
@@ -116,15 +119,15 @@ async def _visible(
         if locked is None:
             raise not_found()
         approval = locked
-    return approval, permissions
+    return approval, project, permissions
 
 
 async def get_approval(
     env: ProjectEnv, actor: Actor, approval_id: uuid.UUID, *, now: datetime | None = None
 ) -> ApprovalView:
     async with env.sessions() as session:
-        approval, permissions = await _visible(session, actor, approval_id, lock=False)
-    return view_of(approval, permissions, now=now)
+        approval, project, permissions = await _visible(session, actor, approval_id, lock=False)
+    return view_of(approval, project, permissions, now=now)
 
 
 def _not_pending(status: str) -> AppError:
@@ -149,7 +152,7 @@ async def decide(
 ) -> ApprovalView:
     lapsed = False
     async with env.sessions() as session:
-        approval, permissions = await _visible(session, actor, approval_id, lock=True)
+        approval, _, permissions = await _visible(session, actor, approval_id, lock=True)
         at = _now(now)  # read after the lock wait: an approval is not decided past its time
         if not may_decide(approval, permissions):
             raise AppError("FORBIDDEN", "Not allowed", http_status=403)
@@ -186,6 +189,7 @@ async def decide(
         # Read directly: the caller was authorised for this decision, and an approved delete has just made
         # the project invisible to everyone.
         decided = await session.get(Approval, approval_id)
-    if decided is None:
+        project = await session.get(Project, decided.project_id) if decided is not None else None
+    if decided is None or project is None:
         raise not_found()
-    return ApprovalView(decided, can_decide=False)
+    return ApprovalView(decided, can_decide=False, project_name=project.name)
