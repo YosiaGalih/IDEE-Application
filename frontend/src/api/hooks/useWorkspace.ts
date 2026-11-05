@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { getBranches, getGitDiff, getGitLog } from "../git";
 import { getGitStatus, getTree, searchProject, type SearchParams } from "../workspace";
 
@@ -61,5 +61,7 @@ export function useGitLog(projectId: string, limit: number, enabled = true) {
     queryKey: [...gitLogKey(projectId), limit],
     queryFn: ({ signal }) => getGitLog(projectId, limit, signal),
     enabled,
+    // "Load more" keeps the commits already shown while the longer list arrives.
+    placeholderData: keepPreviousData,
   });
 }

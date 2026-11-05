@@ -417,7 +417,8 @@
       "right": "Panel kanan",
       "bottom": "Panel bawah",
       "showBottom": "Tampilkan panel bawah",
-      "hideBottom": "Sembunyikan panel bawah"
+      "hideBottom": "Sembunyikan panel bawah",
+      "left": "Panel kiri"
     },
     "explorer": {
       "title": "Explorer",

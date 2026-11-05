@@ -137,6 +137,10 @@ function backend({ permissions = WRITE_PERMS, files = {}, put, gitFails = false,
             changes: [{ path: "app.py", status: "modified" }],
           }),
     ),
+    http.get(`${BASE}/git/branches`, () =>
+      ok([{ name: "main", head: "c".repeat(40), is_task_branch: false }]),
+    ),
+    http.get(`${BASE}/git/log`, () => ok([])),
     http.get(`${BASE}/files/*`, ({ request }) => {
       const path = decodeURIComponent(new URL(request.url).pathname.split("/files/")[1] ?? "");
       state.fileReads.push(path);
@@ -628,6 +632,38 @@ describe("WorkspacePage", () => {
     await userEvent.click(submit);
     expect(await screen.findByText(id.workspace.search.empty)).toBeInTheDocument();
     expect(calls).toBe(2);
+  });
+
+  it("switches between the explorer and Git without losing open folders", async () => {
+    backend();
+    renderApp(`/projects/${PROJECT}/workspace`);
+    await userEvent.click(
+      await screen.findByRole("button", { name: id.workspace.explorer.expandOf.replace("{{name}}", "src") }),
+    );
+    const util = id.workspace.explorer.openOf.replace("{{name}}", "util.py");
+    expect(await screen.findByRole("button", { name: util })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /^Git/ }));
+    expect(screen.queryByRole("button", { name: util })).toBeNull();
+    expect(await screen.findByText(id.workspace.gitPanel.changes)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: id.workspace.gitPanel.view.explorer }));
+    expect(screen.getByRole("button", { name: util })).toBeInTheDocument();
+  });
+
+  it("counts changes on the Git button and tells the panel which tabs are unsaved", async () => {
+    backend({ files: { "app.py": textFile("app.py", "x = 1\n") } });
+    renderApp(`/projects/${PROJECT}/workspace`);
+    const gitButton = await screen.findByRole("button", {
+      name: id.workspace.gitPanel.view.gitCount.replace("{{count}}", "1"),
+    });
+    await openFromExplorer("app.py");
+    fireEvent.change(await editorOf("app.py"), { target: { value: "unsaved\n" } });
+    await userEvent.click(gitButton);
+    expect(gitButton).toHaveAttribute("aria-pressed", "true");
+    expect(
+      await screen.findByText(
+        id.workspace.gitPanel.commit.unsaved.replace("{{count}}", "1").replace("{{paths}}", "app.py"),
+      ),
+    ).toBeInTheDocument();
   });
 
   it("says chat and the terminal are not available yet", async () => {

@@ -417,7 +417,8 @@
       "right": "Right panel",
       "bottom": "Bottom panel",
       "showBottom": "Show bottom panel",
-      "hideBottom": "Hide bottom panel"
+      "hideBottom": "Hide bottom panel",
+      "left": "Left panel"
     },
     "explorer": {
       "title": "Explorer",

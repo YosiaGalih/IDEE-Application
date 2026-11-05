@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import { Link, useBlocker, useParams } from "react-router";
 import { ApiError } from "@/api/errors";
 import { useProject } from "@/api/hooks/useProjects";
-import { gitStatusKey, treeKey } from "@/api/hooks/useWorkspace";
+import { gitStatusKey, treeKey, useGitStatus } from "@/api/hooks/useWorkspace";
 import type { Project } from "@/api/projects";
 import { uxStateForError } from "@/api/uxState";
 import { createPath, deleteFile, getFile, putFile, VersionConflict, type FileContent } from "@/api/workspace";
@@ -19,12 +19,14 @@ import { ConflictDialog } from "./ConflictDialog";
 import { EditorArea } from "./EditorArea";
 import { initialTabs, isDirty, tabsReducer, type TabsAction } from "./editorTabs";
 import { Explorer } from "./Explorer";
+import { GitPanel } from "./git/GitPanel";
 import { disposeModel, disposeProjectModels } from "./lazyEditor";
 import { SearchPanel } from "./SearchPanel";
 import { ConfirmDialog, CreateDialog, DeleteDialog } from "./workspaceDialogs";
 import { saveErrorOf, workspaceErrorText, type RepoReason } from "./workspaceErrors";
 
 const RIGHT_TABS = ["search", "chat"] as const;
+type LeftView = "explorer" | "git";
 type RightTab = (typeof RIGHT_TABS)[number];
 /** Why a project that is not active cannot be changed (the workspace API's 409 reasons). */
 const STATUS_REASON: Partial<Record<string, RepoReason>> = {
@@ -90,6 +92,8 @@ function Workspace({ projectId, project, refreshError, onRefresh }: WorkspacePro
       : null;
   const canWrite =
     project.permissions.includes("workspace:write") && project.status === "active" && repoReason === null;
+  const canBranch =
+    project.permissions.includes("git:branch") && project.status === "active" && repoReason === null;
   const [state, dispatchToReact] = useReducer(tabsReducer, initialTabs);
   // Handlers read the tabs from this ref, which runs the same pure reducer at dispatch time: Monaco can
   // deliver Ctrl+S before React renders the last keystroke, and the save must send what is on screen.
@@ -108,6 +112,9 @@ function Workspace({ projectId, project, refreshError, onRefresh }: WorkspacePro
   const [creating, setCreating] = useState<"file" | "dir" | null>(null);
   const [deletePath, setDeletePath] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>("search");
+  const [leftView, setLeftView] = useState<LeftView>("explorer");
+  const gitStatus = useGitStatus(projectId);
+  const changeCount = gitStatus.data?.changes.length ?? 0;
   const [isBottomOpen, setIsBottomOpen] = useState(true);
   const rightId = useId();
   const hasDirty = state.tabs.some(isDirty);
@@ -296,14 +303,61 @@ function Workspace({ projectId, project, refreshError, onRefresh }: WorkspacePro
         </p>
       ) : null}
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[16rem_minmax(0,1fr)_20rem]">
-        <Explorer
-          projectId={projectId}
-          canWrite={canWrite}
-          activePath={state.active}
-          onOpen={(path) => void openFile(path)}
-          onCreate={setCreating}
-          onDelete={setDeletePath}
-        />
+        <div className="flex max-h-[50vh] min-h-0 flex-col border-b border-line bg-surface lg:max-h-none lg:border-r lg:border-b-0">
+          <div role="group" aria-label={t("workspace.layout.left")} className="flex border-b border-line">
+            <button
+              type="button"
+              aria-pressed={leftView === "explorer"}
+              onClick={() => setLeftView("explorer")}
+              className={cn(
+                "flex-1 px-3 py-1.5 text-xs",
+                leftView === "explorer" ? "font-semibold text-fg" : "text-fg-muted",
+              )}
+            >
+              {t("workspace.gitPanel.view.explorer")}
+            </button>
+            <button
+              type="button"
+              aria-pressed={leftView === "git"}
+              aria-label={
+                changeCount > 0 ? t("workspace.gitPanel.view.gitCount", { count: changeCount }) : undefined
+              }
+              onClick={() => setLeftView("git")}
+              className={cn(
+                "flex flex-1 items-center justify-center gap-1 px-3 py-1.5 text-xs",
+                leftView === "git" ? "font-semibold text-fg" : "text-fg-muted",
+              )}
+            >
+              {t("workspace.gitPanel.view.git")}
+              {changeCount > 0 ? (
+                <span aria-hidden="true" className="rounded-full border border-line px-1.5 text-[0.65rem]">
+                  {changeCount}
+                </span>
+              ) : null}
+            </button>
+          </div>
+          {/* Both stay mounted: open folders and a half-written commit message survive the switch. */}
+          <div hidden={leftView !== "explorer"} className="flex min-h-0 flex-1 flex-col">
+            <Explorer
+              projectId={projectId}
+              canWrite={canWrite}
+              activePath={state.active}
+              onOpen={(path) => void openFile(path)}
+              onCreate={setCreating}
+              onDelete={setDeletePath}
+            />
+          </div>
+          <div hidden={leftView !== "git"} className="flex min-h-0 flex-1 flex-col">
+            <GitPanel
+              projectId={projectId}
+              canRead={project.permissions.includes("git:read")}
+              canCommit={canWrite}
+              canBranch={canBranch}
+              unsavedPaths={state.tabs.filter(isDirty).map((tab) => tab.path)}
+              isActive={leftView === "git"}
+            />
+          </div>
+        </div>
         <EditorArea
           projectId={projectId}
           tabs={state.tabs}
