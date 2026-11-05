@@ -1709,10 +1709,10 @@ Keputusan Lead:
 |---|---|
 | `ruff check`, `ruff format --check`, `pyright` @ 17ef409 | bersih; pyright 0 error |
 | `lint-imports` @ 17ef409 | 3 kept, 0 broken. Mutan `import httpx2` dan `from app.workspace import fs` di `app/llm/retry.py` → 2 kontrak BROKEN |
-| Test LLM @ 17ef409 | **182 test baru** (adapter 70, base 24, retry 24, scripted 23, tarif 23, contract 8, factory 6, security 4) + 7 di `test_config.py`, semuanya lulus |
-| Suite backend penuh @ 17ef409 (Python 3.12, PG16 + Redis 7; dijalankan sendirian 05:23:56–05:29:29 UTC) | **1947 passed, 1 skipped** dalam 5 menit 30 detik (`main` @ d3f4440: 1758 passed) |
-| Kebocoran prompt di log DEBUG SDK | `test_debug_logging_leaks_no_prompt_or_key`: dengan penjaga dimatikan, penanda prompt muncul di log ("Request options"); dengan penjaga, tidak ada prompt maupun key |
-| Mutan putaran review (R1–R7, S1–S7, T1–T2) | semuanya merah: base URL kosong diteruskan, https tanpa host diterima, stream bocor saat cancel pemanggil, cancel pemanggil tertelan saat penutupan, teks di-replay saat retry, percobaan cancel tidak tercatat, cancel kalah dari balasan selesai, sleep rusak dianggap jeda, harga 0 diterima, redirect diikuti, string vendor tanpa batas, request id tanpa batas, prompt di repr, base URL http di produksi, key tidak di-strip, scripted menyimpan prompt |
+| Test LLM @ 5400a49 | [Pasti] **186 test baru** (adapter 70, base 24, retry 24, tarif `test_pricing_usage.py` 24, scripted 23, contract 8, factory 6, security `test_llm_secrets.py` 6, penjaga import SDK di `test_no_host_exec.py` 1) + 7 di `test_config.py`. File yang diubah di 5400a49 (hanya test) dijalankan ulang: `33 passed` |
+| Suite backend penuh @ 17ef409 (Python 3.12, PG16 + Redis 7; dijalankan sendirian 05:23:56–05:29:29 UTC) | [Pasti] `1947 passed, 1 skipped in 330.15s` (`main` @ d3f4440: 1758 passed). Kode `app/` tidak berubah sesudahnya; 5400a49 hanya memindah/menambah test |
+| Kebocoran prompt di log DEBUG SDK | [Pasti] `test_debug_logging_leaks_no_prompt_or_key`: dengan penjaga dimatikan, test gagal dengan `assert 'PROMPT-MARKER-7f3a9c' not in '{"event": "...'` ("Request options"); dengan penjaga lulus. `test_anthropic_log_cannot_reopen_debug` (interpreter baru, `ANTHROPIC_LOG=debug`): SDK sendiri → `DEBUG`; logging dulu atau SDK dulu → `WARNING` |
+| Mutan putaran review (R1–R7, S1–S7, T1–T2, U1–U2; skrip mutasi di scratchpad, satu perubahan per run lalu dipulihkan) | [Pasti] output skrip: setiap baris `<mutan>: RED`, tidak ada `SURVIVED`. Mutan: base URL kosong diteruskan, https tanpa host diterima, stream bocor saat cancel pemanggil, cancel pemanggil tertelan saat penutupan, teks di-replay saat retry, percobaan cancel tidak tercatat, cancel kalah dari balasan selesai, sleep rusak dianggap jeda, harga 0 diterima, redirect diikuti, string vendor tanpa batas, request id tanpa batas, prompt di repr, base URL http di produksi, key tidak di-strip, scripted menyimpan prompt, adapter tidak memasang ulang level logger SDK, `configure_logging` tidak memasang level |
 
 Catatan: suite penuh pertama di worktree berjalan di Python 3.13 (uv memilihnya karena `backend` tanpa `.python-version`) dan `test_deep_symlink_chain_is_a_violation` gagal, sama dengan konflik #66. Venv dibangun ulang di 3.12, versi CI dan produksi.
 
@@ -1741,7 +1741,7 @@ Hasil awal @ dba9b6e:
 | AG-13 L4: string vendor tanpa batas | tipe/stop reason `^[A-Za-z0-9_.:-]{1,64}$`, request id `^[A-Za-z0-9_-]{1,128}$` | `test_vendor_error_type_is_bounded`, `test_odd_request_ids_are_dropped` (S2, S3) |
 | AG-13 L5: teks spec menyebut `httpx`/`httpcore`; handler belakangan | spec diselaraskan; test semua handler root membawa filter | `test_every_root_handler_drops_vendor_debug` |
 | AG-13 L6: `ScriptedProvider.requests` tumbuh tanpa batas | perekaman opt-in | `test_requests_are_not_kept_unless_asked` (S7) |
-| AG-13 L7: `.dockerignore` membuka seluruh `backend/config/` | hanya `backend/config/pricing.yaml` | review kode |
+| AG-13 L7: `.dockerignore` membuka seluruh `backend/config/` | hanya `backend/config/pricing.yaml` | [Kemungkinan Besar] pola sama dengan `!backend/pyproject.toml` yang sudah terbukti; dockerd tidak berjalan di sini, jadi build image di CI (`clean-install`) yang membuktikan |
 | AG-13 I1: repr `LLMRequest` memuat prompt | `system`/`messages` tanpa repr | `test_request_repr_hides_the_prompt` (S4) |
 | AG-13 L8 (review delta): `ANTHROPIC_BASE_URL=""` dari compose diteruskan ke SDK, sehingga setiap panggilan gagal 5× `transient`; `https:gw.internal` tanpa host diterima | nilai kosong = tidak di-set (default SDK); produksi wajib https dengan host | `test_blank_base_url_means_the_default`, `test_blank_base_url_reaches_the_default_host`, `test_production_rejects_unsafe_settings` (T1, T2) |
 
@@ -1754,6 +1754,20 @@ Tidak ditutup di 3.1a (alasan dan pemilik; juga di spec bagian "Syarat yang diwa
 - **silent L5:** naskah scripted yang habis mengulang giliran terakhir; batas iterasi runtime menghentikan loop.
 - **silent L6:** kegagalan `on_attempt` diteruskan (keras, tidak diam); keputusan nasib respons berbayar saat ledger gagal ada di 3.1f.
 - **backend nit:** `timeout_s` adalah batas total satu percobaan; 3.1f memilihnya sesuai `max_tokens`.
+
+#### `/code-review` (sumbu standar + sumbu spec) @ 98cdf48
+
+| Temuan | Penutupan |
+|---|---|
+| standar (keras): `test_pricing.py` menyimpang dari kontrak lokasi TEST_STRATEGY (`test_pricing_usage.py::test_estimated_vs_unavailable`) | file diganti nama dan test itu ditambah (5400a49) |
+| standar (keras): `tests/contract/` tidak ada di tabel lapisan TEST_STRATEGY §2 | ARCHITECTURE §13.4 menyebut `tests/contract/test_llm_provider.py`; dilaporkan di #72 dengan usulan baris baru di §2 |
+| standar: penjaga "hanya adapter mengimpor SDK" bukan di `test_no_host_exec.py` (TEST_STRATEGY §3) | dipindah (5400a49) |
+| standar: bukti tracker tanpa output / label | baris bukti diberi output dan label `[Pasti]`/`[Kemungkinan Besar]` |
+| spec (a2): test log tidak benar-benar menyetel `ANTHROPIC_LOG` | `test_anthropic_log_cannot_reopen_debug` di interpreter baru; mutan U1 (adapter tidak memasang ulang) dan U2 (`configure_logging` tidak memasang) merah |
+| spec (a1): Review Focus 5 "file tarif rusak menolak start" belum ada pemakainya | ditambahkan ke syarat warisan (3.1f) |
+| spec (b3, b4, c5–c7): pemetaan error stream, `retry-after` untuk semua status, tipe tak dikenal → `transient`, aturan nama tool, waktu parse input tool | teks spec diselaraskan dengan kode yang sudah diputuskan saat review; plan Global Constraints diberi catatan revisi |
+
+Tidak diubah (smell, penilaian): duplikasi hitung giliran `assistant` (scripted dan `generic`) dan hitung `duration_ms`; encoding nama tool terbagi antara port (validasi panjang) dan adapter (ADR-023 menaruh encoding di adapter); `AttemptRecord` posisional di `retry._report`; `_Block.kind` berupa `str`; kunci `metadata` bertipe string. Mengubahnya menyentuh `app/llm` tanpa perubahan perilaku dan butuh review delta AG-13 lagi; kandidat dirapikan saat 3.1f menyentuh retry dan scripted.
 
 **Sign-off AG-13:** SIGNED OFF WITH CONDITIONS @ 3e81ddb, lalu delta **SIGNED OFF WITH CONDITIONS @ 81b3341** (M1, L1, L2, L4, L6, L7, I1 diterima ditutup; L5 diterima; M2 tetap terbuka untuk 3.1f; temuan baru L8 ditutup di 17ef409, yang hanya menyentuh `app/core/config.py` dan test-nya). Syarat warisan ada di spec bagian "Syarat yang diwariskan".
 
