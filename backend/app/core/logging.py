@@ -20,6 +20,8 @@ from app.core.redaction import Redactor
 
 _redactor = Redactor()
 _STDLIB_LOGGERS = ("", "uvicorn", "uvicorn.error", "uvicorn.access")
+# The LLM SDK and its HTTP stack log request options (the prompt) at DEBUG; never below WARNING (WP-3.1a).
+QUIET_LOGGERS = ("anthropic", "httpx2", "httpcore2")
 
 
 def _add_request_id(_: Any, __: str, event_dict: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
@@ -78,6 +80,24 @@ class _CurrentStdoutHandler(logging.StreamHandler):  # type: ignore[type-arg]
         super().emit(record)
 
 
+def _is_quiet(name: str) -> bool:
+    return any(name == quiet or name.startswith(f"{quiet}.") for quiet in QUIET_LOGGERS)
+
+
+class QuietVendorFilter(logging.Filter):
+    """Drops records below WARNING from QUIET_LOGGERS, whatever level a library or env var set on them."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING or not _is_quiet(record.name)
+
+
+def quiet_vendor_loggers() -> None:
+    """Pin QUIET_LOGGERS at WARNING. The SDK sets its level from ``ANTHROPIC_LOG`` when imported, so the
+    adapter calls this again after its import; the handler filter covers any other order."""
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def _configure_stdlib(level: int) -> None:
     root = logging.getLogger()
     root.setLevel(level)
@@ -85,8 +105,11 @@ def _configure_stdlib(level: int) -> None:
         root.addHandler(_CurrentStdoutHandler())
     for name in _STDLIB_LOGGERS:
         for handler in logging.getLogger(name).handlers:
+            if not any(isinstance(f, QuietVendorFilter) for f in handler.filters):
+                handler.addFilter(QuietVendorFilter())
             if not any(isinstance(f, RedactingFilter) for f in handler.filters):
                 handler.addFilter(RedactingFilter())
+    quiet_vendor_loggers()
 
 
 def configure_logging(level: str, redactor: Redactor) -> None:
