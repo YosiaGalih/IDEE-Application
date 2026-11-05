@@ -96,13 +96,27 @@ describe("ApprovalsPage", () => {
     backend({ pending: () => okPage([tricky], { page_size: 200 }) });
     const { container } = renderApp("/approvals");
     const card = await screen.findByRole("group", { name: "Kalkulator API" });
-    expect(within(card).getByText(tricky.summary)).toBeInTheDocument();
+    // The summary in the screen's language, from the hash-bound payload (not the server's English text).
+    expect(
+      within(card).getByText(id.approvals.summaries.project_delete.replace("{{name}}", "<b>bold</b>")),
+    ).toBeInTheDocument();
     expect(within(card).getByText(/"name": "<b>bold<\/b>"/)).toBeInTheDocument();
     expect(container.querySelector("b")).toBeNull(); // shown as text, never as markup
     expect(within(card).getByText("abcdef012345…")).toBeInTheDocument();
     expect(within(card).getByText(tricky.requested_by)).toBeInTheDocument();
     expect(within(card).getByText(/R3/)).toHaveTextContent(id.approvals.risk[3]);
     expect(within(card).getByText(id.approvals.card.bound)).toBeInTheDocument();
+  });
+
+  it("shows an action type it does not know as it is, with the server's summary", async () => {
+    const unknown = approval({ action_type: "deploy_canary", summary: "Deploy build 42 to canary" });
+    backend({ pending: () => okPage([unknown], { page_size: 200 }) });
+    renderApp("/approvals");
+    const card = await screen.findByRole("group", { name: "Kalkulator API" });
+    expect(
+      within(card).getByText(id.approvals.card.required.replace("{{action}}", "deploy_canary")),
+    ).toBeInTheDocument();
+    expect(within(card).getByText("Deploy build 42 to canary")).toBeInTheDocument();
   });
 
   it("approves with the hash of the approval shown and announces the deletion", async () => {

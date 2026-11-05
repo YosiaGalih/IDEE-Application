@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import type { Approval } from "@/api/approvals";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
-import { actionLabel, riskText } from "./approvalText";
+import { actionLabel, riskText, summaryText } from "./approvalText";
 import type { Decision } from "./DecisionDialog";
 import { PayloadView } from "./PayloadView";
 
@@ -33,7 +33,7 @@ export function ApprovalCard({ approval, onDecide }: Props) {
         </Badge>
       </header>
       <div className="space-y-3 px-4 py-3 text-sm">
-        <p className="break-words text-fg">{approval.summary}</p>
+        <p className="break-words text-fg">{summaryText(t, approval)}</p>
         <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
           <dt className="text-fg-muted">{t("approvals.card.hash")}</dt>
           <dd className="font-mono" title={approval.payload_hash}>

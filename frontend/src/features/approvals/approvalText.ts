@@ -30,6 +30,18 @@ export function riskText(t: TFunction, level: number): string {
     : t("approvals.riskLevel", { level, label: t(`approvals.risk.${key}`) });
 }
 
+/**
+ * What the approval asks for, in the screen's language. For a known action it is built from the payload
+ * (which the hash binds); otherwise it is the server's `summary` as sent (spec 3.1c2 Lead 3).
+ */
+export function summaryText(t: TFunction, approval: Approval): string {
+  const name = approval.payload.name;
+  if (approval.action_type === "project_delete" && typeof name === "string") {
+    return t("approvals.summaries.project_delete", { name });
+  }
+  return approval.summary;
+}
+
 export type Outcome = { tone: "success" | "warning"; text: string };
 
 /**

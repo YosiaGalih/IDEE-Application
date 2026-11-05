@@ -888,6 +888,9 @@
       "consumed": "Dijalankan",
       "superseded": "Diganti"
     },
-    "pendingTitle": "Tertunda"
+    "pendingTitle": "Tertunda",
+    "summaries": {
+      "project_delete": "Hapus project {{name}}. Workspace disimpan 7 hari, lalu dihapus permanen."
+    }
   }
 }

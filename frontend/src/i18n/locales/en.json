@@ -888,6 +888,9 @@
       "consumed": "Carried out",
       "superseded": "Replaced"
     },
-    "pendingTitle": "Pending"
+    "pendingTitle": "Pending",
+    "summaries": {
+      "project_delete": "Delete project {{name}}. The workspace is kept for 7 days, then removed for good."
+    }
   }
 }

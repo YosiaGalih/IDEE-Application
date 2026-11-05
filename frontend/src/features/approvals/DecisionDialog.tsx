@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/Button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/Dialog";
 import { ErrorSummary } from "@/components/ui/ErrorSummary";
 import { Label } from "@/components/ui/Label";
-import { actionLabel, decisionError, decisionOutcome, type Outcome } from "./approvalText";
+import { actionLabel, decisionError, decisionOutcome, summaryText, type Outcome } from "./approvalText";
 import { PayloadView } from "./PayloadView";
 
 /** API §8 / DATA_MODEL: `decision_note` is at most 2000 characters (checked again by the server). */
@@ -68,7 +68,7 @@ export function DecisionDialog({ approval, decision, onClose, onDecided }: Props
             <dt className="text-fg-muted">{t("approvals.dialog.project")}</dt>
             <dd className="break-words">{approval.project_name}</dd>
             <dt className="text-fg-muted">{t("approvals.dialog.summary")}</dt>
-            <dd className="break-words">{approval.summary}</dd>
+            <dd className="break-words">{summaryText(t, approval)}</dd>
             <dt className="text-fg-muted">{t("approvals.dialog.hashFull")}</dt>
             <dd className="break-all font-mono text-xs">{approval.payload_hash}</dd>
           </dl>
