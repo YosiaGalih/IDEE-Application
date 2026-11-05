@@ -43,8 +43,10 @@ async def new(
     )
 
 
-async def actions(session: AsyncSession) -> list[str]:
-    return list((await session.scalars(select(AuditEvent.action).order_by(AuditEvent.id))).all())
+async def actions(session: AsyncSession, project: Project) -> list[str]:
+    # audit_events is append-only: earlier tests' rows stay, so read only this project's.
+    query = select(AuditEvent.action).where(AuditEvent.project_id == project.id).order_by(AuditEvent.id)
+    return list((await session.scalars(query)).all())
 
 
 async def test_create_sets_hash_and_expiry(session: AsyncSession) -> None:
@@ -55,7 +57,7 @@ async def test_create_sets_hash_and_expiry(session: AsyncSession) -> None:
     assert approval.payload_hash == store.payload_hash(
         "project_delete", project_id=project.id, task_id=None, payload=approval.payload
     )
-    assert await actions(session) == ["approval.requested"]
+    assert await actions(session, project) == ["approval.requested"]
 
 
 async def test_waive_criterion_is_never_created(session: AsyncSession) -> None:
@@ -129,7 +131,11 @@ async def test_renew_supersedes_and_keeps_requester(session: AsyncSession) -> No
     assert renewed.requested_by == old.requested_by
     assert renewed.payload_hash != old.payload_hash
     assert renewed.expires_at == NOW + timedelta(hours=1, days=7)
-    assert await actions(session) == ["approval.requested", "approval.superseded", "approval.requested"]
+    assert await actions(session, project) == [
+        "approval.requested",
+        "approval.superseded",
+        "approval.requested",
+    ]
 
 
 async def test_renew_without_an_open_approval_does_nothing(session: AsyncSession) -> None:
@@ -161,4 +167,5 @@ async def test_expire_due_only_past_pending(session: AsyncSession) -> None:
     assert expired == [gone.id]
     await session.refresh(gone)
     assert (gone.status, gone.handler_status) == ("expired", "pending")
-    assert (await actions(session)).count("approval.expired") == 1
+    assert (await actions(session, past)).count("approval.expired") == 1
+    assert "approval.expired" not in await actions(session, decided)

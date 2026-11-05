@@ -187,6 +187,7 @@ async def renew_open(
     if old is None:
         return None
     old.status = "superseded"
+    old.handler_status = "not_required"  # nothing was decided, so nothing has to run
     await session.flush()  # before the insert: one open approval per action is enforced by an index
     await _audit(session, audit, old, "approval.superseded", actor=actor_id, ip=actor_ip)
     return await create(
