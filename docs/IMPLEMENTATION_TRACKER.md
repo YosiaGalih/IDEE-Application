@@ -1663,7 +1663,7 @@ Isi Phase 2 yang sudah di `main` (d3f4440):
 | Pemeriksaan | Hasil aktual |
 |---|---|
 | Test cross-project (`backend/tests/security/test_cross_project.py`) | **117 test**, matriks setiap route `/projects/{id}`: user lain → 404, reader berscope bisa membaca tetapi tidak menulis, project terhapus → 404 bahkan untuk owner, tanpa sesi → 401, write tanpa CSRF ditolak, role global dihitung hanya di project yang di-grant. Bersama test scope/path/input terkait (dashboard, path workspace, input git, input search): **159 test**. Seluruh `tests/security`: **322 test** |
-| Backend `pytest -q` @ d3f4440 (PostgreSQL 16 + Redis 7 lokal) | sedang dijalankan; hasilnya ditulis di commit berikutnya |
+| Backend `pytest -q` @ d3f4440 (PostgreSQL 16 + Redis 7 lokal) | **1758 passed, 1 skipped** (5 menit 53 detik) |
 | Frontend `npm test` @ d3f4440 | **442 passed** (33 file); layar P2 (`features/workspace`, `features/projects`, route map): 160 |
 | CI `main` @ d3f4440 (merge PR #16) | 9/9 hijau pada head PR yang sama (4bdab34), termasuk `security-scan` |
 
