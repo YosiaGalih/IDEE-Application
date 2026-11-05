@@ -85,6 +85,15 @@ def test_long_prompt_counts_cache_tokens_and_uses_tier_prices(table: PricingTabl
     assert estimate.estimated_cost == Decimal("2.532000625")  # 0.03 + 2.5 + 0.000000625 + 0.002
 
 
+def test_estimated_vs_unavailable(table: PricingTable) -> None:
+    """TEST_STRATEGY AC-16: a known price gives an estimate; an unknown one says "unavailable", never 0."""
+    usage = Usage(input_tokens=1_000, output_tokens=100)
+    known = table.estimate("claude-test-model", usage, partial=False)
+    unknown = table.estimate("claude-not-priced", usage, partial=False)
+    assert (known.cost_status, known.estimated_cost) == ("estimated", Decimal("0.0045"))
+    assert (unknown.cost_status, unknown.estimated_cost) == ("unavailable", None)
+
+
 def test_unknown_model_is_unavailable_not_zero(table: PricingTable) -> None:
     estimate = table.estimate("claude-unknown", Usage(input_tokens=10, output_tokens=10), partial=False)
     assert estimate.estimated_cost is None

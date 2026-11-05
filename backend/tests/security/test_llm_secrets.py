@@ -5,8 +5,11 @@ The snapshot adapter leaked prompts through the SDK DEBUG log ("Request options"
 
 from __future__ import annotations
 
-import ast
+import json
 import logging
+import os
+import subprocess
+import sys
 import traceback
 from pathlib import Path
 
@@ -80,25 +83,52 @@ async def test_error_text_repr_and_traceback_carry_no_secret() -> None:
     assert error.__suppress_context__ is True
 
 
-def test_only_the_adapter_imports_the_vendor_sdk() -> None:
-    offenders: list[str] = []
-    for path in sorted(APP.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                names = [node.module]
-            else:
-                continue
-            if any(name.split(".")[0] in VENDOR_MODULES for name in names):
-                offenders.append(str(path.relative_to(APP)))
-    assert sorted(set(offenders)) == ["llm/anthropic_provider.py"]
-
-
 def test_every_root_handler_drops_vendor_debug(debug_logging) -> None:  # type: ignore[no-untyped-def]
     from app.core.logging import QuietVendorFilter
 
     handlers = logging.getLogger().handlers
     assert handlers
     assert all(any(isinstance(f, QuietVendorFilter) for f in h.filters) for h in handlers)
+
+
+_ORDER_PROBE = """
+import json, logging, sys
+order = sys.argv[1]
+from app.core.logging import configure_logging
+from app.core.redaction import Redactor
+levels = {}
+if order == "sdk-alone":
+    import anthropic  # noqa: F401
+elif order == "logging-first":
+    configure_logging("DEBUG", Redactor())
+    import app.llm.anthropic_provider  # noqa: F401
+else:
+    import anthropic  # noqa: F401
+    configure_logging("DEBUG", Redactor())
+for name in ("anthropic", "httpx2"):
+    levels[name] = logging.getLevelName(logging.getLogger(name).level)
+print(json.dumps(levels))
+"""
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [
+        ("sdk-alone", "DEBUG"),  # the hazard is real: ANTHROPIC_LOG=debug lowers the SDK's logger on import
+        ("logging-first", "WARNING"),  # the adapter pins it again after importing the SDK
+        ("sdk-first", "WARNING"),  # configure_logging pins it whichever came first
+    ],
+)
+def test_anthropic_log_cannot_reopen_debug(order: str, expected: str) -> None:
+    # A fresh interpreter per order: the SDK reads ANTHROPIC_LOG only when it is first imported.
+    env = {**os.environ, "ANTHROPIC_LOG": "debug"}
+    result = subprocess.run(  # noqa: S603 - fixed argv: this interpreter running a probe written above
+        [sys.executable, "-c", _ORDER_PROBE, order],
+        cwd=APP.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    assert json.loads(result.stdout.strip().splitlines()[-1])["anthropic"] == expected

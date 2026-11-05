@@ -120,3 +120,23 @@ def test_processes_only_in_gitops() -> None:
         if (found := violations(path.read_text(), process_allowed=path.is_relative_to(PROCESS_ALLOWED)))
     }
     assert problems == {}
+
+
+# The LLM vendor SDK and its HTTP client live only in their adapter (CLAUDE.md #6, ADR-023, TEST_STRATEGY §3).
+VENDOR_MODULES = ("anthropic", "httpx2", "httpcore2")
+
+
+def test_only_the_adapter_imports_the_vendor_sdk() -> None:
+    offenders: list[str] = []
+    for path in sorted(APP.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            else:
+                continue
+            if any(name.split(".")[0] in VENDOR_MODULES for name in names):
+                offenders.append(str(path.relative_to(APP)))
+    assert sorted(set(offenders)) == ["llm/anthropic_provider.py"]
