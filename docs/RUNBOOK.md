@@ -367,6 +367,14 @@ Saat: korupsi data, migrasi buruk, penghapusan tak sengaja.
 
 ---
 
+### 10.7 Approval: handler gagal, hapus project, purge (WP-3.1c)
+
+- **Handler gagal.** Keputusan approval tidak pernah dibatalkan oleh handler yang gagal (ADR-024). Worker (`approvals-sweep`, tiap 60 dtk) mengulang handler dengan jeda 30 dtk, 2 mnt, 10 mnt, 1 jam. Sesudah 5 percobaan approval tetap `handler_status = failed` dan audit `approval.handler_gave_up` tercatat sekali.
+  - Periksa: `SELECT id, action_type, status, handler_attempts, handler_error FROM approvals WHERE handler_status = 'failed';`
+  - Perbaiki penyebabnya (DB, disk, izin folder), lalu jadwalkan ulang: `UPDATE approvals SET handler_status = 'pending', handler_attempts = 0 WHERE id = '<id>';`. Handler idempotent, jadi menjalankannya lagi aman.
+- **Hapus project.** `DELETE /projects/{id}` hanya membuat approval `project_delete` (7 hari). Disetujui → task terbuka dibatalkan dan project `deleted` (hilang dari daftar dan akses). Ditolak atau kedaluwarsa → project kembali ke status sebelumnya.
+- **Purge.** Worker (`projects-purge`, tiap jam) menghapus project yang `deleted_at` ≥ 7 hari: folder `WORKSPACE_ROOT/<id>`, grant `project:<id>`, lalu barisnya (repository, indeks, task, run, approval ikut terhapus). Jejak audit tetap ada. Purge berjalan di `worker` karena `scheduler` tidak me-mount volume workspace. Untuk memulihkan project yang sudah `deleted` tetapi belum di-purge, pulihkan dari backup (§7.2); tidak ada endpoint undelete.
+
 ## 11. gVisor (opsional, direkomendasikan production — ADR-009)
 
 gVisor (`runsc`) menambah kernel user-space antara kode project dan kernel host.

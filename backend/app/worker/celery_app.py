@@ -18,6 +18,12 @@ from celery.signals import setup_logging, worker_ready
 from app.core.config import Settings, load_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
+from app.worker.platform_jobs import (
+    APPROVALS_SWEEP_SECONDS,
+    APPROVALS_SWEEP_TASK,
+    PROJECTS_PURGE_SECONDS,
+    PROJECTS_PURGE_TASK,
+)
 
 RECOVERY_SWEEP_SECONDS = 30.0  # ARCHITECTURE §5.3
 
@@ -46,6 +52,17 @@ def create_celery(settings: Settings) -> Celery:
                 "schedule": RECOVERY_SWEEP_SECONDS,
                 # A sweep that waited past the next one is dropped, not replayed in a burst.
                 "options": {"expires": RECOVERY_SWEEP_SECONDS - 5},
+            },
+            # WP-3.1c: approvals past their time, handler retries (ADR-024), and the 7-day project purge.
+            "approvals-sweep": {
+                "task": APPROVALS_SWEEP_TASK,
+                "schedule": APPROVALS_SWEEP_SECONDS,
+                "options": {"expires": APPROVALS_SWEEP_SECONDS - 5},
+            },
+            "projects-purge": {
+                "task": PROJECTS_PURGE_TASK,
+                "schedule": PROJECTS_PURGE_SECONDS,
+                "options": {"expires": PROJECTS_PURGE_SECONDS - 60},
             },
         },
     )
