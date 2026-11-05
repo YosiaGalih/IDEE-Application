@@ -365,8 +365,6 @@ Saat: korupsi data, migrasi buruk, penghapusan tak sengaja.
 
 `make logs SERVICE=caddy` → cari `obtaining certificate` / `challenge failed`. Periksa: DNS `APP_DOMAIN` mengarah ke VPS, port 80 & 443 terbuka (ufw + firewall provider), `CADDY_EMAIL` alamat valid, rate limit Let's Encrypt (tunggu / pakai staging). Data sertifikat ada di volume `caddy_data` — jangan dihapus.
 
----
-
 ### 10.7 Approval: handler gagal, hapus project, purge (WP-3.1c)
 
 - **Handler gagal.** Keputusan approval tidak pernah dibatalkan oleh handler yang gagal (ADR-024). Worker (`approvals-sweep`, tiap 60 dtk) mengulang handler dengan jeda 30 dtk, 2 mnt, 10 mnt, 1 jam. Sesudah 5 percobaan approval tetap `handler_status = failed` dan audit `approval.handler_gave_up` tercatat sekali.
@@ -378,6 +376,8 @@ Saat: korupsi data, migrasi buruk, penghapusan tak sengaja.
 - **`project.purge_failed`.** Satu project gagal di-purge (mis. berkas milik uid lain di folder workspace): dicatat di audit dan log error, dipindah ke belakang antrean, project lain tetap di-purge. Perbaiki izin berkas (`chown -R 10001:10001 WORKSPACE_ROOT/<id>`); purge berikutnya (tiap jam) mencoba lagi.
 - **Purge berhenti: "workspace root is not a directory".** `WORKSPACE_ROOT` tidak ada atau volume tidak ter-mount di worker. Tidak ada yang dihapus. Pasang volume, lalu tunggu jam berikutnya. Catatan: folder kosong yang ter-mount salah tetap terlihat sebagai direktori; audit `project.purged` dengan `workspace: absent` beruntun adalah tandanya.
 - **Purge.** Worker (`projects-purge`, tiap jam) menghapus project yang `deleted_at` ≥ 7 hari: folder `WORKSPACE_ROOT/<id>`, grant `project:<id>`, lalu barisnya (repository, indeks, task, run, approval ikut terhapus). Jejak audit tetap ada. Purge berjalan di `worker` karena `scheduler` tidak me-mount volume workspace. Untuk memulihkan project yang sudah `deleted` tetapi belum di-purge, pulihkan dari backup (§7.2); tidak ada endpoint undelete.
+
+---
 
 ## 11. gVisor (opsional, direkomendasikan production — ADR-009)
 

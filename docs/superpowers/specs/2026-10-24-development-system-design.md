@@ -414,6 +414,15 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
       - `agent_profiles.slug` unik hanya di antara agent aktif registry (index parsial), bukan `unique` penuh seperti DATA_MODEL: baris agent pensiun disimpan dan slug-nya boleh dipakai lagi. CHECK `approval_grant = 'deny'` di tabel adalah tambahan.
       - Mockup screen-05 dan PRD v2.2 menyebut 42 agent; registry v2 berisi 53. Layar mengikuti data.
       - `scripts/test_validate_registry.py` ("17 test") yang disebut README, AGENT_CATALOG, dan TEST_STRATEGY tidak ada. Paritas loader–validator diuji di `backend/tests/unit/test_registry_loader.py`.
+    - **3.1c** (spec `docs/superpowers/specs/2026-11-05-wp-3.1c-approvals-design.md`, bagian "Konflik"; 3.1c1 = backend, 3.1c2 = layar):
+      - Kedaluwarsa API §11.1 (7 hari / 24 jam / 4 jam / 7 hari) vs SECURITY_MODEL §5 "(turunan)" 24 jam / 1 jam (#13): §11.1 dipakai (ADR-034).
+      - `waive_criterion`: ada di CHECK DATA_MODEL, "bukan approval" menurut §11.1/ADR-034, baris approval yang langsung dikonsumsi menurut USER_PROXY_ACCEPTANCE:34, aksi R3 menurut SECURITY_MODEL §3. Tetap di CHECK, tidak pernah dibuat.
+      - Jawaban `DELETE /projects/{id}`: §3 `{approval}` vs §11 #14 `{approval, project}`: §11 dipakai.
+      - `target` dan `canonical_json` tidak didefinisikan: `target = {project_id, task_id}`, JSON kanonik dengan kunci terurut tanpa float. Payload hapus §11 #6 vs SECURITY_MODEL §5 (ukuran, retensi): payload §11 #6, retensi 7 hari di `summary`, ukuran workspace belum dihitung.
+      - FR-018 (`active → archived → deleting_pending_approval`) vs `previous_status` di payload: hapus boleh dari `active` atau `archived`.
+      - Tambahan di luar DATA_MODEL: `approvals.updated_at` (jam backoff), `projects.deleted_at` (jam purge), CHECK `requested_by`/`payload_hash`/`decision_note`/`risk_level`, index unik parsial satu `project_delete` terbuka per project; index handler ADR-024 diperluas ke `expired` (pemulihan project) dan `consumed` (pemulihan crash). Filter `superseded` di `GET /approvals`.
+      - Izin keputusan: `approval:decide` (§8) vs "izin sesuai `action_type`" (§11.1, ARCHITECTURE): keduanya diterapkan, di service (route hanya menuntut sesi). Aturan SECURITY_MODEL §5 "requester … role lebih rendah" tidak jelas dan tidak diterapkan; `four_eyes` (P1) belum ada, owner tunggal boleh memutus permintaannya sendiri.
+      - Replay keputusan atas hapus project yang sudah dijalankan menjawab 404 (project dan approval-nya tidak terlihat lagi), bukan 409 `consumed`.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
