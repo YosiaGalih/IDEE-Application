@@ -76,3 +76,12 @@ def test_cancel_token_can_be_made_outside_a_loop() -> None:
     token = CancelToken()
     token.cancel()
     assert token.cancelled is True
+
+
+@pytest.mark.parametrize(
+    "field", ["input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens"]
+)
+def test_usage_rejects_negative_counts(field: str) -> None:
+    counts = {"input_tokens": 1, "output_tokens": 1, field: -1}
+    with pytest.raises(ValueError, match="token"):
+        Usage(**counts)

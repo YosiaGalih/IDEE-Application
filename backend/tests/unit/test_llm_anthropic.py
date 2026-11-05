@@ -383,3 +383,96 @@ def test_provider_repr_hides_the_key() -> None:
     adapter = AnthropicClaudeProvider("sk-ant-api03-secret-value", http_client=httpx2.AsyncClient())
     assert "secret-value" not in repr(adapter)
     assert adapter.name == "anthropic"
+
+
+def held(stream: ChunkStream, request_id: str = "req_h") -> FakeAnthropic:
+    return FakeAnthropic(
+        lambda _: httpx2.Response(
+            200, headers={"content-type": "text/event-stream", "request-id": request_id}, stream=stream
+        )
+    )
+
+
+def live_tasks() -> set[asyncio.Task[object]]:
+    return {task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()}
+
+
+async def test_outer_cancel_closes_the_stream_and_propagates() -> None:
+    stream = ChunkStream(sse(message_start(), *text_block(0, "first")), hold=asyncio.Event())
+    started = asyncio.Event()
+
+    async def on_delta(_: str) -> None:
+        started.set()
+
+    before = live_tasks()
+    caller = asyncio.create_task(call(held(stream), on_text_delta=on_delta))
+    await asyncio.wait_for(started.wait(), 5)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert stream.closed
+    await asyncio.sleep(0)
+    assert live_tasks() - before == set()  # nothing keeps streaming after the caller is gone
+
+
+async def test_outer_cancel_during_teardown_is_not_swallowed() -> None:
+    gate = asyncio.Event()
+    stream = ChunkStream(sse(message_start(), *text_block(0, "first")), hold=asyncio.Event(), close_gate=gate)
+    token = CancelToken()
+
+    async def on_delta(_: str) -> None:
+        token.cancel()  # the adapter now stops the stream; closing it waits on the gate
+
+    caller = asyncio.create_task(call(held(stream), on_text_delta=on_delta, cancel=token))
+    await asyncio.wait_for(stream.closing.wait(), 5)
+    caller.cancel()  # e.g. worker shutdown while the stream is being closed
+    with pytest.raises(asyncio.CancelledError):
+        await caller  # the caller's own cancel wins over LLMError("cancelled")
+    gate.set()
+    await asyncio.sleep(0)
+
+
+async def test_cancel_set_on_the_last_delta_wins_over_the_finished_reply() -> None:
+    body = sse(message_start(), *text_block(0, "only"), *message_end("end_turn", output_tokens=15))
+    token = CancelToken()
+
+    async def on_delta(_: str) -> None:
+        token.cancel()
+
+    error = await failure(
+        FakeAnthropic(lambda _: stream_response(body)), on_text_delta=on_delta, cancel=token
+    )
+    assert error.kind == "cancelled"
+    assert error.usage == Usage(input_tokens=25, output_tokens=15)  # what was billed, kept for the ledger
+
+
+async def test_unexpected_event_shape_is_malformed() -> None:
+    start = message_start()
+    del start["message"]["usage"]
+    body = sse(start, *text_block(0, "x"), *message_end("end_turn"))
+    error = await failure(FakeAnthropic(lambda _: stream_response(body)))
+    assert error.kind == "malformed"
+
+
+async def test_undecodable_body_is_normalised() -> None:
+    def handler(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream", "content-encoding": "gzip"},
+            content=b"not gzip",
+        )
+
+    error = await failure(FakeAnthropic(handler))
+    # The SDK reports a body it cannot decode as a connection error: retried, within the retry bound.
+    assert error.kind == "transient"
+
+
+async def test_text_handler_failure_propagates_unchanged() -> None:
+    stream = ChunkStream(sse(message_start(), *text_block(0, "first")), hold=asyncio.Event())
+
+    async def on_delta(_: str) -> None:
+        raise RuntimeError("event bus down")
+
+    with pytest.raises(RuntimeError, match="event bus down"):
+        await asyncio.wait_for(call(held(stream), on_text_delta=on_delta), 5)
+    assert stream.closed

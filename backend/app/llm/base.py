@@ -66,6 +66,11 @@ class Usage:
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
 
+    def __post_init__(self) -> None:
+        counts = (self.input_tokens, self.output_tokens, self.cache_creation_tokens, self.cache_read_tokens)
+        if any(count < 0 for count in counts):
+            raise ValueError("token counts cannot be negative")
+
 
 @dataclass(frozen=True, slots=True)
 class LLMRequest:

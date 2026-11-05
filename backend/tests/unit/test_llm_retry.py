@@ -229,3 +229,99 @@ async def test_duration_is_measured_per_attempt() -> None:
     provider, recorder = FakeProvider([LLMError("overloaded"), ok()]), Recorder()
     await run(provider, recorder)
     assert all(r.duration_ms >= 0 for r in recorder.records)
+
+
+class StreamingProvider(FakeProvider):
+    """Sends ``deltas[i]`` through ``on_text_delta`` before playing back outcome i."""
+
+    def __init__(self, outcomes: Sequence[LLMResponse | LLMError], deltas: Sequence[Sequence[str]]) -> None:
+        super().__init__(outcomes)
+        self.deltas = deltas
+
+    async def create_message(self, req, *, on_text_delta=None, cancel=None):  # type: ignore[no-untyped-def]
+        for text in self.deltas[self.calls]:
+            if on_text_delta is not None:
+                await on_text_delta(text)
+        return await super().create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+
+async def test_outer_cancel_is_recorded_and_propagates() -> None:
+    entered = asyncio.Event()
+
+    class Hanging(FakeProvider):
+        async def create_message(self, req, *, on_text_delta=None, cancel=None):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    records: list[AttemptRecord] = []
+
+    async def on_attempt(record: AttemptRecord) -> None:
+        records.append(record)
+
+    caller = asyncio.create_task(create_with_retry(Hanging([]), REQ, on_attempt=on_attempt))
+    await asyncio.wait_for(entered.wait(), 5)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    # The request reached the provider, so the ledger sees it; its cost is unknown, never zero.
+    assert [(r.status, r.error_kind, r.usage) for r in records] == [("cancelled", "cancelled", None)]
+
+
+async def test_text_sent_then_failure_is_not_retried_without_a_restart_handler() -> None:
+    provider = StreamingProvider([LLMError("overloaded"), ok()], deltas=[["Hel"], ["Hello"]])
+    seen: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        seen.append(text)
+
+    recorder = Recorder()
+    with pytest.raises(LLMError) as raised:
+        await run(provider, recorder, on_text_delta=on_delta)
+    assert raised.value.kind == "overloaded"
+    assert provider.calls == 1
+    assert seen == ["Hel"]  # never "HelHello"
+
+
+async def test_text_sent_then_failure_restarts_through_the_handler() -> None:
+    provider = StreamingProvider([LLMError("overloaded"), ok()], deltas=[["Hel"], ["Hello"]])
+    events: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        events.append(text)
+
+    async def on_restart(attempt: int) -> None:
+        events.append(f"<restart {attempt}>")
+
+    await run(provider, Recorder(), on_text_delta=on_delta, on_restart=on_restart)
+    assert events == ["Hel", "<restart 2>", "Hello"]
+
+
+async def test_failure_before_any_text_retries_without_a_restart() -> None:
+    provider = StreamingProvider([LLMError("overloaded"), ok()], deltas=[[], ["Hello"]])
+    restarts: list[int] = []
+
+    async def on_restart(attempt: int) -> None:
+        restarts.append(attempt)
+
+    async def on_delta(_: str) -> None:
+        return None
+
+    await run(provider, Recorder(), on_text_delta=on_delta, on_restart=on_restart)
+    assert provider.calls == 2
+    assert restarts == []
+
+
+@pytest.mark.parametrize("with_cancel", [False, True])
+async def test_a_failing_sleep_is_not_mistaken_for_a_pause(with_cancel: bool) -> None:
+    provider = FakeProvider([LLMError("overloaded"), ok()])
+
+    async def broken_sleep(_: float) -> None:
+        raise RuntimeError("clock broke")
+
+    with pytest.raises(RuntimeError, match="clock broke"):
+        await create_with_retry(
+            provider, REQ, sleep=broken_sleep, rng=lambda: 0.5, cancel=CancelToken() if with_cancel else None
+        )
+    assert provider.calls == 1

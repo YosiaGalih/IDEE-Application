@@ -95,14 +95,23 @@ def error_response(
 
 
 class ChunkStream(httpx2.AsyncByteStream):
-    """Yields ``chunks``, then either raises ``fail`` or waits on ``hold`` (never set: a stalled stream)."""
+    """Yields ``chunks``, then either raises ``fail`` or waits on ``hold`` (never set: a stalled stream).
+
+    ``close_gate`` makes closing wait until it is set, to hold a teardown in progress.
+    """
 
     def __init__(
-        self, *chunks: bytes, fail: Exception | None = None, hold: asyncio.Event | None = None
+        self,
+        *chunks: bytes,
+        fail: Exception | None = None,
+        hold: asyncio.Event | None = None,
+        close_gate: asyncio.Event | None = None,
     ) -> None:
         self.chunks = chunks
         self.fail = fail
         self.hold = hold
+        self.close_gate = close_gate
+        self.closing = asyncio.Event()
         self.closed = False
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -114,6 +123,9 @@ class ChunkStream(httpx2.AsyncByteStream):
             await self.hold.wait()
 
     async def aclose(self) -> None:
+        self.closing.set()
+        if self.close_gate is not None:
+            await self.close_gate.wait()
         self.closed = True
 
 

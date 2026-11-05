@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -21,7 +21,6 @@ from app.llm.base import Usage
 CostStatus = Literal["estimated", "partial", "unavailable"]
 
 _MILLION = Decimal(1_000_000)
-_SIX_PLACES = Decimal("0.000001")
 
 
 class PricingError(Exception):
@@ -35,7 +34,8 @@ def _exact_number(value: object) -> object:
     return value
 
 
-Price = Annotated[Decimal, BeforeValidator(_exact_number), Field(ge=0, allow_inf_nan=False)]
+# Zero is refused too: a "0" typo would price every call at nothing while looking like a real price.
+Price = Annotated[Decimal, BeforeValidator(_exact_number), Field(gt=0, allow_inf_nan=False)]
 
 
 class _Prices(BaseModel):
@@ -74,6 +74,13 @@ class ModelPrice(_Prices):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class CostEstimate:
+    estimated_cost: Decimal | None
+    cost_status: CostStatus
+    pricing_version: str
+
+
 class PricingTable(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -83,20 +90,16 @@ class PricingTable(BaseModel):
     verify_before_production: bool
     models: Mapping[str, ModelPrice]
 
-    def estimate(self, model: str, usage: Usage | None, *, partial: bool = False) -> CostEstimate:
+    def estimate(self, model: str, usage: Usage | None, *, partial: bool) -> CostEstimate:
+        """``partial`` must be stated: True for an attempt that failed or was cancelled after it started,
+        whose usage is a lower bound (output seen so far)."""
         price = self.models.get(model)
         if price is None or usage is None:
             return CostEstimate(None, "unavailable", self.version)
-        total = price.for_usage(usage).cost(usage)
-        cost = total.quantize(_SIX_PLACES, rounding=ROUND_HALF_EVEN)  # numeric(12,6) in the ledger
+        # Exact (prices are decimals, counts integers): rounding a tiny call to 0.000000 would read as a price
+        # of zero. The ledger chooses its stored precision (WP-3.1f).
+        cost = price.for_usage(usage).cost(usage)
         return CostEstimate(cost, "partial" if partial else "estimated", self.version)
-
-
-@dataclass(frozen=True, slots=True)
-class CostEstimate:
-    estimated_cost: Decimal | None
-    cost_status: CostStatus
-    pricing_version: str
 
 
 def load_pricing(path: Path) -> PricingTable:

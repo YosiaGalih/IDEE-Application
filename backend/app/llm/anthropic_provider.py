@@ -9,7 +9,6 @@ never chained: their messages and request objects can hold the prompt or echo th
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import math
 import time
@@ -94,6 +93,24 @@ class _Progress:
         return LLMError(kind, usage=self.usage, **details)
 
 
+class _HandlerFailed(Exception):
+    """Carries an exception raised by the caller's ``on_text_delta`` past the provider-error mapping."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(type(cause).__name__)
+        self.cause = cause
+
+
+async def _stop(work: asyncio.Future[Any]) -> None:
+    """Cancel the streaming task and wait until it has closed the HTTP stream. Its own outcome is already
+    reported by the caller, so it is retrieved here (no "exception was never retrieved") but not raised.
+    A cancel of the caller during this wait propagates."""
+    work.cancel()
+    await asyncio.wait({work})
+    if not work.cancelled():
+        work.exception()
+
+
 class AnthropicClaudeProvider:
     name = "anthropic"
 
@@ -119,21 +136,27 @@ class AnthropicClaudeProvider:
         started = time.monotonic()
         progress = _Progress()
         work = asyncio.ensure_future(self._attempt(req, progress, on_text_delta))
-        cancelled = asyncio.ensure_future(cancel.wait()) if cancel is not None else None
+        watcher = asyncio.ensure_future(cancel.wait()) if cancel is not None else None
         try:
             done, _ = await asyncio.wait(
-                {work} if cancelled is None else {work, cancelled},
+                {work} if watcher is None else {work, watcher},
                 timeout=req.timeout_s,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+        except BaseException:
+            # The caller itself was cancelled (shutdown, lease lost): close the stream, then let it propagate.
+            await _stop(work)
+            raise
         finally:
-            if cancelled is not None:
-                cancelled.cancel()
+            if watcher is not None:
+                watcher.cancel()
+        if cancel is not None and cancel.cancelled:
+            # Cancel wins even over a reply that finished at the same moment; its usage is still reported.
+            await _stop(work)
+            raise progress.error("cancelled")
         if work not in done:
-            work.cancel()
-            with contextlib.suppress(BaseException):
-                await work  # let the stream close before reporting
-            raise progress.error("cancelled" if cancelled is not None and cancelled in done else "timeout")
+            await _stop(work)
+            raise progress.error("timeout")
         content, stop_reason = work.result()
         return LLMResponse(
             content=content,
@@ -159,7 +182,16 @@ class AnthropicClaudeProvider:
             raise progress.error("timeout") from None
         except (anthropic.APIConnectionError, httpx2.TransportError):
             raise progress.error("transient") from None
-        except (json.JSONDecodeError, anthropic.APIResponseValidationError):
+        except _HandlerFailed as failed:
+            raise failed.cause from None  # the caller's own callback broke: not a provider failure
+        except (
+            ValueError,  # JSON and validation errors from the SDK's event parsing
+            AttributeError,  # an event without the fields the API documents
+            KeyError,
+            TypeError,
+            httpx2.HTTPError,  # e.g. an undecodable body
+            anthropic.AnthropicError,
+        ):
             raise progress.error("malformed") from None
         return _finish(progress)
 
@@ -241,7 +273,10 @@ async def _apply(event: Any, progress: _Progress, on_text_delta: TextDeltaHandle
         if target is not None and target.kind == "text" and delta.type == "text_delta":
             target.parts.append(delta.text)
             if on_text_delta is not None:
-                await on_text_delta(delta.text)
+                try:
+                    await on_text_delta(delta.text)
+                except Exception as exc:
+                    raise _HandlerFailed(exc) from exc
         elif target is not None and target.kind == "tool_use" and delta.type == "input_json_delta":
             target.parts.append(delta.partial_json)
         else:

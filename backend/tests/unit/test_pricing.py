@@ -49,24 +49,31 @@ def test_estimate_known_model(table: PricingTable) -> None:
         cache_creation_tokens=1_000_000,
         cache_read_tokens=1_000_000,
     )
-    estimate = table.estimate("claude-test-model", usage)
-    assert estimate.estimated_cost == Decimal("22.050000")
+    estimate = table.estimate("claude-test-model", usage, partial=False)
+    assert estimate.estimated_cost == Decimal("22.05")
     assert estimate.cost_status == "estimated"
     assert estimate.pricing_version == "2026-11-05"
 
 
-def test_estimate_rounds_to_six_places(table: PricingTable) -> None:
-    estimate = table.estimate("claude-test-model", Usage(input_tokens=1, output_tokens=0))
+def test_estimate_is_exact(table: PricingTable) -> None:
+    estimate = table.estimate("claude-test-model", Usage(input_tokens=1, output_tokens=0), partial=False)
     assert estimate.estimated_cost == Decimal("0.000003")
-    # 0.3 millionths of a dollar rounds to six places as a decimal, never to a float artefact.
-    tiny = table.estimate("claude-test-model", Usage(input_tokens=0, output_tokens=0, cache_read_tokens=1))
-    assert tiny.estimated_cost == Decimal("0.000000")
+    # A tiny call is never rounded to a zero that looks like a price; the ledger decides its own precision.
+    tiny = table.estimate(
+        "claude-test-model", Usage(input_tokens=0, output_tokens=0, cache_read_tokens=1), partial=False
+    )
+    assert tiny.estimated_cost == Decimal("0.0000003")
+
+
+def test_partial_must_be_stated(table: PricingTable) -> None:
+    with pytest.raises(TypeError):
+        table.estimate("claude-test-model", Usage(input_tokens=1, output_tokens=0))  # type: ignore[call-arg]
 
 
 def test_prompt_at_threshold_uses_base_prices(table: PricingTable) -> None:
     usage = Usage(input_tokens=60_000, output_tokens=1_000_000, cache_read_tokens=40_000)  # prompt = 100_000
-    estimate = table.estimate("claude-tiered-model", usage)
-    assert estimate.estimated_cost == Decimal("0.506400")  # 0.006 + 0.5 + 0.0004
+    estimate = table.estimate("claude-tiered-model", usage, partial=False)
+    assert estimate.estimated_cost == Decimal("0.5064")  # 0.006 + 0.5 + 0.0004
 
 
 def test_long_prompt_counts_cache_tokens_and_uses_tier_prices(table: PricingTable) -> None:
@@ -74,12 +81,12 @@ def test_long_prompt_counts_cache_tokens_and_uses_tier_prices(table: PricingTabl
     usage = Usage(
         input_tokens=60_000, output_tokens=1_000_000, cache_creation_tokens=1, cache_read_tokens=40_000
     )
-    estimate = table.estimate("claude-tiered-model", usage)
-    assert estimate.estimated_cost == Decimal("2.532001")  # 0.03 + 2.5 + 0.000000625 + 0.002, half-even
+    estimate = table.estimate("claude-tiered-model", usage, partial=False)
+    assert estimate.estimated_cost == Decimal("2.532000625")  # 0.03 + 2.5 + 0.000000625 + 0.002
 
 
 def test_unknown_model_is_unavailable_not_zero(table: PricingTable) -> None:
-    estimate = table.estimate("claude-unknown", Usage(input_tokens=10, output_tokens=10))
+    estimate = table.estimate("claude-unknown", Usage(input_tokens=10, output_tokens=10), partial=False)
     assert estimate.estimated_cost is None
     assert estimate.cost_status == "unavailable"
     assert estimate.pricing_version == "2026-11-05"
@@ -95,7 +102,7 @@ def test_no_usage_is_unavailable(table: PricingTable, partial: bool) -> None:
 def test_partial_usage_is_marked_partial(table: PricingTable) -> None:
     usage = Usage(input_tokens=1_000_000, output_tokens=0)
     estimate = table.estimate("claude-test-model", usage, partial=True)
-    assert estimate.estimated_cost == Decimal("3.000000")
+    assert estimate.estimated_cost == Decimal("3")
     assert estimate.cost_status == "partial"
 
 
@@ -114,6 +121,7 @@ def test_partial_usage_is_marked_partial(table: PricingTable) -> None:
         (TABLE.replace("currency: USD", "currency: EUR"), "currency other than USD"),
         (TABLE.replace('    cache_read: "0.30"\n', ""), "missing price"),
         (TABLE.replace("above_tokens: 100000", "above_tokens: 0"), "tier threshold not positive"),
+        (TABLE.replace('input: "3"', 'input: "0"'), "zero price (a typo that would look like a real price)"),
     ],
 )
 def test_load_rejects(tmp_path: Path, content: str | None, reason: str) -> None:

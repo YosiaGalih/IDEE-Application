@@ -1,9 +1,14 @@
 """Bounded retry around any ``LLMProvider`` (ARCHITECTURE §6.1, PRD §7.3.3, FR-056).
 
-Every attempt that reaches the provider is reported through ``on_attempt``, including the failed ones, so the
-usage ledger can record each request with its own id, tokens and duration (FR-133). Only transient kinds are
+Every attempt that reaches the provider is reported through ``on_attempt``, including the failed and the
+cancelled ones, so the usage ledger can record each request with its own id, tokens and duration (FR-133). A
+failure of ``on_attempt`` itself propagates: losing a ledger entry is not silent. Only transient kinds are
 retried; ``retry-after`` is honoured up to a ceiling, past which the error is passed on instead of holding a
 worker (and its task lease) asleep.
+
+Text already streamed to ``on_text_delta`` cannot be taken back. After such text, an attempt is retried only
+when ``on_restart(attempt)`` is given, so the consumer can discard the partial text first; without it the
+error is passed on rather than streaming the answer twice.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ class AttemptRecord:
 
 
 AttemptHandler = Callable[[AttemptRecord], Awaitable[None]]
+RestartHandler = Callable[[int], Awaitable[None]]
 
 
 async def create_with_retry(
@@ -49,28 +55,47 @@ async def create_with_retry(
     *,
     policy: RetryPolicy = RetryPolicy(),  # noqa: B008 - frozen, so a shared default is safe
     on_text_delta: TextDeltaHandler | None = None,
+    on_restart: RestartHandler | None = None,
     cancel: CancelToken | None = None,
     on_attempt: AttemptHandler | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: Callable[[], float] = random.random,
 ) -> LLMResponse:
     attempt = 0
+    streamed = False  # text of a failed attempt already reached the consumer
     while True:
         if cancel is not None and cancel.cancelled:
             raise LLMError("cancelled")
         attempt += 1
+        if streamed and on_restart is not None:
+            await on_restart(attempt)
+        streamed = False
+
+        async def forward(text: str) -> None:
+            nonlocal streamed
+            streamed = True
+            assert on_text_delta is not None
+            await on_text_delta(text)
+
         started = time.monotonic()
         try:
-            response = await provider.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+            response = await provider.create_message(
+                req, on_text_delta=forward if on_text_delta is not None else None, cancel=cancel
+            )
         except LLMError as error:
             await _report(on_attempt, provider, req, attempt, started, error=error)
             delay = _delay(policy, attempt, error, rng)
-            if delay is None:
+            if delay is None or (streamed and on_restart is None):
                 raise
             await _pause(delay, sleep, cancel)
             continue
+        except asyncio.CancelledError:
+            # The caller was cancelled mid-attempt: the request still reached the provider. Its usage is not
+            # known here, so the record says so (None, priced "unavailable"), never zero.
+            await _report(on_attempt, provider, req, attempt, started, cancelled=True)
+            raise
         except Exception:
-            await _report(on_attempt, provider, req, attempt, started, error=None, unexpected=True)
+            await _report(on_attempt, provider, req, attempt, started, unexpected=True)
             raise
         await _report(on_attempt, provider, req, attempt, started, response=response)
         return response
@@ -97,8 +122,12 @@ async def _pause(delay: float, sleep: Callable[[float], Awaitable[None]], cancel
     finally:
         for pending in (sleeper, waiter):
             pending.cancel()
+        await asyncio.wait({sleeper, waiter})
     if cancel.cancelled:
         raise LLMError("cancelled")
+    failure = None if sleeper.cancelled() else sleeper.exception()
+    if failure is not None:
+        raise failure  # a broken sleep is not a pause
 
 
 async def _report(
@@ -110,6 +139,7 @@ async def _report(
     *,
     response: LLMResponse | None = None,
     error: LLMError | None = None,
+    cancelled: bool = False,
     unexpected: bool = False,
 ) -> None:
     if on_attempt is None:
@@ -123,6 +153,10 @@ async def _report(
         status: Literal["error", "cancelled"] = "cancelled" if error.kind == "cancelled" else "error"
         record = AttemptRecord(
             provider.name, req.model, attempt, error.request_id, error.usage, duration_ms, status, error.kind
+        )
+    elif cancelled:
+        record = AttemptRecord(
+            provider.name, req.model, attempt, None, None, duration_ms, "cancelled", "cancelled"
         )
     else:
         assert unexpected
