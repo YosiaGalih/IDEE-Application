@@ -36,6 +36,8 @@ class Project(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "projects"
     __table_args__ = (
         CheckConstraint(in_values("status", PROJECT_STATUSES), name="status"),
+        # The purge clock (7 days, ADR-005) exists exactly while the project is deleted.
+        CheckConstraint("(status = 'deleted') = (deleted_at IS NOT NULL)", name="deleted_at"),
         UniqueConstraint("owner_id", "slug", name="uq_projects_owner_id_slug"),
     )
 
@@ -49,6 +51,7 @@ class Project(UUIDPrimaryKey, Timestamps, Base):
     workspace_ref: Mapped[str] = mapped_column(String(255), nullable=False)
     default_branch: Mapped[str] = mapped_column(String(100), nullable=False, server_default=text("'main'"))
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     settings: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
