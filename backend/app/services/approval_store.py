@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import AuditWriter
@@ -34,6 +34,9 @@ EXPIRY: Mapping[str, timedelta] = MappingProxyType(
     }
 )
 OPEN = ("pending", "approved")
+PROJECT_DELETE = "project_delete"
+# The action types that can be requested today: each has a handler (approval_registry). 3.1d adds tool_r3.
+REQUESTABLE = frozenset({PROJECT_DELETE})
 
 
 def _now(now: datetime | None) -> datetime:
@@ -82,7 +85,7 @@ def _actor(requested_by: str) -> tuple[str, str]:
     return ("user" if kind == "user" else "system"), name
 
 
-async def _audit(
+async def audit_event(
     session: AsyncSession,
     audit: AuditWriter,
     approval: Approval,
@@ -129,8 +132,8 @@ async def create(
 ) -> Approval:
     """A ``pending`` approval bound to the hash of exactly this action, expiring per §11.1. ``audit_actor``:
     who caused this request when it is not the requester (a renewal)."""
-    if action_type not in EXPIRY:
-        raise ValueError(f"{action_type} cannot be requested as an approval")
+    if action_type not in EXPIRY or action_type not in REQUESTABLE:
+        raise ValueError(f"{action_type} cannot be requested as an approval (no handler)")
     at = _now(now)
     approval = Approval(
         project_id=project_id,
@@ -145,7 +148,7 @@ async def create(
     )
     session.add(approval)
     await session.flush()
-    await _audit(
+    await audit_event(
         session,
         audit,
         approval,
@@ -196,7 +199,7 @@ async def renew_open(
     old.status = "superseded"
     old.handler_status = "not_required"  # nothing was decided, so nothing has to run
     await session.flush()  # before the insert: one open approval per action is enforced by an index
-    await _audit(session, audit, old, "approval.superseded", actor=actor_id, ip=actor_ip)
+    await audit_event(session, audit, old, "approval.superseded", actor=actor_id, ip=actor_ip)
     return await create(
         session,
         audit,
@@ -226,7 +229,8 @@ async def consume(
             Approval.id == approval_id,
             Approval.status == "approved",
             Approval.payload_hash == payload_hash,
-            Approval.expires_at > at,
+            # NULL: never expires (ARCHITECTURE §10)
+            or_(Approval.expires_at.is_(None), Approval.expires_at > at),
         )
         .values(status="consumed", consumed_at=at)
         .returning(Approval.id)
@@ -252,7 +256,7 @@ async def decide(
     approval.decided_by, approval.decided_at, approval.decision_note = user_id, at, note
     approval.handler_status, approval.updated_at = "pending", at
     await session.flush()
-    await _audit(
+    await audit_event(
         session,
         audit,
         approval,
@@ -271,7 +275,7 @@ async def expire(
     approval.status = "expired"
     approval.handler_status, approval.updated_at = "pending", _now(now)
     await session.flush()
-    await _audit(session, audit, approval, "approval.expired", actor=actor)
+    await audit_event(session, audit, approval, "approval.expired", actor=actor)
 
 
 async def expire_due(

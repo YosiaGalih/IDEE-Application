@@ -26,13 +26,15 @@ from app.models.approvals import Approval
 from app.models.identity import UserRole
 from app.models.projects import Project
 from app.services import approval_store
+from app.services.approval_handlers import MAX_ATTEMPTS
 from app.services.project_tasks import cancel_open_tasks
-from app.services.projects import Actor, ProjectEnv, ProjectView, audit_project, authorize, committed_view
+from app.services.projects import Actor, ProjectEnv, ProjectView, audit_project, authorize, commit_and_view
 from app.workflow.states import Actor as WorkflowActor
 
 logger = get_logger(__name__)
 
-ACTION = "project_delete"
+ACTION = approval_store.PROJECT_DELETE
+_HANDLER_ACTOR = "approval_handlers"
 DELETABLE = ("active", "archived")
 PURGE_AFTER = timedelta(days=7)
 SUMMARY = "Delete project (workspace kept 7 days, then purged)"
@@ -67,7 +69,7 @@ async def request_delete(
             approval = await approval_store.find_open(session, project_id=project.id, action_type=ACTION)
             if approval is None:  # the last request expired or was rejected; its handler has not restored yet
                 raise _invalid(project)
-            if approval.status == "approved" and approval.handler_status == "failed":
+            if approval.status == "approved" and approval.handler_attempts >= MAX_ATTEMPTS:
                 # Approved, but the deletion keeps failing: "accepted" would promise what is not happening.
                 raise AppError(
                     "INVALID_TRANSITION",
@@ -101,7 +103,7 @@ async def request_delete(
             )
         else:
             raise _invalid(project)
-        view = await committed_view(env, session, project, permissions)
+        view = await commit_and_view(env, session, project, permissions)
     return approval, view
 
 
@@ -132,7 +134,7 @@ class ProjectDeleteHandler:
         )
         return None if project is None or approval is None else (approval, project)
 
-    async def _write(
+    async def _audit_event(
         self, session: AsyncSession, approval: Approval, action: str, metadata: dict[str, object]
     ) -> None:
         await self._audit.write(
@@ -157,7 +159,7 @@ class ProjectDeleteHandler:
         previous = approval.payload.get("previous_status")
         fallback = previous not in DELETABLE
         project.status = "archived" if fallback else str(previous)
-        await self._write(
+        await self._audit_event(
             session, approval, action, {"restored_status": project.status, "fallback": fallback}
         )
 
@@ -172,10 +174,10 @@ class ProjectDeleteHandler:
             if project.status != "deleting_pending_approval":
                 # Nothing should get here; a silent return would be recorded as success (silent M2).
                 raise RuntimeError(f"project is {project.status}, not awaiting deletion")
-            if approval.expires_at is None or approval.expires_at <= now:
+            if approval.expires_at is not None and approval.expires_at <= now:
                 # Approved, but its time ran out before it could be used: the request lapses.
                 await approval_store.expire(
-                    session, self._audit, approval, actor="system:approval_handlers", now=now
+                    session, self._audit, approval, actor=f"system:{_HANDLER_ACTOR}", now=now
                 )
                 await self._restore(session, approval, project, "project.delete_expired")
                 await session.commit()
@@ -201,8 +203,10 @@ class ProjectDeleteHandler:
                 audit=self._audit,
             )
             project.status, project.deleted_at = "deleted", now
-            await self._write(session, approval, "approval.consumed", {"payload_hash": approval.payload_hash})
-            await self._write(session, approval, "project.deleted", {"cancelled_tasks": cancelled})
+            await approval_store.audit_event(
+                session, self._audit, approval, "approval.consumed", actor=f"system:{_HANDLER_ACTOR}"
+            )
+            await self._audit_event(session, approval, "project.deleted", {"cancelled_tasks": cancelled})
             await session.commit()
 
     async def rejected(self, approval_id: uuid.UUID, *, now: datetime) -> None:

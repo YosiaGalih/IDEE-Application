@@ -179,3 +179,30 @@ async def test_expire_due_only_past_pending(session: AsyncSession) -> None:
     assert (gone.status, gone.handler_status) == ("expired", "pending")
     assert (await actions(session, past)).count("approval.expired") == 1
     assert "approval.expired" not in await actions(session, decided)
+
+
+async def test_only_action_types_with_a_handler_can_be_requested(session: AsyncSession) -> None:
+    project = await make_project(session)
+    with pytest.raises(ValueError, match="no handler"):
+        await store.create(
+            session,
+            AUDIT,
+            project_id=project.id,
+            task_id=None,
+            action_type="tool_r3",
+            payload={},
+            summary="x",
+            risk_level=3,
+            requested_by="system:orchestrator",
+            now=NOW,
+        )
+
+
+async def test_an_approval_without_expiry_never_expires(session: AsyncSession) -> None:
+    # ARCHITECTURE §10: expires_at IS NULL OR expires_at > now() (v1 always sets one; NULL stays consistent).
+    project = await make_project(session)
+    approval = await new(session, project)
+    approval.status, approval.expires_at = "approved", None
+    await session.flush()
+    later = NOW + timedelta(days=365)
+    assert await store.consume(session, approval.id, payload_hash=approval.payload_hash, now=later) is True

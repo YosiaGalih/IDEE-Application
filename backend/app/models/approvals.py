@@ -43,12 +43,14 @@ class Approval(UUIDPrimaryKey, Timestamps, Base):
         CheckConstraint("risk_level BETWEEN 0 AND 4", name="risk_level"),
         CheckConstraint(f"char_length(decision_note) <= {NOTE_MAX}", name="decision_note"),
         Index("ix_approvals_project_id_status", "project_id", "status"),
-        # ADR-024's sweep index, widened to expired: an expired delete must still restore its project.
+        # ADR-024's sweep index, widened to expired (an expired delete must still restore its project) and
+        # consumed (a handler that died between consuming and committing is run again).
         Index(
             "ix_approvals_handler_due",
             "handler_status",
             postgresql_where=text(
-                "handler_status IN ('pending', 'failed') AND status IN ('approved', 'rejected', 'expired')"
+                "handler_status IN ('pending', 'failed') "
+                "AND status IN ('approved', 'consumed', 'rejected', 'expired')"
             ),
         ),
         # Two concurrent DELETEs of one project open one approval, never two.

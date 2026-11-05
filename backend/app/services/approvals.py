@@ -20,12 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import AppError
 from app.models.approvals import Approval
 from app.models.projects import Project
-from app.services import approval_handlers, approval_store
+from app.services import approval_handlers, approval_store, project_delete
 from app.services.approval_handlers import Handlers
 from app.services.projects import Actor, ProjectEnv, not_found, permissions_for, visible_projects_filter
 
 # The permission an action needs on top of approval:decide (API §11.1, ADR-034).
-DECIDE_PERMISSION: Mapping[str, str] = MappingProxyType({"project_delete": "project:delete"})
+DECIDE_PERMISSION: Mapping[str, str] = MappingProxyType({project_delete.ACTION: "project:delete"})
 ListStatus = Literal["pending", "approved", "rejected", "expired", "consumed", "superseded", "all"]
 Decision = Literal["approve", "reject"]
 
@@ -40,14 +40,17 @@ def _now(now: datetime | None) -> datetime:
     return now if now is not None else datetime.now(UTC)
 
 
-def can_decide(approval: Approval, permissions: frozenset[str], at: datetime) -> bool:
+def may_decide(approval: Approval, permissions: frozenset[str]) -> bool:
+    """``approval:decide`` and the action's own permission on the approval's project (ADR-034)."""
     needed = DECIDE_PERMISSION.get(approval.action_type)
+    return "approval:decide" in permissions and needed is not None and needed in permissions
+
+
+def can_decide(approval: Approval, permissions: frozenset[str], at: datetime) -> bool:
     return (
         approval.status == "pending"
         and (approval.expires_at is None or approval.expires_at > at)
-        and "approval:decide" in permissions
-        and needed is not None
-        and needed in permissions
+        and may_decide(approval, permissions)
     )
 
 
@@ -148,8 +151,7 @@ async def decide(
     async with env.sessions() as session:
         approval, permissions = await _visible(session, actor, approval_id, lock=True)
         at = _now(now)  # read after the lock wait: an approval is not decided past its time
-        needed = DECIDE_PERMISSION.get(approval.action_type)
-        if "approval:decide" not in permissions or needed is None or needed not in permissions:
+        if not may_decide(approval, permissions):
             raise AppError("FORBIDDEN", "Not allowed", http_status=403)
         if approval.status != "pending":
             raise _not_pending(approval.status)

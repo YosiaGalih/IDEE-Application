@@ -7,8 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
 from app.services.approval_handlers import Handlers
-from app.services.project_delete import ProjectDeleteHandler
+from app.services.project_delete import ACTION, ProjectDeleteHandler
 
 
 def default_handlers(*, sessions: async_sessionmaker[AsyncSession], audit: AuditWriter) -> Handlers:
-    return {"project_delete": ProjectDeleteHandler(sessions=sessions, audit=audit)}
+    return {ACTION: ProjectDeleteHandler(sessions=sessions, audit=audit)}

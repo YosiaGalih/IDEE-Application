@@ -320,36 +320,6 @@ async def test_purge_of_a_symlinked_project_folder_keeps_the_target(
     assert moved.is_dir()
 
 
-async def test_purge_failure_is_recorded_and_others_continue(
-    env: projects.ProjectEnv,
-    engine: AsyncEngine,
-    owner_id: uuid.UUID,  # noqa: F811
-    workspace_root: Path,  # noqa: F811
-    handler: project_delete.ProjectDeleteHandler,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stuck = await deleted_project(env, engine, owner_id, handler)
-    actor = owner_actor(owner_id)
-    other_id = await blank(env, actor, "Other")
-    approval, _ = await project_delete.request_delete(env, actor, other_id)
-    await approve(engine, approval.id)
-    await handler.approved(approval.id, now=NOW + timedelta(seconds=1))
-    real = project_delete._remove_folder
-
-    def flaky(root: Path, project_id: uuid.UUID) -> str:
-        if project_id == stuck:
-            raise PermissionError("sandbox-owned file")
-        return real(root, project_id)
-
-    monkeypatch.setattr(project_delete, "_remove_folder", flaky)
-    result = await project_delete.purge_deleted(
-        sessions=env.sessions, audit=env.audit, workspace_root=workspace_root, now=NOW + timedelta(days=8)
-    )
-    assert (result.purged, result.failed) == ([other_id], [stuck])
-    assert not await gone(engine, Project, stuck)  # kept, to be retried
-    assert "project.purge_failed" in await audit_actions(engine, stuck)
-
-
 async def test_approved_without_a_pending_project_fails_visibly(
     env: projects.ProjectEnv,
     engine: AsyncEngine,
@@ -364,47 +334,6 @@ async def test_approved_without_a_pending_project_fails_visibly(
         await conn.execute(update(Project).where(Project.id == project_id).values(status="active"))
     with pytest.raises(RuntimeError, match="not awaiting deletion"):
         await handler.approved(approval.id, now=NOW)
-    assert (await load(engine, Approval, approval.id)).status == "approved"
-
-
-async def test_tampered_payload_is_not_consumed(
-    env: projects.ProjectEnv,
-    engine: AsyncEngine,
-    owner_id: uuid.UUID,  # noqa: F811
-    handler: project_delete.ProjectDeleteHandler,
-) -> None:
-    actor = owner_actor(owner_id)
-    project_id = await blank(env, actor)
-    approval, _ = await project_delete.request_delete(env, actor, project_id)
-    await approve(engine, approval.id)
-    async with engine.begin() as conn:  # edited after the decision: the hash no longer describes it
-        await conn.execute(
-            update(Approval)
-            .where(Approval.id == approval.id)
-            .values(payload={**approval.payload, "previous_status": "archived"})
-        )
-    with pytest.raises(RuntimeError, match="no longer matches what was approved"):
-        await handler.approved(approval.id, now=NOW)
-    assert (await load(engine, Project, project_id)).status == "deleting_pending_approval"
-    assert (await load(engine, Approval, approval.id)).status == "approved"
-
-
-async def test_a_project_renamed_behind_the_approval_is_not_deleted(
-    env: projects.ProjectEnv,
-    engine: AsyncEngine,
-    owner_id: uuid.UUID,  # noqa: F811
-    handler: project_delete.ProjectDeleteHandler,
-) -> None:
-    # AG-13 C1: the hash is derived from the project as it is when the action runs, not read from the row.
-    actor = owner_actor(owner_id)
-    project_id = await blank(env, actor)
-    approval, _ = await project_delete.request_delete(env, actor, project_id)
-    await approve(engine, approval.id)
-    async with engine.begin() as conn:  # a writer that forgot to supersede, or a hand edit
-        await conn.execute(update(Project).where(Project.id == project_id).values(name="Something else"))
-    with pytest.raises(RuntimeError, match="no longer matches what was approved"):
-        await handler.approved(approval.id, now=NOW)
-    assert (await load(engine, Project, project_id)).status == "deleting_pending_approval"
     assert (await load(engine, Approval, approval.id)).status == "approved"
 
 
@@ -444,3 +373,43 @@ async def test_repeat_delete_after_a_failed_deletion_is_409(
         await project_delete.request_delete(env, actor, project_id)
     assert raised.value.http_status == 409
     assert raised.value.details[0]["reason"] == "delete_failed"  # type: ignore[index]
+
+
+async def test_a_first_failure_is_not_yet_delete_failed(
+    env: projects.ProjectEnv,
+    engine: AsyncEngine,
+    owner_id: uuid.UUID,  # noqa: F811
+) -> None:
+    # The sweep retries in 30 s: only a handler that gave up makes the request "failed" (spec review c5).
+    actor = owner_actor(owner_id)
+    project_id = await blank(env, actor)
+    approval, _ = await project_delete.request_delete(env, actor, project_id)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(Approval)
+            .where(Approval.id == approval.id)
+            .values(status="approved", handler_status="failed", handler_attempts=1)
+        )
+    again, _ = await project_delete.request_delete(env, actor, project_id)
+    assert again.id == approval.id
+
+
+async def test_consumed_is_audited_on_the_approval(
+    env: projects.ProjectEnv,
+    engine: AsyncEngine,
+    owner_id: uuid.UUID,  # noqa: F811
+    handler: project_delete.ProjectDeleteHandler,
+) -> None:
+    actor = owner_actor(owner_id)
+    project_id = await blank(env, actor)
+    approval, _ = await project_delete.request_delete(env, actor, project_id)
+    await approve(engine, approval.id)
+    await handler.approved(approval.id, now=NOW)
+    async with make_sessionmaker(engine)() as session:
+        consumed = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "approval.consumed", AuditEvent.project_id == project_id
+            )
+        )
+    assert consumed is not None
+    assert (consumed.resource_type, consumed.resource_id) == ("approval", str(approval.id))

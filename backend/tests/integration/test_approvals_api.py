@@ -180,6 +180,7 @@ async def test_concurrent_decisions_one_wins(owner: httpx.AsyncClient) -> None: 
         {"decision": "approve", "payload_hash": "a" * 64, "status": "approved"},
         {"decision": "approve", "payload_hash": "a" * 64, "note": "nul\u0000here"},
         {"decision": "approve", "payload_hash": "a" * 64, "note": "bidi \u202e txet"},
+        {"decision": "approve", "payload_hash": "a" * 64, "note": "line\u2028separator"},
     ],
 )
 async def test_bad_decision_bodies_are_422(owner: httpx.AsyncClient, body: dict[str, object]) -> None:  # noqa: F811
@@ -268,3 +269,33 @@ async def test_a_decision_waits_for_a_concurrent_change(
     response = await decision
     assert response.status_code == 409
     assert response.json()["error"]["details"][0]["reason"] == "rejected"
+
+
+async def test_approvals_need_a_session(app: FastAPI, owner: httpx.AsyncClient) -> None:  # noqa: F811
+    approval = (await request_delete(owner, await project(owner)))["approval"]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as anonymous:
+        assert (await anonymous.get(APPROVALS)).status_code == 401
+        assert (await anonymous.get(f"{APPROVALS}/{approval['id']}")).status_code == 401  # type: ignore[index]
+
+
+async def test_a_decision_needs_the_csrf_token(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    approval = (await request_delete(owner, await project(owner)))["approval"]
+    body = {"decision": "approve", "payload_hash": approval["payload_hash"]}  # type: ignore[index]
+    response = await owner.post(f"{APPROVALS}/{approval['id']}/decision", json=body)  # type: ignore[index]
+    assert response.status_code == 403
+    shown = (await owner.get(f"{APPROVALS}/{approval['id']}")).json()["data"]  # type: ignore[index]
+    assert shown["status"] == "pending"
+
+
+async def test_approvals_are_paged(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    for name in ("One", "Two", "Three"):
+        await request_delete(owner, await project(owner, name))
+    first = (await owner.get(APPROVALS, params={"page_size": 2})).json()
+    second = (await owner.get(APPROVALS, params={"page_size": 2, "page": 2})).json()
+    assert (len(first["data"]), len(second["data"])) == (2, 1)
+    assert first["meta"]["total"] == second["meta"]["total"] == 3
+    history = (await owner.get(APPROVALS, params={"status": "all", "page_size": 2, "page": 2})).json()
+    assert (len(history["data"]), history["meta"]["total"]) == (1, 3)
+    assert (await owner.get(APPROVALS, params={"page_size": 201})).status_code == 422
+    assert (await owner.get(APPROVALS, params={"page": 0})).status_code == 422

@@ -904,7 +904,7 @@ async def audit_project(
     await _audit(env, session, actor, project, action, metadata)
 
 
-async def committed_view(
+async def commit_and_view(
     env: ProjectEnv, session: AsyncSession, project: Project, permissions: frozenset[str]
 ) -> ProjectView:
     """Commit the caller's transaction and build the response view; nothing after the commit may fail."""
@@ -935,7 +935,7 @@ async def update_project(
                         session,
                         env.audit,
                         project_id=project.id,
-                        action_type="project_delete",
+                        action_type=approval_store.PROJECT_DELETE,
                         changes={"name": name},
                         actor_id=f"user:{actor.user_id}",
                         actor_ip=actor.ip,

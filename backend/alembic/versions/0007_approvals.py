@@ -93,7 +93,8 @@ def upgrade() -> None:
         "approvals",
         ["handler_status"],
         postgresql_where=sa.text(
-            "handler_status IN ('pending', 'failed') AND status IN ('approved', 'rejected', 'expired')"
+            "handler_status IN ('pending', 'failed') "
+            "AND status IN ('approved', 'consumed', 'rejected', 'expired')"
         ),
     )
     op.create_index(

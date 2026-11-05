@@ -6,7 +6,6 @@ Decisions come only from a signed-in person over HTTP with a session (CSRF-prote
 
 from __future__ import annotations
 
-import unicodedata
 import uuid
 from typing import Annotated
 
@@ -21,9 +20,9 @@ from app.models.approvals import NOTE_MAX
 from app.services import approvals
 from app.services.approval_registry import default_handlers
 from app.services.approvals import Decision, ListStatus
+from app.services.projects import PAGE_SIZE_MAX, has_hidden_characters
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
-PAGE_SIZE_MAX = 200
 
 
 class DecisionIn(BaseModel):
@@ -36,11 +35,9 @@ class DecisionIn(BaseModel):
     @field_validator("note")
     @classmethod
     def _plain_text(cls, note: str | None) -> str | None:
-        # PostgreSQL text refuses NUL (a 500 otherwise); control and format characters (bidi) would reach
-        # the screen that shows the note. Line breaks and tabs stay.
-        if note is not None and any(
-            unicodedata.category(c) in ("Cc", "Cf") and c not in "\n\t" for c in note
-        ):
+        # PostgreSQL text refuses NUL (a 500 otherwise); control, format (bidi) and line/paragraph separator
+        # characters would reach the screen that shows the note. Line breaks and tabs stay.
+        if note is not None and has_hidden_characters(note.replace("\n", "").replace("\t", "")):
             raise ValueError("note must be plain text")
         return note
 

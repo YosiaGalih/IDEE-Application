@@ -140,7 +140,10 @@ async def dispatch(
         try:
             if handler is None:
                 raise LookupError(f"no handler registered for {action_type}")
-            await getattr(handler, path)(approval_id, now=at)
+            run = {"approved": handler.approved, "rejected": handler.rejected, "expired": handler.expired}[
+                path
+            ]
+            await run(approval_id, now=at)
         except Exception as exc:  # recorded and retried, never lost: ADR-024
             logger.warning(
                 "approval_handler_failed",

@@ -12,7 +12,7 @@ from app.services.approvals import ApprovalView
 
 
 class ApprovalOut(BaseModel):
-    """``Approval`` (API §6) + ``consumed_at``, ``handler_status`` and ``can_decide`` for the caller."""
+    """``Approval`` (API §8) + ``consumed_at``, ``handler_status`` and ``can_decide`` for the caller."""
 
     id: uuid.UUID
     project_id: uuid.UUID
