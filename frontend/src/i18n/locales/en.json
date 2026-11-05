@@ -556,6 +556,82 @@
     },
     "projectStale": "The project could not be refreshed; what is shown may be out of date.",
     "retry": "Try again",
-    "repoChangedWhileOpen": "Open tabs stay; copy any unsaved changes before leaving the page."
+    "repoChangedWhileOpen": "Open tabs stay; copy any unsaved changes before leaving the page.",
+    "gitPanel": {
+      "view": {
+        "explorer": "Explorer",
+        "git": "Git",
+        "gitCount": "Git, {{count}} changes"
+      },
+      "head": "Branch {{branch}} · {{head}}",
+      "noCommit": "This repository has no commit yet.",
+      "clean": "No changes since the last commit.",
+      "changes": "Changes",
+      "selectAll": "Select all",
+      "clearAll": "Clear",
+      "pickOf": "Include {{path}} in the commit",
+      "showDiffOf": "Show the changes in {{path}}",
+      "showAllDiff": "Show the whole diff",
+      "statusLoadFailed": "The git status could not be read.",
+      "statusStale": "The git status could not be read again; the list below may be out of date.",
+      "commit": {
+        "title": "Commit",
+        "message": "Commit message",
+        "picked": "{{count}} files selected",
+        "submit": "Commit",
+        "done": "Commit {{sha}} created.",
+        "nothing": "Nothing to commit: the selected files are the same as in the last commit.",
+        "unknownOutcome": "It is not certain whether the commit was created; the status and log are read again. Retrying sends the same request, so it does not commit twice.",
+        "failed": "The commit failed.",
+        "unsaved": "{{count}} files are not saved, so the commit uses what is saved on the server: {{paths}}",
+        "tooLong": "The message can be at most 5000 characters."
+      },
+      "branch": {
+        "title": "Branches",
+        "current": "current",
+        "task": "task",
+        "name": "New branch name",
+        "from": "From",
+        "fromHead": "HEAD (the current commit)",
+        "submit": "Create branch",
+        "hint": "Only creates the branch; the working tree does not move.",
+        "done": "Branch {{name}} created at {{head}}. The working tree stays on branch {{current}}; switching branches is not available yet.",
+        "exists": "That branch already exists.",
+        "reserved": "The names kk, kk/…, refs/… and HEAD are used by the platform.",
+        "invalid": "Git does not accept that branch name.",
+        "unknownOutcome": "It is not certain whether the branch was created; the branch list is read again.",
+        "failed": "The branch could not be created.",
+        "loadFailed": "The branch list could not be read."
+      },
+      "log": {
+        "title": "Log",
+        "empty": "No commit yet.",
+        "more": "Load more",
+        "limit": "The limit of {{count}} commits is reached; older commits are not shown.",
+        "loadFailed": "The log could not be read."
+      },
+      "diff": {
+        "titleOf": "Changes in {{path}}",
+        "titleAll": "All changes",
+        "files": "{{count}} files",
+        "lineStats": "+{{additions}} −{{deletions}}",
+        "status": {
+          "added": "Added",
+          "modified": "Modified",
+          "deleted": "Deleted"
+        },
+        "movedFrom": "from {{path}}",
+        "binary": "Binary file: its content is not shown.",
+        "truncated": "The diff is cut at 1 MiB: what is shown is incomplete.",
+        "empty": "No changes against the last commit.",
+        "oldLine": "Old line",
+        "newLine": "New line",
+        "sign": "Line kind",
+        "added": "added",
+        "removed": "removed",
+        "close": "Close",
+        "loadFailed": "The diff could not be read."
+      }
+    }
   }
 }
