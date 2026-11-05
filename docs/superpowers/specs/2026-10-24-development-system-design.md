@@ -406,6 +406,14 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - **TEST_STRATEGY §3 (`respx`):** SDK resmi yang boleh dipakai (`anthropic` 1.13.0) memakai `httpx2`, sehingga adapter diuji dengan `httpx2.MockTransport`. Usulan: §3 menyebut transport tiruan tanpa nama library.
     - **Lapisan test contract:** ARCHITECTURE §13.4 menyebut `tests/contract/test_llm_provider.py`, tetapi tabel lapisan TEST_STRATEGY §2 tidak punya lapisan contract. 3.1a mengikuti ARCHITECTURE (urutan sumber kebenaran lebih tinggi). Usulan: TEST_STRATEGY §2 menambah baris `backend/tests/contract/`.
     - **3.1a:** tabel tarif awal hanya memuat empat model yang ID API-nya tercantum di halaman harga resmi (dibaca 5 Nov 2026), `verify_before_production: true`. Model lain berbiaya `unavailable`.
+    - **3.1b** (spec `docs/superpowers/specs/2026-11-05-wp-3.1b-agent-registry-design.md`, bagian "Konflik"):
+      - Registry: `agents/registry.v2.yaml` disalin ke `/app/agents/registry.yaml` di image; `AGENT_REGISTRY_PATH` tidak berubah. AGENT_CATALOG §12.9 menaruh loader v2 di WP-9.0; 3.1b membutuhkannya sekarang karena hanya file v2 yang ada.
+      - Status `not_ready` + `status_reasons` memperluas enum FR-045 / API §6 (`ready|disabled|planned`): "siap" tanpa runtime, readiness provider, dan tool adalah klaim tanpa bukti (prinsip #1).
+      - Kolom di luar DATA_MODEL: `purpose`, `triggers`, kontrak I/O, field v2, `registry_hash`, `in_registry`, `created_at`, `agent_runs.cost_status`. `permission_profile` di API berisi 8 field, bukan 6.
+      - `GET /agents` tanpa paginasi (registry terbatas), dengan `meta.counts` dan filter `status` (FR-044).
+      - `agent_profiles.slug` unik hanya di antara agent aktif registry (index parsial), bukan `unique` penuh seperti DATA_MODEL: baris agent pensiun disimpan dan slug-nya boleh dipakai lagi. CHECK `approval_grant = 'deny'` di tabel adalah tambahan.
+      - Mockup screen-05 dan PRD v2.2 menyebut 42 agent; registry v2 berisi 53. Layar mengikuti data.
+      - `scripts/test_validate_registry.py` ("17 test") yang disebut README, AGENT_CATALOG, dan TEST_STRATEGY tidak ada. Paritas loader–validator diuji di `backend/tests/unit/test_registry_loader.py`.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

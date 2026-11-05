@@ -54,7 +54,7 @@ Satu daftar kanonik. `backend/app/core/config.py`, `sandbox_manager/…/config.p
 | `SANDBOX_DRIVER` | `docker` | sandbox-manager | `docker` \| `fake` (test) |
 | `SANDBOX_MAX_CONCURRENT_RUNS` | `4` | sandbox-manager | |
 | `DOCKER_HOST` | `tcp://docker-socket-proxy:2375` | sandbox-manager | tidak pernah socket langsung di production |
-| `AGENT_REGISTRY_PATH` | `/app/agents/registry.yaml` | api, worker | |
+| `AGENT_REGISTRY_PATH` | `/app/agents/registry.yaml` | api, worker | Image menyalin `agents/registry.v2.yaml` ke path ini (WP-3.1b). Di luar image (dev, test) setel ke file di repo. Registry tidak valid → API tidak start. |
 | `CELERY_TASK_ALWAYS_EAGER` | `false` | api, worker | `true` hanya untuk test/dev single-process |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `` | semua | opsional |
 | `VITE_API_BASE` | `/api/v1` | frontend build | |

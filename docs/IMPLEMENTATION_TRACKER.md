@@ -1774,3 +1774,96 @@ Tidak diubah (smell, penilaian): duplikasi hitung giliran `assistant` (scripted 
 AG-13 C8: gitleaks, semgrep, dan trivy tidak dijalankan lokal (tidak terpasang / proxy 403); bukti dari job CI `security-scan` di PR. C10: commit sesudah 8948d33 yang menyentuh `app/llm/**`, `app/core/logging.py`, `app/core/cancel.py`, dependensi, Dockerfile, atau `.dockerignore` butuh review delta AG-13.
 
 Pelajaran proses (AG-13 D4): `tests/security/*` selalu memigrasi ulang dan me-reset DB uji bersama (`tests/security/conftest.py`, fixture autouse). Reviewer yang menjalankan test itu bersamaan dengan suite penuh merusak hasil suite (run @ 8948d33: 4 error `relation "users" does not exist` dan 1 kegagalan turunan). Suite penuh dijalankan ulang tanpa proses lain; reviewer paralel hanya memakai `--noconftest` atau DB yang tidak terjangkau.
+
+### WP-3.1b (🔒 registry dan image) — registry agent, katalog, status, catatan run (FR-041–046 sisi baca; FR-047 ditunda)
+
+Spec: `docs/superpowers/specs/2026-11-05-wp-3.1b-agent-registry-design.md`. Plan: `docs/superpowers/plans/2026-11-05-wp-3.1b-agent-registry.md`. Konflik: #72 butir 3.1b. Branch dimulai dari ujung WP-3.1a (c986f0f, PR #18).
+
+Keputusan Lead (rinci di spec; yang berubah sesudah review ditandai):
+- `agents/registry.v2.yaml` disalin ke `/app/agents/registry.yaml` di image; loader membaca skema 2. Dev di luar image dan test menyetel `AGENT_REGISTRY_PATH` ke file repo.
+- Loader runtime menegakkan aturan keamanan dan struktur; validator CI tetap memegang kesetiaan teks dokumen dan jumlah 53 id. **Sesudah review:** izin yang dipin per agent (termasuk `git` untuk agent read-only) juga ditegakkan saat start; kunci YAML ganda, list berupa set, dan digit non-ASCII ditolak.
+- Status `planned | disabled | not_ready | ready` + `status_reasons`. Semua agent aktif `not_ready` di 3.1b. **Sesudah review:** agent tool-mode menunggu workflow engine (AGENT_CATALOG §4.3).
+- Sinkron di bawah `pg_advisory_xact_lock`; id yang hilang pensiun, tidak dihapus. **Sesudah review:** baris dibandingkan per kolom; slug unik hanya di antara agent aktif (index parsial) dan baris yang berganti slug keluar dari himpunan aktif dulu; audit menyebut id, versi, dan hash yang berubah, plus `version_not_bumped`.
+- `GET /agents` tanpa paginasi dengan `meta.counts`; `GET /agents/{id}` datar (API §6) dengan run dan statistik hanya dari project yang terlihat. **Sesudah review:** agent pensiun → 404; `success_rate` hanya atas run yang selesai.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `ruff check`, `ruff format --check`, `pyright`, `lint-imports` @ 6086f66 | bersih; `187 files already formatted`; pyright `0 errors`; `Contracts: 3 kept, 0 broken` |
+| `validate_registry.py agents/registry.v2.yaml` @ 6086f66 | `OK: 53 agents (41 specialists + ORCH + 11 K2) — schema_version 2` |
+| Test baru backend | [Pasti] 117: `test_registry_loader.py` 43 (termasuk 29 mutan yang wajib ditolak loader **dan** validator CI), `test_agent_readiness.py` 8, `test_tool_catalog.py` 4, `test_policy.py` 5, `test_agent_tables.py` 18, `test_agent_sync.py` 13, `test_agents_api.py` 25, `tests/security/test_agents_scope.py` 1 |
+| Suite backend penuh @ 355e32c (sebelum review; Python 3.12, PG16 + Redis 7, sendirian) | [Pasti] `2032 passed, 1 skipped in 421.69s` |
+| Suite backend penuh @ b4756bf (sesudah putaran review pertama, sendirian 09:03:16–09:10:11 UTC) | [Pasti] `2058 passed, 1 skipped in 410.92s`; test C0 AG-13 dengan `-v`: `53 passed`, termasuk `test_runs_and_stats_only_from_visible_projects`, `test_concurrent_syncs`, `test_missing_id_is_retired_not_deleted`, `test_api_refuses_to_start_with_an_invalid_registry`, `test_requires_sign_in`, `test_no_enabled_agent_is_ready` (semua `PASSED`) |
+| Suite backend penuh @ a5b93e5 (final; backend sama dengan 6086f66; sendirian 09:19:35–09:26:30 UTC) | [Pasti] `2068 passed, 1 skipped in 412.09s`; lalu `-v` atas `test_agents_scope.py`, `test_agent_sync.py`, `test_agents_api.py`, `test_agent_tables.py`, `test_policy.py`: `62 passed`, termasuk setiap test yang disebut C0 kedua review AG-13 (`test_a_retired_slug_can_be_taken_in_the_same_sync`, `test_two_agents_can_swap_slugs`, `test_a_hand_edited_row_is_restored`, `test_the_audit_names_what_changed`, `test_a_change_without_a_version_bump_is_flagged`, `test_concurrent_syncs`, `test_no_row_can_grant_approvals[permissions0/1]`, `test_slugs_are_unique_among_live_agents_only`, `test_models_match_the_migration`, `test_migration_round_trip`, `test_success_rate_counts_finished_runs_only`, `test_a_retired_agent_is_not_found`, `test_bad_filters_are_422` ×7, `test_runs_and_stats_only_from_visible_projects`, `test_reviewer_profile_read_only`, `test_r4_never_registered`: semua `PASSED`); pyright `0 errors`; lint-imports `3 kept, 0 broken` |
+| Frontend @ a5b93e5: `format:check`, `lint`, `lint:guards`, `typecheck`, `npm test`, `vite build` | [Pasti] semua lulus; `Tests  469 passed (469)` (27 test layar agent) |
+| Mutan (satu perubahan per run lalu dipulihkan; skrip di scratchpad) | [Pasti] setiap baris `RED`, tidak ada `SURVIVED`: B1–B5, M1–M3, Y1–Y3, A1–A2 (implementasi); F1–F7 (frontend review); K1–K12 + K2' (backend review); C1–C6 (code review + AG-13 delta); G1–G5 (frontend code review) |
+
+Catatan proses: migrasi 0006 belum ada di `main`, jadi diubah di tempat dua kali (index slug parsial + CHECK `approval_grant`, lalu CHECK `contract_status`). DB uji bersama di-reset manual ke 0005 (`DROP TABLE agent_runs, agent_profiles` + `alembic_version`) sebelum test berikutnya; CI selalu mulai dari DB kosong.
+
+#### Review WP-3.1b
+
+Hasil awal @ 355e32c:
+- `kk-backend-reviewer`: 0 blocker, 2 should, 4 nit.
+- `kk-frontend-reviewer`: 0 blocker, 4 should, beberapa nit.
+- `kk-silent-failure-hunter`: 0 HIGH, 4 MEDIUM, 6 LOW.
+- `kk-security-reviewer` (AG-13): **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH, 1 MEDIUM, 3 LOW, 9 INFO.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| backend S1 + silent L3: id baru yang memakai slug agent pensiun (atau tukar slug) membuat start gagal dengan `IntegrityError` | slug unik di antara baris aktif saja; baris yang berganti slug keluar dari himpunan aktif sebelum ditulis | `test_a_retired_slug_can_be_taken_in_the_same_sync`, `test_two_agents_can_swap_slugs`, `test_slugs_are_unique_among_live_agents_only` (K6, K12) |
+| backend S2 + silent L1: `approval_required` dihitung sebagai run selesai | `FINISHED_RUN_STATUSES` = succeeded/failed/cancelled/budget_exceeded; satu query `GROUP BY status` (backend N3) | `test_success_rate_counts_finished_runs_only` (K8) |
+| silent M2 + AG-13 L1: agent tool-mode bisa `ready` tanpa runtime | semua agent non-model menunggu `workflow_engine` | `test_no_agent_is_ready_while_no_runtime_exists`, `test_tool_agent_waits_for_the_engine_and_its_tools` (K2, K2') |
+| AG-13 M1 (C1): izin yang dipin hanya dicek CI | `PINNED_PERMISSIONS` di loader, tabel sama dengan validator | `test_pinned_permissions_match_the_ci_validator`, 6 mutan pin (K1) |
+| silent M1 + AG-13 I1: kunci YAML ganda memakai nilai terakhir | `SafeLoader` turunan yang menolak duplikat, di loader dan validator CI | `test_duplicate_keys_are_refused` (K3) |
+| AG-13 I3: `tools` berupa `!!set`, id dengan digit Unicode | field list wajib list YAML; pola id `[0-9]`; label masalah hanya id ASCII | mutan "tools given as a set", "agent id with a non-ASCII digit" (K4, K5) |
+| silent L4 + AG-13 L2: baris yang diubah langsung di DB bertahan | sinkron membandingkan semua kolom; CHECK `approval_grant = 'deny'` di tabel | `test_a_hand_edited_row_is_restored`, `test_no_row_can_grant_approvals` (K7) |
+| silent M3 + AG-13 L3: audit sinkron hanya berisi jumlah | metadata menyebut id inserted/retired dan versi + hash updated | `test_the_audit_names_what_changed` (K10) |
+| silent M4: isi berubah tanpa kenaikan versi diam-diam | `version_not_bumped` di audit + log WARNING; tidak menolak start (rollback image tetap mungkin) | `test_a_change_without_a_version_bump_is_flagged` (K11) |
+| backend N1 + silent L2 + AG-13 I6: detail agent pensiun tampil `disabled` | 404, sama dengan daftar yang menyembunyikannya | `test_a_retired_agent_is_not_found` (K9) |
+| backend N2 + AG-13 I5: tabel enum/registry tanpa test paritas | `test_enums_match_the_tables`, `test_registry_tables_match_the_ci_validator` | — |
+| backend N4: 422 tanpa cek envelope; run di project `deleted` belum diuji | envelope `VALIDATION_ERROR` tanpa echo input; run project terhapus tidak dihitung | `test_bad_filters_are_422`, `test_runs_and_stats_only_from_visible_projects` |
+| AG-13 I8: `test_r4_never_registered` belum ada | `tests/unit/test_policy.py` (lokasi SECURITY_MODEL T7) | `test_r4_never_registered`, `test_r3_tools_are_not_live_and_have_owners` |
+| frontend S1: test error tidak membuktikan request id dan retry | request id `r-err-0001` diperiksa; retry memanggil lagi | (F1, F6) |
+| frontend S3: detail tanpa h1 saat error/404 | `titleAs="h1"` | (F2) |
+| frontend S4: state loading dan 403 tidak diuji | test loading (`aria-busy`) dan 403 tanpa tombol coba lagi di kedua layar | — |
+| frontend nit: statistik tanpa nama, subtitle tanpa plural dan tanpa agent nonaktif, kunci i18n tak terpakai | `aria-label`, `subtitle_one/_other` dengan `disabled`, kunci dihapus | (F5, F7) |
+| silent L5/L6: pernyataan approval untuk katalog kosong; jumlah chip tidak dicek | tanpa pernyataan bila kosong; klien menolak jumlah yang tidak sama dengan baris | (F3, F4) |
+
+Tidak diubah (dengan alasan):
+- frontend S2: enum ketat (`z.enum`) membuat satu nilai tak dikenal menggagalkan layar. Dipertahankan: frontend dan backend dirilis berbarengan dari satu repo, dan gagal tertutup tidak pernah menampilkan "siap" palsu.
+- silent L1 (sisa): run `running` yang macet karena worker mati tidak masuk penyebut; penandaan run basi milik sweep 3.1f.
+- AG-13 I2 (validator CI crash `TypeError` untuk nilai izin unhashable): tetap gagal tertutup (exit ≠ 0).
+- AG-13 I7 (`git.push`/`deploy.staging` tanpa peta pemilik R3): tool-nya `disabled` dan agent planned tidak aktif; pemiliknya ditetapkan saat tool dibangun.
+- AG-13 I9 (`pg_advisory_xact_lock` tanpa timeout): soal ketersediaan saja; dicatat untuk RUNBOOK bila `seed-agents` macet.
+
+#### Review delta AG-13 @ b4756bf
+
+**SIGNED OFF WITH CONDITIONS @ b4756bf**: kesembilan klaim b4756bf terbukti, tanpa regresi, 0 CRITICAL/HIGH. Temuan baru ditutup di 6086f66:
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| M-1 (C5): `git` tidak dipin; reviewer dan user proxy bisa diberi `branch_commit` + `git.commit_task` | `git` dipin untuk A01–A07, C16, D22, D23, D26, E29, F33 di loader dan validator CI | `test_a_reviewer_given_write_or_commit_is_refused`, mutan "user proxy given commit" (C2, C3) |
+| L-1: nama test melebihi buktinya | diganti `test_a_tool_agent_without_tools_still_waits_for_the_engine` | — |
+| L-2: pola nama R4 terlalu sempit | daftar eksplisit prefix/nama/fragmen R4 dari SECURITY_MODEL §3 dan T19 | `test_r4_never_registered` |
+| L-3: `phase` menerima digit Unicode | pola `^P[0-9]{1,2}$` | mutan "phase with a non-ASCII digit" (C5) |
+
+#### `/code-review` (sumbu standar + sumbu spec) @ b4756bf
+
+| Temuan | Penutupan |
+|---|---|
+| standar + spec (c1): detail bersarang `{agent, recent_runs, stats}`, API §6 menulis `AgentProfile + {recent_runs, stats}` | respons datar di backend dan klien (6086f66, a5b93e5) |
+| standar: `contract_status` tanpa CHECK (backend.md, ADR-018) | `ck_agent_profiles_contract_status` |
+| standar: status run dan badge "belum tersedia" hanya teks (frontend.md) | `RunStatusBadge` dan ikon pada badge tool (G1, G5) |
+| standar: lokasi test AC-10 dan readiness | `test_policy.py::test_reviewer_profile_read_only`; readiness pindah ke `test_agent_readiness.py` |
+| spec (a2, a3): filter grup tidak ada; `tool_quota` dan `contract_status` tidak tampil | filter grup; kuota tool; kontrak agent planned diberi label "direncanakan" (G2–G4, C6) |
+| spec (c2): `q` menerima karakter kontrol C1 | ditolak (C4) |
+| spec (c3): pesan masalah menggemakan nama kunci apa adanya | hanya kunci berbentuk identifier pendek; selain itu `<key>` (C1) |
+| spec (a1, d): path registry dev, drift spec/plan/spec induk, `agents/README.md` usang | `docs/CONFIGURATION.md`, `agents/README.md`, spec 3.1b, plan, spec WP-3.1, konflik #72 diselaraskan |
+| standar: tidak ada `response_model` | tidak diubah: pola seluruh route yang ada (`_respond` + `JSONResponse`); mengubahnya lintas modul di luar WP ini |
+| smell (penilaian) | `STATUSES` dari `get_args`, pola id dipakai bersama, helper durasi. Tidak diubah: `provider_ready` (seam untuk 3.1e), `_Facts`/`RunSummaryOut` (lapisan service ↔ API), pemisahan sinkron/baca di `services/agents.py` (kandidat dipecah saat FR-047) |
+
+**Sign-off AG-13:** SIGNED OFF WITH CONDITIONS @ 355e32c, delta SIGNED OFF WITH CONDITIONS @ b4756bf. Status syarat:
+- **C0** (bukti test): suite penuh @ b4756bf dan @ a5b93e5 di atas, dengan test bernama dalam output `-v`.
+- **C1, C2, C5:** tertutup (b4756bf, 6086f66).
+- **C3** (sebagian terbuka, WP-3.1d): ToolGateway dan AgentRuntime membaca allowlist dan izin dari `AgentRegistry` yang divalidasi di memori, bukan dari baris `agent_profiles` (role runtime boleh UPDATE tabel itu di antara dua sinkron).
+- **C4** (WP-3.1f): penulis `agent_runs.input/output/error` lewat `Redactor`.
+- **I-1** (catatan untuk FR-047): kolom override admin tidak boleh masuk `_values` sinkron, kalau tidak kill switch admin batal di setiap restart.

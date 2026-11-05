@@ -1,22 +1,20 @@
 # agents/ — Agent registry KodeKantor
 
-Dua file registry (sampai WP-9.0):
-
-| File | Schema | Entri | Dipakai | Validator |
-|---|---|---|---|---|
-| `registry.yaml` | 1 | 42 | runtime snapshot (`AGENT_REGISTRY_PATH`, `seed-agents`) | `scripts/validate_registry_v1.py` |
-| `registry.v2.yaml` | 2 | 53 | rancangan v2 (ADR-048), **sumber kebenaran katalog** | `scripts/validate_registry.py` (file schema 1 otomatis didelegasikan ke validator v1) |
+Satu file registry di repo: `registry.v2.yaml` (schema 2, 53 entri), divalidasi `scripts/validate_registry.py`. File schema 1 (`registry.yaml`, 42 entri) yang dirujuk dokumen lama tidak ada di repo; validator tetap mendelegasikan file schema 1 ke `scripts/validate_registry_v1.py`.
 
 `registry.v2.yaml` adalah **sumber kebenaran** katalog agent. Sejak **schema v2** (ADR-048, rancangan 21 Okt 2026) berisi **53 entri**: 41 specialist PRD §6 (A01–H41) + Orchestrator (`ORCH`, PRD §6.1) + 11 agent perluasan K2 (`docs/PLATFORM_EXPANSION.md` §9b): I42–I47 (Portal AI), J48 (GitHub App), K49–K51 (Portfolio), S52 (Content Safety). Semua agent v2 masih `mvp_mode: planned`, `enabled: false` — **belum diimplementasikan**. Penjelasan lengkap, tabel induk 53 entri, kartu spesifikasi, dan rencana aktivasi P9–P12: `docs/AGENT_CATALOG.md` (§12 = v2).
 
-Backend memuat registry lewat `AGENT_REGISTRY_PATH` dan `python -m app.cli seed-agents` menyinkronkannya ke tabel `agent_profiles` (DATA_MODEL). **Catatan:** loader backend (`backend/app/agents/registry.py`) masih hanya menerima `schema_version: 1`, sehingga `registry.yaml` tetap v1 dan v2 disimpan terpisah di `registry.v2.yaml`. WP-9.0 memperbarui loader lalu mengganti `registry.yaml` dengan isi v2 (`docs/AGENT_CATALOG.md` §12.9 #1).
+Backend memuat registry lewat `AGENT_REGISTRY_PATH` (sejak WP-3.1b loader `backend/app/agents/registry.py` membaca schema 2) dan menyinkronkannya ke tabel `agent_profiles` saat API start dan lewat `python -m app.cli seed-agents` (`make seed-agents`). Registry yang melanggar aturan keamanan (izin, tool, `approval_grant`, izin yang dipin per agent, kunci YAML ganda) membuat API menolak start.
+
+- **Image:** `backend/Dockerfile` menyalin `registry.v2.yaml` ke `/app/agents/registry.yaml`, nilai default `AGENT_REGISTRY_PATH`.
+- **Dev di luar image dan test:** setel `AGENT_REGISTRY_PATH` ke file di repo, mis. `AGENT_REGISTRY_PATH=$(pwd)/../agents/registry.v2.yaml` dari `backend/` (test melakukannya di `backend/tests/conftest.py`).
 
 ## Validasi
 
 ```bash
 python3 scripts/validate_registry.py                 # default agents/registry.v2.yaml; exit 0 = valid, 1 = error validasi, 2 = file/usage error
-python3 scripts/validate_registry.py agents/registry.yaml   # schema 1 → validate_registry_v1.py
-backend/.venv/bin/python -m pytest -q -p no:cacheprovider scripts/test_validate_registry.py scripts/test_validate_registry_v1.py
+python3 scripts/validate_registry.py path/ke/registry-schema-1.yaml   # schema 1 → validate_registry_v1.py
+cd backend && uv run pytest -q --noconftest tests/unit/test_registry_loader.py tests/unit/test_tool_catalog.py   # paritas loader runtime ↔ validator CI
 ```
 
 Validator hanya bergantung pada PyYAML + stdlib, membaca `backend/app/agents/contracts.py` via `ast` (tanpa import), dan menanam salinan mekanis PRD §6 (`PRD_CATALOG`), K2 (`K2_CATALOG`), serta TOOL_CATALOG v2 (risk, executor, prasyarat, status). Jalankan setiap kali registry, `docs/TOOL_CATALOG.md`, `contracts.py`, atau §9b PLATFORM_EXPANSION berubah.
@@ -27,7 +25,7 @@ Validator hanya bergantung pada PyYAML + stdlib, membaca `backend/app/agents/con
 
 | Field | Isi | Sumber |
 |---|---|---|
-| `agent_id` | `A01`…`H41`, `ORCH`, atau ID K2 `I42`…`I47`, `J48`, `K49`…`K51`, `S52` (unik; pola `^(?:[A-H]\d{2}\|[IJKS]\d{2}\|ORCH)$`) | PRD §6, K2 |
+| `agent_id` | `A01`…`H41`, `ORCH`, atau ID K2 `I42`…`I47`, `J48`, `K49`…`K51`, `S52` (unik; pola `^(?:[A-H][0-9]{2}\|[IJKS][0-9]{2}\|ORCH)$`, digit ASCII saja) | PRD §6, K2 |
 | `slug` | snake_case unik (mis. `user_proxy`, `web_research`); entri K2 verbatim dari K2 | turunan / K2 |
 | `name`, `description`, `capabilities` | entri PRD: **verbatim** PRD (validator menolak perbedaan); entri K2: `name` verbatim K2, `description` & `capabilities` turunan (gaya `namespace.function`, mis. `research.synthesize_with_citations`) | PRD §6 / K2 |
 | `group` | v1: `planning_intent` · `software_development` · `testing_debugging` · `quality_security` · `git_collaboration` · `devops_operations` · `documentation_knowledge` · `specialized_engineering` · `orchestration`; **v2:** `ai_assistant` · `integrations` · `portfolio` | PRD §6, K2 |
