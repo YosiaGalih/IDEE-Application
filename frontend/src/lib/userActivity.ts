@@ -5,7 +5,9 @@
  */
 export const IDLE_AFTER_MS = 10 * 60_000;
 
-const INPUT_EVENTS = ["pointerdown", "pointermove", "keydown", "wheel", "touchstart"] as const;
+// No pointermove: browsers send synthetic moves when content changes under a still cursor, which a poll
+// itself causes; that would keep an unattended page "in use" (AG-13 WP-3.1c2 delta INFO).
+const INPUT_EVENTS = ["pointerdown", "keydown", "wheel", "touchstart"] as const;
 let lastInput = Date.now();
 const resumeListeners = new Set<() => void>();
 

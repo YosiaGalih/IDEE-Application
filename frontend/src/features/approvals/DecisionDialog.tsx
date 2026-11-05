@@ -7,7 +7,14 @@ import { Button } from "@/components/ui/Button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/Dialog";
 import { ErrorSummary } from "@/components/ui/ErrorSummary";
 import { Label } from "@/components/ui/Label";
-import { actionLabel, decisionError, decisionOutcome, summaryText, type Outcome } from "./approvalText";
+import {
+  actionLabel,
+  decisionError,
+  decisionOutcome,
+  revealHidden,
+  summaryText,
+  type Outcome,
+} from "./approvalText";
 import { PayloadView } from "./PayloadView";
 
 /** API §8 / DATA_MODEL: `decision_note` is at most 2000 characters (checked again by the server). */
@@ -32,14 +39,15 @@ export function DecisionDialog({ approval, decision, onClose, onDecided }: Props
   const [note, setNote] = useState("");
   const decide = useDecideApproval();
   // A second click before React re-renders the disabled button must not send a second decision.
-  const sending = useRef(false);
+  const isSending = useRef(false);
   const action = actionLabel(t, approval.action_type);
-  const isTooLong = note.length > NOTE_MAX;
+  // In characters (code points), as the server counts them: an emoji is one, not two.
+  const isTooLong = [...note].length > NOTE_MAX;
   const failure = decide.isError ? decisionError(t, decide.error) : null;
 
-  const submit = () => {
-    if (sending.current || isTooLong) return;
-    sending.current = true;
+  const handleConfirm = () => {
+    if (isSending.current || isTooLong) return;
+    isSending.current = true;
     decide.mutate(
       {
         approvalId: approval.id,
@@ -48,7 +56,7 @@ export function DecisionDialog({ approval, decision, onClose, onDecided }: Props
       {
         onSuccess: (decided) => onDecided(decisionOutcome(t, decided)),
         onSettled: () => {
-          sending.current = false;
+          isSending.current = false;
         },
       },
     );
@@ -67,7 +75,7 @@ export function DecisionDialog({ approval, decision, onClose, onDecided }: Props
         <div className="max-h-[60vh] space-y-3 overflow-y-auto text-sm">
           <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
             <dt className="text-fg-muted">{t("approvals.dialog.project")}</dt>
-            <dd className="break-words">{approval.project_name}</dd>
+            <dd className="break-words">{revealHidden(approval.project_name)}</dd>
             <dt className="text-fg-muted">{t("approvals.dialog.summary")}</dt>
             <dd className="break-words">{summaryText(t, approval)}</dd>
             <dt className="text-fg-muted">{t("approvals.dialog.hashFull")}</dt>
@@ -109,7 +117,7 @@ export function DecisionDialog({ approval, decision, onClose, onDecided }: Props
             variant={decision === "approve" ? "primary" : "danger"}
             disabled={decide.isPending || isTooLong || (failure?.isFinal ?? false)}
             aria-busy={decide.isPending}
-            onClick={submit}
+            onClick={handleConfirm}
           >
             {t(decision === "approve" ? "approvals.dialog.confirmApprove" : "approvals.dialog.confirmReject")}
           </Button>

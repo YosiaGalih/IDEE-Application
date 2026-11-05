@@ -4,7 +4,7 @@ import { approval } from "@/__tests__/approvalFixtures";
 import type { Approval } from "@/api/approvals";
 import { ApiError } from "@/api/errors";
 import id from "@/i18n/locales/id.json";
-import { decisionError, decisionOutcome, revealHidden } from "../approvalText";
+import { decisionError, decisionOutcome, revealHidden, summaryText } from "../approvalText";
 
 const t = i18next.getFixedT("id");
 const name = approval().project_name;
@@ -125,5 +125,23 @@ describe("revealHidden (AG-13 WP-3.1c2 L1)", () => {
       "a\\u202eb\\u2066c\\u200bd\\u2028e\nf\tg",
     );
     expect(revealHidden("Kalkulator API")).toBe("Kalkulator API");
+  });
+});
+
+describe("summaryText reveals hidden characters on both paths (AG-13 WP-3.1c2 L3)", () => {
+  it("in the project name a delete summary is built from", () => {
+    const spoofed = approval({ payload: { name: "a\u202Eb", project_id: "x", previous_status: "active" } });
+    expect(summaryText(t, spoofed)).toBe(
+      id.approvals.summaries.project_delete.replace("{{name}}", "a\\u202eb"),
+    );
+  });
+
+  it("in the server summary of an action type the screen does not know", () => {
+    const spoofed = approval({ action_type: "tool_r3", summary: "run\u2066 tool" });
+    expect(summaryText(t, spoofed)).toBe("run\\u2066 tool");
+  });
+
+  it("writes characters outside the BMP unambiguously", () => {
+    expect(revealHidden("tag\u{E0041}x")).toBe("tag\\u{e0041}x");
   });
 });

@@ -61,7 +61,7 @@ export function ProjectsPage() {
   }
   const [announcement, setAnnouncement] = useState<string | null>(null);
   const [toDelete, setToDelete] = useState<Project | null>(null);
-  const [deleteRequested, setDeleteRequested] = useState<string | null>(null);
+  const [requestedDeleteName, setRequestedDeleteName] = useState<string | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const projects = useProjects(filter);
   const archive = useSetProjectArchived();
@@ -104,7 +104,7 @@ export function ProjectsPage() {
   const handleArchive = (project: Project) => {
     const archived = project.status === "active";
     setAnnouncement(null);
-    setDeleteRequested(null);
+    setRequestedDeleteName(null);
     archive.mutate(
       { projectId: project.id, archived },
       {
@@ -253,7 +253,7 @@ export function ProjectsPage() {
                         aria-label={t("projects.delete.actionOf", { name: project.name })}
                         onClick={() => {
                           setAnnouncement(null);
-                          setDeleteRequested(null);
+                          setRequestedDeleteName(null);
                           setToDelete(project);
                         }}
                       >
@@ -361,9 +361,9 @@ export function ProjectsPage() {
         />
       ) : null}
       {announcement ? <Alert tone="success">{announcement}</Alert> : null}
-      {deleteRequested ? (
+      {requestedDeleteName ? (
         <Alert tone="success">
-          {t("projects.delete.requested", { name: deleteRequested })}{" "}
+          {t("projects.delete.requested", { name: requestedDeleteName })}{" "}
           <Link to={APPROVALS_PATH} className="font-medium underline">
             {t("projects.delete.openApprovals")}
           </Link>
@@ -377,7 +377,7 @@ export function ProjectsPage() {
           onClose={() => setToDelete(null)}
           onRequested={(requested) => {
             setToDelete(null);
-            setDeleteRequested(requested.name);
+            setRequestedDeleteName(requested.name);
             headingRef.current?.focus(); // the row leaves this filter: its status changed
           }}
         />

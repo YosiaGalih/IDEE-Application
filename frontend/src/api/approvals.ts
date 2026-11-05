@@ -14,7 +14,6 @@ export const APPROVAL_STATUSES = [
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 /** ADR-024: whether the action behind a decided approval has run. */
 export const HANDLER_STATUSES = ["pending", "succeeded", "failed", "not_required"] as const;
-export type HandlerStatus = (typeof HANDLER_STATUSES)[number];
 
 /**
  * `Approval` (API §8) + `project_name`, `consumed_at`, `handler_status`, `can_decide` (spec WP-3.1c Lead 16,

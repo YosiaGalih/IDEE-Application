@@ -10,11 +10,11 @@ import { StateView } from "@/components/ui/StateView";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { ApprovalCard } from "./ApprovalCard";
 import { ApprovalHistory } from "./ApprovalHistory";
-import type { Outcome } from "./approvalText";
+import { revealHidden, type Outcome } from "./approvalText";
 import { DecisionDialog, type Decision } from "./DecisionDialog";
 
 /** Pending approvals are few by nature; one page this large shows them all (spec 3.1c2 Lead 2). */
-export const PENDING_PAGE_SIZE = 200;
+const PENDING_PAGE_SIZE = 200;
 
 type Group = { projectId: string; projectName: string; approvals: Approval[] };
 
@@ -24,7 +24,7 @@ function byProject(approvals: Approval[]): Group[] {
   for (const approval of approvals) {
     const group = groups.get(approval.project_id) ?? {
       projectId: approval.project_id,
-      projectName: approval.project_name,
+      projectName: revealHidden(approval.project_name),
       approvals: [],
     };
     group.approvals.push(approval);
@@ -144,7 +144,9 @@ export function ApprovalsPage() {
   );
 }
 
-function ProjectGroup({ group, children }: { group: Group; children: React.ReactNode }) {
+type ProjectGroupProps = { group: Group; children: React.ReactNode };
+
+function ProjectGroup({ group, children }: ProjectGroupProps) {
   const headingId = useId();
   return (
     <div role="group" aria-labelledby={headingId} className="space-y-2">

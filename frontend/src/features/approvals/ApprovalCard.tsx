@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import type { Approval } from "@/api/approvals";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
-import { actionLabel, riskText, summaryText } from "./approvalText";
+import { actionLabel, revealHidden, riskText, summaryText } from "./approvalText";
 import type { Decision } from "./DecisionDialog";
 import { PayloadView } from "./PayloadView";
 
@@ -15,7 +15,7 @@ export function ApprovalCard({ approval, onDecide }: Props) {
   const { t, i18n } = useTranslation();
   const titleId = useId();
   // "long" time includes the zone: an expiry is a deadline, so it says which clock it is on.
-  const when = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeStyle: "long" });
+  const dateTimeFormat = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeStyle: "long" });
   const isHighRisk = approval.risk_level >= 3;
   return (
     <article
@@ -40,15 +40,17 @@ export function ApprovalCard({ approval, onDecide }: Props) {
             {t("approvals.card.shortHash", { hash: approval.payload_hash.slice(0, 12) })}
           </dd>
           <dt className="text-fg-muted">{t("approvals.card.requestedBy")}</dt>
-          <dd className="break-all font-mono">{approval.requested_by}</dd>
+          <dd className="break-all font-mono">{revealHidden(approval.requested_by)}</dd>
           <dt className="text-fg-muted">{t("approvals.card.requestedAt")}</dt>
           <dd>
-            <time dateTime={approval.created_at}>{when.format(new Date(approval.created_at))}</time>
+            <time dateTime={approval.created_at}>{dateTimeFormat.format(new Date(approval.created_at))}</time>
           </dd>
           <dt className="text-fg-muted">{t("approvals.card.expires")}</dt>
           <dd>
             {approval.expires_at ? (
-              <time dateTime={approval.expires_at}>{when.format(new Date(approval.expires_at))}</time>
+              <time dateTime={approval.expires_at}>
+                {dateTimeFormat.format(new Date(approval.expires_at))}
+              </time>
             ) : (
               t("approvals.card.noExpiry")
             )}

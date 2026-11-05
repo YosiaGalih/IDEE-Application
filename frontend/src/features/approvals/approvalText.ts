@@ -44,43 +44,39 @@ export function summaryText(t: TFunction, approval: Approval): string {
 
 export type Outcome = { tone: "success" | "warning"; text: string };
 
+/** The outcome texts per kind of action: a new action type adds one entry, not four branches. */
+const RESULT_TEXTS = {
+  project_delete: {
+    rejected: "approvals.result.rejected",
+    done: "approvals.result.deleted",
+    retrying: "approvals.result.approvedRetrying",
+    running: "approvals.result.approvedRunning",
+  },
+  generic: {
+    rejected: "approvals.result.rejectedGeneric",
+    done: "approvals.result.approvedGeneric",
+    retrying: "approvals.result.approvedGenericRetrying",
+    running: "approvals.result.approvedGenericRunning",
+  },
+} as const;
+
 /**
  * What a decision did, from the approval the server returned (spec 3.1c2 Lead 4). Every state is named:
  * "done" only once the approval is consumed and its handler succeeded; running and failing say so; anything
  * else is "unclear, reload", never a claim (review WP-3.1c2, silent-failure L2/L3).
  */
 export function decisionOutcome(t: TFunction, decided: Approval): Outcome {
-  const name = decided.project_name;
-  const isDelete = decided.action_type === "project_delete";
-  const ran = decided.status === "consumed" && decided.handler_status === "succeeded";
-  const decidedYes = decided.status === "approved" || decided.status === "consumed";
-  if (decided.status === "rejected") {
-    return {
-      tone: "success",
-      text: isDelete ? t("approvals.result.rejected", { name }) : t("approvals.result.rejectedGeneric"),
-    };
+  const texts = decided.action_type === "project_delete" ? RESULT_TEXTS.project_delete : RESULT_TEXTS.generic;
+  const name = revealHidden(decided.project_name);
+  const isApproved = decided.status === "approved" || decided.status === "consumed";
+  const hasRun = decided.status === "consumed" && decided.handler_status === "succeeded";
+  if (decided.status === "rejected") return { tone: "success", text: t(texts.rejected, { name }) };
+  if (hasRun) return { tone: "success", text: t(texts.done, { name }) };
+  if (isApproved && decided.handler_status === "failed") {
+    return { tone: "warning", text: t(texts.retrying, { name }) };
   }
-  if (ran) {
-    return {
-      tone: "success",
-      text: isDelete ? t("approvals.result.deleted", { name }) : t("approvals.result.approvedGeneric"),
-    };
-  }
-  if (decidedYes && decided.handler_status === "failed") {
-    return {
-      tone: "warning",
-      text: isDelete
-        ? t("approvals.result.approvedRetrying", { name })
-        : t("approvals.result.approvedGenericRetrying"),
-    };
-  }
-  if (decidedYes && decided.handler_status === "pending") {
-    return {
-      tone: "warning",
-      text: isDelete
-        ? t("approvals.result.approvedRunning", { name })
-        : t("approvals.result.approvedGenericRunning"),
-    };
+  if (isApproved && decided.handler_status === "pending") {
+    return { tone: "warning", text: t(texts.running, { name }) };
   }
   return { tone: "warning", text: t("approvals.result.unclear") };
 }
@@ -90,11 +86,13 @@ export function decisionOutcome(t: TFunction, decided: Approval): Outcome {
  * WP-3.1c2 L1): what a person approves must not be reordered or hidden on screen. Line breaks and tabs stay.
  */
 export const revealHidden = (text: string): string =>
-  text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
-    character === "\n" || character === "\t"
-      ? character
-      : `\\u${character.codePointAt(0)?.toString(16).padStart(4, "0") ?? ""}`,
-  );
+  text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
+    if (character === "\n" || character === "\t") return character;
+    const code = character.codePointAt(0) ?? 0;
+    const hex = code.toString(16);
+    // Outside the BMP in braces: "\\ue0041" would read as U+E004 followed by "1".
+    return code > 0xffff ? `\\u{${hex}}` : `\\u${hex.padStart(4, "0")}`;
+  });
 
 export type DecisionError = ErrorText & {
   /** The approval cannot be decided any more (or may already be): sending again would not help. */
@@ -116,23 +114,30 @@ const isNoteError = (details: unknown): boolean =>
 export function decisionError(t: TFunction, error: unknown): DecisionError {
   const api = error instanceof ApiError ? error : null;
   const requestId = api?.requestId ?? null;
-  const own = (title: string, isFinal: boolean): DecisionError => ({ title, body: null, requestId, isFinal });
+  const screenError = (title: string, isFinal: boolean): DecisionError => ({
+    title,
+    body: null,
+    requestId,
+    isFinal,
+  });
   if (api?.kind === "http" && api.code === "INVALID_TRANSITION") {
     const reason = errorReason(api.details);
-    if (reason === "expired") return own(t("approvals.errors.expired"), true);
-    if (reason === "superseded") return own(t("approvals.errors.superseded"), true);
-    if (reason !== null && DECIDED.has(reason)) return own(t("approvals.errors.decided"), true);
-    return own(t("approvals.errors.cannotDecide"), true); // a reason this screen does not know: no guess
+    if (reason === "expired") return screenError(t("approvals.errors.expired"), true);
+    if (reason === "superseded") return screenError(t("approvals.errors.superseded"), true);
+    if (reason !== null && DECIDED.has(reason)) return screenError(t("approvals.errors.decided"), true);
+    return screenError(t("approvals.errors.cannotDecide"), true); // a reason this screen does not know: no guess
   }
   if (api?.kind === "http" && api.code === "APPROVAL_PAYLOAD_MISMATCH") {
-    return own(t("approvals.errors.mismatch"), true);
+    return screenError(t("approvals.errors.mismatch"), true);
   }
-  if (api?.kind === "http" && api.code === "FORBIDDEN") return own(t("approvals.errors.forbidden"), true);
-  if (api?.kind === "http" && api.code === "NOT_FOUND") return own(t("approvals.errors.notFound"), true);
+  if (api?.kind === "http" && api.code === "FORBIDDEN")
+    return screenError(t("approvals.errors.forbidden"), true);
+  if (api?.kind === "http" && api.code === "NOT_FOUND")
+    return screenError(t("approvals.errors.notFound"), true);
   if (api?.kind === "http" && api.code === "VALIDATION_ERROR" && isNoteError(api.details)) {
-    return own(t("approvals.errors.invalidNote"), false);
+    return screenError(t("approvals.errors.invalidNote"), false);
   }
   // A timeout or lost answer: the decision may already be recorded, and a second one could only be refused.
-  if (isOutcomeUnknown(error)) return own(t("approvals.errors.outcomeUnknown"), true);
+  if (isOutcomeUnknown(error)) return screenError(t("approvals.errors.outcomeUnknown"), true);
   return { ...describeError(error, t), isFinal: false };
 }

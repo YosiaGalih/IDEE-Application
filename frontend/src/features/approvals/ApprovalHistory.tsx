@@ -15,22 +15,27 @@ import { APPROVAL_STATUSES, type ApprovalFilter, type ApprovalStatus } from "@/a
 import { ApiError } from "@/api/errors";
 import { useApprovals } from "@/api/hooks/useApprovals";
 import { uxStateForError } from "@/api/uxState";
-import { Badge } from "@/components/ui/Badge";
+import { Badge, type badgeVariants } from "@/components/ui/Badge";
+import type { VariantProps } from "class-variance-authority";
 import { Button } from "@/components/ui/Button";
 import { Label } from "@/components/ui/Label";
 import { StateView } from "@/components/ui/StateView";
 import { cn } from "@/lib/cn";
-import { actionLabel } from "./approvalText";
+import { actionLabel, revealHidden } from "./approvalText";
 
-export const HISTORY_PAGE_SIZE = 20;
+const HISTORY_PAGE_SIZE = 20;
 type HistoryStatus = ApprovalFilter["status"];
-const FILTERS: readonly HistoryStatus[] = ["all", ...APPROVAL_STATUSES];
+// No "pending": for it the server lists only what the caller can decide (the section above), which would
+// hide requests that "all" shows (spec 3.1c2 Lead 5).
+const FILTERS: readonly HistoryStatus[] = [
+  "all",
+  ...APPROVAL_STATUSES.filter((status) => status !== "pending"),
+];
 const isFilter = (value: string): value is HistoryStatus => (FILTERS as readonly string[]).includes(value);
 
-const LOOK: Record<
-  ApprovalStatus,
-  { icon: LucideIcon; tone: "success" | "neutral" | "warning" | "danger" | "info" }
-> = {
+type BadgeTone = NonNullable<VariantProps<typeof badgeVariants>["tone"]>;
+
+const LOOK: Record<ApprovalStatus, { icon: LucideIcon; tone: BadgeTone }> = {
   pending: { icon: Hourglass, tone: "warning" },
   approved: { icon: CheckCircle2, tone: "info" },
   consumed: { icon: CheckCircle2, tone: "success" },
@@ -53,7 +58,7 @@ export function ApprovalHistory() {
     pageSize: HISTORY_PAGE_SIZE,
   });
   const history = useApprovals(filter);
-  const when = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeStyle: "short" });
+  const dateTimeFormat = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeStyle: "short" });
   const meta = history.data?.meta;
   const pages = meta ? Math.max(1, Math.ceil(meta.total / meta.page_size)) : 1;
 
@@ -111,7 +116,7 @@ export function ApprovalHistory() {
               return (
                 <tr key={approval.id} className="border-b border-line align-top last:border-0">
                   <td className="px-4 py-3">{actionLabel(t, approval.action_type)}</td>
-                  <td className="break-words px-4 py-3">{approval.project_name}</td>
+                  <td className="break-words px-4 py-3">{revealHidden(approval.project_name)}</td>
                   <td className="px-4 py-3">
                     <div className="flex flex-wrap gap-1">
                       <Badge tone={tone}>
@@ -127,16 +132,20 @@ export function ApprovalHistory() {
                     </div>
                   </td>
                   <td className="px-4 py-3 text-fg-muted">
-                    <time dateTime={approval.created_at}>{when.format(new Date(approval.created_at))}</time>
-                    <div className="break-all font-mono text-xs">{approval.requested_by}</div>
+                    <time dateTime={approval.created_at}>
+                      {dateTimeFormat.format(new Date(approval.created_at))}
+                    </time>
+                    <div className="break-all font-mono text-xs">{revealHidden(approval.requested_by)}</div>
                   </td>
                   <td className="px-4 py-3 text-fg-muted">
                     {approval.decided_at ? (
-                      <time dateTime={approval.decided_at}>{when.format(new Date(approval.decided_at))}</time>
+                      <time dateTime={approval.decided_at}>
+                        {dateTimeFormat.format(new Date(approval.decided_at))}
+                      </time>
                     ) : null}
                     {approval.decision_note ? (
                       <p className="whitespace-pre-wrap break-words text-xs">
-                        {t("approvals.history.note", { note: approval.decision_note })}
+                        {t("approvals.history.note", { note: revealHidden(approval.decision_note) })}
                       </p>
                     ) : null}
                   </td>

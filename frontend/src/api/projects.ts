@@ -153,7 +153,7 @@ export async function setProjectArchived(projectId: string, archived: boolean): 
   return (await apiRequest(path, { method: "POST", schema: ProjectSchema })).data;
 }
 
-export const DeleteRequestedSchema = z.object({ approval: ApprovalSchema, project: ProjectSchema });
+const DeleteRequestedSchema = z.object({ approval: ApprovalSchema, project: ProjectSchema });
 export type DeleteRequested = z.infer<typeof DeleteRequestedSchema>;
 
 /**

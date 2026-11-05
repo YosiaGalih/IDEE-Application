@@ -360,4 +360,35 @@ describe("ApprovalsPage", () => {
     const card = await screen.findByRole("group", { name: "Kalkulator API" });
     expect(within(card).getByText(/"path": "invoice\\u202etxt\.exe"/)).toBeInTheDocument();
   });
+  it("shows hidden characters in a project name as escapes in the group and the dialog", async () => {
+    const spoofed = approval({ project_name: "Kalku\u202Elator" });
+    backend({ pending: () => okPage([spoofed], { page_size: 200 }) });
+    renderApp("/approvals");
+    const shown = "Kalku\\u202elator";
+    await screen.findByRole("group", { name: shown });
+    const dialog = await openDecision(shown, "approve");
+    expect(within(dialog).getByText(shown)).toBeInTheDocument();
+  });
+
+  it("does not offer 'pending' as a history filter: the server lists only decidable ones for it", async () => {
+    backend();
+    renderApp("/approvals");
+    const filter = await screen.findByLabelText(id.approvals.history.filterLabel);
+    const options = within(filter)
+      .getAllByRole("option")
+      .map((option) => option.textContent);
+    expect(options).not.toContain(id.approvals.status.pending);
+    expect(options).toContain(id.approvals.history.all);
+  });
+
+  it("counts the note in characters, as the server does (an emoji is one)", async () => {
+    backend();
+    renderApp("/approvals");
+    const dialog = await openDecision("Kalkulator API", "approve");
+    const note = within(dialog).getByLabelText(id.approvals.dialog.note);
+    await userEvent.click(note);
+    await userEvent.paste("😀".repeat(1500)); // 1500 characters, 3000 UTF-16 units
+    expect(within(dialog).queryByText(id.approvals.dialog.noteTooLong)).toBeNull();
+    expect(within(dialog).getByRole("button", { name: id.approvals.dialog.confirmApprove })).toBeEnabled();
+  });
 });
