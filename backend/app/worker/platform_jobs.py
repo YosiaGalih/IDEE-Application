@@ -148,17 +148,17 @@ async def run_approvals_sweep(*, now: datetime | None = None) -> dict[str, int]:
 
 
 @shared_task(name=PROJECTS_PURGE_TASK, time_limit=int(PROJECTS_PURGE_SECONDS) - 60)
-def projects_purge() -> list[str]:
+def projects_purge() -> dict[str, list[str]]:
     """Projects deleted 7 days ago or more: workspace, grants, rows (ADR-005). Runs where the workspace volume
     is mounted (the worker, not the scheduler)."""
     return asyncio.run(run_projects_purge())
 
 
-async def run_projects_purge(*, now: datetime | None = None) -> list[str]:
+async def run_projects_purge(*, now: datetime | None = None) -> dict[str, list[str]]:
     settings = load_settings()
     engine = make_engine(settings.database_url)
     try:
-        purged = await project_delete.purge_deleted(
+        result = await project_delete.purge_deleted(
             sessions=make_sessionmaker(engine),
             audit=AuditWriter(Redactor(settings.secret_values())),
             workspace_root=Path(settings.workspace_root),
@@ -166,4 +166,4 @@ async def run_projects_purge(*, now: datetime | None = None) -> list[str]:
         )
     finally:
         await engine.dispose()
-    return [str(project_id) for project_id in purged]
+    return {"purged": [str(i) for i in result.purged], "failed": [str(i) for i in result.failed]}

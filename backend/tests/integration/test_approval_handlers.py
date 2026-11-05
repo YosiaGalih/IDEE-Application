@@ -198,3 +198,67 @@ async def test_pending_and_superseded_are_not_dispatched(sessions: async_session
         sessions=sessions, audit=AUDIT, handlers={"project_delete": fake}, approval_id=pending, now=NOW
     )
     assert fake.calls == []
+
+
+async def test_superseded_while_running_stays_not_required(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    # decided, then a rename supersedes it while the handler runs: success must not be written over it.
+    approval_id = await decided(sessions)
+
+    class Superseding(Fake):
+        async def approved(self, approval_id: uuid.UUID, *, now: datetime) -> None:
+            async with sessions() as session:
+                row = await session.get(Approval, approval_id)
+                assert row is not None
+                row.status, row.handler_status = "superseded", "not_required"
+                await session.commit()
+
+    await handlers.dispatch(
+        sessions=sessions,
+        audit=AUDIT,
+        handlers={"project_delete": Superseding()},
+        approval_id=approval_id,
+        now=NOW,
+    )
+    assert (await row(sessions, approval_id)).handler_status == "not_required"
+
+
+@pytest.mark.parametrize(("attempts", "wait"), [(1, 30), (2, 120), (3, 600), (4, 3600)])
+async def test_backoff_steps(sessions: async_sessionmaker[AsyncSession], attempts: int, wait: int) -> None:
+    approval_id = await decided(sessions)
+    async with sessions() as session:
+        found = await session.get(Approval, approval_id)
+        assert found is not None
+        found.handler_status, found.handler_attempts, found.updated_at = "failed", attempts, NOW
+        await session.commit()
+    fake = Fake()
+    registry = {"project_delete": fake}
+    before = await handlers.sweep(
+        sessions=sessions, audit=AUDIT, handlers=registry, now=NOW + timedelta(seconds=wait - 1)
+    )
+    assert before.dispatched == 0
+    after = await handlers.sweep(
+        sessions=sessions, audit=AUDIT, handlers=registry, now=NOW + timedelta(seconds=wait)
+    )
+    assert after.dispatched == 1
+
+
+async def test_dispatch_never_raises_when_recording_fails(
+    sessions: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    approval_id = await decided(sessions)
+    broken = AuditWriter(Redactor())
+
+    async def down(*args: object, **kwargs: object) -> None:
+        raise ConnectionError("database went away")
+
+    monkeypatch.setattr(broken, "write", down)
+    result = await handlers.dispatch(
+        sessions=sessions,
+        audit=broken,
+        handlers={"project_delete": Fake(fail=1)},
+        approval_id=approval_id,
+        now=NOW,
+    )
+    assert result == "failed"

@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.models.approvals import Approval
@@ -178,6 +178,8 @@ async def test_concurrent_decisions_one_wins(owner: httpx.AsyncClient) -> None: 
         {"decision": "maybe", "payload_hash": "a" * 64},
         {"decision": "approve", "payload_hash": "A" * 64},
         {"decision": "approve", "payload_hash": "a" * 64, "status": "approved"},
+        {"decision": "approve", "payload_hash": "a" * 64, "note": "nul\u0000here"},
+        {"decision": "approve", "payload_hash": "a" * 64, "note": "bidi \u202e txet"},
     ],
 )
 async def test_bad_decision_bodies_are_422(owner: httpx.AsyncClient, body: dict[str, object]) -> None:  # noqa: F811
@@ -201,3 +203,50 @@ async def test_expired_pending_is_not_decidable(owner: httpx.AsyncClient, engine
     assert (await owner.get(APPROVALS)).json()["data"] == []
     shown = (await owner.get(f"{APPROVALS}/{approval['id']}")).json()["data"]  # type: ignore[index]
     assert shown["can_decide"] is False
+
+
+async def test_a_note_keeps_line_breaks(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    approval = (await request_delete(owner, await project(owner)))["approval"]
+    response = await decide(owner, approval, "reject", note="line one\nline two\tend")  # type: ignore[arg-type]
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["decision_note"] == "line one\nline two\tend"
+
+
+async def test_rename_racing_a_decision_never_deletes_the_renamed_project(
+    owner: httpx.AsyncClient,  # noqa: F811
+) -> None:
+    # AG-13 LOW-7a: whichever wins, the old name is never what gets deleted under a new name.
+    project_id = await project(owner, "Before")
+    approval = (await request_delete(owner, project_id))["approval"]
+    rename = owner.patch(f"{PROJECTS}/{project_id}", json={"name": "After"}, headers=headers(owner))
+    decision = decide(owner, approval)  # type: ignore[arg-type]
+    renamed, decided = await asyncio.gather(rename, decision)
+    if decided.status_code == 200 and decided.json()["data"]["status"] == "consumed":
+        assert renamed.status_code == 404  # deleted first: the rename found nothing
+    else:
+        assert renamed.status_code == 200
+        pending = (await owner.get(APPROVALS)).json()["data"]
+        assert [a["payload"]["name"] for a in pending] == ["After"]
+        shown = (await owner.get(f"{PROJECTS}/{project_id}")).json()["data"]
+        assert shown["status"] == "deleting_pending_approval"
+
+
+async def test_a_decision_waits_for_a_concurrent_change(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    # Deterministic form of the race: another transaction holds the row and settles it; the decision must
+    # wait for it and then see the new state, never overwrite it (Review Focus 3).
+    approval = (await request_delete(owner, await project(owner)))["approval"]
+    approval_id = uuid.UUID(str(approval["id"]))  # type: ignore[index]
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        await conn.execute(select(Approval.id).where(Approval.id == approval_id).with_for_update())
+        decision = asyncio.create_task(decide(owner, approval))  # type: ignore[arg-type]
+        await asyncio.sleep(0.3)
+        assert not decision.done()  # held by the lock
+        await conn.execute(update(Approval).where(Approval.id == approval_id).values(status="rejected"))
+        await transaction.commit()
+    response = await decision
+    assert response.status_code == 409
+    assert response.json()["error"]["details"][0]["reason"] == "rejected"

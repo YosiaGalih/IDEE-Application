@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
@@ -57,6 +57,12 @@ def _now(now: datetime | None) -> datetime:
     return now if now is not None else datetime.now(UTC)
 
 
+def _error_text(exc: BaseException) -> str:
+    """Type and the first line only: driver errors put SQL parameters (payload text) on later lines."""
+    first = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    return f"{type(exc).__name__}: {first}"[:ERROR_MAX]
+
+
 async def _record(
     sessions: async_sessionmaker[AsyncSession],
     audit: AuditWriter,
@@ -69,6 +75,10 @@ async def _record(
         approval = await session.get(Approval, approval_id, with_for_update=True)
         if approval is None:  # the project was purged meanwhile: nothing left to record
             return "succeeded"
+        if approval.status == "superseded" or approval.handler_status == "not_required":
+            return approval.handler_status  # superseded while the handler ran: nothing was owed
+        if approval.handler_status == "succeeded":
+            return "succeeded"  # a concurrent run already finished it; a late failure does not undo that
         approval.handler_attempts += 1
         approval.updated_at = at  # the backoff clock
         if error is None:
@@ -76,10 +86,9 @@ async def _record(
         else:
             approval.handler_status = "failed"
             approval.handler_error = audit.redactor.redact(error)[:ERROR_MAX]
+            gave_up = approval.handler_attempts == MAX_ATTEMPTS
             metadata = {"action_type": approval.action_type, "attempts": approval.handler_attempts}
-            for action in ("approval.handler_failed",) + (
-                ("approval.handler_gave_up",) if approval.handler_attempts >= MAX_ATTEMPTS else ()
-            ):
+            for action in ("approval.handler_failed",) + (("approval.handler_gave_up",) if gave_up else ()):
                 await audit.write(
                     session,
                     actor_type="system",
@@ -90,6 +99,13 @@ async def _record(
                     resource_id=str(approval.id),
                     project_id=approval.project_id,
                     metadata=metadata,
+                )
+            if gave_up:
+                logger.error(
+                    "approval_handler_gave_up",
+                    approval_id=str(approval.id),
+                    action_type=approval.action_type,
+                    attempts=approval.handler_attempts,
                 )
         status = approval.handler_status
         await session.commit()
@@ -105,32 +121,48 @@ async def dispatch(
     now: datetime | None = None,
 ) -> str:
     """Run the handler path the approval's status calls for; return the resulting ``handler_status``. Never
-    raises: a failure is recorded and left to the sweep."""
+    raises: a failure is recorded and left to the sweep; a failure to record is logged and retried there."""
     at = _now(now)
-    async with sessions() as session:
-        approval = await session.get(Approval, approval_id)
-        if approval is None:
-            return "succeeded"
-        status, handler_status, action_type = approval.status, approval.handler_status, approval.action_type
-    path = _PATHS.get(status)
-    if path is None or handler_status in ("succeeded", "not_required"):
-        return handler_status  # pending/superseded need no handler; done is done
-    handler = handlers.get(action_type)
     try:
-        if handler is None:
-            raise LookupError(f"no handler registered for {action_type}")
-        await getattr(handler, path)(approval_id, now=at)
-    except Exception as exc:  # recorded and retried, never lost: ADR-024
-        logger.warning("approval_handler_failed", approval_id=str(approval_id), error_type=type(exc).__name__)
-        return await _record(sessions, audit, approval_id, error=f"{type(exc).__name__}: {exc}", at=at)
-    return await _record(sessions, audit, approval_id, error=None, at=at)
+        async with sessions() as session:
+            approval = await session.get(Approval, approval_id)
+            if approval is None:
+                return "succeeded"
+            status, handler_status, action_type = (
+                approval.status,
+                approval.handler_status,
+                approval.action_type,
+            )
+        path = _PATHS.get(status)
+        if path is None or handler_status in ("succeeded", "not_required"):
+            return handler_status  # pending/superseded need no handler; done is done
+        handler = handlers.get(action_type)
+        try:
+            if handler is None:
+                raise LookupError(f"no handler registered for {action_type}")
+            await getattr(handler, path)(approval_id, now=at)
+        except Exception as exc:  # recorded and retried, never lost: ADR-024
+            logger.warning(
+                "approval_handler_failed",
+                approval_id=str(approval_id),
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+            return await _record(sessions, audit, approval_id, error=_error_text(exc), at=at)
+        return await _record(sessions, audit, approval_id, error=None, at=at)
+    except Exception:  # the database itself failed: nothing could be recorded; the sweep will see it again
+        logger.error("approval_dispatch_unrecorded", approval_id=str(approval_id), exc_info=True)
+        return "failed"
 
 
-def _due(approval: Approval, at: datetime) -> bool:
-    if approval.handler_attempts == 0:
-        return True
-    wait = BACKOFF[min(approval.handler_attempts, len(BACKOFF)) - 1]
-    return approval.updated_at + wait <= at
+def _due_clause(at: datetime) -> ColumnElement[bool]:
+    """Due now: a first attempt at once, a retry after its backoff (computed in SQL, so rows waiting on a
+    long backoff never crowd out due ones in the batch)."""
+    waits = [Approval.handler_attempts == 0] + [
+        and_(Approval.handler_attempts == n, Approval.updated_at <= at - BACKOFF[n - 1])
+        for n in range(1, MAX_ATTEMPTS)
+    ]
+    return or_(*waits)
 
 
 async def sweep(
@@ -146,25 +178,23 @@ async def sweep(
         expired = await approval_store.expire_due(session, audit, now=at)
         await session.commit()
     async with sessions() as session:
-        candidates = (
+        due = (
             await session.scalars(
-                select(Approval)
+                select(Approval.id)
                 .where(
                     Approval.handler_status.in_(("pending", "failed")),
                     Approval.status.in_(tuple(_PATHS)),
-                    Approval.handler_attempts < MAX_ATTEMPTS,
-                    or_(Approval.handler_attempts == 0, Approval.updated_at <= at),
+                    _due_clause(at),
                 )
                 .order_by(Approval.updated_at)
                 .limit(_SWEEP_BATCH)
             )
         ).all()
-        due = [approval.id for approval in candidates if _due(approval, at)]
     failed = 0
     for approval_id in due:
-        if (
-            await dispatch(sessions=sessions, audit=audit, handlers=handlers, approval_id=approval_id, now=at)
-            == "failed"
-        ):
-            failed += 1
+        # The clock is read again per dispatch (``now`` is only ever fixed by tests).
+        result = await dispatch(
+            sessions=sessions, audit=audit, handlers=handlers, approval_id=approval_id, now=now
+        )
+        failed += result == "failed"
     return SweepResult(expired=len(expired), dispatched=len(due), failed=failed)

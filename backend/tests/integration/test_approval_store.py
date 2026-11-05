@@ -136,6 +136,16 @@ async def test_renew_supersedes_and_keeps_requester(session: AsyncSession) -> No
         "approval.superseded",
         "approval.requested",
     ]
+    renewal = await session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.resource_id == str(renewed.id), AuditEvent.action == "approval.requested"
+        )
+    )
+    assert renewal is not None
+    # who caused the renewal is the actor; the original requester stays on record (AG-13 LOW-4)
+    assert (renewal.actor_type, renewal.actor_id) == ("user", "00000000-0000-4000-8000-000000000001")
+    assert renewal.metadata_["requested_by"] == old.requested_by
+    assert renewal.metadata_["renewed_from"] == str(old.id)
 
 
 async def test_renew_without_an_open_approval_does_nothing(session: AsyncSession) -> None:

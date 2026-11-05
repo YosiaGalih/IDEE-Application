@@ -97,14 +97,22 @@ async def list_approvals(
 async def _visible(
     session: AsyncSession, actor: Actor, approval_id: uuid.UUID, *, lock: bool
 ) -> tuple[Approval, frozenset[str]]:
-    query = select(Approval).where(Approval.id == approval_id)
-    if lock:
-        query = query.with_for_update().execution_options(populate_existing=True)
-    approval = await session.scalar(query)
+    approval = await session.get(Approval, approval_id)
     project = await session.get(Project, approval.project_id) if approval is not None else None
     permissions = permissions_for(actor, project) if project is not None else frozenset()
     if approval is None or "project:read" not in permissions:
         raise not_found()  # out of scope reads as unknown (§1)
+    if lock:
+        # Only after the scope check, so a stranger never holds (or waits on) a lock on someone else's row.
+        locked = await session.scalar(
+            select(Approval)
+            .where(Approval.id == approval_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if locked is None:
+            raise not_found()
+        approval = locked
     return approval, permissions
 
 
@@ -136,17 +144,17 @@ async def decide(
     note: str | None,
     now: datetime | None = None,
 ) -> ApprovalView:
-    at = _now(now)
     lapsed = False
     async with env.sessions() as session:
         approval, permissions = await _visible(session, actor, approval_id, lock=True)
+        at = _now(now)  # read after the lock wait: an approval is not decided past its time
         needed = DECIDE_PERMISSION.get(approval.action_type)
         if "approval:decide" not in permissions or needed is None or needed not in permissions:
             raise AppError("FORBIDDEN", "Not allowed", http_status=403)
         if approval.status != "pending":
             raise _not_pending(approval.status)
         if approval.expires_at is not None and approval.expires_at <= at:
-            await approval_store.expire(session, env.audit, approval, actor=f"user:{actor.user_id}")
+            await approval_store.expire(session, env.audit, approval, actor=f"user:{actor.user_id}", now=at)
             lapsed = True
         elif payload_hash != approval.payload_hash:
             raise AppError(
@@ -155,24 +163,15 @@ async def decide(
                 http_status=409,
             )
         else:
-            approval.status = "approved" if decision == "approve" else "rejected"
-            approval.decided_by, approval.decided_at, approval.decision_note = actor.user_id, at, note
-            approval.handler_status, approval.updated_at = "pending", at
-            await env.audit.write(
+            await approval_store.decide(
                 session,
-                actor_type="user",
-                actor_id=str(actor.user_id),
-                action="approval.decided",
-                result="success",
-                resource_type="approval",
-                resource_id=str(approval.id),
-                project_id=approval.project_id,
-                metadata={
-                    "action_type": approval.action_type,
-                    "decision": decision,
-                    "payload_hash": approval.payload_hash,
-                },
+                env.audit,
+                approval,
+                approve=decision == "approve",
+                user_id=actor.user_id,
+                note=note,
                 ip=actor.ip,
+                now=at,
             )
         await session.commit()
     # ADR-024: the decision (or the lapse) is committed; the handler runs on its own transactions.

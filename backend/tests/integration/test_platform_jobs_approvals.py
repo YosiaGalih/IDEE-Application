@@ -64,7 +64,7 @@ async def test_purge_job_removes_due_projects(engine: AsyncEngine, worker_env: P
         await session.commit()
         project_id = project.id
     (worker_env / str(project_id) / "repo").mkdir(parents=True)
-    assert await platform_jobs.run_projects_purge(now=NOW) == [str(project_id)]
+    assert await platform_jobs.run_projects_purge(now=NOW) == {"purged": [str(project_id)], "failed": []}
     assert not (worker_env / str(project_id)).exists()
     async with make_sessionmaker(engine)() as session:
         assert await session.scalar(select(Project).where(Project.id == project_id)) is None

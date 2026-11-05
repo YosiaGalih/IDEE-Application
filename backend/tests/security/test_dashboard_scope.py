@@ -46,8 +46,11 @@ async def _project(engine: AsyncEngine, owner: uuid.UUID, name: str, status: str
     if status != "active":
         async with engine.begin() as conn:  # projects writes its own status; a test may set any value
             await conn.execute(
-                text("UPDATE projects SET status = :status WHERE id = :id"),
-                {"status": status, "id": project_id},
+                text(  # deleted_at exists exactly while a project is deleted (ck_projects_deleted_at)
+                    "UPDATE projects SET status = :status, deleted_at = CASE WHEN :gone THEN now() END "
+                    "WHERE id = :id"
+                ),
+                {"status": status, "gone": status == "deleted", "id": project_id},
             )
     return project_id
 
@@ -188,7 +191,9 @@ async def test_a_grant_on_a_deleted_project_counts_nothing(
     await grant(engine, people["ids"]["carl"], "readonly", f"project:{main}")
     assert (await seen(await people["client"]("carl")))["metrics"]["failed_tasks"] == 1  # the grant works
     async with engine.begin() as conn:
-        await conn.execute(text("UPDATE projects SET status = 'deleted' WHERE id = :id"), {"id": main})
+        await conn.execute(
+            text("UPDATE projects SET status = 'deleted', deleted_at = now() WHERE id = :id"), {"id": main}
+        )
     carl = await seen(await people["client"]("carl"))
     assert carl["metrics"] == dict.fromkeys(carl["metrics"], 0)
     assert (carl["projects"], carl["tasks"], carl["queue"]) == (set(), set(), set())

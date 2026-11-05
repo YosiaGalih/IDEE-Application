@@ -293,7 +293,12 @@ async def test_approvals_of_other_projects_do_not_exist(world: dict[str, object]
     for who in ("stranger", "admin"):
         client = world[who]
         assert isinstance(client, httpx.AsyncClient)
-        assert (await client.get(f"/api/v1/approvals/{approval['id']}")).status_code == 404
+        hidden = await client.get(f"/api/v1/approvals/{approval['id']}")
+        missing = await client.get(f"/api/v1/approvals/{uuid.uuid4()}")
+        assert (hidden.status_code, hidden.json()["error"]) == (
+            404,
+            missing.json()["error"],
+        )  # indistinguishable
         decision = await client.post(
             f"/api/v1/approvals/{approval['id']}/decision",
             json={"decision": "approve", "payload_hash": approval["payload_hash"]},

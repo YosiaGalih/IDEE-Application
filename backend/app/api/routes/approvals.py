@@ -6,12 +6,13 @@ Decisions come only from a signed-in person over HTTP with a session (CSRF-prote
 
 from __future__ import annotations
 
+import unicodedata
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.deps import CurrentActor
 from app.api.routes.approval_out import ApprovalOut
@@ -31,6 +32,17 @@ class DecisionIn(BaseModel):
     decision: Decision
     payload_hash: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     note: Annotated[str | None, Field(max_length=NOTE_MAX)] = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_text(cls, note: str | None) -> str | None:
+        # PostgreSQL text refuses NUL (a 500 otherwise); control and format characters (bidi) would reach
+        # the screen that shows the note. Line breaks and tabs stay.
+        if note is not None and any(
+            unicodedata.category(c) in ("Cc", "Cf") and c not in "\n\t" for c in note
+        ):
+            raise ValueError("note must be plain text")
+        return note
 
 
 @router.get("")

@@ -37,6 +37,8 @@ def _in(column: str, values: Sequence[str]) -> str:
 
 def upgrade() -> None:
     op.add_column("projects", sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True))
+    # No code path set "deleted" before this revision; a row edited by hand gets its purge clock started.
+    op.execute("UPDATE projects SET deleted_at = updated_at WHERE status = 'deleted'")
     op.create_check_constraint(
         op.f("ck_projects_deleted_at"), "projects", "(status = 'deleted') = (deleted_at IS NOT NULL)"
     )

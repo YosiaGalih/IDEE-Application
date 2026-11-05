@@ -123,9 +123,12 @@ async def create(
     risk_level: int,
     requested_by: str,
     actor_ip: str | None = None,
+    audit_actor: str | None = None,
+    renewed_from: uuid.UUID | None = None,
     now: datetime | None = None,
 ) -> Approval:
-    """A ``pending`` approval bound to the hash of exactly this action, expiring per §11.1."""
+    """A ``pending`` approval bound to the hash of exactly this action, expiring per §11.1. ``audit_actor``:
+    who caused this request when it is not the requester (a renewal)."""
     if action_type not in EXPIRY:
         raise ValueError(f"{action_type} cannot be requested as an approval")
     at = _now(now)
@@ -147,8 +150,12 @@ async def create(
         audit,
         approval,
         "approval.requested",
-        actor=requested_by,
-        metadata={"expires_at": approval.expires_at.isoformat() if approval.expires_at else None},
+        actor=audit_actor or requested_by,
+        metadata={
+            "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
+            "requested_by": requested_by,
+            **({"renewed_from": str(renewed_from)} if renewed_from else {}),
+        },
         ip=actor_ip,
     )
     return approval
@@ -201,6 +208,8 @@ async def renew_open(
         risk_level=old.risk_level,
         requested_by=old.requested_by,
         actor_ip=actor_ip,
+        audit_actor=actor_id,
+        renewed_from=old.id,
         now=now,
     )
 
@@ -225,11 +234,42 @@ async def consume(
     return consumed is not None
 
 
-async def expire(session: AsyncSession, audit: AuditWriter, approval: Approval, *, actor: str) -> None:
+async def decide(
+    session: AsyncSession,
+    audit: AuditWriter,
+    approval: Approval,
+    *,
+    approve: bool,
+    user_id: uuid.UUID,
+    note: str | None,
+    ip: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Record a person's decision on a locked, ``pending``, unexpired approval whose hash the caller checked.
+    The handler runs after the caller commits (ADR-024)."""
+    at = _now(now)
+    approval.status = "approved" if approve else "rejected"
+    approval.decided_by, approval.decided_at, approval.decision_note = user_id, at, note
+    approval.handler_status, approval.updated_at = "pending", at
+    await session.flush()
+    await _audit(
+        session,
+        audit,
+        approval,
+        "approval.decided",
+        actor=f"user:{user_id}",
+        metadata={"decision": "approve" if approve else "reject"},
+        ip=ip,
+    )
+
+
+async def expire(
+    session: AsyncSession, audit: AuditWriter, approval: Approval, *, actor: str, now: datetime | None = None
+) -> None:
     """``pending`` (or approved but not consumed) past its time: ``expired``, with its handler still to run so
     the action's owner can undo what the request did (a pending delete restores the project)."""
     approval.status = "expired"
-    approval.handler_status = "pending"
+    approval.handler_status, approval.updated_at = "pending", _now(now)
     await session.flush()
     await _audit(session, audit, approval, "approval.expired", actor=actor)
 
@@ -248,5 +288,5 @@ async def expire_due(
         )
     ).all()
     for approval in due:
-        await expire(session, audit, approval, actor="system:approvals_sweep")
+        await expire(session, audit, approval, actor="system:approvals_sweep", now=at)
     return [approval.id for approval in due]
