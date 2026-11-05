@@ -1,6 +1,8 @@
 import type { RouteObject } from "react-router";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { StateView } from "@/components/ui/StateView";
+import { AgentDetailPage } from "@/features/agents/AgentDetailPage";
+import { AgentsPage } from "@/features/agents/AgentsPage";
 import { ForgotPasswordPage } from "@/features/auth/ForgotPasswordPage";
 import { LoginPage } from "@/features/auth/LoginPage";
 import { RequireSession } from "@/features/auth/RequireSession";
@@ -59,7 +61,8 @@ export const routes: RouteObject[] = [
           { path: "tasks/:taskId/testing", element: page("testing") },
           { path: "tasks/:taskId/review", element: page("review") },
           { path: "tasks/:taskId/acceptance", element: page("acceptance") },
-          { path: "agents", element: page("agents") },
+          { path: "agents", element: <AgentsPage /> },
+          { path: "agents/:agentId", element: <AgentDetailPage /> },
           { path: "approvals", element: page("approvals") },
           { path: "settings/providers", element: page("providers") },
           { path: "settings/usage", element: page("usage") },

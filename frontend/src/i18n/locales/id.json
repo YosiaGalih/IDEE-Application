@@ -647,5 +647,126 @@
       },
       "fresh": "{{count}} file baru muncul dan belum dipilih: {{paths}}"
     }
+  },
+  "agents": {
+    "subtitle": "{{total}} agent terdaftar · {{ready}} siap · {{notReady}} belum siap · {{planned}} direncanakan",
+    "approvalStatement": "Tidak ada agent yang dapat memberi persetujuan.",
+    "approvalWarning_one": "{{count}} agent tercatat dapat memberi persetujuan. Periksa registry.",
+    "approvalWarning_other": "{{count}} agent tercatat dapat memberi persetujuan. Periksa registry.",
+    "filters": {
+      "chip": "{{label}} ({{count}})",
+      "label": "Saring agent",
+      "all": "Semua",
+      "status": "Status",
+      "anyStatus": "Semua status",
+      "search": "Cari nama, ID, atau tool",
+      "searchPlaceholder": "mis. B14 atau git.commit_task"
+    },
+    "modes": {
+      "llm": "LLM",
+      "profile": "Profil",
+      "tool": "Tool",
+      "planned": "Direncanakan"
+    },
+    "status": {
+      "ready": "Siap",
+      "not_ready": "Belum siap",
+      "disabled": "Nonaktif",
+      "planned": "Direncanakan"
+    },
+    "reasons": {
+      "lead": "Belum siap: {{reasons}}",
+      "runtime_unavailable": "runtime belum dibangun",
+      "provider_readiness_unknown": "readiness provider belum diuji",
+      "provider_not_ready": "provider belum lulus readiness",
+      "tools_unavailable_one": "{{count}} tool belum tersedia",
+      "tools_unavailable_other": "{{count}} tool belum tersedia"
+    },
+    "groups": {
+      "planning_intent": "Perencanaan & intent",
+      "software_development": "Pengembangan software",
+      "testing_debugging": "Testing & debugging",
+      "quality_security": "Kualitas & keamanan",
+      "git_collaboration": "Git & kolaborasi",
+      "devops_operations": "DevOps & operasi",
+      "documentation_knowledge": "Dokumentasi & knowledge",
+      "specialized_engineering": "Engineering khusus",
+      "orchestration": "Orkestrasi",
+      "ai_assistant": "Asisten AI",
+      "integrations": "Integrasi",
+      "portfolio": "Portfolio"
+    },
+    "groupHeading": "{{group}} ({{count}})",
+    "noMatch": {
+      "title": "Tidak ada agent yang cocok",
+      "body": "Ubah filter atau kata pencarian."
+    },
+    "card": {
+      "priority": "Prioritas {{priority}}",
+      "mode": "Mode {{mode}}"
+    },
+    "runStatus": {
+      "running": "Berjalan",
+      "succeeded": "Berhasil",
+      "failed": "Gagal",
+      "cancelled": "Dibatalkan",
+      "budget_exceeded": "Budget habis",
+      "approval_required": "Menunggu persetujuan"
+    },
+    "tiers": {
+      "fast": "Cepat",
+      "default": "Default",
+      "complex": "Kompleks"
+    },
+    "permissionFields": {
+      "filesystem": "Filesystem",
+      "sandbox": "Sandbox",
+      "git": "Git",
+      "network": "Jaringan",
+      "deployment": "Deployment",
+      "portfolio": "Portfolio",
+      "data_sensitivity_max": "Sensitivitas data maksimum",
+      "approval_grant": "Memberi persetujuan"
+    },
+    "detail": {
+      "heading": "{{name}} ({{id}})",
+      "back": "Kembali ke katalog",
+      "purpose": "Tujuan",
+      "description": "Deskripsi",
+      "triggers": "Pemicu",
+      "capabilities": "Kemampuan",
+      "permissions": "Izin",
+      "permission": "Izin",
+      "value": "Nilai",
+      "tools": "Tool",
+      "toolUnavailable": "belum tersedia",
+      "noTools": "Tidak ada tool",
+      "limits": "Batas",
+      "maxIterations": "Iterasi maksimum",
+      "timeout": "Batas waktu",
+      "seconds_one": "{{count}} detik",
+      "seconds_other": "{{count}} detik",
+      "modelTier": "Tier model",
+      "contracts": "Kontrak",
+      "input": "Input",
+      "output": "Output",
+      "none": "Tidak ada",
+      "runtimeAgent": "Memakai runtime {{agent}}",
+      "accessNote": "Catatan akses",
+      "version": "Versi {{version}}",
+      "runs": "Run terbaru",
+      "noRuns": "Belum ada run untuk agent ini.",
+      "runsScope": "Hanya run dari project yang dapat Anda lihat.",
+      "started": "Mulai",
+      "task": "Task",
+      "runStatusColumn": "Status",
+      "duration": "Durasi",
+      "durationValue": "{{seconds}} dtk",
+      "stats": "Statistik run",
+      "statRuns": "Jumlah run",
+      "statSuccess": "Tingkat berhasil",
+      "statDuration": "Durasi rata-rata",
+      "notAvailable": "Tidak tersedia"
+    }
   }
 }
