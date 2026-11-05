@@ -87,8 +87,19 @@ def upgrade() -> None:
             "target_mode IS NULL OR " + _in("target_mode", ("llm", "profile", "tool")),
             name=op.f("ck_agent_profiles_target_mode"),
         ),
+        sa.CheckConstraint(
+            "coalesce(permission_profile ->> 'approval_grant', '') = 'deny'",
+            name=op.f("ck_agent_profiles_approval_grant_deny"),
+        ),
         sa.PrimaryKeyConstraint("agent_id", name=op.f("pk_agent_profiles")),
-        sa.UniqueConstraint("slug", name=op.f("uq_agent_profiles_slug")),
+    )
+    # A retired agent keeps its slug; only the agents of the current registry need distinct ones.
+    op.create_index(
+        "uq_agent_profiles_slug",
+        "agent_profiles",
+        ["slug"],
+        unique=True,
+        postgresql_where=sa.text("in_registry"),
     )
     op.create_table(
         "agent_runs",
@@ -145,4 +156,5 @@ def downgrade() -> None:
     op.drop_index("ix_agent_runs_agent_id_started_at", table_name="agent_runs")
     op.drop_index("ix_agent_runs_task_id", table_name="agent_runs")
     op.drop_table("agent_runs")
+    op.drop_index("uq_agent_profiles_slug", table_name="agent_profiles")
     op.drop_table("agent_profiles")

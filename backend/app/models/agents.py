@@ -36,6 +36,7 @@ from app.models.enums import (
 )
 
 _EMPTY_JSON = text("'{}'::jsonb")
+APPROVAL_GRANT_DENY = "coalesce(permission_profile ->> 'approval_grant', '') = 'deny'"
 
 
 class AgentProfile(Timestamps, Base):
@@ -51,10 +52,14 @@ class AgentProfile(Timestamps, Base):
         CheckConstraint(
             "target_mode IS NULL OR " + in_values("target_mode", AGENT_TARGET_MODES), name="target_mode"
         ),
+        # Under the loader's rule, for a row written any other way (the runtime role may UPDATE this table).
+        CheckConstraint(APPROVAL_GRANT_DENY, name="approval_grant_deny"),
+        # A retired agent keeps its slug; only the agents of the current registry need distinct ones.
+        Index("uq_agent_profiles_slug", "slug", unique=True, postgresql_where=text("in_registry")),
     )
 
     agent_id: Mapped[str] = mapped_column(String(40), primary_key=True)
-    slug: Mapped[str] = mapped_column(String(60), nullable=False, unique=True)
+    slug: Mapped[str] = mapped_column(String(60), nullable=False)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     group: Mapped[str] = mapped_column(String(40), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -54,6 +54,10 @@ async def test_runs_and_stats_only_from_visible_projects(app: FastAPI, engine: A
     assert as_bob["recent_runs"] == []
     assert as_bob["stats"] == {"runs": 0, "success_rate": None, "avg_duration_ms": None}
 
+    gone = await add_project(engine, alice, "Deleted Project", status="deleted")
+    await add_run(engine, await add_task(engine, gone, alice, "running", "Gone"), status="succeeded")
+    assert (await seen("alice@example.test"))["stats"]["runs"] == 2  # type: ignore[index]  # a deleted project counts for no one
+
     as_carl = await seen("carl@example.test")  # a grant on the shared project only
     assert [run["id"] for run in as_carl["recent_runs"]] == [str(shared_run)]  # type: ignore[union-attr,index]
     assert as_carl["stats"] == {"runs": 1, "success_rate": 0.0, "avg_duration_ms": 500}

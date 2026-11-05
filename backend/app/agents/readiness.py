@@ -1,7 +1,8 @@
 """Agent status (FR-045, spec WP-3.1b goal 4): computed when read, never stored.
 
 ``ready`` is a claim that the agent can run now. It is only made when nothing it needs is missing: its
-runtime (the AgentRuntime for llm/profile agents, WP-3.1f; the workflow engine for ORCH, WP-3.2), a provider
+runtime (the AgentRuntime for llm/profile agents, WP-3.1f; the workflow engine for tool-mode agents and
+ORCH, WP-3.2, since the orchestrator runs their tools in their name, AGENT_CATALOG §4.3), a provider
 that passed the readiness gate (WP-3.1e) for agents that call the model, and every allowlisted tool built.
 """
 
@@ -43,10 +44,8 @@ def assess(
         return "disabled", [], []
     reasons: list[StatusReason] = []
     calls_model = agent.mvp_mode in {"llm", "profile"}
-    runtime = (
-        "agent_runtime" if calls_model else "workflow_engine" if agent.group == "orchestration" else None
-    )
-    if runtime is not None and not RUNTIMES_AVAILABLE[runtime]:
+    runtime = "agent_runtime" if calls_model else "workflow_engine"
+    if not RUNTIMES_AVAILABLE[runtime]:
         reasons.append("runtime_unavailable")
     if calls_model and provider_ready is None:
         reasons.append("provider_readiness_unknown")

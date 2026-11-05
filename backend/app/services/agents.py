@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -14,11 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.readiness import AgentStatus, StatusReason, assess
 from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.audit import AuditWriter
+from app.core.logging import get_logger
 from app.models.agents import AgentProfile, AgentRun
 from app.models.enums import AGENT_GROUPS, AGENT_MODES
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.services.projects import Actor, visible_projects_filter
+
+logger = get_logger(__name__)
 
 # One sync at a time across every process (API replicas starting together, seed-agents): held to commit.
 _SYNC_LOCK = text("SELECT pg_advisory_xact_lock(hashtext('kk.agent_registry'))")
@@ -70,32 +73,58 @@ def _values(spec: AgentSpec) -> dict[str, Any]:
     }
 
 
+def _differs(row: AgentProfile, values: Mapping[str, Any]) -> bool:
+    # Every column, not only the stored hash: a row edited in place is put back too.
+    return any(getattr(row, field) != value for field, value in values.items())
+
+
 async def sync_registry(session: AsyncSession, registry: AgentRegistry, audit: AuditWriter) -> SyncResult:
     """Make ``agent_profiles`` match the registry; the caller commits. Rows are never deleted: an id that
     left the registry is kept with ``in_registry`` and ``enabled`` false (ids are never reused; runs point at
-    them)."""
+    them). The audit event names every agent that changed, with its versions and hashes."""
     await session.execute(_SYNC_LOCK)
     rows = {row.agent_id: row for row in (await session.scalars(select(AgentProfile))).all()}
-    inserted = updated = unchanged = retired = 0
-    for spec in registry.agents:
-        values = _values(spec)
-        row = rows.pop(spec.agent_id, None)
-        if row is None:
-            session.add(AgentProfile(**values))
-            inserted += 1
-        elif row.registry_hash != values["registry_hash"] or not row.in_registry:
-            for field, value in values.items():
-                setattr(row, field, value)
-            updated += 1
-        else:
-            unchanged += 1
-    for row in rows.values():
-        if row.in_registry or row.enabled:
-            row.in_registry = False
-            row.enabled = False
-            retired += 1
-    result = SyncResult(inserted=inserted, updated=updated, retired=retired, unchanged=unchanged)
+    wanted = {spec.agent_id: (spec, _values(spec)) for spec in registry.agents}
+    retired = sorted(
+        aid for aid, row in rows.items() if aid not in wanted and (row.in_registry or row.enabled)
+    )
+    stale = sorted(aid for aid in wanted if aid in rows and _differs(rows[aid], wanted[aid][1]))
+    inserted = sorted(aid for aid in wanted if aid not in rows)
+    for aid in retired:
+        rows[aid].in_registry, rows[aid].enabled = False, False
+    # A row taking another slug leaves the live set first, so a slug freed in this same sync (by a retired
+    # agent or by a swap) can be taken: slugs are unique among live rows only.
+    for aid in stale:
+        if rows[aid].slug != wanted[aid][1]["slug"]:
+            rows[aid].in_registry = False
     await session.flush()
+    updated: list[dict[str, Any]] = []
+    not_bumped: list[str] = []
+    for aid in stale:
+        row, (spec, values) = rows[aid], wanted[aid]
+        updated.append(
+            {
+                "agent_id": aid,
+                "version": [row.version, spec.version],
+                "hash": [row.registry_hash, values["registry_hash"]],
+            }
+        )
+        if row.registry_hash != values["registry_hash"] and spec.version <= row.version:
+            not_bumped.append(aid)
+        for field, value in values.items():
+            setattr(row, field, value)
+    for aid in inserted:
+        session.add(AgentProfile(**wanted[aid][1]))
+    await session.flush()
+    result = SyncResult(
+        inserted=len(inserted),
+        updated=len(stale),
+        retired=len(retired),
+        unchanged=len(wanted) - len(stale) - len(inserted),
+    )
+    if not_bumped:
+        # agent_runs.agent_version no longer names one behaviour for these ids.
+        logger.warning("agent_registry_version_not_bumped", agent_ids=not_bumped)
     if result.changed:
         await audit.write(
             session,
@@ -104,7 +133,13 @@ async def sync_registry(session: AsyncSession, registry: AgentRegistry, audit: A
             action="agent.registry_synced",
             result="success",
             resource_type="agent_registry",
-            metadata={"inserted": inserted, "updated": updated, "retired": retired, "unchanged": unchanged},
+            metadata={
+                "inserted": inserted,
+                "updated": updated,
+                "retired": retired,
+                "unchanged": result.unchanged,
+                "version_not_bumped": not_bumped,
+            },
         )
     return result
 
@@ -113,6 +148,8 @@ async def sync_registry(session: AsyncSession, registry: AgentRegistry, audit: A
 
 STATUSES: tuple[AgentStatus, ...] = ("planned", "disabled", "not_ready", "ready")
 RECENT_RUNS = 10
+# Runs with a result. ``running`` and ``approval_required`` (paused, ADR-025) have none yet.
+FINISHED_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled", "budget_exceeded"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,7 +249,7 @@ async def get_agent(
     """One agent with its recent runs and run statistics, counting only runs of tasks in projects the actor
     can see (AC-01): the catalog is shared, the runs are not."""
     profile = await session.get(AgentProfile, agent_id)
-    if profile is None:
+    if profile is None or not profile.in_registry:  # the catalog is the registry as it is now (list agrees)
         return None
     visible = (
         select(AgentRun.id)
@@ -231,7 +268,14 @@ async def get_agent(
     ).all()
     totals = (
         await session.execute(
-            select(AgentRun.status, func.count()).where(AgentRun.id.in_(visible)).group_by(AgentRun.status)
+            select(
+                AgentRun.status,
+                func.count(),
+                func.sum(AgentRun.duration_ms),
+                func.count(AgentRun.duration_ms),
+            )
+            .where(AgentRun.id.in_(visible))
+            .group_by(AgentRun.status)
         )
     ).all()
     return AgentDetail(
@@ -249,17 +293,19 @@ async def get_agent(
             )
             for run, project_id in recent
         ],
-        stats=await _stats(session, visible, totals),
+        stats=_stats(totals),
     )
 
 
-async def _stats(session: AsyncSession, visible: Any, totals: Any) -> RunStats:
-    by_status = Counter({status: count for status, count in totals})
-    runs = sum(by_status.values())
-    finished = runs - by_status.get("running", 0)
-    avg = await session.scalar(select(func.avg(AgentRun.duration_ms)).where(AgentRun.id.in_(visible)))
+def _stats(totals: Sequence[tuple[str, int, int | None, int]]) -> RunStats:
+    """From one grouped query: (status, runs, sum of durations, runs with a duration) per status."""
+    runs = sum(count for _, count, _, _ in totals)
+    finished = sum(count for status, count, _, _ in totals if status in FINISHED_RUN_STATUSES)
+    succeeded = sum(count for status, count, _, _ in totals if status == "succeeded")
+    timed = sum(with_duration for _, _, _, with_duration in totals)
+    total_ms = sum(duration or 0 for _, _, duration, _ in totals)
     return RunStats(
         runs=runs,
-        success_rate=(by_status.get("succeeded", 0) / finished) if finished else None,
-        avg_duration_ms=round(avg) if avg is not None else None,
+        success_rate=succeeded / finished if finished else None,
+        avg_duration_ms=round(total_ms / timed) if timed else None,
     )

@@ -1,11 +1,11 @@
 """Agent registry loader, schema 2 (FR-041 to FR-043, AGENT_CATALOG §2 to §4, §12.2).
 
-The API refuses to start on a registry that breaks a rule here: structure and enums, the mode, profile and
-contract rules, ``approval_grant`` always ``deny``, every allowlisted tool known and consistent with the
-permissions, the ``submit_result`` rules and the limits. Documentation fidelity (names and capabilities copied
-from the PRD, pinned per-agent permissions, exactly 53 ids) stays in ``scripts/validate_registry.py`` in
-CI: a doc wording drift is not a reason to refuse to start. test_registry_loader.py proves both refuse the
-same unsafe registries.
+The API refuses to start on a registry that breaks a rule here: structure and enums (no duplicate YAML key),
+the mode, profile and contract rules, ``approval_grant`` always ``deny``, the per-agent pinned permissions,
+every allowlisted tool known and consistent with the permissions, the ``submit_result`` rules and the limits.
+Documentation fidelity (names and capabilities copied from the PRD, exactly 53 ids) stays in
+``scripts/validate_registry.py`` in CI: a doc wording drift is not a reason to refuse to start.
+test_registry_loader.py proves both refuse the same unsafe registries.
 
 Problems name the agent id and the rule, never field contents.
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 
 from app.tools.catalog import CITATION_SOURCE_TOOLS, R3_OWNERS, TOOL_CATALOG
 
@@ -55,6 +55,28 @@ RUNTIME_CONTRACTS: Mapping[str, tuple[str, str]] = {
     "A07": ("UserProxyInput", "UserProxyOutput"),
 }
 ONLY_DEPLOYER = frozenset({"F32"})
+# Permission fields pinned by the PRD access notes, AC-10 and FR-043 (the same table as the CI validator's):
+# a reviewer or the user proxy that could write or execute is refused at start, not only in CI.
+PINNED_PERMISSIONS: Mapping[str, Mapping[str, str]] = {
+    "A01": {"filesystem": "read_only"},
+    "A02": {"filesystem": "read_only"},
+    "A03": {"filesystem": "read_only"},
+    "A04": {"filesystem": "read_only"},
+    "A05": {"filesystem": "read_only"},
+    "A06": {"filesystem": "read_only"},
+    "A07": {"filesystem": "read_only", "sandbox": "deny", "deployment": "deny"},
+    "C16": {"filesystem": "read_only"},
+    "C17": {"filesystem": "test_only"},
+    "D22": {"filesystem": "read_only", "sandbox": "deny"},
+    "D23": {"filesystem": "read_only"},
+    "D26": {"filesystem": "read_only"},
+    "F33": {"filesystem": "read_only"},
+    "G35": {"filesystem": "docs_only"},
+    "G36": {"filesystem": "docs_only"},
+    "B14": {"filesystem": "scoped_write", "deployment": "deny"},
+    "E27": {"git": "branch_commit"},
+    "E29": {"filesystem": "read_only"},
+}
 CITED_ANSWER = "CitedAnswer"
 _V1_PERMISSION_FIELDS = frozenset({"filesystem", "sandbox", "git", "network", "deployment", "approval_grant"})
 _V2_PERMISSION_FIELDS = _V1_PERMISSION_FIELDS | {"portfolio", "data_sensitivity_max"}
@@ -65,6 +87,16 @@ Snake = Annotated[str, Field(max_length=60, pattern=r"^[a-z][a-z0-9_]*$")]
 Capability = Annotated[str, Field(max_length=120, pattern=r"^[a-z0-9_]+\.[a-z0-9_]+$")]
 ToolName = Annotated[str, Field(max_length=64)]
 ContractName = Annotated[str, Field(max_length=60, pattern=r"^[A-Z][A-Za-z0-9]*$")]
+
+
+def _list_only(value: object) -> object:
+    # A YAML !!set or a mapping would load in lax mode with no stable order, hence no stable hash.
+    if not isinstance(value, list):
+        raise ValueError("must be a list")
+    return value
+
+
+Listed = BeforeValidator(_list_only)
 
 
 class RegistryError(Exception):
@@ -103,7 +135,7 @@ class AgentSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    agent_id: Annotated[str, Field(pattern=r"^(?:[A-H]\d{2}|[IJKS]\d{2}|ORCH)$")]
+    agent_id: Annotated[str, Field(pattern=r"^(?:[A-H][0-9]{2}|[IJKS][0-9]{2}|ORCH)$")]
     slug: Snake
     name: Name
     group: Group
@@ -115,9 +147,9 @@ class AgentSpec(BaseModel):
     model_tier: ModelTier
     description: Text
     purpose: Text
-    triggers: Annotated[tuple[Snake, ...], Field(min_length=1)]
-    capabilities: Annotated[tuple[Capability, ...], Field(min_length=1)]
-    tools: tuple[ToolName, ...]
+    triggers: Annotated[tuple[Snake, ...], Listed, Field(min_length=1)]
+    capabilities: Annotated[tuple[Capability, ...], Listed, Field(min_length=1)]
+    tools: Annotated[tuple[ToolName, ...], Listed]
     permissions: PermissionProfile
     input_contract: ContractName | None
     output_contract: ContractName | None
@@ -128,7 +160,7 @@ class AgentSpec(BaseModel):
     target_mode: TargetMode | None = None
     phase: Annotated[str, Field(pattern=r"^P\d{1,2}$")] | None = None
     contract_status: Literal["planned"] | None = None
-    notes: Annotated[tuple[Text, ...], Field(min_length=1)] | None = None
+    notes: Annotated[tuple[Text, ...], Listed, Field(min_length=1)] | None = None
 
     def canonical_hash(self) -> str:
         """sha256 of the entry as canonical JSON: changes exactly when the entry's content changes."""
@@ -150,9 +182,34 @@ class AgentRegistry(BaseModel):
         return next((agent for agent in self.agents if agent.agent_id == agent_id), None)
 
 
+class _DuplicateKey(yaml.YAMLError):
+    def __init__(self, line: int) -> None:
+        super().__init__(f"duplicate key at line {line}")
+        self.line = line
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """``safe_load`` that refuses a key repeated in one mapping instead of keeping the last one."""
+
+
+def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode) -> dict[Any, Any]:
+    seen: list[object] = []
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node)
+        if key in seen:
+            raise _DuplicateKey(key_node.start_mark.line + 1)
+        seen.append(key)
+    return loader.construct_mapping(node)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
 def load_registry(path: Path) -> AgentRegistry:
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader
+    except _DuplicateKey as exc:
+        raise RegistryError([f"registry: duplicate key at line {exc.line}"]) from None
     except (OSError, yaml.YAMLError) as exc:
         raise RegistryError([f"registry: cannot read {path.name} ({type(exc).__name__})"]) from None
     return parse_registry(raw)
@@ -190,7 +247,7 @@ def parse_registry(raw: object) -> AgentRegistry:
 def _label(entry: object, index: int) -> str:
     agent_id = entry.get("agent_id") if isinstance(entry, dict) else None
     # Only an id that looks like one is echoed; anything else is named by its position.
-    if isinstance(agent_id, str) and len(agent_id) <= 4 and agent_id.isalnum():
+    if isinstance(agent_id, str) and len(agent_id) <= 4 and agent_id.isascii() and agent_id.isalnum():
         return agent_id
     return f"agents[{index}]"
 
@@ -265,6 +322,9 @@ def _mode_problems(agent: AgentSpec, by_id: Mapping[str, AgentSpec]) -> list[str
 def _permission_problems(agent: AgentSpec) -> list[str]:
     perms = agent.permissions
     problems: list[str] = []
+    for field, value in PINNED_PERMISSIONS.get(agent.agent_id, {}).items():
+        if getattr(perms, field) != value:
+            problems.append(f"permissions.{field} must be {value} (pinned by the PRD access note)")
     if perms.deployment != "deny" and agent.agent_id not in ONLY_DEPLOYER:
         problems.append("deployment is reserved for F32")
     if perms.network == "provider_web" and not any(

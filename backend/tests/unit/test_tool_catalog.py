@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+from app.agents.registry import ONLY_DEPLOYER, RUNTIME_CONTRACTS
 from app.tools.catalog import CITATION_SOURCE_TOOLS, R3_OWNERS, TOOL_CATALOG
 
 VALIDATOR = Path(__file__).resolve().parents[3] / "scripts" / "validate_registry.py"
@@ -33,6 +34,13 @@ def test_catalog_matches_the_ci_validator() -> None:
         ), name
     assert {name: set(owners) for name, owners in R3_OWNERS.items()} == ci.R3_OWNERS
     assert set(CITATION_SOURCE_TOOLS) == ci.CITATION_SOURCE_TOOLS
+
+
+def test_registry_tables_match_the_ci_validator() -> None:
+    # The other tables the loader shares with CI (AG-13 I5); PINNED_PERMISSIONS: test_registry_loader.py.
+    ci = ci_validator()
+    assert set(ONLY_DEPLOYER) == ci.ONLY_DEPLOYER
+    assert dict(RUNTIME_CONTRACTS) == ci.FALLBACK_CONTRACTS
 
 
 def test_nothing_is_implemented_yet() -> None:

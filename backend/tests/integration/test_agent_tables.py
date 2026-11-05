@@ -65,6 +65,23 @@ async def test_profile_enum_checks(session: AsyncSession, field: str, value: str
         await session.flush()
 
 
+@pytest.mark.parametrize("permissions", [{"approval_grant": "allow"}, {}])
+async def test_no_row_can_grant_approvals(session: AsyncSession, permissions: dict[str, str]) -> None:
+    # Defence in depth under the loader (AG-13 L2): the runtime role may UPDATE this table.
+    session.add(profile(permission_profile=permissions))
+    with pytest.raises(IntegrityError, match="ck_agent_profiles_approval_grant_deny"):
+        await session.flush()
+
+
+async def test_slugs_are_unique_among_live_agents_only(session: AsyncSession) -> None:
+    session.add(profile("A02", slug="analyst", in_registry=False, enabled=False))
+    session.add(profile("A03", slug="analyst"))  # a retired agent's slug may be taken
+    await session.flush()
+    session.add(profile("A04", slug="analyst"))
+    with pytest.raises(IntegrityError, match="uq_agent_profiles_slug"):
+        await session.flush()
+
+
 async def test_profile_defaults(session: AsyncSession) -> None:
     session.add(profile())
     await session.flush()

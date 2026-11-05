@@ -15,7 +15,7 @@ from app.agents.registry import load_registry
 from app.core.audit import AuditWriter
 from app.core.db import make_sessionmaker
 from app.core.redaction import Redactor
-from app.models.agents import AgentRun
+from app.models.agents import AgentProfile, AgentRun
 from app.services.agents import sync_registry
 from tests.integration.test_dashboard_api import add_project, add_task
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
@@ -111,7 +111,11 @@ async def test_filters(owner: httpx.AsyncClient, query: str, expected: set[str] 
     "query", ["group=marketing", "mode=agentic", "status=busy", "q=" + "x" * 101, "q=a%00b"]
 )
 async def test_bad_filters_are_422(owner: httpx.AsyncClient, query: str) -> None:  # noqa: F811
-    assert (await owner.get(f"{AGENTS}?{query}")).status_code == 422
+    response = await owner.get(f"{AGENTS}?{query}")
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    assert "x" * 101 not in response.text and "\\u0000" not in response.text  # the input is not echoed
 
 
 async def test_detail(owner: httpx.AsyncClient) -> None:  # noqa: F811
@@ -143,6 +147,33 @@ async def test_detail_lists_runs_newest_first_with_stats(
     assert body["recent_runs"][0]["project_id"] == str(project)
     assert body["recent_runs"][0]["agent_name"] == "Requirement Analyst"
     assert body["stats"] == {"runs": 3, "success_rate": 0.5, "avg_duration_ms": 2000}
+
+
+async def test_success_rate_counts_finished_runs_only(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+    owner_id: uuid.UUID,  # noqa: F811
+) -> None:
+    # A run waiting for approval or still running has no result yet (ADR-025).
+    project = await add_project(engine, owner_id, "Rates")
+    task = await add_task(engine, project, owner_id, "running", "Rate task")
+    await add_run(engine, task, status="succeeded", duration_ms=1000)
+    await add_run(engine, task, status="cancelled", duration_ms=3000)
+    await add_run(engine, task, status="approval_required")
+    await add_run(engine, task, status="running")
+    body = (await owner.get(f"{AGENTS}/A02")).json()["data"]
+    assert body["stats"] == {"runs": 4, "success_rate": 0.5, "avg_duration_ms": 2000}
+
+
+async def test_a_retired_agent_is_not_found(owner: httpx.AsyncClient, engine: AsyncEngine) -> None:  # noqa: F811
+    # The catalog shows the registry as it is now; the list and the detail agree.
+    async with make_sessionmaker(engine)() as session:
+        h41 = await session.get(AgentProfile, "H41")
+        assert h41 is not None
+        h41.in_registry, h41.enabled = False, False
+        await session.commit()
+    assert (await owner.get(f"{AGENTS}/H41")).status_code == 404
+    assert "H41" not in {a["agent_id"] for a in (await owner.get(AGENTS)).json()["data"]}
 
 
 async def test_requires_sign_in(app: FastAPI) -> None:  # noqa: F811

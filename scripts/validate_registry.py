@@ -1164,6 +1164,23 @@ def summarize(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """safe_load that refuses a key repeated in one mapping (YAML keeps the last one silently)."""
+
+
+def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode) -> dict:
+    seen: list = []
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(None, None, f"duplicate key {key!r}", key_node.start_mark)
+        seen.append(key)
+    return loader.construct_mapping(node)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) > 1 or (argv and argv[0] in {"-h", "--help"}):
@@ -1171,7 +1188,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     path = Path(argv[0]) if argv else DEFAULT_REGISTRY
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader
     except FileNotFoundError:
         print(f"ERROR: registry file not found: {path}", file=sys.stderr)
         return 2

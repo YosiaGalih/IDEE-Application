@@ -6,13 +6,14 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 import yaml
 
 from app.agents import readiness
-from app.agents.registry import RegistryError, load_registry, parse_registry
+from app.agents.registry import PINNED_PERMISSIONS, Group, Mode, RegistryError, load_registry, parse_registry
+from app.models.enums import AGENT_GROUPS, AGENT_MODES
 from app.tools import catalog
 from tests.unit.test_tool_catalog import ci_validator
 
@@ -68,6 +69,11 @@ def _planned_enabled(data: Raw) -> None:
 
 def _duplicate_a02(data: Raw) -> None:
     data["agents"].append(copy.deepcopy(agent(data, "A02")))
+
+
+def _tools_as_set(data: Raw) -> None:
+    # A YAML !!set: no order, so no stable hash (AG-13 I3).
+    agent(data, "A04")["tools"] = set(agent(data, "A04")["tools"])
 
 
 def _schema_1(data: Raw) -> None:
@@ -129,6 +135,33 @@ MUTATIONS: dict[str, tuple[Callable[[Raw], None], str]] = {
         "A02: llm/profile timeout_seconds",
     ),
     "duplicate agent id": (_duplicate_a02, "A02: agent_id is not unique"),
+    # Pinned permissions (PRD access notes, AC-10, FR-043): read-only agents stay read-only (AG-13 M1).
+    "reviewer given scoped_write": (
+        _set(["permissions", "filesystem"], "scoped_write", "D22"),
+        "D22: permissions.filesystem must be read_only",
+    ),
+    "reviewer given the sandbox": (
+        _set(["permissions", "sandbox"], "allow", "D22"),
+        "D22: permissions.sandbox must be deny",
+    ),
+    "user proxy given scoped_write": (
+        _set(["permissions", "filesystem"], "scoped_write", "A07"),
+        "A07: permissions.filesystem must be read_only",
+    ),
+    "test writer given scoped_write": (
+        _set(["permissions", "filesystem"], "scoped_write", "C17"),
+        "C17: permissions.filesystem must be test_only",
+    ),
+    "docs writer given scoped_write": (
+        _set(["permissions", "filesystem"], "scoped_write", "G35"),
+        "G35: permissions.filesystem must be docs_only",
+    ),
+    "git operator given no git": (
+        _set(["permissions", "git"], "read", "E27"),
+        "E27: permissions.git must be branch_commit",
+    ),
+    "tools given as a set": (_tools_as_set, "A04: tools"),
+    "agent id with a non-ASCII digit": (_set(["agent_id"], "A\u0669\u0669", "A02"), "agents["),
     "unknown field": (_set(["shell"], "bash", "A02"), "A02: shell Extra inputs are not permitted"),
     "schema version 1": (_schema_1, "registry: schema_version must be 2"),
 }
@@ -181,6 +214,35 @@ def test_missing_or_broken_file(tmp_path: Path) -> None:
         load_registry(broken)
 
 
+def test_duplicate_keys_are_refused(tmp_path: Path) -> None:
+    # The last duplicate would win silently, and a review would read the first one (silent M1, AG-13 I1).
+    text = REGISTRY.read_text(encoding="utf-8").replace(
+        "approval_grant: deny", "approval_grant: deny, approval_grant: deny", 1
+    )
+    assert text != REGISTRY.read_text(encoding="utf-8")
+    twice = tmp_path / "registry.yaml"
+    twice.write_text(text, encoding="utf-8")
+    with pytest.raises(RegistryError) as raised:
+        load_registry(twice)
+    assert raised.value.problems == [
+        f"registry: duplicate key at line {_line_of(text, 'approval_grant: deny, approval_grant')}"
+    ]
+    assert ci_validator().main([str(twice)]) != 0
+
+
+def _line_of(text: str, needle: str) -> int:
+    return text[: text.index(needle)].count("\n") + 1
+
+
+def test_pinned_permissions_match_the_ci_validator() -> None:
+    assert dict(PINNED_PERMISSIONS) == ci_validator().PINNED_PERMISSIONS
+
+
+def test_enums_match_the_tables() -> None:
+    assert get_args(Group) == AGENT_GROUPS
+    assert get_args(Mode) == AGENT_MODES
+
+
 def test_canonical_hash_changes_with_content(raw: Raw) -> None:
     before = parse_registry(copy.deepcopy(raw)).by_id("A02")
     data = copy.deepcopy(raw)
@@ -208,10 +270,29 @@ def test_enabled_llm_agent_is_not_ready_with_all_reasons() -> None:
     assert unavailable == [tool for tool in a02.tools if tool != "submit_result"]
 
 
-def test_tool_agent_needs_only_its_tools() -> None:
+def test_tool_agent_waits_for_the_engine_and_its_tools() -> None:
+    # Tool-mode agents are invoked by the orchestrator (AGENT_CATALOG §4.3), not by themselves.
     a04 = registry_agent("A04")
     status, reasons, _ = readiness.assess(a04, enabled=True, provider_ready=None)
-    assert (status, reasons) == ("not_ready", ["tools_unavailable"])
+    assert (status, reasons) == ("not_ready", ["runtime_unavailable", "tools_unavailable"])
+
+
+def test_no_agent_is_ready_while_no_runtime_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every tool built and the provider ready: the runtimes alone still decide (AG-13 L1, silent M2).
+    monkeypatch.setattr(readiness, "_built", lambda tool: True)
+    statuses = {
+        a.agent_id: readiness.assess(a, enabled=a.enabled, provider_ready=True)[0]
+        for a in load_registry(REGISTRY).agents
+    }
+    assert "ready" not in statuses.values()
+
+
+def test_an_enabled_agent_without_tools_is_not_ready(raw: Raw) -> None:
+    data = copy.deepcopy(raw)
+    agent(data, "A04")["tools"] = []
+    a04 = parse_registry(data).by_id("A04")
+    assert a04 is not None
+    assert readiness.assess(a04, enabled=True, provider_ready=True)[0] == "not_ready"
 
 
 def test_orch_waits_for_the_engine() -> None:
