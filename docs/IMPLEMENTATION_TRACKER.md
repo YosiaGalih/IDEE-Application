@@ -1696,7 +1696,7 @@ Hal terbuka yang relevan untuk keputusan G2:
 
 ### WP-3.1a (🔒 key dan jalur prompt) — port LLM, adapter Anthropic, retry, ScriptedProvider, tarif (FR-129, FR-130, FR-134, FR-056 bagian LLM, FR-133 data per percobaan; AC-15 dan AC-16 sebagian)
 
-Spec: `docs/superpowers/specs/2026-11-05-wp-3.1-agentic-core-design.md` (pembagian WP-3.1 dan rancangan 3.1a). Plan: `docs/superpowers/plans/2026-11-05-wp-3.1a-llm-port.md`. Konflik: #72. Belum ada tabel, endpoint, atau layar; ledger usage ada di 3.1f.
+Spec: `docs/superpowers/specs/2026-11-05-wp-3.1-agentic-core-design.md` (pembagian WP-3.1 dan rancangan 3.1a). SHA di bagian ini adalah SHA sesudah rebase ke `main` 42008ca (isi identik: `git diff` antara ujung lama dan baru kosong). Review AG-13 berjalan pada SHA sebelum rebase: 3e81ddb = 1f18202, 81b3341 = 8948d33, 17ef409 = 9fd0d19. Plan: `docs/superpowers/plans/2026-11-05-wp-3.1a-llm-port.md`. Konflik: #72. Belum ada tabel, endpoint, atau layar; ledger usage ada di 3.1f.
 
 Keputusan Lead:
 - WP-3.1 dibagi menjadi 3.1a–3.1f. Kode baru langsung mengikuti ADR-021..035. Status baris WP-INT tidak diubah; bagian yang terpenuhi dicatat per sub-WP.
@@ -1707,10 +1707,10 @@ Keputusan Lead:
 
 | Pemeriksaan | Hasil aktual |
 |---|---|
-| `ruff check`, `ruff format --check`, `pyright` @ 17ef409 | bersih; pyright 0 error |
-| `lint-imports` @ 17ef409 | 3 kept, 0 broken. Mutan `import httpx2` dan `from app.workspace import fs` di `app/llm/retry.py` → 2 kontrak BROKEN |
-| Test LLM @ 5400a49 | [Pasti] **186 test baru** (adapter 70, base 24, retry 24, tarif `test_pricing_usage.py` 24, scripted 23, contract 8, factory 6, security `test_llm_secrets.py` 6, penjaga import SDK di `test_no_host_exec.py` 1) + 7 di `test_config.py`. File yang diubah di 5400a49 (hanya test) dijalankan ulang: `33 passed` |
-| Suite backend penuh @ 17ef409 (Python 3.12, PG16 + Redis 7; dijalankan sendirian 05:23:56–05:29:29 UTC) | [Pasti] `1947 passed, 1 skipped in 330.15s` (`main` @ d3f4440: 1758 passed). Kode `app/` tidak berubah sesudahnya; 5400a49 hanya memindah/menambah test |
+| `ruff check`, `ruff format --check`, `pyright` @ 9fd0d19 | bersih; pyright 0 error |
+| `lint-imports` @ 9fd0d19 | 3 kept, 0 broken. Mutan `import httpx2` dan `from app.workspace import fs` di `app/llm/retry.py` → 2 kontrak BROKEN |
+| Test LLM @ 4e64313 | [Pasti] **186 test baru** (adapter 70, base 24, retry 24, tarif `test_pricing_usage.py` 24, scripted 23, contract 8, factory 6, security `test_llm_secrets.py` 6, penjaga import SDK di `test_no_host_exec.py` 1) + 7 di `test_config.py`. File yang diubah di 4e64313 (hanya test) dijalankan ulang: `33 passed` |
+| Suite backend penuh @ 9fd0d19 (Python 3.12, PG16 + Redis 7; dijalankan sendirian 05:23:56–05:29:29 UTC) | [Pasti] `1947 passed, 1 skipped in 330.15s` (`main` @ d3f4440: 1758 passed). Kode `app/` tidak berubah sesudahnya; 4e64313 hanya memindah/menambah test |
 | Kebocoran prompt di log DEBUG SDK | [Pasti] `test_debug_logging_leaks_no_prompt_or_key`: dengan penjaga dimatikan, test gagal dengan `assert 'PROMPT-MARKER-7f3a9c' not in '{"event": "...'` ("Request options"); dengan penjaga lulus. `test_anthropic_log_cannot_reopen_debug` (interpreter baru, `ANTHROPIC_LOG=debug`): SDK sendiri → `DEBUG`; logging dulu atau SDK dulu → `WARNING` |
 | Mutan putaran review (R1–R7, S1–S7, T1–T2, U1–U2; skrip mutasi di scratchpad, satu perubahan per run lalu dipulihkan) | [Pasti] output skrip: setiap baris `<mutan>: RED`, tidak ada `SURVIVED`. Mutan: base URL kosong diteruskan, https tanpa host diterima, stream bocor saat cancel pemanggil, cancel pemanggil tertelan saat penutupan, teks di-replay saat retry, percobaan cancel tidak tercatat, cancel kalah dari balasan selesai, sleep rusak dianggap jeda, harga 0 diterima, redirect diikuti, string vendor tanpa batas, request id tanpa batas, prompt di repr, base URL http di produksi, key tidak di-strip, scripted menyimpan prompt, adapter tidak memasang ulang level logger SDK, `configure_logging` tidak memasang level |
 
@@ -1718,10 +1718,10 @@ Catatan: suite penuh pertama di worktree berjalan di Python 3.13 (uv memilihnya 
 
 #### Review WP-3.1a
 
-Hasil awal @ dba9b6e:
+Hasil awal @ 5ad441b:
 - `kk-backend-reviewer`: 0 blocker, 3 should, beberapa nit.
 - `kk-silent-failure-hunter`: 3 HIGH, 4 MEDIUM, 6 LOW.
-- `kk-security-reviewer` (AG-13) @ 3e81ddb: **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH, 2 MEDIUM, 7 LOW.
+- `kk-security-reviewer` (AG-13) @ 1f18202: **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH, 2 MEDIUM, 7 LOW.
 
 | Temuan | Penutupan | Bukti |
 |---|---|---|
@@ -1755,13 +1755,13 @@ Tidak ditutup di 3.1a (alasan dan pemilik; juga di spec bagian "Syarat yang diwa
 - **silent L6:** kegagalan `on_attempt` diteruskan (keras, tidak diam); keputusan nasib respons berbayar saat ledger gagal ada di 3.1f.
 - **backend nit:** `timeout_s` adalah batas total satu percobaan; 3.1f memilihnya sesuai `max_tokens`.
 
-#### `/code-review` (sumbu standar + sumbu spec) @ 98cdf48
+#### `/code-review` (sumbu standar + sumbu spec) @ 946bc06
 
 | Temuan | Penutupan |
 |---|---|
-| standar (keras): `test_pricing.py` menyimpang dari kontrak lokasi TEST_STRATEGY (`test_pricing_usage.py::test_estimated_vs_unavailable`) | file diganti nama dan test itu ditambah (5400a49) |
+| standar (keras): `test_pricing.py` menyimpang dari kontrak lokasi TEST_STRATEGY (`test_pricing_usage.py::test_estimated_vs_unavailable`) | file diganti nama dan test itu ditambah (4e64313) |
 | standar (keras): `tests/contract/` tidak ada di tabel lapisan TEST_STRATEGY §2 | ARCHITECTURE §13.4 menyebut `tests/contract/test_llm_provider.py`; dilaporkan di #72 dengan usulan baris baru di §2 |
-| standar: penjaga "hanya adapter mengimpor SDK" bukan di `test_no_host_exec.py` (TEST_STRATEGY §3) | dipindah (5400a49) |
+| standar: penjaga "hanya adapter mengimpor SDK" bukan di `test_no_host_exec.py` (TEST_STRATEGY §3) | dipindah (4e64313) |
 | standar: bukti tracker tanpa output / label | baris bukti diberi output dan label `[Pasti]`/`[Kemungkinan Besar]` |
 | spec (a2): test log tidak benar-benar menyetel `ANTHROPIC_LOG` | `test_anthropic_log_cannot_reopen_debug` di interpreter baru; mutan U1 (adapter tidak memasang ulang) dan U2 (`configure_logging` tidak memasang) merah |
 | spec (a1): Review Focus 5 "file tarif rusak menolak start" belum ada pemakainya | ditambahkan ke syarat warisan (3.1f) |
@@ -1769,8 +1769,8 @@ Tidak ditutup di 3.1a (alasan dan pemilik; juga di spec bagian "Syarat yang diwa
 
 Tidak diubah (smell, penilaian): duplikasi hitung giliran `assistant` (scripted dan `generic`) dan hitung `duration_ms`; encoding nama tool terbagi antara port (validasi panjang) dan adapter (ADR-023 menaruh encoding di adapter); `AttemptRecord` posisional di `retry._report`; `_Block.kind` berupa `str`; kunci `metadata` bertipe string. Mengubahnya menyentuh `app/llm` tanpa perubahan perilaku dan butuh review delta AG-13 lagi; kandidat dirapikan saat 3.1f menyentuh retry dan scripted.
 
-**Sign-off AG-13:** SIGNED OFF WITH CONDITIONS @ 3e81ddb, lalu delta **SIGNED OFF WITH CONDITIONS @ 81b3341** (M1, L1, L2, L4, L6, L7, I1 diterima ditutup; L5 diterima; M2 tetap terbuka untuk 3.1f; temuan baru L8 ditutup di 17ef409, yang hanya menyentuh `app/core/config.py` dan test-nya). Syarat warisan ada di spec bagian "Syarat yang diwariskan".
+**Sign-off AG-13:** SIGNED OFF WITH CONDITIONS @ 1f18202, lalu delta **SIGNED OFF WITH CONDITIONS @ 8948d33** (M1, L1, L2, L4, L6, L7, I1 diterima ditutup; L5 diterima; M2 tetap terbuka untuk 3.1f; temuan baru L8 ditutup di 9fd0d19, yang hanya menyentuh `app/core/config.py` dan test-nya). Syarat warisan ada di spec bagian "Syarat yang diwariskan".
 
-AG-13 C8: gitleaks, semgrep, dan trivy tidak dijalankan lokal (tidak terpasang / proxy 403); bukti dari job CI `security-scan` di PR. C10: commit sesudah 81b3341 yang menyentuh `app/llm/**`, `app/core/logging.py`, `app/core/cancel.py`, dependensi, Dockerfile, atau `.dockerignore` butuh review delta AG-13.
+AG-13 C8: gitleaks, semgrep, dan trivy tidak dijalankan lokal (tidak terpasang / proxy 403); bukti dari job CI `security-scan` di PR. C10: commit sesudah 8948d33 yang menyentuh `app/llm/**`, `app/core/logging.py`, `app/core/cancel.py`, dependensi, Dockerfile, atau `.dockerignore` butuh review delta AG-13.
 
-Pelajaran proses (AG-13 D4): `tests/security/*` selalu memigrasi ulang dan me-reset DB uji bersama (`tests/security/conftest.py`, fixture autouse). Reviewer yang menjalankan test itu bersamaan dengan suite penuh merusak hasil suite (run @ 81b3341: 4 error `relation "users" does not exist` dan 1 kegagalan turunan). Suite penuh dijalankan ulang tanpa proses lain; reviewer paralel hanya memakai `--noconftest` atau DB yang tidak terjangkau.
+Pelajaran proses (AG-13 D4): `tests/security/*` selalu memigrasi ulang dan me-reset DB uji bersama (`tests/security/conftest.py`, fixture autouse). Reviewer yang menjalankan test itu bersamaan dengan suite penuh merusak hasil suite (run @ 8948d33: 4 error `relation "users" does not exist` dan 1 kegagalan turunan). Suite penuh dijalankan ulang tanpa proses lain; reviewer paralel hanya memakai `--noconftest` atau DB yang tidak terjangkau.
