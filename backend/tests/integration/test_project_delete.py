@@ -217,6 +217,34 @@ async def test_rejected_and_expired_restore_previous_status(
     assert action in await audit_actions(engine, project_id)
 
 
+async def test_a_corrupt_previous_status_restores_to_archived(
+    env: projects.ProjectEnv,
+    engine: AsyncEngine,
+    owner_id: uuid.UUID,  # noqa: F811
+    handler: project_delete.ProjectDeleteHandler,
+) -> None:
+    """A ``previous_status`` that is not deletable (a hand-edited payload) never reopens the project as
+    ``active``: it comes back archived, and the audit says so."""
+    actor = owner_actor(owner_id)
+    project_id = await blank(env, actor)
+    approval, _ = await project_delete.request_delete(env, actor, project_id)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(Approval)
+            .where(Approval.id == approval.id)
+            .values(status="rejected", payload={**approval.payload, "previous_status": "deleted"})
+        )
+    await handler.rejected(approval.id, now=NOW)
+    assert (await load(engine, Project, project_id)).status == "archived"
+    async with make_sessionmaker(engine)() as session:
+        restored = await session.scalar(
+            select(AuditEvent.metadata_).where(
+                AuditEvent.project_id == project_id, AuditEvent.action == "project.delete_rejected"
+            )
+        )
+    assert restored == {"approval_id": str(approval.id), "restored_status": "archived", "fallback": True}
+
+
 async def test_deleted_project_cannot_be_requested_again(
     env: projects.ProjectEnv,
     engine: AsyncEngine,
