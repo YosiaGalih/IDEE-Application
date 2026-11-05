@@ -90,10 +90,11 @@ describe("route map (ARCHITECTURE §3.1b)", () => {
 
   it("switches the language from the top bar and records it on <html lang>", async () => {
     renderAt("/approvals"); // a name that differs between the two languages
-    await userEvent.selectOptions(await screen.findByRole("combobox"), "en");
+    // By name: /approvals has its own status filter too.
+    await userEvent.selectOptions(await screen.findByRole("combobox", { name: id.common.language }), "en");
     expect(screen.getByTestId("screen-title")).toHaveTextContent(en.screens.approvals);
     expect(document.documentElement.lang).toBe("en");
-    await userEvent.selectOptions(screen.getByRole("combobox"), "id");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: en.common.language }), "id");
   });
 
   it.each([

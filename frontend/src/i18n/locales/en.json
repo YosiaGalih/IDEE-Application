@@ -775,5 +775,106 @@
       "quotaValue_one": "{{count}} call",
       "quotaValue_other": "{{count}} calls"
     }
+  },
+  "approvals": {
+    "subtitle": "High-risk actions wait for your decision. An agent can never approve on its own.",
+    "pendingHeading": "Pending ({{count}})",
+    "pendingTruncated": "Showing {{shown}} of {{total}} pending, the ones expiring soonest first.",
+    "pendingEmpty": {
+      "title": "No pending approvals",
+      "body": "Requests you can decide will appear here."
+    },
+    "card": {
+      "required": "Approval required · {{action}}",
+      "payload": "Payload",
+      "hash": "Payload hash",
+      "requestedBy": "Requested by",
+      "requestedAt": "Requested at",
+      "expires": "Expires",
+      "noExpiry": "Does not expire",
+      "bound": "The decision is bound to the payload hash above.",
+      "approve": "Approve",
+      "reject": "Reject",
+      "shortHash": "{{hash}}…"
+    },
+    "actions": {
+      "project_delete": "Delete project",
+      "apply_changes": "Apply changes",
+      "budget_increase": "Increase budget",
+      "tool_r3": "High-risk tool",
+      "git_push": "Git push",
+      "deploy_staging": "Deploy to staging",
+      "deploy_production": "Deploy to production",
+      "waive_criterion": "Waive criterion"
+    },
+    "riskLevel": "R{{level}} {{label}}",
+    "risk": {
+      "0": "Read only",
+      "1": "Low",
+      "2": "Medium",
+      "3": "High, needs approval",
+      "4": "Forbidden"
+    },
+    "dialog": {
+      "approveTitle": "Approve: {{action}}",
+      "rejectTitle": "Reject: {{action}}",
+      "description": "You decide exactly the action below. If it changes after this, the server refuses the decision.",
+      "project": "Project",
+      "summary": "Summary",
+      "hashFull": "Full payload hash",
+      "note": "Note (optional)",
+      "noteHint": "Plain text, at most 2000 characters.",
+      "noteTooLong": "The note is longer than 2000 characters.",
+      "projectDeleteWarning": "The project is closed and its open tasks are cancelled. The workspace is kept for 7 days, then removed for good.",
+      "confirmApprove": "Approve",
+      "confirmReject": "Reject",
+      "cancel": "Cancel"
+    },
+    "result": {
+      "deleted": "Project {{name}} deleted.",
+      "approvedRunning": "Approved. Deleting project {{name}} is running.",
+      "approvedRetrying": "Approved, but deleting project {{name}} failed and will be retried automatically.",
+      "rejected": "Rejected. Project {{name}} is not deleted.",
+      "approvedGeneric": "Approved.",
+      "rejectedGeneric": "Rejected."
+    },
+    "errors": {
+      "mismatch": "This action changed since you opened it. The list has been reloaded; review it again before deciding.",
+      "expired": "This approval has expired.",
+      "superseded": "This approval was replaced by a newer request.",
+      "decided": "This approval has already been decided.",
+      "forbidden": "You are not allowed to decide this approval.",
+      "notFound": "This approval no longer exists.",
+      "invalidNote": "The note may only contain plain text, at most 2000 characters.",
+      "outcomeUnknown": "No answer came back; the decision may already be recorded. Reload the list before trying again."
+    },
+    "history": {
+      "heading": "History",
+      "caption": "Approval history",
+      "filterLabel": "Status",
+      "all": "All",
+      "empty": "No approvals yet.",
+      "filteredEmpty": "No approvals with this status.",
+      "action": "Action",
+      "project": "Project",
+      "statusColumn": "Status",
+      "requested": "Requested",
+      "decided": "Decided",
+      "note": "Note: {{note}}",
+      "handlerFailed": "Execution failed, will be retried",
+      "previous": "Previous",
+      "next": "Next",
+      "pageStatus": "Page {{page}} of {{pages}} · {{total}} approvals",
+      "pagination": "History pages"
+    },
+    "status": {
+      "pending": "Pending",
+      "approved": "Approved",
+      "rejected": "Rejected",
+      "expired": "Expired",
+      "consumed": "Carried out",
+      "superseded": "Replaced"
+    },
+    "pendingTitle": "Pending"
   }
 }

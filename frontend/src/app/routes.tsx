@@ -3,6 +3,7 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import { StateView } from "@/components/ui/StateView";
 import { AgentDetailPage } from "@/features/agents/AgentDetailPage";
 import { AgentsPage } from "@/features/agents/AgentsPage";
+import { ApprovalsPage } from "@/features/approvals/ApprovalsPage";
 import { ForgotPasswordPage } from "@/features/auth/ForgotPasswordPage";
 import { LoginPage } from "@/features/auth/LoginPage";
 import { RequireSession } from "@/features/auth/RequireSession";
@@ -63,7 +64,7 @@ export const routes: RouteObject[] = [
           { path: "tasks/:taskId/acceptance", element: page("acceptance") },
           { path: "agents", element: <AgentsPage /> },
           { path: "agents/:agentId", element: <AgentDetailPage /> },
-          { path: "approvals", element: page("approvals") },
+          { path: "approvals", element: <ApprovalsPage /> },
           { path: "settings/providers", element: page("providers") },
           { path: "settings/usage", element: page("usage") },
           { path: "settings/users", element: page("users") },

@@ -1,3 +1,4 @@
+import type { TFunction } from "i18next";
 import { FileArchive, RotateCcw, Upload } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -7,7 +8,7 @@ import { Button } from "@/components/ui/Button";
 import { ErrorSummary } from "@/components/ui/ErrorSummary";
 import { Label } from "@/components/ui/Label";
 import { Spinner } from "@/components/ui/Spinner";
-import { describeError } from "@/lib/describeError";
+import { describeError, type ErrorText } from "@/lib/describeError";
 import { formatBytes } from "@/lib/formatBytes";
 import { CONFLICTS, conflictReason, importErrorText } from "./importText";
 import { isArchiveName } from "./schemas";
@@ -188,7 +189,9 @@ function Importing({ slow }: { slow: boolean }) {
   );
 }
 
-function uploadErrorText(error: unknown, t: ReturnType<typeof useTranslation>["t"]) {
+// `TFunction`, not `useTranslation()["t"]`: with a union of keys the hook's type grows too deep for tsc once
+// the catalogue passes ~600 keys (WP-3.1c2), the same type `importText.ts` uses.
+function uploadErrorText(error: unknown, t: TFunction): ErrorText {
   if (error instanceof ApiError && error.code === "CONFLICT") {
     const reason = conflictReason(error.details);
     if (reason) return { title: t(CONFLICTS[reason]), body: null, requestId: error.requestId };
