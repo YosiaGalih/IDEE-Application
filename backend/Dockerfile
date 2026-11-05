@@ -30,9 +30,11 @@ ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
 # (WP-2.1a). Debian trixie's git, without recommends; set-uid bits are stripped after it is installed.
 # Not pinned to a revision (DL3008): the Debian archive serves only the latest one, so a pin breaks the build at
 # the next security update. The base is pinned by digest and security-scan (Trivy) checks what this installs.
+# apt and libapt-pkg7.0 are upgraded to the archive's current revision: the base digest carries apt 3.0.3
+# (CVE-2026-109518, fixed in 3.0.4). Not pinned (DL3008), as for git: the archive serves only the latest.
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends git apt libapt-pkg7.0 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app \

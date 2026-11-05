@@ -417,7 +417,8 @@
       "right": "Panel kanan",
       "bottom": "Panel bawah",
       "showBottom": "Tampilkan panel bawah",
-      "hideBottom": "Sembunyikan panel bawah"
+      "hideBottom": "Sembunyikan panel bawah",
+      "left": "Panel kiri"
     },
     "explorer": {
       "title": "Explorer",
@@ -556,6 +557,95 @@
     },
     "projectStale": "Data project tidak dapat diperbarui; yang tampil mungkin sudah tidak terbaru.",
     "retry": "Coba lagi",
-    "repoChangedWhileOpen": "Tab yang terbuka tetap ada; salin perubahan yang belum disimpan sebelum meninggalkan halaman."
+    "repoChangedWhileOpen": "Tab yang terbuka tetap ada; salin perubahan yang belum disimpan sebelum meninggalkan halaman.",
+    "gitPanel": {
+      "view": {
+        "explorer": "Explorer",
+        "git": "Git",
+        "gitCount": "Git, {{count}} perubahan",
+        "gitError": "Git, status tidak dapat dibaca"
+      },
+      "head": "Branch {{branch}} · {{head}}",
+      "noCommit": "Belum ada commit di repository ini.",
+      "clean": "Tidak ada perubahan sejak commit terakhir.",
+      "changes": "Perubahan",
+      "selectAll": "Pilih semua",
+      "clearAll": "Kosongkan",
+      "pickOf": "Sertakan {{path}} di commit",
+      "showDiffOf": "Lihat perubahan {{path}}",
+      "showAllDiff": "Lihat semua diff",
+      "statusLoadFailed": "Status git tidak dapat dibaca.",
+      "statusStale": "Status git tidak dapat dibaca ulang; daftar di bawah mungkin sudah tidak terbaru.",
+      "commit": {
+        "title": "Commit",
+        "message": "Pesan commit",
+        "picked": "{{count}} file dipilih",
+        "submit": "Commit",
+        "done": "Commit {{sha}} dibuat.",
+        "nothing": "Tidak ada yang di-commit: file yang dipilih sama dengan commit terakhir.",
+        "unknownOutcome": "Belum pasti apakah commit dibuat; status dan log dibaca ulang. Mengulang dengan pesan dan pilihan yang sama, selama daftar perubahan belum berubah, mengirim permintaan yang sama sehingga tidak membuat commit dua kali.",
+        "failed": "Commit gagal.",
+        "unsaved": "{{count}} file belum disimpan, jadi commit memakai isi yang tersimpan di server: {{paths}}",
+        "tooLong": "Pesan maksimal 5000 karakter.",
+        "tooMany": "Maksimal 500 file per commit; kurangi pilihan.",
+        "invalid": "Server menolak commit ini: pesan atau daftar file tidak valid."
+      },
+      "branch": {
+        "title": "Branch",
+        "current": "aktif",
+        "task": "task",
+        "name": "Nama branch baru",
+        "from": "Dari",
+        "fromHead": "HEAD (commit saat ini)",
+        "submit": "Buat branch",
+        "hint": "Hanya membuat branch; working tree tidak berpindah.",
+        "done": "Branch {{name}} dibuat di {{head}}. Working tree tetap di branch {{current}}; pindah branch belum tersedia.",
+        "exists": "Branch itu sudah ada.",
+        "reserved": "Nama kk, kk/…, refs/… dan HEAD dipakai platform.",
+        "invalid": "Nama branch tidak diterima git.",
+        "unknownOutcome": "Belum pasti apakah branch dibuat; daftar branch dibaca ulang.",
+        "failed": "Branch tidak dapat dibuat.",
+        "loadFailed": "Daftar branch tidak dapat dibaca.",
+        "invalidFrom": "Git tidak mengenal titik awal itu.",
+        "tooLong": "Nama branch maksimal 255 karakter.",
+        "doneNoCurrent": "Branch {{name}} dibuat di {{head}}. Working tree tidak berpindah; pindah branch belum tersedia.",
+        "stale": "Daftar branch tidak dapat dibaca ulang; yang tampil mungkin sudah tidak terbaru."
+      },
+      "log": {
+        "title": "Log",
+        "empty": "Belum ada commit.",
+        "more": "Muat lebih banyak",
+        "limit": "Batas {{count}} commit tercapai; commit yang lebih lama tidak ditampilkan.",
+        "loadFailed": "Log tidak dapat dibaca.",
+        "stale": "Log tidak dapat dibaca ulang; yang tampil mungkin sudah tidak terbaru.",
+        "loadingMore": "Memuat commit lain…"
+      },
+      "diff": {
+        "titleOf": "Perubahan di {{path}}",
+        "titleAll": "Semua perubahan",
+        "files": "{{count}} file",
+        "lineStats": "+{{additions}} −{{deletions}}",
+        "status": {
+          "added": "Ditambahkan",
+          "modified": "Diubah",
+          "deleted": "Dihapus"
+        },
+        "movedFrom": "dari {{path}}",
+        "binary": "File biner: isinya tidak ditampilkan.",
+        "truncated": "Diff dipotong di 1 MiB: yang tampil tidak lengkap.",
+        "empty": "Tidak ada perubahan terhadap commit terakhir.",
+        "oldLine": "Baris lama",
+        "newLine": "Baris baru",
+        "sign": "Jenis baris",
+        "added": "ditambahkan",
+        "removed": "dihapus",
+        "close": "Tutup",
+        "loadFailed": "Diff tidak dapat dibaca.",
+        "stale": "Diff tidak dapat dibaca ulang; yang tampil mungkin sudah tidak terbaru.",
+        "noHunks": "Tidak ada perubahan isi yang dapat ditampilkan (misalnya hanya mode file yang berubah).",
+        "content": "Isi baris"
+      },
+      "fresh": "{{count}} file baru muncul dan belum dipilih: {{paths}}"
+    }
   }
 }

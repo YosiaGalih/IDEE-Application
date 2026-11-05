@@ -28,7 +28,13 @@ ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
-RUN groupadd --gid 10001 app \
+# apt and libapt-pkg7.0 are upgraded to the archive's current revision: the base digest carries apt 3.0.3
+# (CVE-2026-109518, fixed in 3.0.4). Not pinned (DL3008), as for git: the archive serves only the latest.
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends apt libapt-pkg7.0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app \
     && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 COPY --from=build /opt/venv /opt/venv
