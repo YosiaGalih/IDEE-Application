@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.agents.readiness import AgentStatus, StatusReason
-from app.agents.registry import Group, Mode
+from app.agents.registry import AGENT_ID_PATTERN, Group, Mode
 from app.api.deps import CurrentActor
 from app.api.routes.projects import EnvDep, _respond
 from app.core.errors import AppError
@@ -24,8 +24,7 @@ from app.services import agents
 from app.services.agents import AgentDetail, AgentView, RunStats, RunSummary
 
 router = APIRouter(prefix="/agents", tags=["agents"])
-_AGENT_ID = r"^(?:[A-H]\d{2}|[IJKS]\d{2}|ORCH)$"
-_SEARCH = r"^[^\x00-\x1f\x7f]*$"  # no control characters (a NUL would reach PostgreSQL)
+_SEARCH = r"^[^\x00-\x1f\x7f-\x9f]*$"  # no C0/C1 control characters (a NUL would reach PostgreSQL)
 
 
 class AgentOut(BaseModel):
@@ -54,6 +53,7 @@ class AgentOut(BaseModel):
     access_note: str
     target_mode: str | None
     phase: str | None
+    contract_status: str | None  # "planned": the contract names belong to a planned agent
     status: AgentStatus
     status_reasons: list[StatusReason]
 
@@ -84,6 +84,7 @@ class AgentOut(BaseModel):
             access_note=p.access_note,
             target_mode=p.target_mode,
             phase=p.phase,
+            contract_status=p.contract_status,
             status=view.status,
             status_reasons=view.status_reasons,
         )
@@ -116,15 +117,16 @@ class RunStatsOut(BaseModel):
         return cls(runs=stats.runs, success_rate=stats.success_rate, avg_duration_ms=stats.avg_duration_ms)
 
 
-class AgentDetailOut(BaseModel):
-    agent: AgentOut
+class AgentDetailOut(AgentOut):
+    """API §6: ``AgentProfile + {recent_runs, stats}``, one flat object."""
+
     recent_runs: list[RunSummaryOut]
     stats: RunStatsOut
 
     @classmethod
-    def of(cls, detail: AgentDetail) -> AgentDetailOut:
+    def of_detail(cls, detail: AgentDetail) -> AgentDetailOut:
         return cls(
-            agent=AgentOut.of(detail.agent),
+            **AgentOut.of(detail.agent).model_dump(),
             recent_runs=[RunSummaryOut.of(run) for run in detail.recent_runs],
             stats=RunStatsOut.of(detail.stats),
         )
@@ -157,10 +159,12 @@ async def get_agent(
     env: EnvDep,
     agent_id: str,
 ) -> JSONResponse:
-    if not re.fullmatch(_AGENT_ID, agent_id):  # malformed ids are just unknown ones: 404, never a 422 echo
+    if not re.fullmatch(
+        AGENT_ID_PATTERN, agent_id
+    ):  # malformed ids are just unknown ones: 404, never a 422 echo
         raise AppError("NOT_FOUND", "Not found", http_status=404)
     async with env.sessions() as session:
         detail = await agents.get_agent(session, actor, agent_id)
     if detail is None:
         raise AppError("NOT_FOUND", "Not found", http_status=404)
-    return _respond(request, AgentDetailOut.of(detail).model_dump(mode="json"))
+    return _respond(request, AgentDetailOut.of_detail(detail).model_dump(mode="json"))

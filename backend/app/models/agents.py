@@ -52,6 +52,7 @@ class AgentProfile(Timestamps, Base):
         CheckConstraint(
             "target_mode IS NULL OR " + in_values("target_mode", AGENT_TARGET_MODES), name="target_mode"
         ),
+        CheckConstraint("contract_status IS NULL OR contract_status = 'planned'", name="contract_status"),
         # Under the loader's rule, for a row written any other way (the runtime role may UPDATE this table).
         CheckConstraint(APPROVAL_GRANT_DENY, name="approval_grant_deny"),
         # A retired agent keeps its slug; only the agents of the current registry need distinct ones.

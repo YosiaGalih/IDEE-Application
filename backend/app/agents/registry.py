@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -56,26 +57,26 @@ RUNTIME_CONTRACTS: Mapping[str, tuple[str, str]] = {
 }
 ONLY_DEPLOYER = frozenset({"F32"})
 # Permission fields pinned by the PRD access notes, AC-10 and FR-043 (the same table as the CI validator's):
-# a reviewer or the user proxy that could write or execute is refused at start, not only in CI.
+# a reviewer or the user proxy that could write, commit or execute is refused at start, not only in CI.
 PINNED_PERMISSIONS: Mapping[str, Mapping[str, str]] = {
-    "A01": {"filesystem": "read_only"},
-    "A02": {"filesystem": "read_only"},
-    "A03": {"filesystem": "read_only"},
-    "A04": {"filesystem": "read_only"},
-    "A05": {"filesystem": "read_only"},
-    "A06": {"filesystem": "read_only"},
-    "A07": {"filesystem": "read_only", "sandbox": "deny", "deployment": "deny"},
-    "C16": {"filesystem": "read_only"},
+    "A01": {"filesystem": "read_only", "git": "none"},
+    "A02": {"filesystem": "read_only", "git": "none"},
+    "A03": {"filesystem": "read_only", "git": "none"},
+    "A04": {"filesystem": "read_only", "git": "none"},
+    "A05": {"filesystem": "read_only", "git": "none"},
+    "A06": {"filesystem": "read_only", "git": "read"},
+    "A07": {"filesystem": "read_only", "sandbox": "deny", "deployment": "deny", "git": "read"},
+    "C16": {"filesystem": "read_only", "git": "none"},
     "C17": {"filesystem": "test_only"},
-    "D22": {"filesystem": "read_only", "sandbox": "deny"},
-    "D23": {"filesystem": "read_only"},
-    "D26": {"filesystem": "read_only"},
-    "F33": {"filesystem": "read_only"},
+    "D22": {"filesystem": "read_only", "sandbox": "deny", "git": "read"},
+    "D23": {"filesystem": "read_only", "git": "none"},
+    "D26": {"filesystem": "read_only", "git": "none"},
+    "F33": {"filesystem": "read_only", "git": "none"},
     "G35": {"filesystem": "docs_only"},
     "G36": {"filesystem": "docs_only"},
     "B14": {"filesystem": "scoped_write", "deployment": "deny"},
     "E27": {"git": "branch_commit"},
-    "E29": {"filesystem": "read_only"},
+    "E29": {"filesystem": "read_only", "git": "read"},
 }
 CITED_ANSWER = "CitedAnswer"
 _V1_PERMISSION_FIELDS = frozenset({"filesystem", "sandbox", "git", "network", "deployment", "approval_grant"})
@@ -87,6 +88,8 @@ Snake = Annotated[str, Field(max_length=60, pattern=r"^[a-z][a-z0-9_]*$")]
 Capability = Annotated[str, Field(max_length=120, pattern=r"^[a-z0-9_]+\.[a-z0-9_]+$")]
 ToolName = Annotated[str, Field(max_length=64)]
 ContractName = Annotated[str, Field(max_length=60, pattern=r"^[A-Z][A-Za-z0-9]*$")]
+# ASCII digits only: ``\d`` would also take other scripts' digits.
+AGENT_ID_PATTERN = r"^(?:[A-H][0-9]{2}|[IJKS][0-9]{2}|ORCH)$"
 
 
 def _list_only(value: object) -> object:
@@ -135,7 +138,7 @@ class AgentSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    agent_id: Annotated[str, Field(pattern=r"^(?:[A-H][0-9]{2}|[IJKS][0-9]{2}|ORCH)$")]
+    agent_id: Annotated[str, Field(pattern=AGENT_ID_PATTERN)]
     slug: Snake
     name: Name
     group: Group
@@ -158,7 +161,7 @@ class AgentSpec(BaseModel):
     output_note: Text
     access_note: Text
     target_mode: TargetMode | None = None
-    phase: Annotated[str, Field(pattern=r"^P\d{1,2}$")] | None = None
+    phase: Annotated[str, Field(pattern=r"^P[0-9]{1,2}$")] | None = None
     contract_status: Literal["planned"] | None = None
     notes: Annotated[tuple[Text, ...], Listed, Field(min_length=1)] | None = None
 
@@ -252,8 +255,12 @@ def _label(entry: object, index: int) -> str:
     return f"agents[{index}]"
 
 
+_KEY = re.compile(r"[a-z_][a-z0-9_]{0,39}")
+
+
 def _where(loc: Iterable[int | str]) -> str:
-    return ".".join(str(part) for part in loc)
+    # A key is file content too: only short identifier-like keys are named, never a sentence or a secret.
+    return ".".join(str(part) if isinstance(part, int) or _KEY.fullmatch(part) else "<key>" for part in loc)
 
 
 def _permission_shape(entry: Mapping[str, Any]) -> list[str]:

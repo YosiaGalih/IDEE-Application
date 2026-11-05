@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, get_args
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -146,7 +146,7 @@ async def sync_registry(session: AsyncSession, registry: AgentRegistry, audit: A
 
 # --- catalog (FR-044, FR-045) ------------------------------------------------------------------------------
 
-STATUSES: tuple[AgentStatus, ...] = ("planned", "disabled", "not_ready", "ready")
+STATUSES: tuple[AgentStatus, ...] = get_args(AgentStatus)
 RECENT_RUNS = 10
 # Runs with a result. ``running`` and ``approval_required`` (paused, ADR-025) have none yet.
 FINISHED_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled", "budget_exceeded"})

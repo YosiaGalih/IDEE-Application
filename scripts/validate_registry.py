@@ -227,28 +227,28 @@ FALLBACK_CONTRACTS: dict[str, tuple[str, str]] = {
 
 # Permission fields pinned by PRD access notes / AC-10 / TOOL_CATALOG semantics.
 PINNED_PERMISSIONS: dict[str, dict[str, str]] = {
-    "A01": {"filesystem": "read_only"},
-    "A02": {"filesystem": "read_only"},
-    "A03": {"filesystem": "read_only"},  # "orchestration only"
-    "A04": {"filesystem": "read_only"},
-    "A05": {"filesystem": "read_only"},
-    "A06": {"filesystem": "read_only"},
-    "A07": {"filesystem": "read_only", "sandbox": "deny", "deployment": "deny"},  # cannot give human approval
-    "C16": {"filesystem": "read_only"},
+    "A01": {"filesystem": "read_only", "git": "none"},
+    "A02": {"filesystem": "read_only", "git": "none"},
+    "A03": {"filesystem": "read_only", "git": "none"},  # "orchestration only"
+    "A04": {"filesystem": "read_only", "git": "none"},
+    "A05": {"filesystem": "read_only", "git": "none"},
+    "A06": {"filesystem": "read_only", "git": "read"},
+    "A07": {"filesystem": "read_only", "sandbox": "deny", "deployment": "deny", "git": "read"},  # cannot give human approval
+    "C16": {"filesystem": "read_only", "git": "none"},
     "C17": {"filesystem": "test_only"},
-    "D22": {"filesystem": "read_only", "sandbox": "deny"},  # AC-10: default reviewer read-only
-    "D23": {"filesystem": "read_only"},
-    "D26": {"filesystem": "read_only"},
-    "F33": {"filesystem": "read_only"},
+    "D22": {"filesystem": "read_only", "sandbox": "deny", "git": "read"},  # AC-10: default reviewer read-only
+    "D23": {"filesystem": "read_only", "git": "none"},
+    "D26": {"filesystem": "read_only", "git": "none"},
+    "F33": {"filesystem": "read_only", "git": "none"},
     "G35": {"filesystem": "docs_only"},
     "G36": {"filesystem": "docs_only"},
     "B14": {"filesystem": "scoped_write", "deployment": "deny"},  # "no direct deploy"
     "E27": {"git": "branch_commit"},
-    "E29": {"filesystem": "read_only"},  # v2: PR author never writes files; push/PR via J48 (K2 promotion)
+    "E29": {"filesystem": "read_only", "git": "read"},  # v2: PR author never writes files; push/PR via J48 (K2 promotion)
 }
 ONLY_DEPLOYER = {"F32"}
 
-ID_RE = re.compile(r"^(?:[A-H]\d{2}|[IJKS]\d{2}|ORCH)$")
+ID_RE = re.compile(r"^(?:[A-H][0-9]{2}|[IJKS][0-9]{2}|ORCH)$")  # ASCII digits only
 SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 CAP_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 TRIGGER_RE = re.compile(r"^[a-z][a-z0-9_]*$")

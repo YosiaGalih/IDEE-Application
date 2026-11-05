@@ -57,6 +57,7 @@ def profile(agent_id: str = "A02", **overrides: object) -> AgentProfile:
         ("model_tier", "huge", "ck_agent_profiles_model_tier"),
         ("group", "marketing", "ck_agent_profiles_group"),
         ("target_mode", "planned", "ck_agent_profiles_target_mode"),
+        ("contract_status", "live", "ck_agent_profiles_contract_status"),
     ],
 )
 async def test_profile_enum_checks(session: AsyncSession, field: str, value: str, constraint: str) -> None:

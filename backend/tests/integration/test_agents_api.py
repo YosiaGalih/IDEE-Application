@@ -108,7 +108,16 @@ async def test_filters(owner: httpx.AsyncClient, query: str, expected: set[str] 
 
 
 @pytest.mark.parametrize(
-    "query", ["group=marketing", "mode=agentic", "status=busy", "q=" + "x" * 101, "q=a%00b"]
+    "query",
+    [
+        "group=marketing",
+        "mode=agentic",
+        "status=busy",
+        "q=" + "x" * 101,
+        "q=a%00b",
+        "q=a%C2%85b",
+        "q=a%C2%9Fb",
+    ],
 )
 async def test_bad_filters_are_422(owner: httpx.AsyncClient, query: str) -> None:  # noqa: F811
     response = await owner.get(f"{AGENTS}?{query}")
@@ -122,7 +131,9 @@ async def test_detail(owner: httpx.AsyncClient) -> None:  # noqa: F811
     response = await owner.get(f"{AGENTS}/B14")
     assert response.status_code == 200, response.text
     body = response.json()["data"]
-    assert body["agent"]["agent_id"] == "B14"
+    # API §6: AgentProfile + {recent_runs, stats}, one flat object.
+    assert body["agent_id"] == "B14" and "agent" not in body
+    assert body["contract_status"] is None
     assert body["recent_runs"] == []
     assert body["stats"] == {"runs": 0, "success_rate": None, "avg_duration_ms": None}
 
@@ -163,6 +174,12 @@ async def test_success_rate_counts_finished_runs_only(
     await add_run(engine, task, status="running")
     body = (await owner.get(f"{AGENTS}/A02")).json()["data"]
     assert body["stats"] == {"runs": 4, "success_rate": 0.5, "avg_duration_ms": 2000}
+
+
+async def test_a_planned_agent_says_its_contracts_are_planned(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    planned = [a for a in (await owner.get(AGENTS)).json()["data"] if a["contract_status"] == "planned"]
+    assert planned, "the registry has planned agents with planned contracts"
+    assert all(a["mvp_mode"] == "planned" and a["input_contract"] for a in planned)
 
 
 async def test_a_retired_agent_is_not_found(owner: httpx.AsyncClient, engine: AsyncEngine) -> None:  # noqa: F811

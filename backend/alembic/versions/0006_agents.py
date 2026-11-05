@@ -88,6 +88,10 @@ def upgrade() -> None:
             name=op.f("ck_agent_profiles_target_mode"),
         ),
         sa.CheckConstraint(
+            "contract_status IS NULL OR contract_status = 'planned'",
+            name=op.f("ck_agent_profiles_contract_status"),
+        ),
+        sa.CheckConstraint(
             "coalesce(permission_profile ->> 'approval_grant', '') = 'deny'",
             name=op.f("ck_agent_profiles_approval_grant_deny"),
         ),
