@@ -848,8 +848,11 @@
       "approvedRunning": "Approved. Deleting project {{name}} is running.",
       "approvedRetrying": "Approved, but deleting project {{name}} failed and will be retried automatically.",
       "rejected": "Rejected. Project {{name}} is not deleted.",
-      "approvedGeneric": "Approved.",
-      "rejectedGeneric": "Rejected."
+      "approvedGeneric": "Approved and carried out.",
+      "rejectedGeneric": "Rejected.",
+      "approvedGenericRunning": "Approved; the action is running.",
+      "approvedGenericRetrying": "Approved, but the action failed and will be retried automatically.",
+      "unclear": "The decision was sent, but its outcome is not clear yet. Reload the list to see its status."
     },
     "errors": {
       "mismatch": "This action changed since you opened it. The list has been reloaded; review it again before deciding.",
@@ -859,7 +862,8 @@
       "forbidden": "You are not allowed to decide this approval.",
       "notFound": "This approval no longer exists.",
       "invalidNote": "The note may only contain plain text, at most 2000 characters.",
-      "outcomeUnknown": "No answer came back; the decision may already be recorded. Reload the list before trying again."
+      "outcomeUnknown": "No answer came back; the decision may already be recorded. Reload the list before trying again.",
+      "cannotDecide": "This approval cannot be decided right now. Reload the list."
     },
     "history": {
       "heading": "History",
@@ -891,6 +895,7 @@
     "pendingTitle": "Pending",
     "summaries": {
       "project_delete": "Delete project {{name}}. The workspace is kept for 7 days, then removed for good."
-    }
+    },
+    "pendingRefreshFailed": "The pending list could not be reloaded; what you see may have changed."
   }
 }

@@ -848,8 +848,11 @@
       "approvedRunning": "Disetujui. Penghapusan project {{name}} sedang dijalankan.",
       "approvedRetrying": "Disetujui, tetapi penghapusan project {{name}} gagal dan akan diulang otomatis.",
       "rejected": "Ditolak. Project {{name}} tidak dihapus.",
-      "approvedGeneric": "Disetujui.",
-      "rejectedGeneric": "Ditolak."
+      "approvedGeneric": "Disetujui dan dijalankan.",
+      "rejectedGeneric": "Ditolak.",
+      "approvedGenericRunning": "Disetujui; aksinya sedang dijalankan.",
+      "approvedGenericRetrying": "Disetujui, tetapi aksinya gagal dan akan diulang otomatis.",
+      "unclear": "Keputusan terkirim, tetapi hasilnya belum jelas. Muat ulang daftar untuk melihat statusnya."
     },
     "errors": {
       "mismatch": "Aksi ini berubah sejak Anda membukanya. Daftar dimuat ulang; tinjau lagi sebelum memutus.",
@@ -859,7 +862,8 @@
       "forbidden": "Anda tidak berwenang memutus persetujuan ini.",
       "notFound": "Persetujuan ini tidak ada lagi.",
       "invalidNote": "Catatan hanya boleh berisi teks biasa, maksimal 2000 karakter.",
-      "outcomeUnknown": "Jawaban tidak sampai; keputusan mungkin sudah tercatat. Muat ulang daftar sebelum mencoba lagi."
+      "outcomeUnknown": "Jawaban tidak sampai; keputusan mungkin sudah tercatat. Muat ulang daftar sebelum mencoba lagi.",
+      "cannotDecide": "Persetujuan ini tidak dapat diputuskan sekarang. Muat ulang daftar."
     },
     "history": {
       "heading": "Riwayat",
@@ -891,6 +895,7 @@
     "pendingTitle": "Tertunda",
     "summaries": {
       "project_delete": "Hapus project {{name}}. Workspace disimpan 7 hari, lalu dihapus permanen."
-    }
+    },
+    "pendingRefreshFailed": "Daftar tertunda gagal dimuat ulang; yang tampil mungkin sudah berubah."
   }
 }

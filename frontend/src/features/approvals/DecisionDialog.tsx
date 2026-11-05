@@ -55,7 +55,8 @@ export function DecisionDialog({ approval, decision, onClose, onDecided }: Props
   };
 
   return (
-    <Dialog open onOpenChange={(open) => (open ? undefined : onClose())}>
+    // Not while the request is in flight: closing would drop the answer, so the outcome would never be shown.
+    <Dialog open onOpenChange={(open) => (open || decide.isPending ? undefined : onClose())}>
       <DialogContent
         className="w-[min(40rem,calc(100vw-2rem))]"
         title={t(decision === "approve" ? "approvals.dialog.approveTitle" : "approvals.dialog.rejectTitle", {
@@ -100,7 +101,9 @@ export function DecisionDialog({ approval, decision, onClose, onDecided }: Props
         </div>
         <div className="mt-4 flex justify-end gap-2">
           <DialogClose asChild>
-            <Button variant="secondary">{t("approvals.dialog.cancel")}</Button>
+            <Button variant="secondary" disabled={decide.isPending}>
+              {t("approvals.dialog.cancel")}
+            </Button>
           </DialogClose>
           <Button
             variant={decision === "approve" ? "primary" : "danger"}

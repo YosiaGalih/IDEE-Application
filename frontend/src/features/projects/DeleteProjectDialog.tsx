@@ -8,20 +8,15 @@ import type { Project } from "@/api/projects";
 import { Button } from "@/components/ui/Button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/Dialog";
 import { ErrorSummary } from "@/components/ui/ErrorSummary";
-import { describeError, isOutcomeUnknown, type ErrorText } from "@/lib/describeError";
+import { describeError, errorReason, isOutcomeUnknown, type ErrorText } from "@/lib/describeError";
 
 type Props = { project: Project; onClose: () => void; onRequested: (project: Project) => void };
-
-const reasonOf = (details: unknown): string | null => {
-  const first: unknown = Array.isArray(details) ? details[0] : null;
-  return typeof first === "object" && first !== null && "reason" in first ? String(first.reason) : null;
-};
 
 /** Why the request was refused, in this screen's words (spec WP-3.1c Goal 5, 3.1c2 Lead 7). */
 function requestError(t: TFunction, error: unknown): ErrorText {
   const api = error instanceof ApiError ? error : null;
   if (api?.kind === "http" && api.code === "INVALID_TRANSITION") {
-    const failedBefore = reasonOf(api.details) === "delete_failed";
+    const failedBefore = errorReason(api.details) === "delete_failed";
     return {
       title: t(failedBefore ? "projects.delete.failedBefore" : "projects.delete.notDeletable"),
       body: null,
@@ -59,7 +54,8 @@ export function DeleteProjectDialog({ project, onClose, onRequested }: Props) {
   };
 
   return (
-    <Dialog open onOpenChange={(open) => (open ? undefined : onClose())}>
+    // Not while the request is in flight: closing would drop the answer, so the outcome would never be shown.
+    <Dialog open onOpenChange={(open) => (open || request.isPending ? undefined : onClose())}>
       <DialogContent
         title={t("projects.delete.title", { name: project.name })}
         description={t("projects.delete.explain")}
@@ -71,7 +67,9 @@ export function DeleteProjectDialog({ project, onClose, onRequested }: Props) {
         ) : null}
         <div className="flex justify-end gap-2">
           <DialogClose asChild>
-            <Button variant="secondary">{t("projects.delete.cancel")}</Button>
+            <Button variant="secondary" disabled={request.isPending}>
+              {t("projects.delete.cancel")}
+            </Button>
           </DialogClose>
           <Button
             variant="danger"

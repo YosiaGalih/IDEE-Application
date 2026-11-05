@@ -150,7 +150,7 @@ export function ApprovalHistory() {
             aria-label={t("approvals.history.pagination")}
             className="flex flex-wrap items-center justify-between gap-2 border-t border-line px-4 py-2 text-sm text-fg-muted"
           >
-            <span>{t("approvals.history.pageStatus", { page: filter.page, pages, total: meta.total })}</span>
+            <span>{t("approvals.history.pageStatus", { page: meta.page, pages, total: meta.total })}</span>
             <div className="flex gap-2">
               <Button
                 variant="secondary"

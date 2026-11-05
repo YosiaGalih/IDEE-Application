@@ -264,4 +264,100 @@ describe("ApprovalsPage", () => {
     await userEvent.click(await screen.findByRole("button", { name: id.approvals.history.next }));
     await waitFor(() => expect(state.historyQueries.some((q) => q.get("page") === "2")).toBe(true));
   });
+  it("stays open while the decision is in flight, then reports it (no lost outcome)", async () => {
+    const { gate, release } = deferred();
+    backend({
+      decide: async () => {
+        await gate;
+        return decided({ status: "rejected", handler_status: "succeeded" });
+      },
+    });
+    renderApp("/approvals");
+    const dialog = await openDecision("Kalkulator API", "reject");
+    await userEvent.click(within(dialog).getByRole("button", { name: id.approvals.dialog.confirmReject }));
+    expect(within(dialog).getByRole("button", { name: id.approvals.dialog.cancel })).toBeDisabled();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    release();
+    expect(
+      await screen.findByText(id.approvals.result.rejected.replace("{{name}}", "Kalkulator API")),
+    ).toBeInTheDocument();
+    // Focus lands on the page heading: the card and its buttons are gone.
+    expect(screen.getByRole("heading", { level: 1 })).toHaveFocus();
+  });
+
+  it("decides on the approval it was opened with, even when the list changes under it (AG-13 L2)", async () => {
+    let current = approval();
+    const state = backend({ pending: () => okPage([current, other], { page_size: 200 }) });
+    const { queryClient } = renderApp("/approvals");
+    const dialog = await openDecision("Kalkulator API", "approve");
+    const before = state.pendingCalls;
+    current = approval({ payload_hash: "9".repeat(64), payload: { name: "Renamed" } });
+    await queryClient.invalidateQueries();
+    await waitFor(() => expect(state.pendingCalls).toBeGreaterThan(before));
+    expect(within(dialog).getByText(approval().payload_hash)).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: id.approvals.dialog.confirmApprove }));
+    await screen.findByText(id.approvals.result.deleted.replace("{{name}}", "Kalkulator API"));
+    expect(state.decisions).toEqual([
+      { decision: "approve", payload_hash: approval().payload_hash, note: null },
+    ]);
+  });
+
+  it.each([
+    ["FORBIDDEN", 403, undefined, id.approvals.errors.forbidden, true],
+    ["NOT_FOUND", 404, undefined, id.approvals.errors.notFound, true],
+    [
+      "VALIDATION_ERROR",
+      422,
+      [{ loc: ["body", "note"], msg: "plain text" }],
+      id.approvals.errors.invalidNote,
+      false,
+    ],
+  ])("explains %s on a decision", async (code, status, details, text, isFinal) => {
+    backend({
+      decide: () =>
+        HttpResponse.json(
+          { request_id: "r-err-0002", status: "failed", error: { code, message: "no", details } },
+          { status },
+        ),
+    });
+    renderApp("/approvals");
+    const dialog = await openDecision("Kalkulator API", "approve");
+    const confirm = within(dialog).getByRole("button", { name: id.approvals.dialog.confirmApprove });
+    await userEvent.click(confirm);
+    expect(await within(dialog).findByText(text)).toBeInTheDocument();
+    if (isFinal) expect(confirm).toBeDisabled();
+    else expect(confirm).toBeEnabled(); // the note can be fixed and sent again
+  });
+
+  it("shows the permission state when the list itself is refused", async () => {
+    backend({ pending: () => fail(403, "FORBIDDEN") });
+    renderApp("/approvals");
+    expect(await screen.findByText(id.states.permission_denied.title)).toBeInTheDocument();
+  });
+
+  it("keeps the cards and says the list is stale when a later read fails", async () => {
+    let failing = false;
+    backend({
+      pending: () => (failing ? fail(500, "INTERNAL_ERROR") : okPage([approval()], { page_size: 200 })),
+    });
+    const { queryClient } = renderApp("/approvals");
+    await cardOf("Kalkulator API");
+    failing = true;
+    await queryClient.invalidateQueries();
+    expect(await screen.findByText(id.approvals.pendingRefreshFailed)).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Kalkulator API" })).toBeInTheDocument();
+  });
+
+  it("shows hidden characters in a payload as escapes (AG-13 L1)", async () => {
+    const spoofed = approval({
+      action_type: "tool_r3",
+      summary: "Run tool",
+      payload: { path: "invoice\u202Etxt.exe" },
+    });
+    backend({ pending: () => okPage([spoofed], { page_size: 200 }) });
+    renderApp("/approvals");
+    const card = await screen.findByRole("group", { name: "Kalkulator API" });
+    expect(within(card).getByText(/"path": "invoice\\u202etxt\.exe"/)).toBeInTheDocument();
+  });
 });

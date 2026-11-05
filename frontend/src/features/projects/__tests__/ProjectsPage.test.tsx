@@ -429,4 +429,27 @@ describe("ProjectsPage", () => {
       screen.queryByRole("button", { name: id.projects.delete.actionOf.replace("{{name}}", "Kalkulator") }),
     ).toBeNull();
   });
+  it("keeps the delete dialog open while the request is in flight", async () => {
+    backend(() => [project()]);
+    const { gate, release } = deferred();
+    deletes(async () => {
+      await gate;
+      return accepted();
+    });
+    renderApp("/projects");
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: id.projects.delete.actionOf.replace("{{name}}", "Kalkulator"),
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.click(within(dialog).getByRole("button", { name: id.projects.delete.confirm }));
+    expect(within(dialog).getByRole("button", { name: id.projects.delete.cancel })).toBeDisabled();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    release();
+    expect(
+      await screen.findByText(id.projects.delete.requested.replace("{{name}}", "Kalkulator")),
+    ).toBeInTheDocument();
+  });
 });

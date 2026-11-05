@@ -5,6 +5,7 @@ import { ApiError } from "@/api/errors";
 import { useApprovals } from "@/api/hooks/useApprovals";
 import { uxStateForError } from "@/api/uxState";
 import { Alert } from "@/components/ui/Alert";
+import { Button } from "@/components/ui/Button";
 import { StateView } from "@/components/ui/StateView";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { ApprovalCard } from "./ApprovalCard";
@@ -51,7 +52,7 @@ export function ApprovalsPage() {
   let pendingBody: React.ReactNode;
   if (pending.isPending) {
     pendingBody = <StateView state="loading" />;
-  } else if (pending.isError) {
+  } else if (pending.data === undefined) {
     pendingBody = (
       <StateView
         state={uxStateForError(pending.error)}
@@ -59,39 +60,51 @@ export function ApprovalsPage() {
         onAction={() => void pending.refetch()}
       />
     );
-  } else if (pending.data.items.length === 0) {
-    pendingBody = (
-      <StateView
-        state="empty"
-        title={t("approvals.pendingEmpty.title")}
-        detail={t("approvals.pendingEmpty.body")}
-      />
-    );
   } else {
     const { items, meta } = pending.data;
-    pendingBody = (
-      <div className="space-y-5">
-        {meta.total > items.length ? (
-          <Alert tone="info">
-            {t("approvals.pendingTruncated", { shown: items.length, total: meta.total })}
-          </Alert>
-        ) : null}
-        {byProject(items).map((group) => (
-          <ProjectGroup key={group.projectId} group={group}>
-            {group.approvals.map((approval) => (
-              <ApprovalCard
-                key={approval.id}
-                approval={approval}
-                onDecide={(chosen, decision) => {
-                  setOutcome(null);
-                  setSelected({ approval: chosen, decision });
-                }}
-              />
-            ))}
-          </ProjectGroup>
-        ))}
-      </div>
-    );
+    // A failed background read keeps the cards on screen (someone may be reading one) and says it is stale.
+    const refreshFailed = pending.isError ? (
+      <Alert tone="warning">
+        <p>{t("approvals.pendingRefreshFailed")}</p>
+        <Button variant="secondary" size="sm" className="mt-2" onClick={() => void pending.refetch()}>
+          {t("states.error.action")}
+        </Button>
+      </Alert>
+    ) : null;
+    pendingBody =
+      items.length === 0 ? (
+        <div className="space-y-3">
+          {refreshFailed}
+          <StateView
+            state="empty"
+            title={t("approvals.pendingEmpty.title")}
+            detail={t("approvals.pendingEmpty.body")}
+          />
+        </div>
+      ) : (
+        <div className="space-y-5">
+          {refreshFailed}
+          {meta.total > items.length ? (
+            <Alert tone="info">
+              {t("approvals.pendingTruncated", { shown: items.length, total: meta.total })}
+            </Alert>
+          ) : null}
+          {byProject(items).map((group) => (
+            <ProjectGroup key={group.projectId} group={group}>
+              {group.approvals.map((approval) => (
+                <ApprovalCard
+                  key={approval.id}
+                  approval={approval}
+                  onDecide={(chosen, decision) => {
+                    setOutcome(null);
+                    setSelected({ approval: chosen, decision });
+                  }}
+                />
+              ))}
+            </ProjectGroup>
+          ))}
+        </div>
+      );
   }
 
   return (
