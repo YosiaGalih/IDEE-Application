@@ -1693,3 +1693,70 @@ Hal terbuka yang relevan untuk keputusan G2:
 - Konflik #71: WP-SEC-01 bergantung pada WP-INT-03/05, yang berada di luar mandat. Perlu keputusan sebelum P4.
 
 **Status G2: bukti siap, menunggu keputusan PO.**
+
+### WP-3.1a (🔒 key dan jalur prompt) — port LLM, adapter Anthropic, retry, ScriptedProvider, tarif (FR-129, FR-130, FR-134, FR-056 bagian LLM, FR-133 data per percobaan; AC-15 dan AC-16 sebagian)
+
+Spec: `docs/superpowers/specs/2026-11-05-wp-3.1-agentic-core-design.md` (pembagian WP-3.1 dan rancangan 3.1a). Plan: `docs/superpowers/plans/2026-11-05-wp-3.1a-llm-port.md`. Konflik: #72. Belum ada tabel, endpoint, atau layar; ledger usage ada di 3.1f.
+
+Keputusan Lead:
+- WP-3.1 dibagi menjadi 3.1a–3.1f. Kode baru langsung mengikuti ADR-021..035. Status baris WP-INT tidak diubah; bagian yang terpenuhi dicatat per sub-WP.
+- Satu `create_message` = satu percobaan. `create_with_retry` mengulang hanya `rate_limited`/`overloaded`/`transient`/`timeout` (maks 4 ulangan, full jitter, `retry-after` ≤ 60 dtk) dan melaporkan setiap percobaan (`AttemptRecord`), termasuk yang gagal dan yang di-cancel.
+- SDK resmi `anthropic` 1.13.0 (rilis 9 Okt, sebelum batas `exclude-newer`). SDK ini memakai `httpx2`, sehingga test memakai `httpx2.MockTransport`, bukan `respx` (#72).
+- Tabel tarif `backend/config/pricing.yaml` versi 2026-11-05 dari halaman harga resmi: hanya claude-fable-5-1, claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5 (ID API yang tercantum resmi), termasuk tingkat prompt > 100.000 token untuk Haiku 5.5. Model lain → `unavailable`. `verify_before_production: true`.
+- Estimasi biaya eksak (tanpa pembulatan); presisi simpan di ledger diputuskan 3.1f.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| `ruff check`, `ruff format --check`, `pyright` @ 17ef409 | bersih; pyright 0 error |
+| `lint-imports` @ 17ef409 | 3 kept, 0 broken. Mutan `import httpx2` dan `from app.workspace import fs` di `app/llm/retry.py` → 2 kontrak BROKEN |
+| Test LLM @ 17ef409 | **182 test baru** (adapter 70, base 24, retry 24, scripted 23, tarif 23, contract 8, factory 6, security 4) + 7 di `test_config.py`, semuanya lulus |
+| Suite backend penuh @ 17ef409 (Python 3.12, PG16 + Redis 7; dijalankan sendirian 05:23:56–05:29:29 UTC) | **1947 passed, 1 skipped** dalam 5 menit 30 detik (`main` @ d3f4440: 1758 passed) |
+| Kebocoran prompt di log DEBUG SDK | `test_debug_logging_leaks_no_prompt_or_key`: dengan penjaga dimatikan, penanda prompt muncul di log ("Request options"); dengan penjaga, tidak ada prompt maupun key |
+| Mutan putaran review (R1–R7, S1–S7, T1–T2) | semuanya merah: base URL kosong diteruskan, https tanpa host diterima, stream bocor saat cancel pemanggil, cancel pemanggil tertelan saat penutupan, teks di-replay saat retry, percobaan cancel tidak tercatat, cancel kalah dari balasan selesai, sleep rusak dianggap jeda, harga 0 diterima, redirect diikuti, string vendor tanpa batas, request id tanpa batas, prompt di repr, base URL http di produksi, key tidak di-strip, scripted menyimpan prompt |
+
+Catatan: suite penuh pertama di worktree berjalan di Python 3.13 (uv memilihnya karena `backend` tanpa `.python-version`) dan `test_deep_symlink_chain_is_a_violation` gagal, sama dengan konflik #66. Venv dibangun ulang di 3.12, versi CI dan produksi.
+
+#### Review WP-3.1a
+
+Hasil awal @ dba9b6e:
+- `kk-backend-reviewer`: 0 blocker, 3 should, beberapa nit.
+- `kk-silent-failure-hunter`: 3 HIGH, 4 MEDIUM, 6 LOW.
+- `kk-security-reviewer` (AG-13) @ 3e81ddb: **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH, 2 MEDIUM, 7 LOW.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| backend S1 + silent H2: cancel task pemanggil meninggalkan task stream yang terus berjalan dan ditagih | stream ditutup lalu `CancelledError` diteruskan | `test_outer_cancel_closes_the_stream_and_propagates` (R1) |
+| backend S2 + silent H1: `suppress(BaseException)` menelan cancel pemanggil selama penutupan, lalu retry melihat "timeout" | penutupan memakai `asyncio.wait`; cancel pemanggil diteruskan | `test_outer_cancel_during_teardown_is_not_swallowed` (R2) |
+| silent H3: percobaan yang dipotong cancel pemanggil tidak tercatat | dicatat `cancelled`, usage `None` (biaya tidak diketahui, bukan 0) | `test_outer_cancel_is_recorded_and_propagates` (R4) |
+| backend S3 + silent M1: retry mengirim ulang teks yang sudah ter-stream | tanpa `on_restart`, percobaan yang sudah mengirim teks tidak diulang; dengan `on_restart`, konsumen diberi tahu sebelum percobaan baru | `test_text_sent_then_failure_*` (R3) |
+| silent M2 + L3, backend nit: error SDK/bentuk event tak terduga lolos mentah atau kehilangan usage | dipetakan ke `malformed` dengan usage; error `on_text_delta` milik pemanggil diteruskan apa adanya | `test_unexpected_event_shape_is_malformed`, `test_text_handler_failure_propagates_unchanged` |
+| silent L2: cancel dan balasan selesai bersamaan → adapter berhasil, scripted gagal | cancel menang di kedua provider | `test_cancel_set_on_the_last_delta_wins_over_the_finished_reply` (R5) |
+| backend nit: `sleep` yang gagal dianggap jeda | diteruskan | `test_a_failing_sleep_is_not_mistaken_for_a_pause` (R6) |
+| silent M3: biaya kecil dibulatkan ke 0.000000 berlabel `estimated` | estimasi eksak | `test_estimate_is_exact` |
+| silent M4: `partial` mudah terlupa | `partial` wajib dinyatakan | `test_partial_must_be_stated` |
+| backend nit + silent L1: harga "0" diterima; `Usage` negatif | harga harus > 0; hitungan negatif ditolak | `test_load_rejects` (R7), `test_usage_rejects_negative_counts` |
+| AG-13 M1: klien bawaan SDK mengikuti redirect; 307 ke origin lain membawa `X-Api-Key` dan prompt | klien adapter `follow_redirects=False`; 3xx → `bad_request` "redirect"; seam test menjadi `transport` | `test_a_redirect_is_not_followed` (S1) |
+| AG-13 L1: base URL http diterima di produksi | produksi wajib https | `test_production_rejects_unsafe_settings[ANTHROPIC_BASE_URL]` (S5) |
+| AG-13 L2: key dengan spasi/newline → literal redaksi beda dengan key yang dikirim | `Settings` men-strip key; kosong = tidak ada | `test_api_key_is_stripped_so_the_redactor_hides_what_is_sent` (S6) |
+| AG-13 L4: string vendor tanpa batas | tipe/stop reason `^[A-Za-z0-9_.:-]{1,64}$`, request id `^[A-Za-z0-9_-]{1,128}$` | `test_vendor_error_type_is_bounded`, `test_odd_request_ids_are_dropped` (S2, S3) |
+| AG-13 L5: teks spec menyebut `httpx`/`httpcore`; handler belakangan | spec diselaraskan; test semua handler root membawa filter | `test_every_root_handler_drops_vendor_debug` |
+| AG-13 L6: `ScriptedProvider.requests` tumbuh tanpa batas | perekaman opt-in | `test_requests_are_not_kept_unless_asked` (S7) |
+| AG-13 L7: `.dockerignore` membuka seluruh `backend/config/` | hanya `backend/config/pricing.yaml` | review kode |
+| AG-13 I1: repr `LLMRequest` memuat prompt | `system`/`messages` tanpa repr | `test_request_repr_hides_the_prompt` (S4) |
+| AG-13 L8 (review delta): `ANTHROPIC_BASE_URL=""` dari compose diteruskan ke SDK, sehingga setiap panggilan gagal 5× `transient`; `https:gw.internal` tanpa host diterima | nilai kosong = tidak di-set (default SDK); produksi wajib https dengan host | `test_blank_base_url_means_the_default`, `test_blank_base_url_reaches_the_default_host`, `test_production_rejects_unsafe_settings` (T1, T2) |
+
+Tidak ditutup di 3.1a (alasan dan pemilik; juga di spec bagian "Syarat yang diwariskan"):
+- **AG-13 M2:** usage percobaan parsial adalah batas bawah (provider mengirim hitungan output di akhir stream). Didokumentasikan; BudgetGuard 3.1f wajib memperhitungkannya dan test stream macet ada di 3.1f.
+- **AG-13 L3:** `CancelToken` tidak thread-safe. Pemiliknya sub-WP yang menyambungkan sumber cancel (3.1d/3.1f).
+- **AG-13 I2–I4:** decode nama tool (3.1d), `verify_before_production` ditegakkan (3.1e/3.1f), CA dan variabel env SDK (3.1e).
+- **AG-13 C3:** test ujung-ke-ujung `test_secret_redaction.py` (3.1f).
+- **silent L4:** balasan `end_turn` tanpa konten dikembalikan apa adanya; runtime (3.1f) yang memberi nudge.
+- **silent L5:** naskah scripted yang habis mengulang giliran terakhir; batas iterasi runtime menghentikan loop.
+- **silent L6:** kegagalan `on_attempt` diteruskan (keras, tidak diam); keputusan nasib respons berbayar saat ledger gagal ada di 3.1f.
+- **backend nit:** `timeout_s` adalah batas total satu percobaan; 3.1f memilihnya sesuai `max_tokens`.
+
+**Sign-off AG-13:** SIGNED OFF WITH CONDITIONS @ 3e81ddb, lalu delta **SIGNED OFF WITH CONDITIONS @ 81b3341** (M1, L1, L2, L4, L6, L7, I1 diterima ditutup; L5 diterima; M2 tetap terbuka untuk 3.1f; temuan baru L8 ditutup di 17ef409, yang hanya menyentuh `app/core/config.py` dan test-nya). Syarat warisan ada di spec bagian "Syarat yang diwariskan".
+
+AG-13 C8: gitleaks, semgrep, dan trivy tidak dijalankan lokal (tidak terpasang / proxy 403); bukti dari job CI `security-scan` di PR. C10: commit sesudah 81b3341 yang menyentuh `app/llm/**`, `app/core/logging.py`, `app/core/cancel.py`, dependensi, Dockerfile, atau `.dockerignore` butuh review delta AG-13.
+
+Pelajaran proses (AG-13 D4): `tests/security/*` selalu memigrasi ulang dan me-reset DB uji bersama (`tests/security/conftest.py`, fixture autouse). Reviewer yang menjalankan test itu bersamaan dengan suite penuh merusak hasil suite (run @ 81b3341: 4 error `relation "users" does not exist` dan 1 kegagalan turunan). Suite penuh dijalankan ulang tanpa proses lain; reviewer paralel hanya memakai `--noconftest` atau DB yang tidak terjangkau.

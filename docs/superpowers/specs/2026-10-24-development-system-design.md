@@ -398,6 +398,14 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - **Simpan eksplisit:** tanpa autosave. Konflik `VERSION_CONFLICT` diselesaikan lewat dialog (lihat perbedaan / muat versi server / timpa dengan sha server yang baru dibaca).
     - **Dependensi WBS di luar mandat:** WP-SEC-01 (prasyarat WP-4.3/G4) bergantung pada WP-INT-03 (ports, handler approval) dan WP-INT-05 (redaksi). Keduanya tidak termasuk mandat "P2, P3, P4". Perlu keputusan PO sebelum P4: masukkan keduanya ke mandat, atau kurangi syarat SEC-01.
 
+72. **Agentic core (WP-3.1).** Spec: `docs/superpowers/specs/2026-11-05-wp-3.1-agentic-core-design.md` (bagian "Konflik kontrak", 14 butir).
+    - **Pembagian:** WP-3.1 dipecah menjadi 3.1a–3.1f (port LLM; registry agent; approval + hapus project; ToolGateway + builtin; pengaturan provider + readiness + kill switch; runtime + budget + usage). Layar ikut WP backend-nya (#63).
+    - **WP-INT:** kode baru langsung mengikuti ADR-021..035 (ToolPorts, transaksi handler approval, enum ADR-025, bentuk API §11, ADR-031/032/034). Baris WP-INT ditulis untuk kode snapshot yang tidak ada; statusnya tidak diubah agent. Tracker mencatat bagian mana yang terpenuhi oleh sub-WP mana, sebagai bukti untuk keputusan PO atas #71.
+    - **Yang belum didefinisikan dokumen:** isi registry yang dipakai (hanya `registry.v2.yaml` skema 2 yang ada; FR-041/ARCHITECTURE §6/`AGENT_REGISTRY_PATH` merujuk `registry.yaml` skema 1), field kontrak I/O agent, isi dan cara memilih skenario `generic`/`calc`/`calc-debug`/`calc-gap`, perilaku budget saat `cost_status=unavailable`. Diputuskan di sub-WP pemiliknya.
+    - **Dokumen yang saling bertentangan:** path tarif (`config/pricing.yaml` vs `backend/config/pricing.yaml`; keduanya terpenuhi oleh `/app/config/pricing.yaml` di image), jawaban smoke test (§9 `{job_id}` vs §11 #8 sinkron), kedaluwarsa approval (#13), `usage:read` tidak ada di RBAC v1, layering tools → llm (`ToolDef`), tiga batas iterasi yang tumpang-tindih, batas konteks 64 KB / 256 KB / 60 KB, FR-158 di luar daftar FR WP-3.1.
+    - **TEST_STRATEGY §3 (`respx`):** SDK resmi yang boleh dipakai (`anthropic` 1.13.0) memakai `httpx2`, sehingga adapter diuji dengan `httpx2.MockTransport`. Usulan: §3 menyebut transport tiruan tanpa nama library.
+    - **3.1a:** tabel tarif awal hanya memuat empat model yang ID API-nya tercantum di halaman harga resmi (dibaca 5 Nov 2026), `verify_before_production: true`. Model lain berbiaya `unavailable`.
+
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
 - Versi Node.js.

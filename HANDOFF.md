@@ -4,17 +4,17 @@ File ini ditulis untuk melanjutkan pembangunan KodeKantor setelah kredit cloud h
 
 Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-continuation-under-usage-limits.md`. File ini hanya memuat posisi terakhir dan langkah berikutnya.
 
-## Status (4 Nov 2026)
+## Status (5 Nov 2026)
 
 | | |
 |---|---|
-| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9), WP-2.1a projects core (PR #10), WP-2.1b import arsip (PR #11), WP-2.1c API workspace dan git (PR #12), WP-2.1d indeks dan pencarian (PR #13), WP-2.1e dashboard (PR #14), WP-2.2a layar IDE (PR #15) |
+| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9), WP-2.1a projects core (PR #10), WP-2.1b import arsip (PR #11), WP-2.1c API workspace dan git (PR #12), WP-2.1d indeks dan pencarian (PR #13), WP-2.1e dashboard (PR #14), WP-2.2a layar IDE (PR #15), WP-2.2b panel git (PR #16). Bukti G2: PR #17 (menunggu merge dan keputusan PO) |
 | Mandat PO | "jalankan P2, P3 dan P4" (2 Nov): WP-2.1, 2.2, 3.1, 3.2, 4.1, 4.2, 4.3 (berhenti di gate G4 untuk PO), SEC-01, bukti G2. Satu sub-WP = satu PR |
 | Branch kerja | `claude/gracious-goodall-3hjh19` |
-| Sedang dikerjakan | **WP-2.2b** panel git (PR #16): daftar perubahan, diff, commit dengan path eksplisit, buat branch, log. Frontend saja, tidak 🔒. Review frontend (0 BLOCK, 3 SHOULD) dan silent-failure (4 MEDIUM) sudah ditutup. PR ini juga memuat perbaikan `apt` CVE-2026-109518 di empat image Debian (security-scan merah karena advisory baru). Merge oleh PO. WP-2.2a sudah di-merge (PR #15) |
-| Berikutnya | P3 (WP-3.1, WP-3.2 termasuk chat), P4 (WP-4.1 termasuk terminal, WP-4.2, SEC-01, WP-4.3 berhenti di G4). Catatan jebakan ada di akhir bagian tracker WP-2.1a–2.2a. Di luar cakupan: shell aplikasi belum responsif di ponsel (sidebar selalu `w-60`; tracker WP-2.1e dan WP-2.2a) |
+| Sedang dikerjakan | **WP-3.1a** port LLM (🔒): `LLMProvider`, adapter SDK `anthropic` 1.13.0, retry dengan catatan per percobaan, `ScriptedProvider`, tabel tarif, factory. Belum ada tabel/endpoint (ledger usage di 3.1f). Review backend, silent-failure, dan AG-13 (signed off with conditions @ 3e81ddb) sudah ditutup; review delta AG-13 untuk 81b3341. Pembagian WP-3.1 (3.1a–3.1f) dan konflik #72 ada di spec WP-3.1 |
+| Berikutnya | WP-3.1b registry agent + `agent_runs` + layar `/agents`; 3.1c approval + hapus project + layar `/approvals`; 3.1d ToolGateway + builtin; 3.1e pengaturan provider + readiness + kill switch; 3.1f runtime + budget + usage. Syarat AG-13 yang diwariskan ada di spec WP-3.1 bagian "Syarat yang diwariskan". Lalu WP-3.2 (termasuk chat), P4 (WP-4.1 termasuk terminal, WP-4.2, SEC-01, WP-4.3 berhenti di G4). Di luar cakupan: shell aplikasi belum responsif di ponsel |
 | Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3 (U4). Dari WP-1.5a: role owner non-superuser untuk migrate. Dari WP-1.4b: token reset dipindah ke fragment sebelum ada jalur pengiriman tautan; stream task berhenti di status terminal. Dari WP-1.6: access log uvicorn rusak (`RedactingFilter`), healthcheck `scheduler` |
-| Menunggu PO | konflik #36–#68 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; EX-02..EX-06 di DECISIONS (EX-02 kini juga mencakup 5 HIGH tanpa fix dari git di image backend); role global di project yang diberi grant (tracker WP-2.1a); konflik #66 (Python 3.13), #67 (sumber `upload`), #68 (HTTP 408); M2 egress sebelum G4; konflik #71 (WP-SEC-01 bergantung pada WP-INT-03/05 yang di luar mandat; perlu keputusan sebelum P4); gate G0/G1 |
+| Menunggu PO | konflik #36–#68 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; EX-02..EX-06 di DECISIONS (EX-02 kini juga mencakup 5 HIGH tanpa fix dari git di image backend); role global di project yang diberi grant (tracker WP-2.1a); konflik #66 (Python 3.13), #67 (sumber `upload`), #68 (HTTP 408); M2 egress sebelum G4; konflik #71 (WP-SEC-01 bergantung pada WP-INT-03/05 yang di luar mandat; perlu keputusan sebelum P4); konflik #72 (agentic core: registry v1/v2, kontrak agent, skenario, tarif awal); gate G0/G1/G2 |
 
 ### WP-1.5a: yang sudah ada (di branch kerja)
 
