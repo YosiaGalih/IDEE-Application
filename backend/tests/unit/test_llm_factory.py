@@ -42,3 +42,15 @@ async def test_anthropic_uses_the_configured_key_and_base_url() -> None:
     sent = fake.requests[0]
     assert sent.headers["x-api-key"] == KEY
     assert str(sent.url).startswith("https://llm.example.test/")
+
+
+async def test_blank_base_url_reaches_the_default_host() -> None:
+    settings = load_settings(
+        make_test_env(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY, ANTHROPIC_BASE_URL="")
+    )
+    fake = FakeAnthropic(
+        lambda _: stream_response(sse(message_start(), *text_block(0, "x"), *message_end("end_turn")))
+    )
+    provider = build_provider(settings, transport=fake.transport())
+    await provider.create_message(LLMRequest(model="m", system="s", messages=(Message("user", "hi"),)))
+    assert str(fake.requests[0].url).startswith("https://api.anthropic.com/")
