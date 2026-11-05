@@ -101,13 +101,18 @@ class ProjectDeleteHandler:
         self._audit = audit
 
     async def _locked(self, session: AsyncSession, approval_id: uuid.UUID) -> tuple[Approval, Project] | None:
-        approval = await session.get(Approval, approval_id, with_for_update=True)
-        if approval is None:
+        """Project first, then approval: the order a rename takes too, so the two never deadlock."""
+        project_id = await session.scalar(select(Approval.project_id).where(Approval.id == approval_id))
+        if project_id is None:
             return None  # purged with its project
-        project = await session.scalar(
-            select(Project).where(Project.id == approval.project_id).with_for_update()
+        project = await session.scalar(select(Project).where(Project.id == project_id).with_for_update())
+        approval = await session.scalar(
+            select(Approval)
+            .where(Approval.id == approval_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-        return None if project is None else (approval, project)
+        return None if project is None or approval is None else (approval, project)
 
     async def _write(
         self, session: AsyncSession, approval: Approval, action: str, metadata: dict[str, object]

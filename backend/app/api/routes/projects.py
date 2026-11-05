@@ -17,10 +17,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from app.api.deps import AuditDep, CurrentActor, LimiterDep, dependencies, require_project_permission
+from app.api.routes.approval_out import ApprovalOut
 from app.core.context import REQUEST_ID_HEADER
 from app.core.errors import envelope, request_id_of
 from app.models.projects import Repository
-from app.services import projects, repo_index
+from app.services import approvals, project_delete, projects, repo_index
 from app.services.projects import Actor, ProjectEnv, ProjectView
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -222,6 +223,7 @@ def project_env(request: Request, audit: AuditDep, limiter: LimiterDep) -> Proje
 EnvDep = Annotated[ProjectEnv, Depends(project_env)]
 ProjectReader = Annotated[Actor, Depends(require_project_permission("project:read"))]
 ProjectWriter = Annotated[Actor, Depends(require_project_permission("project:write"))]
+ProjectDeleter = Annotated[Actor, Depends(require_project_permission("project:delete"))]
 # No control characters: a NUL byte would reach PostgreSQL and fail there as a 500.
 _SEARCH = r"^[^\x00-\x1f\x7f]*$"
 
@@ -314,6 +316,19 @@ async def update_project(
     )
     view = await projects.update_project(env, actor, project_id, changes)
     return _respond(request, ProjectOut.of(view).model_dump(mode="json"))
+
+
+@router.delete("/{project_id}", status_code=202)
+async def delete_project(
+    request: Request, project_id: uuid.UUID, actor: ProjectDeleter, env: EnvDep
+) -> JSONResponse:
+    """R3 (API §11 #14): nothing is deleted until a person approves the ``project_delete`` approval."""
+    approval, view = await project_delete.request_delete(env, actor, project_id)
+    data = {
+        "approval": ApprovalOut.of(approvals.view_of(approval, view.permissions)).model_dump(mode="json"),
+        "project": ProjectOut.of(view).model_dump(mode="json"),
+    }
+    return _respond(request, data, status_code=202, status="accepted")
 
 
 @router.post("/{project_id}/archive")
