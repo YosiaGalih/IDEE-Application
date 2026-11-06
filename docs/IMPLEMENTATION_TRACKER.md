@@ -1777,7 +1777,7 @@ Pelajaran proses (AG-13 D4): `tests/security/*` selalu memigrasi ulang dan me-re
 
 ### WP-3.1b (🔒 registry dan image) — registry agent, katalog, status, catatan run (FR-041–046 sisi baca; FR-047 ditunda)
 
-Spec: `docs/superpowers/specs/2026-11-05-wp-3.1b-agent-registry-design.md`. Plan: `docs/superpowers/plans/2026-11-05-wp-3.1b-agent-registry.md`. Konflik: #72 butir 3.1b. Branch dimulai dari ujung WP-3.1a (c986f0f, PR #18).
+Spec: `docs/superpowers/specs/2026-11-05-wp-3.1b-agent-registry-design.md`. Plan: `docs/superpowers/plans/2026-11-05-wp-3.1b-agent-registry.md`. Konflik: #72 butir 3.1b. Branch dimulai dari ujung WP-3.1a (c986f0f, PR #18), lalu di-rebase ke `main` 7ef43f7 sesudah PR #18 di-merge (isi identik: `git diff` ujung lama vs baru kosong). SHA di bagian ini adalah SHA **sebelum** rebase, tempat test dan review dijalankan. Pemetaan lama → baru: 9eb08f0 → e6837f4, 8f05dc7 → 62fe627, b546379 → 2247970, 8b79de6 → 1ce2dcc, 43a0328 → fbb73c9, 57f00d8 → 3faad20, 355e32c → 31f9720, 69a29b6 → c99be29, b4756bf → 430938e, 6086f66 → d068b7e, a5b93e5 → 593d60a, 530c32a → d03b30c.
 
 Keputusan Lead (rinci di spec; yang berubah sesudah review ditandai):
 - `agents/registry.v2.yaml` disalin ke `/app/agents/registry.yaml` di image; loader membaca skema 2. Dev di luar image dan test menyetel `AGENT_REGISTRY_PATH` ke file repo.
