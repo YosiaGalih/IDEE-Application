@@ -6,7 +6,9 @@ Thin shells: each one builds its clients, runs one service function, and closes 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from celery import shared_task
@@ -17,6 +19,8 @@ from app.core.config import load_settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
+from app.services import approval_handlers, project_delete
+from app.services.approval_registry import default_handlers
 from app.services.job_queue import IMPORT_TASK, INDEX_TASK, CeleryJobQueue
 from app.services.project_imports import ImportEnv, ImportRetry, run_import
 from app.services.projects import ProjectEnv
@@ -112,3 +116,54 @@ async def run_index_job(
     finally:
         await redis.aclose()
         await engine.dispose()
+
+
+# --- approvals (WP-3.1c) -----------------------------------------------------------------------------------
+
+APPROVALS_SWEEP_TASK = "app.worker.platform_jobs.approvals_sweep"
+PROJECTS_PURGE_TASK = "app.worker.platform_jobs.projects_purge"
+APPROVALS_SWEEP_SECONDS = 60.0
+PROJECTS_PURGE_SECONDS = 3600.0
+
+
+@shared_task(name=APPROVALS_SWEEP_TASK, time_limit=int(APPROVALS_SWEEP_SECONDS) - 10)
+def approvals_sweep() -> dict[str, int]:
+    """Expire what is past its time and rerun due handlers (ADR-024). A handler failure is recorded on the
+    approval, not raised here: one stuck approval must not stop the others."""
+    return asyncio.run(run_approvals_sweep())
+
+
+async def run_approvals_sweep(*, now: datetime | None = None) -> dict[str, int]:
+    settings = load_settings()
+    engine = make_engine(settings.database_url)
+    try:
+        sessions = make_sessionmaker(engine)
+        audit = AuditWriter(Redactor(settings.secret_values()))
+        result = await approval_handlers.sweep(
+            sessions=sessions, audit=audit, handlers=default_handlers(sessions=sessions, audit=audit), now=now
+        )
+    finally:
+        await engine.dispose()
+    return dataclasses.asdict(result)
+
+
+@shared_task(name=PROJECTS_PURGE_TASK, time_limit=int(PROJECTS_PURGE_SECONDS) - 60)
+def projects_purge() -> dict[str, list[str]]:
+    """Projects deleted 7 days ago or more: workspace, grants, rows (ADR-005). Runs where the workspace volume
+    is mounted (the worker, not the scheduler)."""
+    return asyncio.run(run_projects_purge())
+
+
+async def run_projects_purge(*, now: datetime | None = None) -> dict[str, list[str]]:
+    settings = load_settings()
+    engine = make_engine(settings.database_url)
+    try:
+        result = await project_delete.purge_deleted(
+            sessions=make_sessionmaker(engine),
+            audit=AuditWriter(Redactor(settings.secret_values())),
+            workspace_root=Path(settings.workspace_root),
+            now=now,
+        )
+    finally:
+        await engine.dispose()
+    return {"purged": [str(i) for i in result.purged], "failed": [str(i) for i in result.failed]}

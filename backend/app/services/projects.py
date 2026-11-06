@@ -46,7 +46,7 @@ from app.core.rbac import RoleGrant, effective_permissions
 from app.gitops.adapter import Author, GitAdapter, GitTarget
 from app.gitops.errors import GitError
 from app.models.projects import Project, Repository
-from app.services import import_lock
+from app.services import approval_store, import_lock
 from app.services.index_stats import indexed_file_count
 from app.services.task_stats import open_task_count
 from app.workspace.fs import Workspace
@@ -892,6 +892,28 @@ async def _audit(
     )
 
 
+async def audit_project(
+    env: ProjectEnv,
+    session: AsyncSession,
+    actor: Actor,
+    project: Project,
+    action: str,
+    metadata: dict[str, Any],
+) -> None:
+    """A user's action on a project, in the caller's transaction."""
+    await _audit(env, session, actor, project, action, metadata)
+
+
+async def commit_and_view(
+    env: ProjectEnv, session: AsyncSession, project: Project, permissions: frozenset[str]
+) -> ProjectView:
+    """Commit the caller's transaction and build the response view; nothing after the commit may fail."""
+    repository, open_tasks, files = await _read_and_commit(session, project)
+    return ProjectView(
+        project, repository, permissions, await _stats(env, project.id, repository, open_tasks, files)
+    )
+
+
 async def update_project(
     env: ProjectEnv, actor: Actor, project_id: uuid.UUID, changes: ProjectChanges
 ) -> ProjectView:
@@ -906,6 +928,18 @@ async def update_project(
             if name != project.name:
                 project.name = name
                 changed.add("name")
+                if project.status == "deleting_pending_approval":
+                    # The name is in the delete approval's payload: the old approval no longer describes
+                    # this action, so it is superseded and the decider is asked again (AC-13).
+                    await approval_store.renew_open(
+                        session,
+                        env.audit,
+                        project_id=project.id,
+                        action_type=approval_store.PROJECT_DELETE,
+                        changes={"name": name},
+                        actor_id=f"user:{actor.user_id}",
+                        actor_ip=actor.ip,
+                    )
         if "description" in changes.fields:
             description = clean_description(changes.description)
             if description != project.description:

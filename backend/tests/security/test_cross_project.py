@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from redis.asyncio import Redis
-from sqlalchemy import text, update
+from sqlalchemy import func, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.routing import BaseRoute
 
@@ -49,9 +49,11 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("POST", "/api/v1/projects/{id}/git/commit", {"message": "matrix"}),
     ("POST", "/api/v1/projects/{id}/index", None),
     ("GET", "/api/v1/projects/{id}/search?q=x", None),
+    ("DELETE", "/api/v1/projects/{id}", None),  # R3: only asks for a project_delete approval
 ]
 FILE = "README.md"  # exists in every blank project
 WRITES = {
+    ("DELETE", "/api/v1/projects/{id}"),
     ("PATCH", "/api/v1/projects/{id}"),
     ("POST", "/api/v1/projects/{id}/archive"),
     ("POST", "/api/v1/projects/{id}/unarchive"),
@@ -201,7 +203,9 @@ async def test_deleted_project_is_gone_even_for_its_owner(
     owner = world["owner"]
     assert isinstance(project, dict) and isinstance(owner, httpx.AsyncClient)
     async with make_sessionmaker(engine)() as session:
-        await session.execute(update(Project).where(Project.id == project["id"]).values(status="deleted"))
+        await session.execute(
+            update(Project).where(Project.id == project["id"]).values(status="deleted", deleted_at=func.now())
+        )
         await session.commit()
     response = await call(owner, method, path.format(id=project["id"], path=FILE), body)
     assert response.status_code == 404
@@ -277,3 +281,28 @@ async def test_a_global_role_counts_inside_a_project_it_was_granted(
         f"/api/v1/projects/{project['id']}", json={"description": "x"}, headers=headers(admin)
     )
     assert response.status_code == 200, response.text
+
+
+async def test_approvals_of_other_projects_do_not_exist(world: dict[str, object]) -> None:
+    """SECURITY_MODEL §11: approvals are scoped like their project (AC-01)."""
+    project, owner = world["project"], world["owner"]
+    assert isinstance(project, dict) and isinstance(owner, httpx.AsyncClient)
+    asked = await owner.delete(f"/api/v1/projects/{project['id']}", headers=headers(owner))
+    assert asked.status_code == 202, asked.text
+    approval = asked.json()["data"]["approval"]
+    for who in ("stranger", "admin"):
+        client = world[who]
+        assert isinstance(client, httpx.AsyncClient)
+        hidden = await client.get(f"/api/v1/approvals/{approval['id']}")
+        missing = await client.get(f"/api/v1/approvals/{uuid.uuid4()}")
+        assert (hidden.status_code, hidden.json()["error"]) == (
+            404,
+            missing.json()["error"],
+        )  # indistinguishable
+        decision = await client.post(
+            f"/api/v1/approvals/{approval['id']}/decision",
+            json={"decision": "approve", "payload_hash": approval["payload_hash"]},
+            headers=headers(client),
+        )
+        assert decision.status_code == 404
+        assert (await client.get("/api/v1/approvals", params={"status": "all"})).json()["data"] == []

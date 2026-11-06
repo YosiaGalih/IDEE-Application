@@ -1869,3 +1869,90 @@ Tidak diubah (dengan alasan):
 - **C3** (sebagian terbuka, WP-3.1d): ToolGateway dan AgentRuntime membaca allowlist dan izin dari `AgentRegistry` yang divalidasi di memori, bukan dari baris `agent_profiles` (role runtime boleh UPDATE tabel itu di antara dua sinkron).
 - **C4** (WP-3.1f): penulis `agent_runs.input/output/error` lewat `Redactor`.
 - **I-1** (catatan untuk FR-047): kolom override admin tidak boleh masuk `_values` sinkron, kalau tidak kill switch admin batal di setiap restart.
+
+### WP-3.1c1 (🔒 approval R3 dan hapus project) — approval, `DELETE /projects/{id}`, handler, sweep, purge (FR-018, FR-063, FR-067, FR-147 bagian; AC-13, AC-19 bagian)
+
+Spec: `docs/superpowers/specs/2026-11-05-wp-3.1c-approvals-design.md` (3.1c dibagi: 3.1c1 backend, 3.1c2 layar `/approvals`). Plan: `docs/superpowers/plans/2026-11-05-wp-3.1c1-approvals.md`. Konflik: #72 butir 3.1c. Branch ditumpuk di atas WP-3.1b (530c32a), lalu di-rebase ke `main` fe35621 sesudah PR #19 di-merge. Isi identik kecuali perbaikan zlib yang ikut masuk dari `main` (1bf1e83: `frontend/Dockerfile`, `scan-exceptions.toml`, DECISIONS, tracker). SHA di bagian ini adalah SHA **sebelum** rebase, tempat test dan review dijalankan. Pemetaan lama → baru: abce56e → 2fc2ee2, 25d94ec → f582415, 46b5278 → 9dfdda0, 2eb7b88 → f5e3ce7, 94dc289 → 22e9bbd, 45f6ccc → 9aac390, fe847f6 → 294dbea, 08c6af2 → c9e0c4d, afe69ec → 388a8f1, 830eea7 → d7705d9, e601616 → 60c633f, 941f628 → 1314f0d, d8ca0be → 7fbb757.
+
+Keputusan Lead (rinci di spec "Keputusan Lead"):
+- Kedaluwarsa menurut API §11.1 (ADR-034); `waive_criterion` tidak pernah dibuat; jawaban DELETE `{approval, project}` (§11 #14).
+- Hash: `sha256(canonical_json({action_type, target: {project_id, task_id}, payload}))`, JSON kanonik tanpa float.
+- Hapus dari `active` atau `archived`; rename saat menunggu → supersede + approval baru; tolak/kedaluwarsa → status sebelumnya; disetujui → task terbuka dibatalkan, `deleted`, purge 7 hari (berkas, grant, baris).
+- Keputusan: `approval:decide` + izin per jenis (`project:delete`); owner tunggal boleh memutus permintaannya sendiri (`four_eyes` P1).
+- Handler ADR-024: dijalankan inline sesudah commit keputusan dan oleh sweep worker (60 dtk); retry 30 dtk / 2 mnt / 10 mnt / 1 jam, maksimal 5.
+
+| Pemeriksaan | Hasil aktual |
+|---|---|
+| Test baru | [Pasti] 73 fungsi test (lebih banyak kasus dengan parametrize): `test_approval_hash.py` 6, `test_approval_tables.py` 7, `test_approval_store.py` 8, `test_approval_handlers.py` 10, `test_project_delete.py` 18, `test_approvals_api.py` 15, `test_platform_jobs_approvals.py` 2, `tests/security/test_approvals.py` 5 (nama dari TEST_STRATEGY AC-13), `test_cross_project.py` +1 (+ DELETE di matriks), `test_celery_app.py` +1 |
+| Suite backend penuh @ fe847f6 → 08c6af2 (sebelum review, sendirian) | [Pasti] `4 failed, 2154 passed, 1 skipped`: tiga helper test masih menulis `status='deleted'` tanpa `deleted_at` (CHECK baru) dan penjaga status-writer menolak `.status` di modul yang mengimpor `Task`. Diperbaiki di afe69ec |
+| Suite backend penuh @ afe69ec | [Pasti] `2 failed, 2173 passed, 1 skipped`: `test_git_adapter.py::test_grep_parses_off_the_event_loop` dan `test_search_inputs.py::test_a_large_search_output_never_blocks_the_loop` (test waktu event loop) gagal saat reviewer AG-13 menjalankan probe bersamaan; dijalankan ulang sendirian 3× → `2 passed` setiap kali. Test C0 dengan `-v`: `264 passed, 1 skipped` |
+| Suite backend penuh @ 830eea7 (final; sendirian 10:38:43–10:46:12 UTC) | [Pasti] `2175 passed, 1 skipped in 445.25s`; lalu `-v` atas 15 file test approval/hapus/scope/migrasi/audit/role: `289 passed, 1 skipped`, termasuk setiap test yang disebut C0 kedua review AG-13 (mis. `test_payload_hash_mismatch_409`, `test_replay_consumed_rejected`, `test_expired_rejected`, `test_superseded_on_payload_change`, `test_agent_cannot_decide`, `test_approvals_of_other_projects_do_not_exist`, `test_a_project_renamed_behind_the_approval_is_not_deleted`, `test_purge_failure_is_recorded_and_others_continue`, `test_a_decision_waits_for_a_concurrent_change`, `test_backoff_steps` ×4, `test_bad_decision_bodies_are_422` ×6, `test_migration_round_trip`: semua `PASSED`); ruff, format, pyright `0 errors`, lint-imports `3 kept, 0 broken` |
+| Suite backend penuh @ e601616 (sesudah `/code-review`; sendirian 11:03:11–11:10:25 UTC) | [Pasti] `2183 passed, 1 skipped in 430.24s` (+8 dari 830eea7: test code-review). Test fallback `test_a_corrupt_previous_status_restores_to_archived` (commit sesudahnya) dijalankan terpisah: `1 passed`. `-v` atas 10 file approval/hapus/scope: `232 passed`, termasuk 5 test AC-13 TEST_STRATEGY, 3 test di `tests/security/test_project_delete_security.py`, dan setiap test baru code-review: semua `PASSED`. ruff, format (206 file), pyright `0 errors`, lint-imports `3 kept, 0 broken` |
+| Mutan (satu perubahan per run, dipulihkan; skrip scratchpad) | [Pasti] X1–X24 semua `RED` (X6 "keputusan tanpa row lock" awalnya `SURVIVED`: test konkuren tidak memaksa interleaving; diganti test deterministik yang menahan lock di transaksi lain dan membuktikan penantian lewat `pg_stat_activity`, lalu `RED`). Mutan: konsumsi tanpa hash/tanpa kedaluwarsa, rename tanpa supersede, keputusan tanpa cek hash/izin per jenis/lock, daftar tanpa filter scope, kegagalan handler dilempar, tanpa backoff, task tidak dibatalkan, tolak tidak memulihkan, purge terlalu cepat/mengikuti symlink/berhenti di kegagalan pertama/tanpa cek root, `waive_criterion` bisa dibuat, keputusan kedaluwarsa diterima, float di JSON kanonik, hash eksekusi dari baris approval, catatan tidak divalidasi, superseded ditimpa, dispatch melempar, give-up dua kali, DELETE macet dijawab "accepted" |
+
+Catatan proses:
+- Migrasi 0007 belum di `main`, jadi diubah di tempat (backfill `deleted_at`); DB uji bersama di-reset manual ke 0006 sebelum test berikutnya.
+- Test pra-ada yang bergantung urutan: `tests/unit/test_celery_app.py` sebelum `tests/integration/test_recovery.py::test_failed_recoveries_fail_the_celery_job` membuat yang kedua gagal (app Celery dengan `task_eager_propagates`). Urutan suite (integration dulu) lulus; sama di base. Di luar WP ini.
+
+#### Review WP-3.1c1
+
+Hasil awal @ 08c6af2:
+- `kk-backend-reviewer`: 0 blocker, 3 should, beberapa nit.
+- `kk-silent-failure-hunter`: 0 HIGH, 4 MEDIUM, 9 LOW.
+- `kk-security-reviewer` (AG-13): **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH, 2 MEDIUM, 7 LOW, 8 INFO.
+
+| Temuan | Penutupan (afe69ec, 830eea7) | Bukti |
+|---|---|---|
+| AG-13 MEDIUM-1 (C1): handler mengonsumsi dengan hash barisnya sendiri | hash aksi dihitung dari project yang dikunci sekarang; tidak cocok → gagal terlihat, tidak menghapus | `test_a_project_renamed_behind_the_approval_is_not_deleted`, `test_tampered_payload_is_not_consumed` (X17) |
+| AG-13 MEDIUM-2 (C2) + backend S2 + silent M1: satu kegagalan purge memblokir semua | per project: log error, audit `project.purge_failed`, ke belakang antrean, lanjut; root bukan direktori → berhenti | `test_purge_failure_is_recorded_and_others_continue`, `test_purge_refuses_a_missing_workspace_root` (X18, X20) |
+| backend S1: handler mengunci project `FOR UPDATE` penuh | `FOR NO KEY UPDATE` seperti `authorize` | — |
+| backend S3 + AG-13 I5: `_record` menimpa `not_required` | superseded/`not_required` dan `succeeded` tidak ditimpa | `test_superseded_while_running_stays_not_required` (X21) |
+| silent M2: approved tanpa project menunggu tercatat sukses | dilempar → gagal terlihat | `test_approved_without_a_pending_project_fails_visibly` |
+| silent M3: DELETE ulang sesudah handler menyerah menjawab "accepted" | 409 `delete_failed`; give-up dicatat log error | `test_repeat_delete_after_a_failed_deletion_is_409` (X24) |
+| silent M4: `dispatch` bisa melempar | try luar; kegagalan mencatat dilog, sweep mengulang | `test_dispatch_never_raises_when_recording_fails` (X22) |
+| silent L1: give-up bisa dua kali | `== MAX_ATTEMPTS` | `test_gives_up_after_five` (X23) |
+| silent L5 + backend nit: backoff di Python, baris menunggu menyesakkan batch | backoff di SQL (`_due_clause`) | `test_backoff_steps` ×4 (X9) |
+| silent L6: `handler_error` bisa membawa parameter SQL | hanya baris pertama, diredaksi | — |
+| AG-13 LOW-1, silent L8: guard folder tidak berguna; keadaan folder tak tercatat | guard dihapus; root dicek; audit `workspace: removed|absent|symlink` | `test_purge_refuses_a_missing_workspace_root` |
+| AG-13 LOW-2: lock sebelum cek scope | scope dulu, lalu `FOR UPDATE` + `populate_existing` | `test_get_out_of_scope_is_404` |
+| AG-13 LOW-3: jam dibaca sebelum menunggu lock | `decide` membaca jam sesudah lock; sweep: jam per dispatch | — |
+| AG-13 LOW-4: renewal diaudit atas nama peminta lama | aktor = yang me-rename; `requested_by` dan `renewed_from` di metadata | `test_renew_supersedes_and_keeps_requester` |
+| AG-13 LOW-6: catatan dengan NUL/kontrol → 500 | 422; baris baru dan tab tetap | `test_bad_decision_bodies_are_422`, `test_a_note_keeps_line_breaks` (X19) |
+| AG-13 LOW-7: bukti konkurensi/404 lemah | test balapan rename vs keputusan; 404 sama dengan id acak; test lock deterministik | `test_rename_racing_a_decision_never_deletes_the_renamed_project`, `test_a_decision_waits_for_a_concurrent_change` (X6) |
+| backend nit: penulisan status keputusan di luar store | `approval_store.decide` | — |
+| backend nit: migrasi gagal bila ada baris `deleted` | backfill `deleted_at = now()` sebelum CHECK (AG-13 INFO-1: tetap 7 hari) | `test_migration_round_trip` |
+| penjaga status-writer: `.status` di modul yang mengimpor `Task` | pembatalan task dipindah ke `services/project_tasks.py` | `test_only_states_module_writes_task_status` |
+
+#### Review delta AG-13 @ afe69ec
+
+**SIGNED OFF** (delta), bersyarat C0. Tidak ada CRITICAL/HIGH/MEDIUM. Ditutup di 830eea7: LOW-C (RUNBOOK §10.7: jangan pernah mengubah payload/hash/status approval dengan tangan; prosedur hash tidak cocok, `delete_failed`, `purge_failed`, root hilang), LOW-D (penantian lock dibuktikan lewat `pg_stat_activity`), INFO-1 (backfill `now()`).
+
+Syarat yang tersisa:
+- **C0:** output suite penuh @ 830eea7 dan @ e601616 di atas, dengan test bernama dalam output `-v`.
+- **C3 (WP-3.1d):** kontrak import-linter/penjaga AST agar hanya `services/approvals.py` memanggil `approval_store.decide` dan hanya `approval_store` menulis `Approval.status`; `decide` menjadi UPDATE bersyarat yang memeriksa prasyaratnya sendiri (AG-13 LOW-5, LOW-B).
+- **WP-3.1d:** jam konsumsi handler dibaca sesudah lock (`clock_timestamp()` atau `now` sesudah `_locked`) (LOW-A); `create` hanya untuk jenis yang punya handler (LOW-E); ToolGateway/AgentRuntime membaca registry yang divalidasi (syarat 3.1b C3).
+- **WP pembuat task (3.2):** pembuatan task mengunci project (`authorize(lock=True)`) dan menolak project yang tidak `active` (AG-13 I3/INFO-3, WP-INT-04).
+- **Diterima:** owner tunggal memutus permintaannya sendiri (§11.1; `four_eyes` P1); replay atas hapus yang sudah dijalankan menjawab 404 (approval ikut tak terlihat); `is_dir()` tidak membuktikan volume ter-mount (audit `workspace: absent` beruntun menandainya).
+
+#### `/code-review` (sumbu standar + sumbu spec) @ 830eea7
+
+Sumbu spec: 12 temuan (2 kurang, 2 tidak diminta, 2 salah, 6 drift dokumen). Sumbu standar: 3 pelanggaran keras, sisanya penilaian. Ditutup di e601616 (kode) dan commit dokumen sesudahnya.
+
+| Temuan | Penutupan | Bukti |
+|---|---|---|
+| spec (a1): `create` menerima jenis tanpa handler (Goal 3, Non-goals) | `REQUESTABLE = {project_delete}`; jenis lain → `ValueError` (sekaligus AG-13 LOW-E) | `test_only_action_types_with_a_handler_can_be_requested` (mutan R2 `RED`) |
+| spec (c5): `delete_failed` sesudah kegagalan pertama, padahal sweep masih mengulang | hanya sesudah `handler_attempts >= MAX_ATTEMPTS` (cocok RUNBOOK §10.7) | `test_a_first_failure_is_not_yet_delete_failed` (R1 `RED`) |
+| spec (c6): `approval.consumed` diaudit pada project | diaudit pada approval (`resource_type="approval"`), aktor `system:approval_handlers` | `test_consumed_is_audited_on_the_approval` (R4 `RED`) |
+| spec (b3): sweep mengulang `consumed` di luar spec dan di luar predikat index | dipertahankan (pemulihan crash, jalur idempotent); spec Goal 4 diperbarui; predikat `ix_approvals_handler_due` mencakup `consumed` (migrasi 0007 diubah di tempat, belum di `main`) | `test_migration_round_trip`; `pg_indexes` sesudah upgrade |
+| spec (b4): fallback `archived` tidak disebut | dipertahankan, ditulis di spec Goal 5; test ditambah | `test_a_corrupt_previous_status_restores_to_archived` |
+| spec (a2): ukuran workspace tidak ada di `summary` | tidak dihitung di 3.1c1 (walk folder di jalur request); Keputusan Lead 10 dan #72 diperbarui; diisi bila layar 3.1c2 membutuhkannya | — |
+| spec (d7–d12): drift spec/plan | Goal 2 (`approval_store.py`), Goal 6 (§8), Goal 8 (test integrasi), Keputusan 12 dan Konflik (izin di service, route hanya sesi), Keputusan 14 (`not_required` juga untuk superseded); plan diberi bagian "Penyimpangan sesudah eksekusi" | — |
+| standar (1): test regresi keamanan C1/C2 di `tests/integration` (backend.md, TEST_STRATEGY §1.5) | dipindah ke `tests/security/test_project_delete_security.py` | 3 test, nama tetap |
+| standar (2): `/approvals` tanpa test 401, CSRF, paging (TEST_STRATEGY §3 `app/api`) | ditambah | `test_approvals_need_a_session`, `test_a_decision_needs_the_csrf_token`, `test_approvals_are_paged` |
+| standar (3): `expires_at` NULL diperlakukan tiga cara (ARCHITECTURE §10: NULL = tidak kedaluwarsa) | `consume` dan handler kini sama dengan `can_decide`/`decide` | `test_an_approval_without_expiry_never_expires` (R3 `RED`) |
+| standar (duplikasi): cek izin keputusan dua kali; `PAGE_SIZE_MAX` ganda; `_plain_text` meniru `has_hidden_characters` dengan himpunan lebih kecil (U+2028/U+2029 lolos) | `may_decide`; `projects.PAGE_SIZE_MAX`; catatan memakai `has_hidden_characters` (baris baru dan tab tetap boleh) | `test_bad_decision_bodies_are_422` + kasus U+2028 (merah dulu, lalu hijau) |
+| standar (shotgun, nama, switch): literal `"project_delete"` di 4 tempat; `committed_view`, `_write`, `_audit`; `getattr(handler, path)` | `approval_store.PROJECT_DELETE` dipakai di semua tempat; `commit_and_view`, `_audit_event`, `audit_event`; peta metode eksplisit yang diperiksa pyright | pyright `0 errors` |
+| standar (nit): docstring `ApprovalOut` "API §6"; RUNBOOK §10.7 sesudah `---` | §8; `---` dipindah ke akhir §10 | — |
+| penilaian, tidak diubah | CHECK `ck_projects_deleted_at` tanpa `NOT VALID`/`VALIDATE`: tabel `projects` kecil (satu baris per project) dan migrasi di-backfill lebih dulu. `_now()` di 4 modul: satu baris, tanpa modul bersama yang cocok di lapisan ini. `audit_project`: pembungkus publik agar `_audit` tetap privat. `sessions` + `audit` berpasangan: worker tidak punya `ProjectEnv`. Status sebagai `str`: mengikuti CHECK + enum tuple di seluruh model. Dua aktor sistem (`system:approval_handlers` untuk event `approval.*`, `approval:<id>` untuk event project dan pembatalan task): yang kedua menunjuk approval mana yang menghapus project. `dict[str, object]` di helper test | — |
+
+Mutan code-review (satu perubahan per run, dipulihkan; skrip scratchpad): R1 `delete_failed` pada kegagalan pertama, R2 semua jenis bisa diminta, R3 `expires_at` NULL tidak pernah bisa dikonsumsi, R4 `approval.consumed` diaudit pada project, R5 fallback membuka project sebagai `active`: semua `RED`.

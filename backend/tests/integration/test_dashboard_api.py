@@ -68,7 +68,12 @@ async def add_project(
     if status != "active":
         async with engine.begin() as conn:
             await conn.execute(
-                text("UPDATE projects SET status = :s WHERE id = :id"), {"s": status, "id": project_id}
+                # deleted_at exists exactly while a project is deleted (ck_projects_deleted_at, WP-3.1c).
+                text(
+                    "UPDATE projects SET status = :s, deleted_at = CASE WHEN :gone THEN now() END "
+                    "WHERE id = :id"
+                ),
+                {"s": status, "gone": status == "deleted", "id": project_id},
             )
     return project_id
 

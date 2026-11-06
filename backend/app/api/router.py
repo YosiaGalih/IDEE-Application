@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.routes import (
     agents,
+    approvals,
     auth,
     dashboard,
     git,
@@ -19,6 +20,7 @@ api_router.include_router(health.router)
 api_router.include_router(auth.router)
 api_router.include_router(dashboard.router)
 api_router.include_router(agents.router)
+api_router.include_router(approvals.router)
 api_router.include_router(projects.router)
 api_router.include_router(project_imports.router)
 api_router.include_router(workspace.router)

@@ -60,3 +60,17 @@ MODEL_TIERS = ("fast", "default", "complex")
 AGENT_RUN_STATUSES = ("running", "succeeded", "failed", "cancelled", "budget_exceeded", "approval_required")
 # ADR-025: "actual" is reserved for provider-reported costs.
 COST_STATUSES = ("estimated", "partial", "actual", "unavailable")
+# DATA_MODEL approvals (v1 CHECK). waive_criterion stays in the CHECK but is never created (ADR-034).
+APPROVAL_ACTION_TYPES = (
+    "apply_changes",
+    "budget_increase",
+    "tool_r3",
+    "project_delete",
+    "deploy_staging",
+    "deploy_production",
+    "git_push",
+    "waive_criterion",
+)
+APPROVAL_STATUSES = ("pending", "approved", "rejected", "expired", "consumed", "superseded")
+# ADR-024: a decision is committed before its handler runs; these track the handler.
+HANDLER_STATUSES = ("pending", "succeeded", "failed", "not_required")

@@ -78,3 +78,15 @@ def test_import_job_is_registered_with_retries_and_a_time_limit(monkeypatch) -> 
     # The API side: a broker that stops answering fails the send instead of holding a thread forever.
     options = CeleryJobQueue("redis://localhost:6379/0")._celery.conf.broker_transport_options
     assert options["socket_timeout"] > 0 and options["socket_connect_timeout"] > 0
+
+
+def test_approvals_sweep_and_purge_are_scheduled() -> None:
+    from app.worker import platform_jobs
+
+    conf = create_celery(load_settings(make_test_env())).conf
+    sweep = conf.beat_schedule["approvals-sweep"]
+    assert (sweep["task"], sweep["schedule"]) == (platform_jobs.APPROVALS_SWEEP_TASK, 60.0)
+    assert sweep["options"]["expires"] < 60.0  # a late sweep is dropped, not replayed in a burst
+    purge = conf.beat_schedule["projects-purge"]
+    assert (purge["task"], purge["schedule"]) == (platform_jobs.PROJECTS_PURGE_TASK, 3600.0)
+    assert purge["options"]["expires"] < 3600.0
