@@ -1959,7 +1959,7 @@ Mutan code-review (satu perubahan per run, dipulihkan; skrip scratchpad): R1 `de
 
 ### WP-3.1c2 (layar persetujuan dan hapus project) — `/approvals`, badge tertunda, aksi "Hapus" di `/projects` (FR-063, FR-067 layar; AC-13 layar)
 
-Spec: `docs/superpowers/specs/2026-11-05-wp-3.1c-approvals-design.md` ("Goals 3.1c2", "Keputusan Lead 3.1c2"). Plan: `docs/superpowers/plans/2026-11-05-wp-3.1c2-approvals-screen.md`. Branch ditumpuk di atas WP-3.1c1 (d8ca0be).
+Spec: `docs/superpowers/specs/2026-11-05-wp-3.1c-approvals-design.md` ("Goals 3.1c2", "Keputusan Lead 3.1c2"). Plan: `docs/superpowers/plans/2026-11-05-wp-3.1c2-approvals-screen.md`. Branch ditumpuk di atas WP-3.1c1 (d8ca0be), lalu di-rebase ke `main` 1dbce29 sesudah PR #20 di-merge. Isi identik kecuali yang ikut masuk dari `main` lewat 3.1b/3.1c1 (perbaikan zlib 1bf1e83 dan baris pemetaan SHA). SHA di bagian ini adalah SHA **sebelum** rebase, tempat test dan review dijalankan. Pemetaan lama → baru: 4294c1f → 5a699f7, 3bf02fb → 012e5c0, 15da926 → 18de1a2, 803160b → 81202e6, a297c87 → 2f7420f, 384e697 → ee59d19, 5d4f6c0 → 3da211d, 0a30d9b → 34eee30, 65c44c3 → 8786609, db0ebc7 → 6211702, ff435b1 → 8af3e7b, c061427 → 10764dc.
 
 Keputusan Lead (rinci di spec):
 - `project_name` ditambahkan pada respons `Approval` (dilaporkan di #72).
