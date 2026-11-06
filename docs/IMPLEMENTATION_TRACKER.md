@@ -1872,7 +1872,7 @@ Tidak diubah (dengan alasan):
 
 ### WP-3.1c1 (🔒 approval R3 dan hapus project) — approval, `DELETE /projects/{id}`, handler, sweep, purge (FR-018, FR-063, FR-067, FR-147 bagian; AC-13, AC-19 bagian)
 
-Spec: `docs/superpowers/specs/2026-11-05-wp-3.1c-approvals-design.md` (3.1c dibagi: 3.1c1 backend, 3.1c2 layar `/approvals`). Plan: `docs/superpowers/plans/2026-11-05-wp-3.1c1-approvals.md`. Konflik: #72 butir 3.1c. Branch ditumpuk di atas WP-3.1b (530c32a).
+Spec: `docs/superpowers/specs/2026-11-05-wp-3.1c-approvals-design.md` (3.1c dibagi: 3.1c1 backend, 3.1c2 layar `/approvals`). Plan: `docs/superpowers/plans/2026-11-05-wp-3.1c1-approvals.md`. Konflik: #72 butir 3.1c. Branch ditumpuk di atas WP-3.1b (530c32a), lalu di-rebase ke `main` fe35621 sesudah PR #19 di-merge. Isi identik kecuali perbaikan zlib yang ikut masuk dari `main` (1bf1e83: `frontend/Dockerfile`, `scan-exceptions.toml`, DECISIONS, tracker). SHA di bagian ini adalah SHA **sebelum** rebase, tempat test dan review dijalankan. Pemetaan lama → baru: abce56e → 2fc2ee2, 25d94ec → f582415, 46b5278 → 9dfdda0, 2eb7b88 → f5e3ce7, 94dc289 → 22e9bbd, 45f6ccc → 9aac390, fe847f6 → 294dbea, 08c6af2 → c9e0c4d, afe69ec → 388a8f1, 830eea7 → d7705d9, e601616 → 60c633f, 941f628 → 1314f0d, d8ca0be → 7fbb757.
 
 Keputusan Lead (rinci di spec "Keputusan Lead"):
 - Kedaluwarsa menurut API §11.1 (ADR-034); `waive_criterion` tidak pernah dibuat; jawaban DELETE `{approval, project}` (§11 #14).
