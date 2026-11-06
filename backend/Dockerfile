@@ -45,6 +45,8 @@ COPY backend/alembic.ini ./alembic.ini
 COPY backend/alembic ./alembic
 COPY backend/app ./app
 COPY backend/config ./config
+# Registry schema 2 at the configured AGENT_REGISTRY_PATH (/app/agents/registry.yaml; WP-9.0 rename).
+COPY agents/registry.v2.yaml ./agents/registry.yaml
 USER 10001:10001
 EXPOSE 8000
 # Proxy headers are believed only from FORWARDED_ALLOW_IPS (uvicorn default 127.0.0.1; compose sets Caddy).

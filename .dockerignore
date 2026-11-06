@@ -9,6 +9,7 @@
 !backend/alembic/
 !backend/app/
 !backend/config/pricing.yaml
+!agents/registry.v2.yaml
 !sandbox_manager/pyproject.toml
 !sandbox_manager/uv.lock
 !sandbox_manager/sandbox_manager/

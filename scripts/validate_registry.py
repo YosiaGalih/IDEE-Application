@@ -227,28 +227,28 @@ FALLBACK_CONTRACTS: dict[str, tuple[str, str]] = {
 
 # Permission fields pinned by PRD access notes / AC-10 / TOOL_CATALOG semantics.
 PINNED_PERMISSIONS: dict[str, dict[str, str]] = {
-    "A01": {"filesystem": "read_only"},
-    "A02": {"filesystem": "read_only"},
-    "A03": {"filesystem": "read_only"},  # "orchestration only"
-    "A04": {"filesystem": "read_only"},
-    "A05": {"filesystem": "read_only"},
-    "A06": {"filesystem": "read_only"},
-    "A07": {"filesystem": "read_only", "sandbox": "deny", "deployment": "deny"},  # cannot give human approval
-    "C16": {"filesystem": "read_only"},
+    "A01": {"filesystem": "read_only", "git": "none"},
+    "A02": {"filesystem": "read_only", "git": "none"},
+    "A03": {"filesystem": "read_only", "git": "none"},  # "orchestration only"
+    "A04": {"filesystem": "read_only", "git": "none"},
+    "A05": {"filesystem": "read_only", "git": "none"},
+    "A06": {"filesystem": "read_only", "git": "read"},
+    "A07": {"filesystem": "read_only", "sandbox": "deny", "deployment": "deny", "git": "read"},  # cannot give human approval
+    "C16": {"filesystem": "read_only", "git": "none"},
     "C17": {"filesystem": "test_only"},
-    "D22": {"filesystem": "read_only", "sandbox": "deny"},  # AC-10: default reviewer read-only
-    "D23": {"filesystem": "read_only"},
-    "D26": {"filesystem": "read_only"},
-    "F33": {"filesystem": "read_only"},
+    "D22": {"filesystem": "read_only", "sandbox": "deny", "git": "read"},  # AC-10: default reviewer read-only
+    "D23": {"filesystem": "read_only", "git": "none"},
+    "D26": {"filesystem": "read_only", "git": "none"},
+    "F33": {"filesystem": "read_only", "git": "none"},
     "G35": {"filesystem": "docs_only"},
     "G36": {"filesystem": "docs_only"},
     "B14": {"filesystem": "scoped_write", "deployment": "deny"},  # "no direct deploy"
     "E27": {"git": "branch_commit"},
-    "E29": {"filesystem": "read_only"},  # v2: PR author never writes files; push/PR via J48 (K2 promotion)
+    "E29": {"filesystem": "read_only", "git": "read"},  # v2: PR author never writes files; push/PR via J48 (K2 promotion)
 }
 ONLY_DEPLOYER = {"F32"}
 
-ID_RE = re.compile(r"^(?:[A-H]\d{2}|[IJKS]\d{2}|ORCH)$")
+ID_RE = re.compile(r"^(?:[A-H][0-9]{2}|[IJKS][0-9]{2}|ORCH)$")  # ASCII digits only
 SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 CAP_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 TRIGGER_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -1164,6 +1164,23 @@ def summarize(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """safe_load that refuses a key repeated in one mapping (YAML keeps the last one silently)."""
+
+
+def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode) -> dict:
+    seen: list = []
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(None, None, f"duplicate key {key!r}", key_node.start_mark)
+        seen.append(key)
+    return loader.construct_mapping(node)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) > 1 or (argv and argv[0] in {"-h", "--help"}):
@@ -1171,7 +1188,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     path = Path(argv[0]) if argv else DEFAULT_REGISTRY
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader
     except FileNotFoundError:
         print(f"ERROR: registry file not found: {path}", file=sys.stderr)
         return 2

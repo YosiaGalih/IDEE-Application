@@ -79,6 +79,8 @@ layers = [
     "app.api",
     "app.services",
     "app.workflow",
+    "app.agents",
+    "app.tools",
     "app.workspace | app.gitops | app.sandbox | app.llm",
     "app.core",
     "app.models",

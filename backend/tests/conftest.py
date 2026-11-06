@@ -31,6 +31,8 @@ def make_test_env(**overrides: str) -> dict[str, str]:
         "SANDBOX_MANAGER_TOKEN": TEST_SANDBOX_TOKEN,
         "LLM_PROVIDER": "scripted",
         "SANDBOX_DRIVER": "fake",
+        # The image ships agents/registry.v2.yaml as /app/agents/registry.yaml; tests read the repo file.
+        "AGENT_REGISTRY_PATH": str(BACKEND.parent / "agents" / "registry.v2.yaml"),
     }
     env.update(overrides)
     return env
@@ -73,5 +75,6 @@ async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 async def reset_data(engine: AsyncEngine) -> None:
     """Delete test-owned rows in FK order (projects restrict their owner). audit_events stays: append-only."""
     async with engine.begin() as conn:
-        await conn.execute(text("DELETE FROM projects"))
+        await conn.execute(text("DELETE FROM projects"))  # cascades to tasks and their agent_runs
+        await conn.execute(text("DELETE FROM agent_profiles"))
         await conn.execute(text("DELETE FROM users"))

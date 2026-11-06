@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.agents.registry import RegistryError, load_registry
 from app.api.router import api_router
-from app.core.audit import audit_guard_problems
+from app.core.audit import AuditWriter, audit_guard_problems
 from app.core.config import Settings, load_settings
 from app.core.context import REQUEST_ID_HEADER, accept_request_id, request_id_var
 from app.core.csrf import CsrfMiddleware
@@ -18,6 +21,7 @@ from app.core.errors import AppError, install_error_handlers
 from app.core.idempotency import IdempotencyMiddleware, SessionIdentity
 from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
+from app.services.agents import sync_registry
 from app.services.auth import resolve_session
 from app.services.health import Dependencies
 from app.services.project_imports import IMPORT_MAX_BYTES
@@ -56,6 +60,25 @@ class RequestIdMiddleware:
             request_id_var.reset(token)
 
 
+async def _sync_agents(settings: Settings, dependencies: Dependencies, redactor: Redactor) -> None:
+    log = get_logger(__name__)
+    try:
+        registry = await asyncio.to_thread(load_registry, Path(settings.agent_registry_path))
+    except RegistryError as exc:
+        log.error("agent_registry_invalid", problems=exc.problems)
+        raise
+    async with dependencies.sessions() as session:
+        result = await sync_registry(session, registry, AuditWriter(redactor))
+        await session.commit()
+    log.info(
+        "agent_registry_synced",
+        inserted=result.inserted,
+        updated=result.updated,
+        retired=result.retired,
+        unchanged=result.unchanged,
+    )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     redactor = Redactor(settings.secret_values())
@@ -74,6 +97,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "audit_events is not protected from the runtime role: " + "; ".join(problems)
                 )
         await load_templates()  # read once, off the event loop; requests then use the cached catalog
+        await _sync_agents(settings, dependencies, redactor)  # an invalid registry fails the start (FR-041)
         yield
         await drain_cleanups()  # cleanups of failed creates still running: no orphan folders
         await drain_writes()  # writes that outlived their request still owe their audit event (T10)

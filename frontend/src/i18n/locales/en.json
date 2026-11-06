@@ -647,5 +647,131 @@
       },
       "fresh": "{{count}} new files appeared and are not selected: {{paths}}"
     }
+  },
+  "agents": {
+    "subtitle_one": "{{count}} agent registered · {{ready}} ready · {{notReady}} not ready · {{disabled}} disabled · {{planned}} planned",
+    "subtitle_other": "{{count}} agents registered · {{ready}} ready · {{notReady}} not ready · {{disabled}} disabled · {{planned}} planned",
+    "approvalStatement": "No agent can grant an approval.",
+    "approvalWarning_one": "{{count}} agent is recorded as able to grant approvals. Check the registry.",
+    "approvalWarning_other": "{{count}} agents are recorded as able to grant approvals. Check the registry.",
+    "filters": {
+      "chip": "{{label}} ({{count}})",
+      "label": "Filter agents",
+      "all": "All",
+      "status": "Status",
+      "anyStatus": "Any status",
+      "search": "Search name, ID or tool",
+      "searchPlaceholder": "e.g. B14 or git.commit_task",
+      "group": "Group",
+      "anyGroup": "Any group"
+    },
+    "modes": {
+      "llm": "LLM",
+      "profile": "Profile",
+      "tool": "Tool",
+      "planned": "Planned"
+    },
+    "status": {
+      "ready": "Ready",
+      "not_ready": "Not ready",
+      "disabled": "Disabled",
+      "planned": "Planned"
+    },
+    "reasons": {
+      "lead": "Not ready: {{reasons}}",
+      "runtime_unavailable": "runtime not built yet",
+      "provider_readiness_unknown": "provider readiness not tested",
+      "provider_not_ready": "provider failed readiness",
+      "tools_unavailable_one": "{{count}} tool not available yet",
+      "tools_unavailable_other": "{{count}} tools not available yet"
+    },
+    "groups": {
+      "planning_intent": "Planning & intent",
+      "software_development": "Software development",
+      "testing_debugging": "Testing & debugging",
+      "quality_security": "Quality & security",
+      "git_collaboration": "Git & collaboration",
+      "devops_operations": "DevOps & operations",
+      "documentation_knowledge": "Documentation & knowledge",
+      "specialized_engineering": "Specialised engineering",
+      "orchestration": "Orchestration",
+      "ai_assistant": "AI assistant",
+      "integrations": "Integrations",
+      "portfolio": "Portfolio"
+    },
+    "groupHeading": "{{group}} ({{count}})",
+    "noMatch": {
+      "title": "No agent matches",
+      "body": "Change the filters or the search."
+    },
+    "card": {
+      "priority": "Priority {{priority}}"
+    },
+    "runStatus": {
+      "running": "Running",
+      "succeeded": "Succeeded",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "budget_exceeded": "Budget exceeded",
+      "approval_required": "Awaiting approval"
+    },
+    "tiers": {
+      "fast": "Fast",
+      "default": "Default",
+      "complex": "Complex"
+    },
+    "permissionFields": {
+      "filesystem": "Filesystem",
+      "sandbox": "Sandbox",
+      "git": "Git",
+      "network": "Network",
+      "deployment": "Deployment",
+      "portfolio": "Portfolio",
+      "data_sensitivity_max": "Maximum data sensitivity",
+      "approval_grant": "Grants approvals"
+    },
+    "detail": {
+      "heading": "{{name}} ({{id}})",
+      "back": "Back to the catalog",
+      "purpose": "Purpose",
+      "description": "Description",
+      "triggers": "Triggers",
+      "capabilities": "Capabilities",
+      "permissions": "Permissions",
+      "permission": "Permission",
+      "value": "Value",
+      "tools": "Tools",
+      "toolUnavailable": "not available yet",
+      "noTools": "No tools",
+      "limits": "Limits",
+      "maxIterations": "Maximum iterations",
+      "timeout": "Timeout",
+      "seconds_one": "{{count}} second",
+      "seconds_other": "{{count}} seconds",
+      "modelTier": "Model tier",
+      "input": "Input",
+      "output": "Output",
+      "none": "None",
+      "runtimeAgent": "Runs on {{agent}}",
+      "accessNote": "Access note",
+      "version": "Version {{version}}",
+      "runs": "Recent runs",
+      "noRuns": "No runs for this agent yet.",
+      "runsScope": "Only runs from projects you can see.",
+      "started": "Started",
+      "task": "Task",
+      "runStatusColumn": "Status",
+      "duration": "Duration",
+      "durationValue": "{{seconds}} s",
+      "stats": "Run statistics",
+      "statRuns": "Runs",
+      "statSuccess": "Success rate",
+      "statDuration": "Average duration",
+      "notAvailable": "Not available",
+      "contractPlanned": "{{name}} (planned)",
+      "toolQuota": "Tool quota",
+      "quotaValue_one": "{{count}} call",
+      "quotaValue_other": "{{count}} calls"
+    }
   }
 }
