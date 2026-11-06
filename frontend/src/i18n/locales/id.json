@@ -12,7 +12,9 @@
     "projects": "Project",
     "agents": "AI Agents",
     "approvals": "Persetujuan",
-    "settings": "Pengaturan"
+    "settings": "Pengaturan",
+    "pendingCount_one": ", {{count}} tertunda",
+    "pendingCount_other": ", {{count}} tertunda"
   },
   "screens": {
     "dashboard": "Dashboard",
@@ -332,6 +334,19 @@
       "runningHere": "Impor arsip untuk project ini sedang berjalan.",
       "openList": "Buka daftar project",
       "stalled": "Unggahan terhenti sebelum selesai. Coba lagi."
+    },
+    "delete": {
+      "action": "Hapus",
+      "actionOf": "Hapus {{name}}",
+      "title": "Hapus project {{name}}?",
+      "explain": "Penghapusan butuh persetujuan di halaman Persetujuan. Sampai disetujui, project tetap ada. Sesudah disetujui, task terbuka dibatalkan dan workspace disimpan 7 hari, lalu dihapus permanen.",
+      "confirm": "Minta hapus",
+      "cancel": "Batal",
+      "requested": "Permintaan hapus {{name}} dibuat dan menunggu persetujuan.",
+      "openApprovals": "Buka Persetujuan",
+      "failedBefore": "Penghapusan project ini sudah disetujui tetapi terus gagal. Operator perlu menanganinya (RUNBOOK §10.7).",
+      "notDeletable": "Project ini tidak dapat dihapus dalam statusnya sekarang.",
+      "outcomeUnknown": "Jawaban tidak sampai; permintaan mungkin sudah dibuat. Muat ulang daftar untuk melihat statusnya."
     }
   },
   "dashboard": {
@@ -773,5 +788,114 @@
       "quotaValue_one": "{{count}} panggilan",
       "quotaValue_other": "{{count}} panggilan"
     }
+  },
+  "approvals": {
+    "subtitle": "Aksi berisiko tinggi menunggu keputusan Anda. Agent tidak pernah dapat menyetujui sendiri.",
+    "pendingHeading": "Tertunda ({{count}})",
+    "pendingTruncated": "Menampilkan {{shown}} dari {{total}} yang tertunda, yang paling dekat kedaluwarsa lebih dulu.",
+    "pendingEmpty": {
+      "title": "Tidak ada persetujuan tertunda",
+      "body": "Permintaan yang dapat Anda putuskan akan muncul di sini."
+    },
+    "card": {
+      "required": "Persetujuan diperlukan · {{action}}",
+      "payload": "Payload",
+      "hash": "Hash payload",
+      "requestedBy": "Diminta oleh",
+      "requestedAt": "Diminta pada",
+      "expires": "Kedaluwarsa",
+      "noExpiry": "Tidak kedaluwarsa",
+      "bound": "Keputusan terikat pada hash payload di atas.",
+      "approve": "Setujui",
+      "reject": "Tolak",
+      "shortHash": "{{hash}}…"
+    },
+    "actions": {
+      "project_delete": "Hapus project",
+      "apply_changes": "Terapkan perubahan",
+      "budget_increase": "Tambah budget",
+      "tool_r3": "Tool berisiko tinggi",
+      "git_push": "Push git",
+      "deploy_staging": "Deploy staging",
+      "deploy_production": "Deploy production",
+      "waive_criterion": "Kesampingkan kriteria"
+    },
+    "riskLevel": "R{{level}} {{label}}",
+    "risk": {
+      "0": "Hanya baca",
+      "1": "Rendah",
+      "2": "Sedang",
+      "3": "Tinggi, butuh persetujuan",
+      "4": "Terlarang"
+    },
+    "dialog": {
+      "approveTitle": "Setujui: {{action}}",
+      "rejectTitle": "Tolak: {{action}}",
+      "description": "Anda memutus aksi persis seperti di bawah. Bila aksinya berubah sesudah ini, keputusan ditolak server.",
+      "project": "Project",
+      "summary": "Ringkasan",
+      "hashFull": "Hash payload lengkap",
+      "note": "Catatan (opsional)",
+      "noteHint": "Teks biasa, maksimal 2000 karakter.",
+      "noteTooLong": "Catatan lebih dari 2000 karakter.",
+      "projectDeleteWarning": "Project ditutup dan task terbukanya dibatalkan. Workspace disimpan 7 hari, lalu dihapus permanen.",
+      "confirmApprove": "Setujui",
+      "confirmReject": "Tolak",
+      "cancel": "Batal"
+    },
+    "result": {
+      "deleted": "Project {{name}} dihapus.",
+      "approvedRunning": "Disetujui. Penghapusan project {{name}} sedang dijalankan.",
+      "approvedRetrying": "Disetujui, tetapi penghapusan project {{name}} gagal dan akan diulang otomatis.",
+      "rejected": "Ditolak. Project {{name}} tidak dihapus.",
+      "approvedGeneric": "Disetujui dan dijalankan.",
+      "rejectedGeneric": "Ditolak.",
+      "approvedGenericRunning": "Disetujui; aksinya sedang dijalankan.",
+      "approvedGenericRetrying": "Disetujui, tetapi aksinya gagal dan akan diulang otomatis.",
+      "unclear": "Keputusan terkirim, tetapi hasilnya belum jelas. Muat ulang daftar untuk melihat statusnya."
+    },
+    "errors": {
+      "mismatch": "Aksi ini berubah sejak Anda membukanya. Daftar dimuat ulang; tinjau lagi sebelum memutus.",
+      "expired": "Persetujuan ini sudah kedaluwarsa.",
+      "superseded": "Persetujuan ini sudah diganti permintaan yang lebih baru.",
+      "decided": "Persetujuan ini sudah diputuskan.",
+      "forbidden": "Anda tidak berwenang memutus persetujuan ini.",
+      "notFound": "Persetujuan ini tidak ada lagi.",
+      "invalidNote": "Catatan hanya boleh berisi teks biasa, maksimal 2000 karakter.",
+      "outcomeUnknown": "Jawaban tidak sampai; keputusan mungkin sudah tercatat. Muat ulang daftar sebelum mencoba lagi.",
+      "cannotDecide": "Persetujuan ini tidak dapat diputuskan sekarang. Muat ulang daftar."
+    },
+    "history": {
+      "heading": "Riwayat",
+      "caption": "Riwayat persetujuan",
+      "filterLabel": "Status",
+      "all": "Semua",
+      "empty": "Belum ada persetujuan.",
+      "filteredEmpty": "Tidak ada persetujuan dengan status ini.",
+      "action": "Aksi",
+      "project": "Project",
+      "statusColumn": "Status",
+      "requested": "Diminta",
+      "decided": "Diputuskan",
+      "note": "Catatan: {{note}}",
+      "handlerFailed": "Eksekusi gagal, akan diulang",
+      "previous": "Sebelumnya",
+      "next": "Berikutnya",
+      "pageStatus": "Halaman {{page}} dari {{pages}} · {{total}} persetujuan",
+      "pagination": "Halaman riwayat"
+    },
+    "status": {
+      "pending": "Tertunda",
+      "approved": "Disetujui",
+      "rejected": "Ditolak",
+      "expired": "Kedaluwarsa",
+      "consumed": "Dijalankan",
+      "superseded": "Diganti"
+    },
+    "pendingTitle": "Tertunda",
+    "summaries": {
+      "project_delete": "Hapus project {{name}}. Workspace disimpan 7 hari, lalu dihapus permanen."
+    },
+    "pendingRefreshFailed": "Daftar tertunda gagal dimuat ulang; yang tampil mungkin sudah berubah."
   }
 }

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ApprovalSchema } from "./approvals";
 import { apiPath, apiRequest, PageMetaSchema, type PageMeta } from "./client";
 import { ApiError } from "./errors";
 import { apiUpload } from "./upload";
@@ -150,4 +151,17 @@ export async function uploadArchive(
 export async function setProjectArchived(projectId: string, archived: boolean): Promise<Project> {
   const path = apiPath("projects", projectId, archived ? "archive" : "unarchive");
   return (await apiRequest(path, { method: "POST", schema: ProjectSchema })).data;
+}
+
+const DeleteRequestedSchema = z.object({ approval: ApprovalSchema, project: ProjectSchema });
+export type DeleteRequested = z.infer<typeof DeleteRequestedSchema>;
+
+/**
+ * `DELETE /projects/{id}` (202, API §11 #14): asks for the delete. Nothing is deleted until a person approves
+ * the `project_delete` approval it returns; asking again returns the same open approval.
+ */
+export async function deleteProject(projectId: string): Promise<DeleteRequested> {
+  return (
+    await apiRequest(apiPath("projects", projectId), { method: "DELETE", schema: DeleteRequestedSchema })
+  ).data;
 }

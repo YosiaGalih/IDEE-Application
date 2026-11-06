@@ -28,7 +28,8 @@ export function Alert({ className, tone = "info", role, children, ...props }: Pr
       {...props}
     >
       <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-      <div>{children}</div>
+      {/* min-w-0: a long word (a name, a path) wraps inside the box instead of spilling out of it. */}
+      <div className="min-w-0 break-words">{children}</div>
     </div>
   );
 }

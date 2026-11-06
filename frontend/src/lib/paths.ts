@@ -9,3 +9,4 @@ export const importPath = (projectId: string) => generatePath("/projects/:projec
 export const taskPath = (taskId: string) => generatePath("/tasks/:taskId", { taskId });
 export const AGENTS_PATH = "/agents";
 export const agentPath = (agentId: string) => generatePath("/agents/:agentId", { agentId });
+export const APPROVALS_PATH = "/approvals";

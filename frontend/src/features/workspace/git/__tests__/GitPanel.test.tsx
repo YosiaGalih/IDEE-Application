@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { useState } from "react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { API, fail, renderApp } from "@/__tests__/harness";
+import { API, fail, pendingApprovals, renderApp } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
 import { GitPanel } from "../GitPanel";
 
@@ -14,7 +14,7 @@ const BASE = `${API}/projects/${PROJECT}/git`;
 const HEAD = "1234567".padEnd(40, "a");
 const NEW = "89abcde".padEnd(40, "b");
 
-const server = setupServer();
+const server = setupServer(pendingApprovals());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());

@@ -4,10 +4,10 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { agentRun, dashboardData, dashboardMeta, project, task } from "@/__tests__/dashboardFixtures";
-import { API, deferred, fail, renderApp, signedIn, user } from "@/__tests__/harness";
+import { API, deferred, fail, pendingApprovals, renderApp, signedIn, user } from "@/__tests__/harness";
 import id from "@/i18n/locales/id.json";
 
-const server = setupServer();
+const server = setupServer(pendingApprovals());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());

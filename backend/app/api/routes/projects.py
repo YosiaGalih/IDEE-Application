@@ -325,7 +325,9 @@ async def delete_project(
     """R3 (API §11 #14): nothing is deleted until a person approves the ``project_delete`` approval."""
     approval, view = await project_delete.request_delete(env, actor, project_id)
     data = {
-        "approval": ApprovalOut.of(approvals.view_of(approval, view.permissions)).model_dump(mode="json"),
+        "approval": ApprovalOut.of(approvals.view_of(approval, view.project, view.permissions)).model_dump(
+            mode="json"
+        ),
         "project": ProjectOut.of(view).model_dump(mode="json"),
     }
     return _respond(request, data, status_code=202, status="accepted")

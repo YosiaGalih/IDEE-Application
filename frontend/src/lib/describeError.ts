@@ -33,6 +33,18 @@ export const isOutcomeUnknown = (error: unknown): boolean =>
       error.code === "CONFLICT" &&
       !hasReason(error.details)));
 
+/** The first `details[].reason` of an error envelope (API_CONTRACTS §1), when the server sent one. */
+export function errorReason(details: unknown): string | null {
+  if (!Array.isArray(details)) return null;
+  for (const detail of details) {
+    if (typeof detail === "object" && detail !== null && "reason" in detail) {
+      const { reason } = detail as { reason: unknown };
+      if (typeof reason === "string") return reason;
+    }
+  }
+  return null;
+}
+
 const hasReason = (details: unknown) =>
   Array.isArray(details) &&
   details.some((detail: unknown) => typeof detail === "object" && detail !== null && "reason" in detail);

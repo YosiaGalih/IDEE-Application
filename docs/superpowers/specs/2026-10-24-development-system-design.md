@@ -423,6 +423,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
       - Tambahan di luar DATA_MODEL: `approvals.updated_at` (jam backoff), `projects.deleted_at` (jam purge), CHECK `requested_by`/`payload_hash`/`decision_note`/`risk_level`, index unik parsial satu `project_delete` terbuka per project; index handler ADR-024 diperluas ke `expired` (pemulihan project) dan `consumed` (pemulihan crash). Filter `superseded` di `GET /approvals`.
       - Izin keputusan: `approval:decide` (§8) vs "izin sesuai `action_type`" (§11.1, ARCHITECTURE): keduanya diterapkan, di service (route hanya menuntut sesi). Aturan SECURITY_MODEL §5 "requester … role lebih rendah" tidak jelas dan tidak diterapkan; `four_eyes` (P1) belum ada, owner tunggal boleh memutus permintaannya sendiri.
       - Replay keputusan atas hapus project yang sudah dijalankan menjawab 404 (project dan approval-nya tidak terlihat lagi), bukan 409 `consumed`.
+      - 3.1c2: `Approval` di respons ditambah `project_name` (nama project sekarang; payload menyimpan nama yang ditinjau), di luar bentuk API §8. Approval milik project yang sudah dihapus hilang dari riwayat `/approvals` bersama project-nya; jejaknya hanya di audit. `summary` server untuk `project_delete` berbahasa Inggris; layar menyusun ringkasan dari payload dalam bahasa UI.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
