@@ -1797,6 +1797,8 @@ Keputusan Lead (rinci di spec; yang berubah sesudah review ditandai):
 | Frontend @ a5b93e5: `format:check`, `lint`, `lint:guards`, `typecheck`, `npm test`, `vite build` | [Pasti] semua lulus; `Tests  469 passed (469)` (27 test layar agent) |
 | Mutan (satu perubahan per run lalu dipulihkan; skrip di scratchpad) | [Pasti] setiap baris `RED`, tidak ada `SURVIVED`: B1–B5, M1–M3, Y1–Y3, A1–A2 (implementasi); F1–F7 (frontend review); K1–K12 + K2' (backend review); C1–C6 (code review + AG-13 delta); G1–G5 (frontend code review) |
 
+CI PR #19 @ 1bd02bc: `security-scan` merah karena CVE-2026-85091 (zlib 1.3.2-r0 → 1.3.2-r1, terbit 6 Nov) di `kodekantor/web` dan `tecnativa/docker-socket-proxy`; `main` @ 7ef43f7 merah dengan dua temuan yang sama, jadi bukan dari WP ini. Perbaikan di-port ke PR ini: zlib dinaikkan di Dockerfile web (nginx me-link zlib), dan socket-proxy (digest upstream terbaru belum membawa perbaikan) masuk entri EX-03-nya (DECISIONS).
+
 Catatan proses: migrasi 0006 belum ada di `main`, jadi diubah di tempat dua kali (index slug parsial + CHECK `approval_grant`, lalu CHECK `contract_status`). DB uji bersama di-reset manual ke 0005 (`DROP TABLE agent_runs, agent_profiles` + `alembic_version`) sebelum test berikutnya; CI selalu mulai dari DB kosong.
 
 #### Review WP-3.1b
