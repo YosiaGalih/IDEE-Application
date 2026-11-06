@@ -44,6 +44,7 @@ WORKDIR /app
 COPY backend/alembic.ini ./alembic.ini
 COPY backend/alembic ./alembic
 COPY backend/app ./app
+COPY backend/config ./config
 USER 10001:10001
 EXPOSE 8000
 # Proxy headers are believed only from FORWARDED_ALLOW_IPS (uvicorn default 127.0.0.1; compose sets Caddy).

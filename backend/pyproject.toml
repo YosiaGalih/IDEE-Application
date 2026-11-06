@@ -5,6 +5,7 @@ description = "KodeKantor backend (API, worker, workflow)"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.13",
+    "anthropic>=1.13",
     "argon2-cffi>=23.1",
     "asyncpg>=0.29",
     "celery>=5.4",
@@ -12,6 +13,7 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.8",
     "python-multipart>=0.0.32",
+    "pyyaml>=6.0",
     "redis>=5.0",
     "sqlalchemy[asyncio]>=2.0.30",
     "structlog>=24.1",
@@ -24,7 +26,6 @@ dev = [
     "pyright>=1.1.380",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
-    "pyyaml>=6.0",
     "respx>=0.21",
     "ruff>=0.6",
 ]
@@ -78,7 +79,7 @@ layers = [
     "app.api",
     "app.services",
     "app.workflow",
-    "app.workspace | app.gitops | app.sandbox",
+    "app.workspace | app.gitops | app.sandbox | app.llm",
     "app.core",
     "app.models",
 ]
@@ -87,15 +88,16 @@ layers = [
 name = "Vendor SDK only in its adapter; no subprocess outside app.gitops (CLAUDE.md #3, #6)"
 type = "forbidden"
 source_modules = ["app"]
-forbidden_modules = ["anthropic", "requests", "subprocess"]
+forbidden_modules = ["anthropic", "httpx2", "httpcore2", "requests", "subprocess"]
 # app.gitops starts git through asyncio.create_subprocess_exec (tests/security/test_no_host_exec.py guards the rest).
-# WP-3.1 adds: ignore_imports = ["app.llm.anthropic_provider -> anthropic"]
+# The Anthropic SDK and its HTTP client live only in the adapter (tests/security/test_llm_secrets.py also checks).
+ignore_imports = ["app.llm.anthropic_provider -> anthropic", "app.llm.anthropic_provider -> httpx2"]
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Services stay framework-free (thin routes, ARCHITECTURE §4.1)"
 type = "forbidden"
-source_modules = ["app.services", "app.workflow"]
+source_modules = ["app.services", "app.workflow", "app.llm"]
 forbidden_modules = ["fastapi", "starlette"]
 allow_indirect_imports = true
 

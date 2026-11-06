@@ -8,6 +8,7 @@
 !backend/alembic.ini
 !backend/alembic/
 !backend/app/
+!backend/config/pricing.yaml
 !sandbox_manager/pyproject.toml
 !sandbox_manager/uv.lock
 !sandbox_manager/sandbox_manager/

@@ -12,7 +12,7 @@ from functools import cached_property
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 _PLACEHOLDER_MARKERS = ("change-me", "changeme", "replace-me", "example", "placeholder")
 _MIN_SECRET_LENGTH = 32
@@ -84,6 +84,15 @@ class Settings(BaseModel):
     celery_task_always_eager: bool = False
     otel_exporter_otlp_endpoint: str = ""
 
+    @field_validator("anthropic_api_key", "anthropic_base_url", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        # The key sent is the stripped one, so the redactor's literal must be too (AG-13 L2). A blank base URL
+        # (compose passes ${ANTHROPIC_BASE_URL:-}) must mean the SDK default, not "" (AG-13 L8).
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
@@ -136,6 +145,10 @@ def _production_problems(settings: Settings) -> list[str]:
         problems.append("CELERY_TASK_ALWAYS_EAGER: must be false in production")
     if settings.docker_host.startswith("unix:"):
         problems.append("DOCKER_HOST: production must use docker-socket-proxy, never the raw socket")
+    base_url = urlsplit(settings.anthropic_base_url) if settings.anthropic_base_url else None
+    if base_url is not None and (base_url.scheme.lower() != "https" or not base_url.hostname):
+        # The API key travels to whatever base URL is set; never in clear text (AG-13 L1).
+        problems.append("ANTHROPIC_BASE_URL: production requires https")
     return problems
 
 

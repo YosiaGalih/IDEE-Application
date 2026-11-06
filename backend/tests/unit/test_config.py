@@ -109,6 +109,8 @@ def test_invalid_values_fail_start(overrides: dict[str, str], variable: str) -> 
         ({"CELERY_TASK_ALWAYS_EAGER": "true"}, "CELERY_TASK_ALWAYS_EAGER"),
         ({"DOCKER_HOST": "unix:///var/run/docker.sock"}, "DOCKER_HOST"),
         ({"SECRET_KEY": "change-me-" + "x" * 30}, "SECRET_KEY"),
+        ({"ANTHROPIC_BASE_URL": "http://203.0.113.9:8080"}, "ANTHROPIC_BASE_URL"),
+        ({"ANTHROPIC_BASE_URL": "https:gw.internal"}, "ANTHROPIC_BASE_URL"),
     ],
 )
 def test_production_rejects_unsafe_settings(overrides: dict[str, str], variable: str) -> None:
@@ -158,3 +160,26 @@ def test_repr_never_shows_secrets_or_dsn() -> None:
     text = repr(settings) + str(settings)
     for secret in (SECRET, TOKEN, "dbpass1234", "redispass99", "sk-ant-test-"):
         assert secret not in text
+
+
+def test_production_accepts_an_https_base_url() -> None:
+    settings = load_settings(production_env(ANTHROPIC_BASE_URL="https://llm-gateway.internal"))
+    assert settings.anthropic_base_url == "https://llm-gateway.internal"
+
+
+def test_api_key_is_stripped_so_the_redactor_hides_what_is_sent() -> None:
+    key = "gateway-key-" + "9" * 30
+    settings = load_settings(base_env(ANTHROPIC_API_KEY=f"  {key}\n"))
+    assert settings.anthropic_api_key == key
+    assert key in settings.secret_values()
+
+
+def test_blank_api_key_is_no_key() -> None:
+    assert load_settings(base_env(ANTHROPIC_API_KEY="  \n")).anthropic_api_key is None
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_base_url_means_the_default(blank: str) -> None:
+    # compose passes ${ANTHROPIC_BASE_URL:-}; "" must not reach the SDK as a base URL (AG-13 L8).
+    assert load_settings(base_env(ANTHROPIC_BASE_URL=blank)).anthropic_base_url is None
+    assert load_settings(production_env(ANTHROPIC_BASE_URL=blank)).anthropic_base_url is None
