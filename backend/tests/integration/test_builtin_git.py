@@ -87,3 +87,20 @@ async def test_a_large_diff_is_cut_at_a_file_boundary(
     assert out.endswith("</untrusted_content>") and len(out.encode()) <= 64 * 1024
     assert "more changed files not shown; pass paths to see them]" in out and "cut after" in out
     assert "[truncated:" not in out  # cut by the tool with its own markers, never by the gateway
+
+
+async def test_what_one_diff_stages_is_bounded_and_the_rest_is_said(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path, monkeypatch: object
+) -> None:
+    """AG-13 WP-3.1d2a MEDIUM-4: the scratch index lives on the worker's tmpfs; one call stages at most
+    STAGE_MAX_BYTES of working-tree files."""
+    import pytest
+
+    ws = await task_worktree(tmp_path, {})
+    for i in range(6):
+        write(ws.root / "gen" / f"f{i}.txt", "x" * 1000 + "\n")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(git_tools, "STAGE_MAX_BYTES", 2500)
+        out = await run(sessions, scope, ws, "git.diff")
+    assert out.count("diff --git") == 2, out
+    assert "[4 more changed files not diffed in one call; pass paths to see them]" in out, out

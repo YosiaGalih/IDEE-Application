@@ -35,6 +35,7 @@ from app.workspace.fs import AGENT_READ_LIMIT
 
 DIFF_MAX_BYTES = 60 * 1024  # below the 64 KB tool_result: the gateway never has to cut the diff
 DIFF_READ_BYTES = 1024 * 1024  # what git may produce before the text is cut
+STAGE_MAX_BYTES = 8 * 1024 * 1024  # [Menebak] working-tree bytes one diff stages on the worker's tmpfs
 LOG_MAX = 50
 _SIGN = {"context": " ", "add": "+", "del": "-"}
 
@@ -69,16 +70,26 @@ async def status(ctx: ToolContext, raw: StatusInput) -> ToolOutput:
     return ToolOutput("\n".join(lines), untrusted=Untrusted("git.status"))
 
 
-def _large(root: Path, names: list[str]) -> set[str]:
-    """Names whose working-tree file is over AGENT_READ_LIMIT (ARCHITECTURE §7): never diffed for agents."""
-    large: set[str] = set()
-    for name in names:
+def _select(root: Path, names: list[str]) -> tuple[list[str], list[str], int]:
+    """(to diff, over AGENT_READ_LIMIT, deferred): a working-tree file over the limit is never diffed for the
+    agent (ARCHITECTURE §7); past STAGE_MAX_BYTES the rest waits for another call, because the scratch index
+    lives on the worker's tmpfs (AG-13 WP-3.1d2a MEDIUM-4). A deleted file stages nothing."""
+    wanted: list[str] = []
+    large: list[str] = []
+    staged = 0
+    for index, name in enumerate(names):
         try:
-            if os.lstat(root / name).st_size > AGENT_READ_LIMIT:
-                large.add(name)
+            size = os.lstat(root / name).st_size
         except OSError:
-            continue  # deleted in the working tree: its old content is checked after the diff
-    return large
+            size = 0  # deleted in the working tree: its old content is checked after the diff
+        if size > AGENT_READ_LIMIT:
+            large.append(name)
+            continue
+        if staged + size > STAGE_MAX_BYTES and wanted:
+            return wanted, large, len(names) - index
+        staged += size
+        wanted.append(name)
+    return wanted, large, 0
 
 
 def _block(file: DiffFile) -> list[str]:
@@ -138,10 +149,11 @@ async def diff(ctx: ToolContext, raw: DiffInput) -> ToolOutput:
         names = await git.changed_paths(target, base=workspace.base_commit)
     kept = await asyncio.to_thread(partition, names.paths, agent_cannot_read(policy))
     in_scope = [n for n in kept.shown if within(n, scopes)]
-    large = await asyncio.to_thread(_large, workspace.root, in_scope)
-    wanted = [n for n in in_scope if n not in large]
+    wanted, large, deferred = await asyncio.to_thread(_select, workspace.root, in_scope)
     notes = counted_notes(kept.hidden, kept.unchecked, names.skipped, "changed paths")
-    notes += [f"[{n} not shown: larger than the agent read limit]" for n in sorted(large)]
+    notes += [f"[{n} not shown: larger than the agent read limit]" for n in large]
+    if deferred:
+        notes.append(f"[{deferred} more changed files not diffed in one call; pass paths to see them]")
     if not wanted:
         outside = len(kept.shown) - len(in_scope)
         head = (
