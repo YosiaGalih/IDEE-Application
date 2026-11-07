@@ -353,3 +353,25 @@ async def test_an_invalid_repo_agentignore_denies_agent_access(tmp_path: Path) -
     with pytest.raises(PathViolation) as caught:
         await task_of(worktree, repo).read_text("a.txt")
     assert caught.value.reason == "agentignore"
+
+
+async def test_one_tree_call_shares_one_budget_across_folders(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP-3.1d2a mutant B7: the budget is one for the whole listing, not one per folder; otherwise a tree of
+    many folders, each cheap alone, costs the budget times the number of folders."""
+    from app.workspace.policy import Budget, Policy
+
+    (root / ".agentignore").write_text("**/x*/**/never\n")
+    for folder in range(10):
+        for name in range(20):
+            (root / f"d{folder}").mkdir(exist_ok=True)
+            (root / f"d{folder}" / f"f{name}.txt").write_text("x\n")
+    probe = Budget(10**9)
+    policy = Policy.from_agentignore((root / ".agentignore").read_text())
+    for name in range(21):  # what one folder's listing costs (its 20 files and the folder itself)
+        policy.denied(("d0", f"f{name}.txt"), Access.AGENT_READ, probe)
+    one_folder = 10**9 - probe.remaining
+    monkeypatch.setattr(fs, "TREE_POLICY_BUDGET", one_folder * 3)  # three folders' worth, not ten
+    result = await Workspace(root).tree(".", Access.AGENT_READ, depth=2, max_entries=5000)
+    assert result.truncated is True, "ten folders listed on three folders' budget"

@@ -844,3 +844,21 @@ async def test_grep_parses_off_the_event_loop(git: GitAdapter, repo: GitTarget) 
     result = await grep
     assert len(result.matches) > 300_000
     assert max(gaps) < 0.5
+
+
+async def test_a_same_size_edit_in_the_second_of_the_checkout_is_in_the_exact_diff(
+    git: GitAdapter, repo: GitTarget
+) -> None:
+    """Silent failure found under load (WP-3.1d2a): the scratch index was a copy with a new mtime, so git no
+    longer saw an entry written in the index's own second as racy and skipped hashing the file: a same-size
+    edit made right after the checkout vanished from git.diff ("[no text diff]")."""
+    base = await git.current_commit(repo)
+    assert base is not None
+    while time.time() % 1 > 0.3:  # start early in a second: index and edit share it
+        await asyncio.sleep(0.01)
+    (repo.repo / "f.txt").unlink()
+    raw_git(repo, "checkout", "--", "f.txt")  # git writes the file and records its stat now, as a worktree add
+    write(repo.repo / "f.txt", "x\ny\nz\n")  # same size as "a\nb\nc\n", same second
+    await asyncio.sleep(1.1)  # the diff runs in a later second
+    got = await git.diff(repo, base=base, paths=["f.txt"], exact_files=True)
+    assert [f.path for f in got.files] == ["f.txt"], got
