@@ -24,6 +24,7 @@ Error:
 | 401 | `UNAUTHENTICATED`, `SESSION_EXPIRED` |
 | 403 | `FORBIDDEN`, `CSRF_FAILED`, `POLICY_DENIED` |
 | 404 | `NOT_FOUND` (juga dipakai bila resource ada tapi di luar scope user — tidak membocorkan keberadaan) |
+| 408 | `BAD_REQUEST` dengan `details[0].reason` ∈ `upload_stalled` (tidak ada byte 60 detik), `upload_too_slow` (belum selesai 30 menit), `client_disconnected`: unggahan berhenti sebelum selesai (`POST /projects/{id}/imports`). Transien: tidak disimpan idempotency, retry dengan key yang sama berjalan lagi (konflik #68, keputusan PO 7 Nov 2026) |
 | 409 | `CONFLICT` (termasuk patch ditolak — `details` per hunk), `INVALID_TRANSITION`, `VERSION_CONFLICT`, `APPROVAL_PAYLOAD_MISMATCH`, `GIT_ERROR` (git juga dapat 400/500) |
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 422 | `VALIDATION_ERROR` |
@@ -69,8 +70,8 @@ Role berscope `project:<id>` hanya berlaku di project itu; role `global` berlaku
 |---|---|---|---|---|
 | GET | `/dashboard` | auth | – | `{metrics:{active_projects, running_tasks, completed_tasks, failed_tasks, waiting_approval}, recent_projects:[Project], recent_tasks:[TaskSummary], agent_activity:[AgentRunSummary], usage:{period, input_tokens, output_tokens, estimated_cost, cost_status}}` |
 | GET | `/projects?status=&q=` | auth | – | `[Project]` |
-| POST | `/projects` | auth | `{name, description?, source:{type:"blank"} \| {type:"template", template_id} \| {type:"git_https", url, branch?}, default_branch?}` | `Project` (201) — `git_https` → `status:"accepted"`, progres via `repository.sync_state` |
-| POST | `/projects/{id}/imports` | project:write | multipart `file` (.zip/.tar.gz ≤ 200 MB) | `{repository: Repository}` (202) |
+| POST | `/projects` | auth | `{name, description?, source:{type:"blank"} \| {type:"template", template_id} \| {type:"upload"} \| {type:"git_https", url, branch?}, default_branch?}` | `Project` (201) — `upload` → `repository.provider = "upload"`, `sync_state = "importing"`, tanpa folder workspace sampai arsip diunggah ke `/imports`; `git_https` → `status:"accepted"`, progres via `repository.sync_state` |
+| POST | `/projects/{id}/imports` | project:write | multipart `file` (.zip/.tar.gz ≤ 200 MB) | `{repository: Repository, job_id, upload: {filename, size, sha256}}` (202, §11 #14). Hanya untuk project `upload` yang belum berisi (FR-015 tanpa overwrite): 409 `CONFLICT` `details[0].reason` ∈ `repository_not_empty`, `not_an_upload_project`, `import_running`, `project_archived`, `import_expired`, `cleanup_failed`; 408 bila unggahan berhenti (§1) |
 | GET | `/projects/templates` | auth | – | `[{id, name, description, stack, icon}]` |
 | GET | `/projects/{id}` | project:read | – | `Project` (+ `repository`, `stats`) |
 | PATCH | `/projects/{id}` | project:write | `{name?, description?, settings?}` | `Project` |
@@ -83,6 +84,7 @@ Role berscope `project:<id>` hanya berlaku di project itu; role `global` berlaku
 | GET | `/projects/{id}/stack` | project:read | – | `Stack` |
 
 `Project = {id, name, slug, description, status, stack, default_branch, settings, owner_id, created_at, updated_at, repository: {provider, remote_url, branch, sync_state, last_indexed_at, error}}`
+`repository.error` (bila ada) adalah kode, bukan pesan: `archive_rejected:<reason>`, `import_git_failed`, `import_failed`, `import_not_started`, `import_expired`, `import_incomplete` (konflik #67, keputusan PO 7 Nov 2026).
 `Stack = {languages:[..], frameworks:[..], package_managers:[..], test_profiles:[profile_id], entrypoints:[path]}`
 
 ## 4. Workspace & Git (M05, M15)

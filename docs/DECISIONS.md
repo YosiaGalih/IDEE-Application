@@ -348,7 +348,7 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 **Konsekuensi:** Tidak ada janji build iOS dari KodeKantor; PO memutuskan runner eksternal bila dibutuhkan (OQ-05).
 
 ## ADR-070 — ToolGateway inti (WP-3.1d1)
-**Status:** Proposed (keputusan Lead di bawah mandat PO "jalankan P2, P3 dan P4"; konflik #72 butir 3.1d). Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md`.
+**Status:** Accepted (PO, 7 Nov 2026; diusulkan Lead di bawah mandat PO "jalankan P2, P3 dan P4"; konflik #72 butir 3.1d). **Ditinjau ulang di WP-9.0:** butir 4 "hanya dari agent run" menolak R3 dari job tool-mode tanpa agent run (impor repo, publish); WP-9.0 mengikat approval `tool_r3` ke `job_id` sebelum job seperti itu boleh memanggil tool R3. Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md`.
 **Konteks:** ARCHITECTURE §4.2 dan DATA_MODEL `tool_calls` ditulis sebelum ada gateway yang harus menjamin bukti saat crash, replay sesudah worker restart, dan pembatalan. Review AG-13 WP-3.1c1 (C3) meminta penulis status approval dijaga.
 **Keputusan:**
 1. Kontrak Python (beda dari §4.2): `ToolContext(task_id, project_id, agent_run_id, grant, offered, correlation_id, cancel, workspace)` tanpa `db` dan tanpa `agent_id`/`permissions` (diganti `grant: AgentGrant` dari registry tervalidasi) dan dengan `offered`; gateway memegang `ToolPorts` dan sesi sendiri. `ToolSpec` tanpa `capability`, dengan `write_paths`; `ToolOutput` tanpa `artifacts` (menyusul bersama tabel `artifacts`); `ToolResult.status` tambah `cancelled`; `tool_defs_for(grant)`; `execute(raw_input: object)` (input model belum tentu objek).
@@ -356,7 +356,7 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 3. Urutan cek: kuota (dan replay tool use yang sama) sebelum risk/approval.
 4. `tool_r3`: satu terbuka per task; dikonsumsi gateway saat tool dijalankan; hanya dari agent run; input yang berubah oleh redaksi ditolak; model input R3 tidak boleh mengecualikan field.
 5. Trigger `approvals_status_guard`: insert hanya `pending`; status hanya lewat `approval_store` dan sepanjang siklus; kolom isi approval tidak berubah sesudah insert.
-**Konsekuensi:** ARCHITECTURE §4.2 dan DATA_MODEL perlu diselaraskan saat ADR ini diterima (DATA_MODEL sudah diberi catatan realisasi). AgentRuntime (3.1f) membangun `ToolContext` dari `grant_for` dan tidak memegang lock baris task selama `execute`.
+**Konsekuensi:** ARCHITECTURE §4.2 dan §6.1, SECURITY_MODEL §3 (urutan cek) dan DATA_MODEL `tool_calls` diselaraskan saat ADR ini diterima (7 Nov 2026). AgentRuntime (3.1f) membangun `ToolContext` dari `grant_for` dan tidak memegang lock baris task selama `execute`.
 
 ## Pengecualian keamanan (SECURITY_MODEL §11)
 
