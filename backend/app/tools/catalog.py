@@ -44,6 +44,11 @@ IMPLEMENTED = frozenset(
         "git.diff",
         "git.log",
         "security.scan_secrets",
+        "repo.search_symbol",
+        "code.write_file",
+        "code.apply_patch",
+        "code.delete_file",
+        "git.commit_task",
     }
 )
 
