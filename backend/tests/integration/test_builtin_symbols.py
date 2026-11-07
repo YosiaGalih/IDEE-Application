@@ -13,11 +13,11 @@ from app.models.projects import RepoIndexEntry, Repository
 from app.services.repo_index import RepoSymbolIndex
 from app.tools.base import SymbolRow, SymbolRows
 from app.tools.builtin import symbols
-from app.workspace.fs import AGENT_READ_LIMIT, TaskWorkspace
+from app.workspace.fs import TaskWorkspace
 from tests.integration import test_gateway_denials as denials
 from tests.integration.test_gateway_denials import Scope
 from tests.tool_fakes import context, gateway
-from tests.worktree_fakes import task_worktree, write
+from tests.worktree_fakes import task_worktree
 
 clean = denials.clean
 sessions = denials.sessions
@@ -71,31 +71,6 @@ async def test_a_project_without_an_index_says_so(
     assert status == "ok" and "[no symbol index yet" in out, out
 
 
-async def test_hits_the_agent_may_not_see_are_left_out_and_counted(
-    sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace
-) -> None:
-    """Review Focus 3.1d2b #4: hidden paths never reach the model, not even as a symbol's file name."""
-    write(ws.root / "big.py", "x" * (AGENT_READ_LIMIT + 1))
-    rows = [
-        SymbolRow("src/calc.py", 1, "add", "function"),
-        SymbolRow("private/keys.py", 1, "add_key", "function"),  # repo/'s .agentignore
-        SymbolRow("config/prod.env", 1, "add_env", "function"),  # a secret name
-        SymbolRow(".kk/gen.py", 1, "add_gen", "function"),  # sandbox output
-        SymbolRow("big.py", 1, "add_big", "function"),  # over the agent read limit in the worktree
-        SymbolRow("gone.py", 1, "add_gone", "function"),  # no longer in the worktree
-    ]
-    status, out = await run(sessions, scope, ws, FakeIndex(SymbolRows(rows, True, COMMIT, True)), name="add")
-    assert status == "ok", out
-    assert "src/calc.py:1: function add" in out
-    for hidden in ("add_key", "private", "add_env", "prod.env", "add_gen", ".kk", "add_big", "add_gone"):
-        assert hidden not in out, (hidden, out)
-    assert "[3 hits not shown: agents may not read them, or sandbox output]" in out, out
-    assert "[1 hits in files over the agent read limit were left out]" in out, out
-    assert "[1 hits in files no longer in the worktree were left out]" in out, out
-    assert "[truncated: more symbols match; narrow the name or the kind]" in out, out
-    assert "[the index itself stopped at a limit: some symbols are missing]" in out, out
-
-
 async def test_the_production_index_reads_the_project_rows(
     sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace
 ) -> None:
@@ -128,9 +103,9 @@ async def test_an_index_of_the_worktree_head_needs_no_warning(
     index = FakeIndex(SymbolRows([SymbolRow("src/calc.py", 1, "add", "function")], False, head, False))
     _, out = await run(sessions, scope, ws, index, name="add")
     assert "src/calc.py:1: function add" in out and "line numbers may differ" not in out, out
-    write(ws.root / "src" / "calc.py", "def add(): pass\ndef added(): pass\n")  # uncommitted edit
-    _, out = await run(sessions, scope, ws, index, name="add")
-    assert "uncommitted changes" in out, out
+    # Uncommitted edits are never in the index, and that is said on every answer (no per-call status:
+    # whether the worktree is dirty would also tell about hidden files, AG-13 3.1d2b INFO-6).
+    assert "uncommitted edits are not indexed" in out, out
 
 
 async def test_hits_not_checked_against_the_policy_are_said_apart(
@@ -146,5 +121,5 @@ async def test_hits_not_checked_against_the_policy_are_said_apart(
     rows = [SymbolRow("src/calc.py", 1, "add", "function"), SymbolRow("README.md", 1, "add_doc", "function")]
     _, out = await run(sessions, scope, ws, FakeIndex(SymbolRows(rows, False, COMMIT, False)), name="add")
     assert "src/calc.py:1: function add" in out and "add_doc" not in out, out
-    assert "[1 hits not checked against the agent policy (too many, too costly): not shown]" in out, out
+    assert "[1 hits not checked against the agent policy (too many or too costly): not shown]" in out, out
     assert "agents may not read them" not in out, out

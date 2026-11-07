@@ -16,7 +16,8 @@ from typing import Literal
 
 from pydantic import Field
 
-from app.gitops.adapter import GitAdapter
+from app.gitops.adapter import GitAdapter, below_a_non_folder
+from app.gitops.errors import GitError
 from app.tools.base import (
     RiskLevel,
     SymbolIndex,
@@ -34,7 +35,7 @@ from app.tools.builtin._common import (
     workspace_errors,
     workspace_of,
 )
-from app.workspace.fs import AGENT_READ_LIMIT
+from app.workspace.fs import AGENT_READ_LIMIT, TaskWorkspace
 from app.workspace.index import SYMBOL_MAX_CHARS
 
 SYMBOL_MAX_RESULTS = 50  # [Menebak] hits shown to the model
@@ -47,18 +48,22 @@ class SearchSymbolInput(StrictInput):
 
 
 def _readable(root: Path, rows: list[SymbolRow], shown: set[str]) -> tuple[list[SymbolRow], int, int]:
-    """(rows in files the agent can read now, hits in files over the limit, hits in files gone)."""
+    """(rows in files the agent can read now, hits in files over the limit, hits in files gone). A path below
+    a symlink or a file is gone: its parents are never followed, so nothing outside the root is measured
+    (/code-review 3.1d2b spec)."""
+    names = list(dict.fromkeys(row.path for row in rows if row.path in shown))
+    below = below_a_non_folder(root, names)
     sizes: dict[str, int | None] = {}
+    for name in names:
+        try:
+            sizes[name] = None if name in below else os.lstat(root / name).st_size
+        except OSError:
+            sizes[name] = None
     kept: list[SymbolRow] = []
     large = gone = 0
     for row in rows:
         if row.path not in shown:
             continue
-        if row.path not in sizes:
-            try:
-                sizes[row.path] = os.lstat(root / row.path).st_size
-            except OSError:
-                sizes[row.path] = None
         size = sizes[row.path]
         if size is None:
             gone += 1
@@ -67,6 +72,13 @@ def _readable(root: Path, rows: list[SymbolRow], shown: set[str]) -> tuple[list[
         else:
             kept.append(row)
     return kept, large, gone
+
+
+async def _worktree_head(workspace: TaskWorkspace) -> str:
+    try:
+        return await GitAdapter().current_commit(git_target(workspace)) or "(none)"
+    except GitError:
+        return "(unknown)"
 
 
 def specs(index: SymbolIndex) -> list[ToolSpec]:
@@ -85,26 +97,23 @@ def specs(index: SymbolIndex) -> list[ToolSpec]:
         shown = set(allowed.shown)
         not_checked = set(paths[len(paths) - allowed.unchecked :]) if allowed.unchecked else set()
         unchecked = sum(1 for row in found.rows if row.path in not_checked)
-        hidden = sum(1 for row in found.rows if row.path not in shown) - unchecked
         kept, large, gone = await asyncio.to_thread(_readable, workspace.root, found.rows, shown)
-        with workspace_errors():
-            state = await GitAdapter().status(git_target(workspace))
-        lines = [f"index: {found.index_commit}"]
-        if state.head != found.index_commit or not state.clean:
+        head = await _worktree_head(workspace)
+        lines = [f"index: {found.index_commit} (committed content only; uncommitted edits are not indexed)"]
+        if head != found.index_commit:
             lines.append(
-                f"[the index is of commit {found.index_commit}; the worktree is at {state.head or '(none)'}"
-                + ("" if state.clean else ", with uncommitted changes")
-                + ": line numbers may differ and new symbols are missing]"
+                f"[the index is of commit {found.index_commit}; the worktree is at {head}:"
+                " line numbers may differ and new symbols are missing]"
             )
         lines += [f"{row.path}:{row.line}: {row.kind} {row.name}" for row in kept[:SYMBOL_MAX_RESULTS]]
+        # Hits in hidden paths leave no trace, not even a count: a count answers "does a hidden file define
+        # a symbol matching this?" one letter at a time (AG-13 3.1d2b LOW-1), as repo.search_text never does.
         if not kept:
-            lines.append("[no symbols shown]" if hidden or unchecked or large or gone else "[no symbols]")
+            lines.append("[no symbols shown]" if unchecked or large or gone else "[no symbols]")
         if unchecked:
             lines.append(
-                f"[{unchecked} hits not checked against the agent policy (too many, too costly): not shown]"
+                f"[{unchecked} hits not checked against the agent policy (too many or too costly): not shown]"
             )
-        if hidden:
-            lines.append(f"[{hidden} hits not shown: agents may not read them, or sandbox output]")
         if large:
             lines.append(f"[{large} hits in files over the agent read limit were left out]")
         if gone:

@@ -14,31 +14,68 @@ The answer names the committed files (repo names: wrapped as untrusted) and the 
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
+from collections.abc import Callable
+from pathlib import Path
 
 from pydantic import Field
 
-from app.gitops.adapter import TASK_BRANCH_PREFIX, Author, GitAdapter, GitTarget
+from app.gitops.adapter import (
+    MESSAGE_MAX,
+    TASK_BRANCH_PREFIX,
+    Author,
+    GitAdapter,
+    GitTarget,
+    below_a_non_folder,
+)
 from app.gitops.errors import GitError
 from app.tools.base import RiskLevel, ToolContext, ToolError, ToolOutput, ToolSpec, Untrusted
 from app.tools.builtin._common import (
     StrictInput,
-    agent_cannot_read,
     git_target,
     partition,
     workspace_errors,
     workspace_of,
 )
+from app.workspace.policy import Access, Budget, Policy
 
 AGENT_AUTHOR = Author("KodeKantor Agent", "agent@kodekantor.invalid")  # never a user's identity (3.1d2b #6)
-LIST_MAX = 200  # committed paths named in the answer
+LIST_MAX = 200  # [Menebak] committed paths named in the answer
 
 
 class CommitTaskInput(StrictInput):
-    message: str = Field(min_length=1, max_length=5000)
+    message: str = Field(min_length=1, max_length=MESSAGE_MAX)
 
 
 def _not_committed(count: int, why: str) -> list[str]:
     return [f"[{count} changed paths not committed: {why}]"] if count else []
+
+
+def _agent_may_not_touch(policy: Policy) -> Callable[[tuple[str, ...], Budget], bool]:
+    """What the agent may not read **or** write stays out of its commit: sandboxed code can plant a workflow,
+    drop one, or empty the task's .agentignore, all paths the agent itself may not write (AG-13 3.1d2b
+    MEDIUM-1; TOOL_CATALOG R4)."""
+    return lambda parts, budget: (
+        policy.denied(parts, Access.AGENT_READ, budget) or policy.denied(parts, Access.AGENT_WRITE, budget)
+    )
+
+
+def _repositories(root: Path, names: list[str]) -> set[str]:
+    """Nested repositories among changed names: untracked ones (``name/``) and tracked gitlinks, whose path
+    is a folder in the worktree. Committing one would point the project at another repository's commit
+    (Lead decision 3.1d2b #5). Parents are not followed (``below_a_non_folder``)."""
+    gone = below_a_non_folder(root, names)
+    found = {name for name in names if name.endswith("/")}
+    for name in names:
+        if name in found or name in gone:
+            continue
+        try:
+            if stat.S_ISDIR(os.lstat(root / name).st_mode):
+                found.add(name)
+        except OSError:
+            continue  # deleted: an ordinary change
+    return found
 
 
 async def _commit(git: GitAdapter, target: GitTarget, message: str, files: list[str]) -> str | None:
@@ -68,9 +105,9 @@ async def commit_task(ctx: ToolContext, raw: CommitTaskInput) -> ToolOutput:
                 raise ToolError("no_base_commit", "the task branch has no commit to build on")
             policy = await workspace.policy()
             names = await git.changed_paths(target, base=state.head)
-            nested = [name for name in names.paths if name.endswith("/")]
-            files = [name for name in names.paths if not name.endswith("/")]
-            kept = await asyncio.to_thread(partition, files, agent_cannot_read(policy))
+            nested = await asyncio.to_thread(_repositories, workspace.root, names.paths)
+            files = [name for name in names.paths if name not in nested]
+            kept = await asyncio.to_thread(partition, files, _agent_may_not_touch(policy))
             sha = await _commit(git, target, raw.message, kept.shown) if kept.shown else None
             # What the commit holds, read back from git: the answer is evidence, not the request.
             committed = await git.commit_files(target, sha) if sha else []
@@ -83,8 +120,8 @@ async def commit_task(ctx: ToolContext, raw: CommitTaskInput) -> ToolOutput:
     unchanged = len(set(kept.shown) - set(committed)) if sha else 0
     if unchanged:
         lines.append(f"[{unchanged} listed paths had no change and are not in the commit]")
-    lines += _not_committed(kept.hidden, "agents may not read them, or sandbox output")
-    lines += _not_committed(kept.unchecked, "not checked against the agent policy (too many, too costly)")
+    lines += _not_committed(kept.hidden, "agents may not read or write them, or sandbox output")
+    lines += _not_committed(kept.unchecked, "not checked against the agent policy (too many or too costly)")
     lines += _not_committed(len(nested), "nested repositories")
     lines += _not_committed(names.skipped, "names that are not UTF-8")
     return ToolOutput("\n".join(lines), untrusted=Untrusted("git.commit_task"))

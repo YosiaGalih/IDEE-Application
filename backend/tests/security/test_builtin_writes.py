@@ -121,14 +121,18 @@ async def test_a_commit_never_takes_what_agents_may_not_read(
     for rel in (".env", "private/notes.md", ".kk/junit.xml", "scratch/x.txt", "config/prod.env"):
         write(ws.root / rel, "HIDDEN-MARK\n")
     write(ws.root / ".agentignore", "private/\nscratch/\n")  # the task's own addition
-    write(ws.root / "nested" / ".git" / "HEAD", "ref: refs/heads/main\n")  # a repository inside the worktree
+    (ws.root / "nested").mkdir()
+    await GitAdapter().init(ws.root / "nested", "main")  # a repository inside the worktree (untracked)
     write(ws.root / "src" / "a.py", "visible\n")
     status, out = await commit_out(sessions, scope, ws, "visible only")
     assert status == "ok", out
     git, target = GitAdapter(), git_target(ws)
     sha = await git.current_commit(target)
     committed = await git.commit_files(target, sha or "")
-    assert sorted(committed) == [".agentignore", "src/a.py"], committed
+    assert committed == ["src/a.py"], (
+        committed
+    )  # .agentignore: agents may not write it (AG-13 3.1d2b MEDIUM-1)
+    assert "[1 changed paths not committed: nested repositories]" in out, out
     assert "HIDDEN-MARK" not in out and "prod.env" not in out and "private/" not in out, out
     assert "not committed" in out, out
     assert (ws.root / "config" / "prod.env").read_text() == "HIDDEN-MARK\n"  # left in the worktree
@@ -153,3 +157,91 @@ async def test_a_visible_change_that_drags_hidden_paths_is_refused(
     assert status == "error" and "nothing was committed" in out, out
     assert await git.current_commit(target) == before
     assert (await git.status(target)).changes  # the worktree change is still there, unstaged
+
+
+async def test_a_commit_never_takes_what_agents_may_not_write(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    """AG-13 3.1d2b MEDIUM-1: sandboxed code can plant or drop a workflow or empty the task's .agentignore;
+    the agent cannot write those paths, so its commit must not carry them either (TOOL_CATALOG R4)."""
+    from app.gitops.adapter import GitAdapter
+    from app.tools.builtin._common import git_target
+
+    ws = await task_worktree(
+        tmp_path,
+        {".github/workflows/ci.yml": "on: push\n", ".github/actions/setup/action.yml": "runs: {}\n",
+         ".agentignore": "private/\n", "src/a.py": "a\n"},
+    )  # fmt: skip
+    write(ws.root / ".github" / "workflows" / "evil.yml", "on: push\njobs: {}\n")
+    write(ws.root / ".github" / "actions" / "setup" / "action.yml", "runs: {using: evil}\n")
+    (ws.root / ".github" / "workflows" / "ci.yml").unlink()
+    write(ws.root / ".agentignore", "")
+    write(ws.root / "src" / "a.py", "visible\n")
+    status, out = await commit_out(sessions, scope, ws, "visible only")
+    assert status == "ok", out
+    git, target = GitAdapter(), git_target(ws)
+    assert await git.commit_files(target, await git.current_commit(target) or "") == ["src/a.py"]
+    assert "[4 changed paths not committed: agents may not read or write them, or sandbox output]" in out, out
+    assert (ws.root / ".github" / "workflows" / "evil.yml").exists()  # left in the worktree, uncommitted
+
+
+async def test_a_workflows_folder_replaced_by_a_file_is_refused(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    import shutil
+
+    from app.gitops.adapter import GitAdapter
+    from app.tools.builtin._common import git_target
+
+    ws = await task_worktree(tmp_path, {".github/workflows/ci.yml": "on: push\n"})
+    git, target = GitAdapter(), git_target(ws)
+    before = await git.current_commit(target)
+    shutil.rmtree(ws.root / ".github")
+    write(ws.root / ".github", "now a file\n")
+    status, out = await commit_out(sessions, scope, ws, "drop the workflows")
+    assert status == "error" and "nothing was committed" in out, out
+    assert await git.current_commit(target) == before
+
+
+async def test_a_tracked_submodule_is_never_committed(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    """/code-review 3.1d2b spec: a gitlink whose checkout moved shows up as a changed path; committing it
+    would point the project at another repository's commit (Lead decision 3.1d2b #5: nested repositories)."""
+    import asyncio
+    import subprocess
+
+    from app.gitops.adapter import GitAdapter
+    from app.tools.builtin._common import git_target
+
+    ws = await task_worktree(tmp_path, {"src/a.py": "a\n"})
+    who = ["-c", "user.name=T", "-c", "user.email=t@example.test"]
+
+    def git(cwd: Path, *args: str) -> str:
+        done = subprocess.run(  # noqa: S603 - test setup: fixed git argv
+            ["git", "-C", str(cwd), *who, *args],  # noqa: S607
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return done.stdout.strip()
+
+    sub = ws.root / "sub"
+    sub.mkdir()
+    await GitAdapter().init(sub, "main")
+    write(sub / "x.txt", "one\n")
+    await asyncio.to_thread(git, sub, "add", "x.txt")
+    await asyncio.to_thread(git, sub, "commit", "-q", "-m", "one")
+    first = await asyncio.to_thread(git, sub, "rev-parse", "HEAD")
+    await asyncio.to_thread(git, ws.root, "update-index", "--add", "--cacheinfo", f"160000,{first},sub")
+    await asyncio.to_thread(git, ws.root, "commit", "-q", "-m", "gitlink")
+    write(sub / "x.txt", "two\n")
+    await asyncio.to_thread(git, sub, "commit", "-q", "-am", "two")  # the submodule's checkout moves
+    write(ws.root / "src" / "a.py", "visible\n")
+    status, out = await commit_out(sessions, scope, ws, "visible only")
+    assert status == "ok", out
+    target = git_target(ws)
+    assert await GitAdapter().commit_files(target, await GitAdapter().current_commit(target) or "") == [
+        "src/a.py"
+    ]
+    assert "[1 changed paths not committed: nested repositories]" in out, out

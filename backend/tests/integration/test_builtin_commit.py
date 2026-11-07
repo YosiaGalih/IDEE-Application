@@ -104,6 +104,59 @@ async def test_a_worktree_on_a_non_task_branch_takes_no_commit(
     assert await head(on_feature) == before
 
 
+async def test_staging_and_committing_run_under_the_worktree_lock(
+    sessions: async_sessionmaker[AsyncSession],
+    scope: Scope,
+    ws: TaskWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/code-review 3.1d2b spec, Review Focus 2: the lock is held while git stages and commits, not only
+    while the names are read: a write attempted during the commit waits and gives up."""
+    from app.workspace.errors import WorkspaceBusy
+
+    monkeypatch.setattr(fs, "LOCK_WAIT_S", 0.1)
+    commit_files = GitAdapter.commit
+    seen: list[str] = []
+
+    async def write_during_commit(self: GitAdapter, *args: object, **kwargs: object) -> str | None:
+        try:
+            await ws.write_text("src/during.py", "x\n")
+            seen.append("written")
+        except WorkspaceBusy:
+            seen.append("busy")
+        return await commit_files(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "commit", write_during_commit)
+    write(ws.root / "src" / "a.py", "changed\n")
+    status, out = await run(sessions, scope, ws, "under the lock")
+    assert status == "ok" and seen == ["busy"], (seen, out)
+
+
+async def test_names_the_commit_cannot_take_are_counted(
+    sessions: async_sessionmaker[AsyncSession],
+    scope: Scope,
+    ws: TaskWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lead decision 3.1d2b #5: names that are not UTF-8 and names past the check cap are not committed,
+    and said."""
+    import os
+
+    from app.tools.builtin import _common
+
+    (ws.root / os.fsdecode(b"bad\xff.txt")).write_text("x\n")
+    write(ws.root / "src" / "a.py", "changed\n")
+    write(ws.root / "src" / "b.py", "new\n")
+    monkeypatch.setattr(_common, "MAX_NAMES", 1)
+    status, out = await run(sessions, scope, ws, "partly")
+    assert status == "ok" and "files: 1\nsrc/a.py\n" in out, out
+    assert "[1 changed paths not committed: names that are not UTF-8]" in out, out
+    assert (
+        "[1 changed paths not committed: not checked against the agent policy (too many or too costly)]"
+        in out
+    )
+
+
 async def test_the_commit_holds_the_worktree_lock(
     sessions: async_sessionmaker[AsyncSession],
     scope: Scope,

@@ -658,8 +658,8 @@ def _like_escape(text: str) -> str:
 
 async def _symbol_rows(
     sessions: async_sessionmaker[AsyncSession], project_id: uuid.UUID, q: str, kind: str | None
-) -> tuple[list[tuple[str, int, str, str]], bool, Repository | None]:
-    """Symbol candidates (path, line, name, kind), best match first, at most ``SYMBOL_CANDIDATES``; whether
+) -> tuple[list[SymbolRow], bool, Repository | None]:
+    """Symbol candidates, best match first, at most ``SYMBOL_CANDIDATES``; whether
     more exist; and the repository row they come from. No policy applied: callers filter."""
     needle = q.lower()
     pattern = _like_escape(needle)
@@ -686,7 +686,7 @@ async def _symbol_rows(
         await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
         repository = await session.scalar(select(Repository).where(Repository.project_id == project_id))
         rows = (await session.execute(query)).all()
-    found = [(path, line or 0, symbol or "", symbol_kind or "") for path, line, symbol, symbol_kind in rows]
+    found = [SymbolRow(path, line or 0, symbol or "", kind_ or "") for path, line, symbol, kind_ in rows]
     return found[:SYMBOL_CANDIDATES], len(rows) > SYMBOL_CANDIDATES, repository
 
 
@@ -702,13 +702,13 @@ async def _search_symbols(
 ) -> SearchResult:
     rows, truncated, repository = await _symbol_rows(env.sessions, project_id, q, kind)
     hits: list[SearchHit] = []
-    for path, line, symbol, symbol_kind in rows:
-        if not _visible(path, glob, policy, access):
+    for row in rows:
+        if not _visible(row.path, glob, policy, access):
             continue
         if len(hits) >= limit:
             truncated = True
             break
-        hits.append(SearchHit(path, line, f"{symbol_kind} {symbol}", symbol, symbol_kind))
+        hits.append(SearchHit(row.path, row.line, f"{row.kind} {row.name}", row.name, row.kind))
     return SearchResult(
         hits,
         truncated,
@@ -728,7 +728,7 @@ class RepoSymbolIndex:
     async def candidates(self, project_id: uuid.UUID, name: str, kind: str | None) -> SymbolRows:
         rows, truncated, repository = await _symbol_rows(self.sessions, project_id, name, kind)
         return SymbolRows(
-            [SymbolRow(path, line, symbol, symbol_kind) for path, line, symbol, symbol_kind in rows],
+            rows,
             truncated,
             repository.index_commit if repository is not None else None,
             repository.index_truncated if repository is not None else None,

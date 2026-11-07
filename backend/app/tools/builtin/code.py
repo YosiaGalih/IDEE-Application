@@ -19,11 +19,12 @@ from pydantic import Field
 
 from app.tools.base import RiskLevel, ToolContext, ToolError, ToolOutput, ToolSpec
 from app.tools.builtin._common import PATH_MAX_CHARS, StrictInput, relative, workspace_errors, workspace_of
+from app.tools.policy import PRECONDITIONS
 from app.workspace.errors import PatchConflict, PatchRejected, PatchRollbackFailed
 from app.workspace.fs import WRITE_LIMIT, FileChange
 from app.workspace.patches import MAX_DIFF_BYTES, FilePatch, parse_unified_diff
 
-DELETE_MODE = "scoped_write"  # code.delete_file's precondition; a patch that deletes needs it too (3.1d2b #3)
+DELETE_PRECONDITION = "fs_scoped_write"  # code.delete_file's; a patch that deletes needs it too (3.1d2b #3)
 
 
 class WriteFileInput(StrictInput):
@@ -97,9 +98,9 @@ async def apply_patch(ctx: ToolContext, raw: ApplyPatchInput) -> ToolOutput:
     workspace = workspace_of(ctx)
     patches = await asyncio.to_thread(_patches, raw.diff)  # up to 1 MiB of diff: off the loop
     deletes = any(patch.new_path is None for patch in patches)
-    if deletes and ctx.grant.permissions.filesystem != DELETE_MODE:
+    if deletes and not PRECONDITIONS[DELETE_PRECONDITION](ctx.grant.permissions, ctx.grant.tools):
         raise ToolError(
-            "delete_not_allowed", f"deleting a file needs filesystem {DELETE_MODE}, as code.delete_file does"
+            "delete_not_allowed", "deleting a file needs filesystem scoped_write, as code.delete_file does"
         )
     with _write_errors():
         changes = await workspace.apply_unified_diff(raw.diff)

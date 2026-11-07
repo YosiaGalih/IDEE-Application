@@ -42,6 +42,7 @@ from app.gitops.errors import GitError, GitInputError
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 TASK_BRANCH_PREFIX = "kk/task-"
+MESSAGE_MAX = 5000  # characters of a commit message
 WORKSPACE_TEMP_PATTERN = ".kk-tmp-*"  # app.workspace.fs.TEMP_PREFIX; gitops must not import workspace
 SANDBOX_ARTIFACTS_PATTERN = "/.kk/"  # sandbox artefacts never enter git (SECURITY_MODEL §4)
 _EXCLUDE_PATTERNS = (WORKSPACE_TEMP_PATTERN, SANDBOX_ARTIFACTS_PATTERN)
@@ -226,7 +227,7 @@ _MESSAGE_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # log() se
 
 
 def _message(message: str) -> str:
-    if not 1 <= len(message) <= 5000 or not message.strip() or _MESSAGE_FORBIDDEN.search(message):
+    if not 1 <= len(message) <= MESSAGE_MAX or not message.strip() or _MESSAGE_FORBIDDEN.search(message):
         raise GitInputError("message")
     return message
 

@@ -37,12 +37,12 @@ from app.workspace import fs
 from app.workspace.errors import AlreadyExists, PatchRollbackFailed, PathViolation, VersionConflict
 from app.workspace.fs import FileChange, TreeResult, Workspace
 from app.workspace.index import language_for
-from app.workspace.policy import Access
+from app.workspace.policy import SANDBOX_OUTPUT_DIR, Access
 
 logger = get_logger(__name__)
 
 AUDIT_PATHS_MAX = 100  # paths listed in one event; the count is always exact
-SANDBOX_DIR = ".kk"  # sandbox artefacts (SECURITY_MODEL §4): never committed, hidden from status and diff
+SANDBOX_DIR = SANDBOX_OUTPUT_DIR  # sandbox artefacts (SECURITY_MODEL §4): never committed, hidden from status
 
 _TASK_REF = re.compile(r"task:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
