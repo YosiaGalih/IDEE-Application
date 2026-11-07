@@ -198,6 +198,22 @@ def classify(path: str, text: str) -> Symbol | None:
     return None
 
 
+def check_regex(q: str) -> None:
+    """Refuse what makes git's (glibc) ERE explode (AG-13 M1, WP-2.1d): backreferences (``\\1``..``\\9``,
+    exponential matching) and bounded repetition (``{m,n}``, compiled to gigabytes when nested), as
+    ``ValueError``. ``\\{`` stays a plain brace. Everything else runs inside git, killed at the timeout."""
+    escaped = False
+    for char in q:
+        if escaped:
+            if char in "123456789":
+                raise ValueError("backreferences are not supported")
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "{":
+            raise ValueError("bounded repetition {m,n} is not supported")
+
+
 def check_glob(glob: str) -> None:
     """Refuse globs whose matching cost or meaning is not bounded (``ValueError``)."""
     if len(glob) > GLOB_MAX_CHARS or glob.count("*") > GLOB_MAX_STARS:

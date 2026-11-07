@@ -31,10 +31,27 @@ class ToolInfo:
     implemented: bool = False
 
 
+# Registered by build_tool_gateway (app.tools.builtin.builtin_specs; equality is tested). Agent readiness
+# (3.1b) reads this flag: an agent whose allowlist names a tool that is not here is not ready.
+IMPLEMENTED = frozenset(
+    {
+        "repo.get_tree",
+        "repo.read_file",
+        "repo.search_text",
+        "repo.detect_stack",
+        "repo.find_related_tests",
+        "git.status",
+        "git.diff",
+        "git.log",
+        "security.scan_secrets",
+    }
+)
+
+
 def _tool(
     name: str, risk: Risk, executor: str, preconditions: tuple[str, ...], status: ToolStatus
 ) -> ToolInfo:
-    return ToolInfo(name, risk, executor, preconditions, status)
+    return ToolInfo(name, risk, executor, preconditions, status, implemented=name in IMPLEMENTED)
 
 
 TOOL_CATALOG: Mapping[str, ToolInfo] = {

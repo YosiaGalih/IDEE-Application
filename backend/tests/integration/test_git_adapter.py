@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from app.gitops.adapter import Author, GitAdapter, GitTarget
+from app.gitops.adapter import GREP_MEMORY_LIMIT, Author, GitAdapter, GitTarget
 from app.gitops.errors import GitError, GitInputError
 
 ME = Author("Dev", "dev@example.test")
@@ -620,6 +620,65 @@ async def test_grep_finds_text_in_the_working_tree_including_untracked(
     assert not result.truncated
 
 
+async def test_changed_paths_lists_names_against_a_base_without_reading_them(
+    git: GitAdapter, repo: GitTarget
+) -> None:
+    """WP-3.1d2a git.diff: names first (committed, staged, worktree, untracked), so a caller can filter
+    them before any content is diffed."""
+    base = await git.current_commit(repo)
+    assert base is not None
+    write(repo.repo / "f.txt", "a\nB\nc\n")
+    await git.commit_all(repo, "change", ME)
+    write(repo.repo / "keep.md", "changed\n")
+    write(repo.repo / "new" / "u.txt", "untracked\n")
+    assert (await git.changed_paths(repo, base=base)).paths == ["f.txt", "keep.md", "new/u.txt"]
+    head = await git.current_commit(repo)
+    assert head is not None
+    assert (await git.changed_paths(repo, base=head)).paths == ["keep.md", "new/u.txt"]
+    write_bytes = repo.repo / os.fsdecode(b"bad\xff.txt")
+    write_bytes.write_text("x\n")
+    listed = await git.changed_paths(repo, base=head)
+    assert listed.skipped == 1 and "keep.md" in listed.paths  # counted, never dropped silently
+
+
+async def test_grep_runs_under_a_hard_memory_limit(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP-2.1d D1: every git grep gets RLIMIT_AS through prlimit (the regex runs inside git)."""
+    seen: list[tuple[str, ...]] = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def spy(*argv: str, **kwargs: object) -> asyncio.subprocess.Process:
+        seen.append(argv)
+        return await spawn(*argv, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    await git.grep(repo, ["a"], commit=None, fixed=True, ignore_case=False,
+                   only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    [argv] = [a for a in seen if "grep" in a]
+    assert argv[:3] == ("prlimit", f"--as={GREP_MEMORY_LIMIT}", "--") and argv[3] == "git"
+    assert all(a[0] == "git" for a in seen if "grep" not in a)  # only grep needs the limit
+
+
+async def test_a_grep_over_its_memory_limit_fails_loudly(git: GitAdapter, repo: GitTarget) -> None:
+    # The limit is real: with a few MiB git cannot even map itself, and the search fails, never "no hits".
+    with pytest.raises(GitError):
+        await git.grep(repo, ["a"], commit=None, fixed=True, ignore_case=False, only_matching=False,
+                       timeout_s=10, max_output=1 << 20, memory_limit=4 << 20)  # fmt: skip
+
+
+async def test_a_missing_prlimit_is_a_git_error_not_a_crash(repo: GitTarget) -> None:
+    # Backend review WP-3.1d2a M1: an image without util-linux fails the search visibly, as a GitError.
+    broken = GitAdapter(prlimit="/nonexistent/prlimit")
+    with pytest.raises(GitError) as caught:
+        await broken.grep(repo, ["a"], commit=None, fixed=True, ignore_case=False, only_matching=False,
+                          timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert caught.value.reason == "prlimit_missing"
+    found = await broken.grep(repo, ["a"], commit=None, fixed=True, ignore_case=False, only_matching=False,
+                              timeout_s=10, max_output=1 << 20, memory_limit=None)  # fmt: skip
+    assert found.matches  # trusted callers (the symbol indexer) run git directly
+
+
 async def test_grep_is_literal_unless_regex(git: GitAdapter, repo: GitTarget) -> None:
     write(repo.repo / "x.txt", "axb\n")
     literal = await git.grep(repo, ["a.b"], commit=None, fixed=True, ignore_case=False,
@@ -785,3 +844,20 @@ async def test_grep_parses_off_the_event_loop(git: GitAdapter, repo: GitTarget) 
     result = await grep
     assert len(result.matches) > 300_000
     assert max(gaps) < 0.5
+
+
+async def test_a_same_size_edit_in_the_second_of_the_checkout_is_in_the_exact_diff(
+    git: GitAdapter, repo: GitTarget
+) -> None:
+    """Silent failure found under load (WP-3.1d2a): the scratch index was a copy with a new mtime, so git no
+    longer saw an entry written in the index's own second as racy and skipped hashing the file: a same-size
+    edit made right after the checkout vanished from git.diff ("[no text diff]")."""
+    base = await git.current_commit(repo)
+    assert base is not None
+    await asyncio.sleep(1.05 - time.time() % 1)  # start early in a second: checkout and edit share it
+    (repo.repo / "f.txt").unlink()
+    raw_git(repo, "checkout", "--", "f.txt")  # git writes the file and records its stat, as worktree add
+    write(repo.repo / "f.txt", "x\ny\nz\n")  # same size as "a\nb\nc\n", same second
+    await asyncio.sleep(1.1)  # the diff runs in a later second
+    got = await git.diff(repo, base=base, paths=["f.txt"], exact_files=True)
+    assert [f.path for f in got.files] == ["f.txt"], got

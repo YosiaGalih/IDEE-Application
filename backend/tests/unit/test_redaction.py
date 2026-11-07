@@ -8,6 +8,10 @@ from app.core.redaction import REDACTED, Redactor
 
 FAKE_ANTHROPIC = "sk-ant-api03-" + "A" * 40
 FAKE_ADMIN = "sk-ant-admin01-" + "B" * 44
+# jwt.io's public example token (not a credential), split so that no source line is a whole token.
+JWT_EXAMPLE = (
+    "eyJhbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+)
 
 
 @pytest.fixture
@@ -266,3 +270,43 @@ def test_url_credentials_inside_a_word_run_are_still_redacted() -> None:
         == "prefixhttps://[REDACTED]@example.test/x"
     )
     assert redactor.redact("git+ssh://deploy:hunter2@host") == "git+ssh://[REDACTED]@host"
+
+
+# --- Redactor.find (security.scan_secrets, spec 3.1d2a Goal 11): the redaction patterns, as findings ---
+
+
+@pytest.mark.parametrize(
+    ("text", "rule"),
+    [
+        (FAKE_ANTHROPIC, "anthropic_key"),
+        (FAKE_ADMIN, "anthropic_admin_key"),
+        ("ghp_" + "a" * 36, "github_token"),
+        ("github_pat_" + "d" * 60, "github_pat"),
+        ("AKIA" + "ABCDEFGHIJKLMNOP", "aws_access_key"),
+        ("xoxb-" + "1234567890-abcdefghij", "slack_token"),
+        ("-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----", "private_key"),
+        ("clone https://alice:hunter22@git.example.com/r.git", "url_credentials"),
+        ("X-Api-Key: s3cr3tv4lue", "credential_header"),
+        ("password=hunter22", "credential_assignment"),
+        ("machine github.com login bob password hunter22", "credential_assignment"),
+        (
+            JWT_EXAMPLE,
+            "jwt",
+        ),
+        ("$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo", "password_hash"),
+    ],
+)
+def test_find_reports_what_redaction_would_remove(text: str, rule: str) -> None:
+    redactor = Redactor()
+    found = redactor.find(f"first line\n{text}\n")
+    assert rule in {f.rule for f in found}, found
+    assert all(f.line == 2 for f in found)
+    assert redactor.redact(text) != text  # the same patterns: what is found is also redacted
+
+
+def test_find_never_returns_the_secret_and_ordinary_code_is_clean() -> None:
+    redactor = Redactor()
+    found = redactor.find(f"a = 1\nkey = '{FAKE_ANTHROPIC}'\ntoken_count = 3\n")
+    assert [(f.line, f.rule) for f in found] == [(2, "anthropic_key")]
+    assert FAKE_ANTHROPIC not in repr(found)
+    assert redactor.find("token_count = 3\ndef tokenize(text): return text.split()\n") == []

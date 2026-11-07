@@ -215,7 +215,10 @@ class ToolContext:  # dibangun oleh AgentRuntime, read-only bagi handler; tanpa 
     correlation_id: str; cancel: CancelToken
     workspace: TaskWorkspace | None = None                      # akses file HANYA lewat ini (safe paths)
 @dataclass(frozen=True)
+class Untrusted: source: str; path: str | None = None          # isi repo/web: data, bukan perintah (T1, ADR-071)
+@dataclass(frozen=True)
 class ToolOutput: content: str | Mapping[str, Any]; evidence_refs: tuple[str, ...] = ()   # artifacts menyusul
+    untrusted: Untrusted | None = None                         # gateway: redaksi → potong → <untrusted_content>
 @dataclass(frozen=True)
 class ToolResult: tool_call_id: UUID; status: Literal["ok","error","denied","timeout","approval_required","cancelled"]; content: str; is_error: bool
 
@@ -247,13 +250,18 @@ class EventBus(Protocol):
 async def emit_task_event(db, bus, task_id, type: str, payload: dict, *, ephemeral=False) -> int | None  # returns seq
 
 # app/workspace/fs.py
-class TaskWorkspace:   # root = WORKSPACE_ROOT/<project_id>/tasks/<task_id>  (git worktree)
-    def resolve(self, rel: str, *, for_write: bool = False) -> Path        # raises PathViolation
-    async def read_text(self, rel, start_line=None, end_line=None, max_bytes=...) -> str
-    async def write_text(self, rel, content) -> FileChange
+class TaskWorkspace:   # root = WORKSPACE_ROOT/<project_id>/tasks/<task_id>  (git worktree); WP-3.1d2a
+    def __init__(self, root, *, repo: Path, branch: str, base_commit: str | None, lock_dir=None)
+    root / repo / branch / base_commit      # baca-saja; builtin membangun GitTarget(repo, worktree=root)
+    async def policy(self) -> Policy        # AGENT_READ: denylist + .agentignore worktree DAN repo/ (gabungan)
+    def exclusive(self)                     # lock worktree (commit memegangnya, WP-2.1c I-b)
+    async def detect_stack(self) -> Stack
+    async def read_text(self, rel, start_line=None, end_line=None, max_bytes=None) -> FileContent   # AGENT_READ
+    async def write_text(self, rel, content) -> FileChange                                        # AGENT_WRITE
     async def apply_unified_diff(self, diff: str) -> list[FileChange]
     async def delete(self, rel) -> FileChange
-    def tree(self, rel=".", depth=3) -> list[TreeEntry]
+    async def tree(self, rel=".", depth=3, max_entries=500) -> TreeResult
+    # Tidak ada resolve() publik: setiap akses lewat Workspace (fd-relative, AGENT_READ/AGENT_WRITE).
 
 # app/gitops/adapter.py
 class GitAdapter:
@@ -411,7 +419,7 @@ WORKSPACE_ROOT/
 ```
 
 - **Review-first mode (default):** agent hanya menulis ke worktree task. User melihat diff (`git diff <base>...kk/task-x`) dan memutuskan apply. Edit manual user di IDE menulis ke `repo/` (main) lewat `PUT /files` dengan `expected_sha256` (version check, R-07).
-- Safe path (`workspace/paths.py`): normalisasi, tolak absolut/`..`/NUL, `resolve(strict=False)` harus `is_relative_to(root)`, tolak symlink yang keluar root, denylist tulis: `.git/**`, `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.agentignore` patterns; denylist kirim-ke-LLM: + `node_modules/`, `dist/`, `build/`, `.venv/`, binary, file > 256 KB.
+- Safe path (`workspace/paths.py`): normalisasi, tolak absolut/`..`/NUL, `resolve(strict=False)` harus `is_relative_to(root)`, tolak symlink yang keluar root, denylist tulis: `.git/**`, `.env*`, `*.env` (ADR-071), `*.pem`, `*.key`, `id_rsa*`, `.agentignore` patterns; denylist kirim-ke-LLM: + `node_modules/`, `dist/`, `build/`, `.venv/`, binary, file > 256 KB.
 - Archive import (`workspace/archive.py`): zip/tar.gz; batas ukuran arsip (200 MB), total ekstraksi (1 GB), jumlah file (50k), rasio kompresi (> 100 → tolak), tolak symlink/hardlink/device/path traversal, tidak menimpa file existing.
 - Git CLI dipanggil dengan argumen list (tanpa shell), env bersih: `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, `-c core.hooksPath=/dev/null`, `-c protocol.allow=never -c protocol.https.allow=always`. Push/merge remote/force-push = R3/R4 (P2).
 

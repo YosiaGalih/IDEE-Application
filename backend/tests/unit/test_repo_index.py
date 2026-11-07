@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.workspace.index import Symbol, check_glob, classify, glob_matches, language_for, preview
+from app.workspace.index import Symbol, check_glob, check_regex, classify, glob_matches, language_for, preview
 
 DEFINITIONS = [
     ("a.py", "def main", Symbol("main", "function")),
@@ -116,3 +116,14 @@ def test_preview_windows_long_lines() -> None:
 def test_preview_keeps_short_lines_and_drops_trailing_space() -> None:
     assert preview("    x = 1   ", 5) == "    x = 1"
     assert preview("short", None) == "short"
+
+
+@pytest.mark.parametrize("q", [r"(a)\1", r"x\9", "a{2}", "(a{1,9}){1,9}"])
+def test_regex_features_that_explode_in_glibc_are_refused(q: str) -> None:
+    with pytest.raises(ValueError):
+        check_regex(q)
+
+
+@pytest.mark.parametrize("q", [r"a\{b", r"\\1", "a+b*", r"\.py$", "x|y"])
+def test_ordinary_regexes_pass(q: str) -> None:
+    check_regex(q)

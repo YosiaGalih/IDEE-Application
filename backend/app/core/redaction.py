@@ -10,8 +10,10 @@ stays covered even if the generic pattern is narrowed later.
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 REDACTED = "[REDACTED]"
@@ -24,21 +26,35 @@ _SENSITIVE_TAIL = (
 )
 _SENSITIVE_KEY_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{_SENSITIVE_TAIL})$")
 
-_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"sk-ant-admin\d{0,2}-[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"sk-ant-[A-Za-z0-9_\-]{10,}"),
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"),  # JWT
-    re.compile(r"\$argon2(?:id|i|d)\$[A-Za-z0-9+/=,$]+"),  # password hash (PHC string)
+# Named so ``Redactor.find`` (security.scan_secrets) reports which rule matched, from the very same patterns.
+_NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("anthropic_admin_key", re.compile(r"sk-ant-admin\d{0,2}-[A-Za-z0-9_\-]{8,}")),
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{10,}")),
+    ("github_pat", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
+    ("github_token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    # Starts only where a token starts: a match tried from every "eyJ" of a long run was quadratic (256 KiB of
+    # "eyJ" took 17 s; AG-13 WP-3.1d2a MEDIUM-2). One "-" that itself follows no token character also counts
+    # as a start: git.diff prints a removed line as "-" + text (/code-review WP-3.1d2a spec HIGH).
+    (
+        "jwt",
+        re.compile(
+            r"(?:(?<![A-Za-z0-9_-])|(?<=^-)|(?<=[^A-Za-z0-9_-]-))"
+            r"eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
+        ),
+    ),
+    ("password_hash", re.compile(r"\$argon2(?:id|i|d)\$[A-Za-z0-9+/=,$]+")),  # PHC string
     # PEM blocks, including a truncated block with no END marker.
-    re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\Z)",
-        re.DOTALL,
+    (
+        "private_key",
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\Z)",
+            re.DOTALL,
+        ),
     ),
 )
+_PATTERNS: tuple[re.Pattern[str], ...] = tuple(pattern for _, pattern in _NAMED_PATTERNS)
 
 # scheme://user:pass@host and scheme://<token-like userinfo>@host → scheme://[REDACTED]@host
 # The scheme is at most 32 characters: an unbounded one was retried from every position of a long run of
@@ -87,6 +103,14 @@ def is_sensitive_key(name: str) -> bool:
     return bool(_SENSITIVE_KEY_NAME.match(normalised))
 
 
+@dataclass(frozen=True, slots=True)
+class Finding:
+    """Where a secret-looking value is, never the value: ``line`` is 1-based."""
+
+    line: int
+    rule: str
+
+
 class Redactor:
     """Removes secrets from text before it is logged, stored, streamed or sent to a provider."""
 
@@ -104,6 +128,25 @@ class Redactor:
         text = _HEADERS.sub(rf"\g<name>\g<sep>{REDACTED}", text)
         text = _KEY_VALUE.sub(rf"\g<key>\g<sep>{REDACTED}", text)
         return _NETRC.sub(rf"\g<key>\g<sep>{REDACTED}", text)
+
+    def find(self, text: str) -> list[Finding]:
+        """What ``redact`` would remove, as (line, rule), in text order; one finding per rule and line. The
+        value itself is never returned (security.scan_secrets, SECURITY_MODEL T5)."""
+        starts = [0, *(m.end() for m in re.finditer("\n", text))]
+        rules: list[tuple[str, re.Pattern[str]]] = [
+            *((f"literal_{index}", re.compile(re.escape(lit))) for index, lit in enumerate(self._literals)),
+            *_NAMED_PATTERNS,
+            ("url_credentials", _URL_CREDENTIALS),
+            ("credential_header", _HEADERS),
+            ("credential_assignment", _KEY_VALUE),
+            ("credential_assignment", _NETRC),
+        ]
+        seen: set[tuple[int, str]] = set()
+        for rule, pattern in rules:
+            for match in pattern.finditer(text):
+                name = "configured_secret" if rule.startswith("literal_") else rule
+                seen.add((bisect.bisect_right(starts, match.start()), name))
+        return [Finding(line, rule) for line, rule in sorted(seen)]
 
     def redact_obj(self, obj: Any, *, stringify: bool = False) -> Any:
         """Redact strings inside containers and drop values under sensitive keys.

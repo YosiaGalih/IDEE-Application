@@ -12,6 +12,7 @@ import yaml
 from app.agents import readiness
 from app.agents.registry import load_registry, parse_registry
 from app.tools import catalog
+from app.tools.catalog import IMPLEMENTED
 
 REGISTRY = Path(__file__).resolve().parents[3] / "agents" / "registry.v2.yaml"
 Raw = dict[str, Any]
@@ -37,7 +38,9 @@ def test_enabled_llm_agent_is_not_ready_with_all_reasons() -> None:
     status, reasons, unavailable = readiness.assess(a02, enabled=True, provider_ready=None)
     assert status == "not_ready"
     assert reasons == ["runtime_unavailable", "provider_readiness_unknown", "tools_unavailable"]
-    assert unavailable == [tool for tool in a02.tools if tool != "submit_result"]
+    # WP-3.1d2a builtins are built; the rest of A02's allowlist is not yet (submit_result: the runtime's).
+    assert unavailable == [t for t in a02.tools if t != "submit_result" and t not in IMPLEMENTED]
+    assert unavailable and set(a02.tools) & IMPLEMENTED  # both kinds are present, so the filter is exercised
 
 
 def test_tool_agent_waits_for_the_engine_and_its_tools() -> None:

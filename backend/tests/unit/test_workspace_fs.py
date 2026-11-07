@@ -383,6 +383,26 @@ async def test_tree_sorted_dirs_first(ws: Workspace, tree_root: Path) -> None:
     assert [(c.path, c.type, c.size) for c in src.children] == [("src/a.py", "file", 19)]
 
 
+async def test_a_folder_that_vanishes_mid_listing_is_not_shown_as_empty(
+    ws: Workspace, tree_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silent-failure delta N4 (WP-3.1d2a): a sub-folder removed or swapped for a link between being listed
+    and being opened is "not listed" (``children=None``), never an empty folder."""
+    list_dir = fs._list_dir  # pyright: ignore[reportPrivateUsage]
+
+    def vanishing(root_fd: int, real: str, parts: tuple[str, ...], *args: object) -> object:
+        if parts == ("src",):
+            raise fs.WorkspaceNotFound()
+        return list_dir(root_fd, real, parts, *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fs, "_list_dir", vanishing)
+    result = await ws.tree(".", Access.USER_READ)
+    src = next(e for e in result.entries if e.name == "src")
+    assert src.children is None, src
+    docs = next(e for e in result.entries if e.name == "docs")
+    assert docs.children is not None  # the others are still listed
+
+
 async def test_tree_hides_git_and_temp(ws: Workspace, tree_root: Path) -> None:
     listed = names((await ws.tree(".", Access.USER_READ)).entries)
     assert ".git" not in listed

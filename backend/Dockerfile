@@ -32,13 +32,15 @@ ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
 # the next security update. The base is pinned by digest and security-scan (Trivy) checks what this installs.
 # apt and libapt-pkg7.0 are upgraded to the archive's current revision: the base digest carries apt 3.0.3
 # (CVE-2026-109518, fixed in 3.0.4). Not pinned (DL3008), as for git: the archive serves only the latest.
+# prlimit (util-linux, Essential in Debian): git grep runs under prlimit --as (WP-2.1d D1); the build fails without it.
 # hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git apt libapt-pkg7.0 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app \
-    && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
+    && find / -xdev -perm /6000 -type f -exec chmod a-s {} + \
+    && prlimit --version
 COPY --from=build /opt/venv /opt/venv
 WORKDIR /app
 COPY backend/alembic.ini ./alembic.ini

@@ -30,6 +30,7 @@ import shutil
 import signal
 import stat
 import tempfile
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -103,6 +104,25 @@ class Author:
 class Change:
     path: str
     status: Literal["added", "modified", "deleted", "untracked", "conflicted"]
+
+
+@dataclass(frozen=True)
+class NameList:
+    paths: list[str]  # sorted, unique
+    skipped: int  # names that are not UTF-8: not addressable through the API, reported, never hidden silently
+
+
+def _names(raw: bytes) -> NameList:
+    names: set[str] = set()
+    skipped = 0
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        try:
+            names.add(item.decode("utf-8"))
+        except UnicodeDecodeError:
+            skipped += 1
+    return NameList(sorted(names), skipped)
 
 
 @dataclass(frozen=True)
@@ -227,6 +247,29 @@ def _pathspec(path: str) -> str:
     return path
 
 
+def below_a_non_folder(tree: Path, names: list[str]) -> set[str]:
+    """The names with a parent that is not a real folder in ``tree`` (a symlink, a file, or missing). git
+    takes such a path as deleted, and staging it as a file fails ("beyond a symbolic link"). Parents are read
+    with ``lstat``, never followed (AG-13 WP-3.1d2a LOW-D1/LOW-D3). File system work: call it in a thread."""
+    folders: dict[str, bool] = {}
+    gone: set[str] = set()
+    for name in names:
+        parts = name.split("/")[:-1]
+        for depth in range(1, len(parts) + 1):
+            parent = "/".join(parts[:depth])
+            real = folders.get(parent)
+            if real is None:
+                try:
+                    real = stat.S_ISDIR(os.lstat(tree / parent).st_mode)
+                except OSError:
+                    real = False
+                folders[parent] = real
+            if not real:
+                gone.add(name)
+                break
+    return gone
+
+
 def _identity_env(author: Author, committer: Author) -> dict[str, str]:
     return {
         "GIT_AUTHOR_NAME": author.name,
@@ -236,16 +279,24 @@ def _identity_env(author: Author, committer: Author) -> dict[str, str]:
     }
 
 
+# WP-2.1d D1: git grep runs a user's or agent's regex inside git; a hard address-space limit (prlimit, from
+# util-linux in the backend image) keeps a pathological pattern from taking the host's memory.
+# [Menebak] 512 MiB.
+GREP_MEMORY_LIMIT = 512 * 1024 * 1024
+
+
 class GitAdapter:
     def __init__(
         self,
         git: str = "git",
         *,
+        prlimit: str = "prlimit",
         timeout_s: float = 60.0,  # [Menebak]
         max_output: int = 16 * 1024 * 1024,  # [Menebak]
         committer: Author = Author("KodeKantor", "kodekantor@localhost"),  # noqa: B008 - frozen value
     ) -> None:
         self.git = git
+        self.prlimit = prlimit
         self.timeout_s = timeout_s
         self.max_output = max_output
         self.committer = _author(committer)
@@ -264,10 +315,14 @@ class GitAdapter:
         truncate: bool = False,
         timeout_s: float | None = None,
         max_output: int | None = None,
+        memory_limit: int | None = None,
     ) -> _Result:
         """Run git. ``truncate``: past ``max_output`` stop reading and return what was read (no error).
-        ``timeout_s`` and ``max_output`` override the adapter's limits for this call."""
+        ``timeout_s`` and ``max_output`` override the adapter's limits for this call. ``memory_limit``: git
+        runs under ``prlimit --as`` (bytes); a git that cannot start under it fails like any git error."""
         argv = [self.git]
+        if memory_limit is not None:
+            argv = [self.prlimit, f"--as={memory_limit}", "--", self.git]
         for setting in _CONFIG:
             argv += ["-c", setting]
         if git_dir is not None:
@@ -275,15 +330,20 @@ class GitAdapter:
         if work_tree is not None:
             argv.append(f"--work-tree={work_tree}")
         argv += args
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=cwd,
-            env={**_BASE_ENV, **(env or {})},
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,  # its own process group, so a timeout kills every child too
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=cwd,
+                env={**_BASE_ENV, **(env or {})},
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # its own process group, so a timeout kills every child too
+            )
+        except FileNotFoundError:
+            if memory_limit is not None:  # the image lacks util-linux: fail visibly, never run unbounded
+                raise GitError("prlimit_missing") from None
+            raise
         try:
             stdout, stderr, cut = await asyncio.wait_for(
                 self._collect(proc, truncate, self.max_output if max_output is None else max_output),
@@ -537,8 +597,11 @@ class GitAdapter:
         head: str | None = None,
         paths: list[str] | None = None,
         max_bytes: int = 1024 * 1024,
+        exact_files: bool = False,
     ) -> Diff:
-        """``base``..``head``; ``head=None`` is the working tree including untracked files."""
+        """``base``..``head``; ``head=None`` is the working tree including untracked files. ``exact_files``
+        (agent tools): ``paths`` are exact file names, and only they are staged for the working-tree diff;
+        otherwise the whole working tree is staged and ``paths`` are pathspecs (folders allowed)."""
         git_dir, tree = await self._adirs(target)
         if base is not None:
             base_sha = await self._resolve(git_dir, tree, base)
@@ -561,20 +624,8 @@ class GitAdapter:
                 max_bytes=max_bytes,
                 output_truncated=result.truncated,
             )
-        with tempfile.TemporaryDirectory(prefix="kk-git-diff-") as scratch:
-            # A copy of the index and a scratch object store: untracked files are staged for the diff, and the
-            # blobs that creates land in the scratch store, so reading a diff never writes to the repository.
-            index = Path(scratch) / "index"
-            objects = Path(scratch) / "objects"
-            await asyncio.to_thread(objects.mkdir)
-            with contextlib.suppress(FileNotFoundError):
-                await asyncio.to_thread(shutil.copyfile, git_dir / "index", index)
-            env = {
-                "GIT_INDEX_FILE": str(index),
-                "GIT_OBJECT_DIRECTORY": str(objects),
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(target.repo / ".git" / "objects"),
-            }
-            await self._run(["add", "-A"], git_dir=git_dir, work_tree=tree, cwd=tree, env=env)
+        files = list(paths or []) if exact_files else None
+        async with self._worktree_index(target, git_dir, tree, files) as env:
             result = await self._run(
                 [*_DIFF_FLAGS, "--cached", base_sha, *pathspec],
                 git_dir=git_dir,
@@ -590,6 +641,86 @@ class GitAdapter:
             max_bytes=max_bytes,
             output_truncated=result.truncated,
         )
+
+    @contextlib.asynccontextmanager
+    async def _worktree_index(
+        self, target: GitTarget, git_dir: Path, tree: Path, files: list[str] | None = None
+    ) -> AsyncIterator[dict[str, str]]:
+        """A copy of the index and a scratch object store with the working tree staged (untracked files too):
+        everything, or only ``files`` (exact paths: added, updated, or removed when gone, a file replacing
+        a folder included). The blobs that creates land in the scratch store, so reading a diff never adds
+        objects to the repository (git may still freshen the mtime of objects it already has). Yields the
+        environment that makes git use them."""
+        with tempfile.TemporaryDirectory(prefix="kk-git-diff-") as scratch:
+            index = Path(scratch) / "index"
+            objects = Path(scratch) / "objects"
+            await asyncio.to_thread(objects.mkdir)
+            with contextlib.suppress(FileNotFoundError):
+                # copy2 keeps the index's mtime: git tells a racily clean entry (written in the index's
+                # own second) by it; with a fresh mtime it would skip hashing a same-size edit.
+                await asyncio.to_thread(shutil.copy2, git_dir / "index", index)
+            env = {
+                "GIT_INDEX_FILE": str(index),
+                "GIT_OBJECT_DIRECTORY": str(objects),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(target.repo / ".git" / "objects"),
+            }
+            if files is None:
+                await self._run(["add", "-A"], git_dir=git_dir, work_tree=tree, cwd=tree, env=env)
+            else:
+                await self._stage_exact(git_dir, tree, files, env)
+            yield env
+
+    async def _stage_exact(self, git_dir: Path, tree: Path, files: list[str], env: dict[str, str]) -> None:
+        """Make each index entry of ``files`` what the working tree holds at that exact path: added, updated,
+        removed when gone, a file replacing a folder included; a path below a symlink or a file is gone."""
+        checked = [_pathspec(name) for name in files]
+        gone = await asyncio.to_thread(below_a_non_folder, tree, checked)
+        removed = [name for name in checked if name in gone]
+        present = [name for name in checked if name not in gone]
+        if removed:
+            await self._run(
+                ["update-index", "--force-remove", "--", *removed],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                env=env,
+            )
+        if present:
+            await self._run(
+                ["update-index", "--add", "--remove", "--replace", "--", *present],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                env=env,
+            )
+
+    async def changed_paths(self, target: GitTarget, *, base: str) -> NameList:
+        """The paths whose content differs between ``base`` and the working tree, untracked (not ignored)
+        files included, sorted; names only and without staging anything, so a caller can filter them before
+        any content is read (WP-3.1d2a git.diff). A deletion is listed under the deleted name. Names that
+        are not UTF-8 are counted in ``skipped``, never dropped silently."""
+        git_dir, tree = await self._adirs(target)
+        base_sha = await self._resolve(git_dir, tree, base)
+        tracked = await self._run(
+            ["diff", "--name-only", "--no-renames", "-z", base_sha], git_dir=git_dir, work_tree=tree, cwd=tree
+        )
+        untracked = await self._run(
+            ["ls-files", "-z", "--others", "--exclude-standard"], git_dir=git_dir, work_tree=tree, cwd=tree
+        )
+        return _names(tracked.stdout + b"\0" + untracked.stdout)
+
+    async def worktree_files(self, target: GitTarget) -> NameList:
+        """What a commit of the working tree could take: tracked files plus untracked ones that are not
+        ignored (``.gitignore``, ``info/exclude``), sorted, names only. Names that are not UTF-8 are counted
+        in ``skipped``."""
+        git_dir, tree = await self._adirs(target)
+        result = await self._run(
+            ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+        )
+        return _names(result.stdout)
 
     async def list_files(self, target: GitTarget, commit: str) -> TreeListing:
         """The regular files of ``commit``'s tree, read from the object database (no working tree, no symlink
@@ -620,6 +751,32 @@ class GitAdapter:
                 skipped += 1
         return TreeListing(files, result.truncated, skipped)
 
+    async def blob_sizes(self, target: GitTarget, commit: str, paths: list[str]) -> dict[str, int]:
+        """The size of each of ``paths`` that is a regular file in ``commit``, read from the object database.
+        Exact names only: a pathspec ``config`` also matches ``config/**``, and those entries are dropped."""
+        if not _SHA.fullmatch(commit):
+            raise GitInputError("ref")
+        if not paths:
+            return {}
+        wanted = {_pathspec(path) for path in paths}
+        git_dir, tree = await self._adirs(target)
+        result = await self._run(
+            ["ls-tree", "-z", "--long", "--full-tree", commit, "--", *sorted(wanted)],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+        )
+        sizes: dict[str, int] = {}
+        for record in result.stdout.split(b"\0"):
+            meta, _, raw_path = record.partition(b"\t")
+            fields = meta.split()
+            if len(fields) != 4 or fields[1] != b"blob" or not fields[3].isdigit():
+                continue  # a tree, a submodule, or the empty tail after the last NUL
+            name = raw_path.decode("utf-8", "replace")
+            if name in wanted:
+                sizes[name] = int(fields[3])
+        return sizes
+
     async def grep(
         self,
         target: GitTarget,
@@ -633,6 +790,7 @@ class GitAdapter:
         max_output: int,
         max_matches: int | None = None,
         threads: int | None = None,
+        memory_limit: int | None = GREP_MEMORY_LIMIT,
     ) -> GrepResult:
         """``git grep`` over the working tree with untracked files (``commit=None``: ignored files and
         ``.git`` are never read, symlinks are not followed) or over ``commit``'s tree. Patterns follow ``-e``
@@ -666,6 +824,7 @@ class GitAdapter:
             truncate=True,
             timeout_s=timeout_s,
             max_output=max_output,
+            memory_limit=memory_limit,
         )
         if result.returncode not in (0, 1) and not result.truncated:
             stderr = result.stderr.decode("utf-8", "replace")

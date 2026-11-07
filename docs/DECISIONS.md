@@ -358,6 +358,16 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 5. Trigger `approvals_status_guard`: insert hanya `pending`; status hanya lewat `approval_store` dan sepanjang siklus; kolom isi approval tidak berubah sesudah insert.
 **Konsekuensi:** ARCHITECTURE §4.2 dan §6.1, SECURITY_MODEL §3 (urutan cek) dan DATA_MODEL `tool_calls` diselaraskan saat ADR ini diterima (7 Nov 2026). AgentRuntime (3.1f) membangun `ToolContext` dari `grant_for` dan tidak memegang lock baris task selama `execute`.
 
+## ADR-071 — Builtin agent R0: konteks task, konten tak tepercaya, denylist (WP-3.1d2a)
+**Status:** Proposed (Lead, 7 Nov 2026, di bawah mandat PO "jalan tanpa menunggu, catat keputusan Lead, laporkan konflik ke #72"; Keputusan Lead 3.1d2 #2, #3, #7, #9). Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md`.
+**Konteks:** builtin pertama yang membaca repo untuk model butuh tiga hal yang belum ada di kontrak. Pertama, konteks git task tanpa memberi `app.workspace` akses ke `app.gitops`. Kedua, cara menandai isi repo sebagai data, bukan perintah (T1). Ketiga, denylist yang menutup `prod.env`, karena kontrak `.env*` hanya mencocokkan awalan.
+**Keputusan:**
+1. `TaskWorkspace(root, *, repo, branch, base_commit)` membawa konteks git sebagai nilai polos; builtin membangun `GitTarget` sendiri. `ToolContext` tidak berubah.
+2. `ToolOutput.untrusted: Untrusted(source, path) | None`. Gateway yang menulis `<untrusted_content>`, dengan urutan redaksi → potong agar muat bersama tag → bungkus. Tag tiruan di isi dinetralkan. Atribut dibersihkan dari karakter kontrol, diredaksi, lalu di-escape.
+3. `*.env` adalah nama secret, sama seperti `.env*`: ditolak untuk `AGENT_READ`, `AGENT_WRITE` dan `USER_WRITE`.
+4. Akses agent ke worktree task mematuhi `.agentignore` worktree **dan** `repo/`. Kode sandbox hanya dapat menambah penyembunyian, tidak menghapusnya. `.agentignore` `repo/` yang tidak valid menolak akses agent.
+**Konsekuensi:** ARCHITECTURE §4.2 (`TaskWorkspace`, `ToolOutput`) dan §7 (denylist) diselaraskan; SECURITY_MODEL §13 mencatat risiko sisa (sandbox dapat menyalin berkas tersembunyi ke nama terlihat; user tidak dapat menulis `*.env` lewat IDE). Builtin 3.1d2b (`code.*`, `git.commit_task`) memakai keputusan yang sama.
+
 ## Pengecualian keamanan (SECURITY_MODEL §11)
 
 Temuan audit yang belum dapat diperbaiki dicatat di sini: siapa, alasan, mitigasi, tanggal kedaluwarsa. Job CI yang mengabaikan temuan hanya mengabaikannya sampai tanggal kedaluwarsa, lalu merah lagi.

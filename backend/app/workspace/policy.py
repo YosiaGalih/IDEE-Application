@@ -40,6 +40,7 @@ DENY_BUDGET = 50_000  # [Menebak] matching cells per denied() call; a few ms of 
 
 _SECRET_PATTERNS = (
     ".env*",
+    "*.env",  # config/prod.env: the .env* contract is a prefix only (WP-1.2, Lead decision 3.1d2 #7)
     "*.pem",
     "*.key",
     "id_rsa*",
@@ -97,6 +98,11 @@ class AgentignoreInvalid(ValueError):
 def _is_secret(segment: str) -> bool:
     lowered = segment.lower()
     return any(fnmatchcase(lowered, pattern) for pattern in _SECRET_PATTERNS)
+
+
+def is_secret_name(parts: tuple[str, ...]) -> bool:
+    """Whether any segment of a path is a secret name (``.env*``, ``*.env``, ``*.pem``, ``.ssh``, ...)."""
+    return any(_is_secret(segment) for segment in parts)
 
 
 class PolicyBudgetExceeded(Exception):
@@ -200,8 +206,19 @@ class Policy:
             return True
         if access is Access.USER_READ:
             return False
-        if any(_is_secret(segment) for segment in parts):
+        if is_secret_name(parts):
             return True
+        return self.hides(parts, access, budget)
+
+    def hides(self, parts: tuple[str, ...], access: Access, budget: Budget | None = None) -> bool:
+        """Whether ``access`` may not touch ``parts`` for a reason other than a secret name: ``.git``,
+        ``.agentignore`` patterns, the policy file itself for writes, dependency folders for agent reads.
+        security.scan_secrets reports a secret name only where nothing else hides it (AG-13 WP-3.1d2a)."""
+        access = Access(access)
+        if any(segment.lower() == ".git" for segment in parts):
+            return True
+        if access is Access.USER_READ:
+            return False
         own_file = parts == (AGENTIGNORE,)
         if not (own_file and access is Access.USER_WRITE):
             try:

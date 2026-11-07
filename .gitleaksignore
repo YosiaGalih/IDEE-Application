@@ -9,3 +9,9 @@
 f7f21facaceaadc9e585ab77009ac29b6146b208:frontend/src/features/auth/__tests__/PasswordReset.test.tsx:generic-api-key:72
 # Synthetic password in the URL-credential redaction regressions (WP-3.1d1, AG-13 HIGH); not a real credential.
 5b5b28ae192877c9da1c698d8d4a5664ab2e5f10:backend/tests/security/test_url_credential_redaction.py:generic-api-key:15
+# jwt.io's public example token (sub "1234567890") in the WP-3.1d2a redaction regressions; committed before the
+# lines carried an inline allow comment. Not a credential.
+1a4edf6983b330dc9ddedb9cd658f0b12fa12177:backend/tests/unit/test_redaction.py:jwt:323
+c5f0382370d519f7a1032e5a17e6de5fa63791a0:backend/tests/unit/test_redaction.py:jwt:289
+c5f0382370d519f7a1032e5a17e6de5fa63791a0:backend/tests/security/test_hostile_output_text.py:jwt:15
+9f015aa9a07b052e3e19159fdb3f20ca926a80c3:backend/tests/security/test_builtin_policy.py:jwt:292

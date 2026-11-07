@@ -2205,3 +2205,64 @@ Tetap terbuka (bukan bagian keputusan ini): cakupan scan #57; EX-02, EX-04, EX-0
 Catatan suite lokal (bukan temuan review): `tests/security/test_search_inputs.py::test_a_large_search_output_never_blocks_the_loop` (ambang jeda event loop 0,5 dtk) gagal 2 kali di suite penuh lokal pada Python 3.12, setiap kali bersamaan dengan build Go/Docker, Trivy, atau subagent. Lulus sendiri 3/3, lulus di bawah 8 proses CPU penuh 3/3, lulus di `tests/security` (397 passed), lulus sesudah semua test integrasi (885 passed), dan lulus di CI (2509 passed). Hipotesis CPU, waktu fork, dan GC diuji dan gugur; akar pastinya belum terbukti [Kemungkinan Besar: gangguan I/O atau memori dari pekerjaan paralel]. Suite penuh diulang saat mesin idle sebelum PR lanjutan dinyatakan selesai.
 
 **Syarat delta terpenuhi (7 Nov 2026), PR #24 @ d80a4e2.** [Pasti] `get_check_runs`: 9 dari 9 `success` (08:00:24–08:06:47 UTC). Log clean-install, langkah "Socket proxy allowlist" terhadap `kodekantor/socket-proxy` yang dibangun CI: `allow GET /_ping: 200`, `/version: 200`, `/containers/json: 200`, `/images/json: 200`; `deny` 403 untuk `/info`, `/volumes`, `/networks`, `/events`, `/system/df`, `/secrets`, `/plugins`, `POST /build`, `POST /exec/0123456789ab/start`, `POST /swarm/init`, `POST /volumes/create`, `POST /networks/create`. infra-config (build caddy dengan `GOPROXY=off`, validasi Caddyfile) dan security-scan (gate) `success`. **Status sign-off AG-13 PR #23 + #24: SIGNED OFF**; dibawa ke WP infra berikutnya (sebelum G7): L2 dan catatan exec-create ADR-026.
+
+### WP-3.1d2a (🔒 builtin R0 dan pembungkus konten tak tepercaya) — `repo.*`, `repo.search_text`, `git.status/diff/log`, `security.scan_secrets`, `<untrusted_content>` (FR-059–062 bagian builtin; T1, T2, T5; syarat warisan WP-1.2, WP-2.1c sebagian, WP-2.1d)
+
+Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md` (Goals 3.1d2a, Keputusan Lead 3.1d2 #1–#9). Plan: `docs/superpowers/plans/2026-11-07-wp-3.1d2a-builtins.md`. 3.1d2b (`code.*`, `git.commit_task`, `repo.search_symbol`) menyusul.
+
+**Keterbatasan nyata:** belum ada kode yang membuat worktree task (`create_worktree` tanpa pemanggil, `Task.base_commit` tidak ditulis). Builtin ini diuji dengan worktree fixture dan baru dipakai produk setelah runtime/engine (3.1f/3.2).
+
+**Bukti (worktree `wp-3.1d2`; kode backend identik dengan branch PR, `git diff wp-3.1d2 pr-3.1d2a -- backend` kosong):**
+
+```text
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 246 files already formatted · 0 errors · Contracts: 5 kept, 0 broken
+$ uv run pytest -q -p no:cacheprovider          # suite penuh, sendirian, DB kodekantor_test_wt
+1 failed, 2663 passed in 430.97s (0:07:10)        # @ ea81b2a (backend = branch PR)
+  (yang gagal: tests/security/test_search_inputs.py::test_a_large_search_output_never_blocks_the_loop,
+   ambang jeda event loop 0,5 dtk; selalu gagal di container lokal ini, lulus di CI, lihat catatan PR #23)
+```
+
+- Test baru per bagian:
+  - integrasi: `tests/integration/test_builtin_{repo,search,git,security}.py`;
+  - keamanan: `tests/security/test_builtin_policy.py`, `test_builtin_limits.py`, `test_hostile_output_text.py`, `test_tool_gateway_security.py` (pembungkus);
+  - unit: `test_untrusted.py`, `test_redaction.py` (`find`), `test_builtin_common.py`, `test_paths.py` (`*.env`), `test_workspace_fs.py`;
+  - integrasi lain: `test_git_adapter.py` (`prlimit`, `changed_paths`).
+- Mutan (skrip satu mutasi per run, lalu dipulihkan; 15 berkas test builtin/keamanan/unit), [Pasti]:
+  - B1–B15 dari plan, B16–B23 dari review. Hasil: B1–B6 dan B8–B21 merah.
+  - **B7** (Budget `tree()` per folder) awalnya **bertahan** karena tidak ada test yang membuktikan Budget dibagi antar folder. Ditutup dengan `test_one_tree_call_shares_one_budget_across_folders`, lalu B7 merah.
+  - **B22** awalnya "bertahan" karena `test_workspace_fs.py` belum masuk daftar skrip. Diulang dengan daftar yang benar: merah.
+  - **B23** (indeks scratch kehilangan mtime) merah.
+  - Penyimpangan: plan meminta B1–B15 sebelum review; bukti tersimpannya baru dibuat sesudah review. Mutan `repo.*` di Task 5 sempat dijalankan, tetapi keluarannya tidak disimpan.
+- **Kegagalan senyap yang ditemukan dari test flaky (bukan dari review):** `git.diff` menyalin index ke scratch dengan `shutil.copyfile`, sehingga mtime-nya berubah.
+  - Akibatnya git tidak lagi menganggap entri yang ditulis pada detik yang sama dengan index sebagai *racily clean*, dan berhenti meng-hash edit berukuran sama yang dibuat tepat sesudah checkout. Keluarannya `[no text diff]` untuk perubahan nyata.
+  - Repro deterministik merah 3/3 dengan kode lama; perbaikan `shutil.copy2` hijau 3/3 (mutan B23).
+- `docker build --check -f backend/Dockerfile .` → bersih; image gagal dibangun tanpa `prlimit`.
+
+**Review:**
+
+| Review | Hasil | Penutupan |
+|---|---|---|
+| `kk-backend-reviewer` @ d4ca32b | **BLOCK**: 2 HIGH (Dockerfile kehilangan `\` sesudah `find`; `scan_secrets` CPU di event loop), 4 MEDIUM, 4 LOW, NIT | e473937, ffdf37a, 4e22f74, a44cea0. MEDIUM `*.env` untuk tulis user diterima: SECURITY_MODEL §13 + ADR-071. MEDIUM `.agentignore` di-parse per operasi berkas: utang performa, di bawah |
+| `kk-backend-reviewer` delta @ 1cc8a4c | **APPROVE WITH NITS**, tanpa HIGH/MEDIUM baru | NIT ringkasan scan (jumlah berkas dipindai juga saat ada temuan) ditutup; `_cut_line` meredaksi ≤ 256 KiB di event loop (milidetik, linear) dan `below_a_non_folder` dipanggil dua kali: diterima |
+| `kk-silent-failure-hunter` @ d4ca32b | 1 HIGH (nama non-UTF-8 dibuang diam-diam), 6 MEDIUM, 5 LOW | ffdf37a, 4e22f74 (`NameList.skipped`; "no secrets"/"no matches" hanya untuk yang benar-benar diperiksa; nomor baris `\n` saja; penanda potong/akhir berkas; folder yang tidak dibuka). M2 (literal secret tidak dicari `scan_secrets`) dan L4 (dedup per baris+aturan) diterima sebagai desain: literal = oracle |
+| `kk-silent-failure-hunter` delta @ 5f89bb5 | **N0 HIGH**: `neutralise` ReDoS (400 karakter invisible = 9 dtk di event loop), diperkenalkan oleh perbaikan LOW-2 saya; N1–N5 LOW | c98b343 (satu kelas celah terbatas, 6 input jahat < 0,2 dtk); N1/N2/N3/N5 c98b343; N4 (folder yang hilang saat listing tampak kosong) di commit "vanishes mid-listing" |
+| AG-13 @ d4ca32b | **NOT SIGNED OFF**: HIGH-1 (`git.diff`: pathspec literal `config` juga cocok `config/**`, isi tersembunyi bocor saat folder diganti berkas; PoC), HIGH-2 (Policy tanpa Budget per panggilan, sinkron di event loop: ±58 dtk); MEDIUM-1..4; LOW-1..6 | ffdf37a (nama tanpa staging, staging berkas persis, keanggotaan persis; satu Budget per panggilan di thread), 4e22f74 (JWT linear), e473937 (Dockerfile), 0544051 (`STAGE_MAX_BYTES`), a44cea0 (LOW-2/3/4). LOW-5 (newline/`:` di nama memalsukan baris) diterima dengan syarat S9 |
+| AG-13 delta @ c98b343 | **SIGNED OFF 🔒 DENGAN SYARAT**: semua HIGH/MEDIUM tertutup (diverifikasi ulang dengan PoC: `diff_prefix2`, `diff_reverse`, `stall` 20 000 nama → jeda loop ≤ 0,1 dtk, `bench` JWT 17 dtk → 0,03 dtk); LOW-D1..D4 baru; INFO-D5..D7 | 1cc8a4c: D1/D3 (path di bawah symlink/berkas = terhapus, `update-index --force-remove`), D2 (`DIFF_MAX_FILES`, `ARGV_MAX_BYTES`), D4 (baris raksasa diredaksi sebelum dipotong, token di tepi potongan dibuang) |
+| `/code-review` @ 1cc8a4c (Standards + Spec) | Standards: 3 pelanggaran keras (test regresi keamanan di luar `tests/security/`; tracker belum ada; ARCHITECTURE §4.2 tanpa `ToolOutput.untrusted`), 1 konflik (`*.env` tanpa ADR), smell. Spec: **HIGH** lookbehind JWT (MEDIUM-2) melewatkan JWT sesudah `-`, yaitu setiap baris diff yang dihapus; sisi base `git.diff` tidak dicek ukurannya; `.kk/` tidak dihitung; D3 tanpa pemilik; konflik `scan_secrets` vs Review Focus 1 tidak dilaporkan; celah bukti Review Focus 1/2/4/5 | b912bde (JWT: satu `-` yang tidak didahului karakter token juga awal token; tetap linear), 0d47703 (`blob_sizes` sisi base; `.kk/` dihitung; `git.log` SHA penuh; test dipindah ke `tests/security/`; bukti baru Review Focus 1/2/4/5; `StrictInput`, `LINE_PATTERN`, `is_secret_name`), docs (ADR-071, ARCHITECTURE §4.2/§7, konflik di spec, pemilik D3/TOCTOU). Smell yang tidak dikerjakan: helper `run` per berkas test, `IMPLEMENTED` manual (dijaga test kesamaan), argumen `exact_files`, `.kk` di tiga lapisan (3.1d2b menyatukan di `SANDBOX_OUTPUT_DIR`), slot pencarian agent terpisah dari user (sesuai Goal 5) |
+| AG-13 delta 2 (c98b343 → N4) | **Sign-off tetap berlaku**, tanpa regresi. Lookbehind JWT baru linear: 10 input jahat 256 K karakter ≤ 0,047 dtk. `force-remove`: parent dibaca `lstat` dari yang paling dangkal dan symlink tidak diikuti; folder↔berkas dan repo bersarang `no leak`. `blob_sizes`: argv ≤ 2000 nama / 256 KiB, nama persis; 19 000 berkas `ok 0.6s` (sebelumnya E2BIG). `_cut_line`: posisi potong digeser ±12 dengan tiga jenis secret, tanpa fragmen. N4 hanya representasi | INFO: JWT sesudah `x-`/`--` tidak diredaksi (dicatat di spec, konflik #72); teks ADR-071 butir 2 diselaraskan dengan urutan kode (kontrol dibuang → redaksi → escape); literal terkonfigurasi bisa tersisa sebagian bila 4096 karakter sebelum potongan tanpa karakter batas (sangat kecil) |
+
+**Status sign-off AG-13 WP-3.1d2a: SIGNED OFF 🔒 dengan syarat** (delta @ c98b343, dikonfirmasi delta 2). Syarat: (1) bagian tracker ini di PR yang sama — dipenuhi di sini; (2) LOW-D1/D2/D4 — **terpenuhi** (1cc8a4c), celah JWT `x-`/`--` dicatat; (3) hand-off S9 — dicatat di "Syarat yang dibawa". Merge setelah CI 9/9 hijau di PR ini.
+
+**Penyimpangan proses (dicatat, bukan disembunyikan):**
+- Test `repo.*` (Task 5) ditulis sesudah kode, bukan TDD; kompensasinya mutan per perilaku kunci (semua merah, satu selamat diperkuat fixture-nya).
+- Dua run suite lokal tercemar karena saya menjalankan test lain pada DB uji yang sama; sejak itu worktree memakai `kodekantor_test_wt` dan setiap reviewer DB sendiri (`rv1`–`rv3`), dan suite dijalankan sendirian.
+- Perbaikan LOW-2 (tag tiruan) memperkenalkan ReDoS (HIGH) yang ditemukan delta review; test kinerja untuk input patologis kini wajib untuk setiap regex baru di jalur keluaran model.
+
+**Syarat yang dibawa:**
+- **S9 (gate scan secret, hand-off AG-13 INFO-D5 dan LOW-5):** `scan_secrets` dengan `not checked`/`not scanned` > 0 dianggap belum lulus; temuan disimpan terstruktur (`path`, `line`, `rule`), tidak diurai dari teks keluaran.
+- **D3 (WP-2.1d, INFO):** timeout regex pencarian **user** (dua pembaca memegang kedua slot); tidak disentuh 3.1d2a karena agent punya slot sendiri. Pemilik: tindak lanjut pencarian user bersama PO.
+- **3.1d2b:** `git.commit_task` memegang `TaskWorkspace.exclusive()` (WP-2.1c I-b) dan bukti keempat `_landed` (I-6); path yang ditolak AGENT_READ dan `.kk/` tidak di-stage; `repo.search_symbol` lewat `ToolPorts`.
+- **3.1f/3.2:** membuat worktree task + `base_commit`/`branch_name`; satu panggilan tool per task pada satu waktu (TOCTOU, Keputusan Lead 3.1d2 #5); `test_prompt_injection.py` dan `test_secret_redaction.py` ujung-ke-ujung.
+- **WP `tests.run` (R2):** kode sandbox bisa menyalin berkas tersembunyi ke nama terlihat (SECURITY_MODEL §13).
+- **Utang performa (backend M4, diterima):** `.agentignore` dibaca ulang per operasi berkas; dibatasi `MAX_FILES`/`MAX_SCAN_BYTES`.

@@ -43,9 +43,26 @@ def test_registry_tables_match_the_ci_validator() -> None:
     assert dict(RUNTIME_CONTRACTS) == ci.FALLBACK_CONTRACTS
 
 
-def test_nothing_is_implemented_yet() -> None:
-    # The builtin tools arrive with the ToolGateway (WP-3.1d); until then no agent may be called ready.
-    assert [name for name, tool in TOOL_CATALOG.items() if tool.implemented] == []
+def test_implemented_is_exactly_what_production_registers() -> None:
+    # WP-3.1d2a: readiness (3.1b) must never call a tool implemented that the gateway does not register.
+    from app.tools.builtin import builtin_specs
+
+    specs = builtin_specs()
+    assert {name for name, tool in TOOL_CATALOG.items() if tool.implemented} == {s.name for s in specs}
+    assert all(TOOL_CATALOG[s.name].status == "mvp" and TOOL_CATALOG[s.name].risk == f"R{int(s.risk)}"
+               for s in specs)  # fmt: skip
+
+
+async def test_the_production_gateway_registers_every_builtin() -> None:
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.core.audit import AuditWriter
+    from app.core.redaction import Redactor
+    from app.services.tool_gateway import build_tool_gateway
+    from app.tools.catalog import IMPLEMENTED
+
+    built = build_tool_gateway(sessions=async_sessionmaker(), audit=AuditWriter(Redactor()))
+    assert built.registered == IMPLEMENTED
 
 
 def test_submit_result_is_terminal() -> None:
