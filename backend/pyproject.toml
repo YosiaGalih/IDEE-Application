@@ -107,14 +107,9 @@ allow_indirect_imports = true
 name = "Tools reach only the LLM port app.llm.base (spec WP-3.1 conflict 5, WP-3.1d Goal 8)"
 type = "forbidden"
 source_modules = ["app.tools"]
-forbidden_modules = [
-    "app.llm.anthropic_provider",
-    "app.llm.factory",
-    "app.llm.pricing",
-    "app.llm.retry",
-    "app.llm.scenarios",
-    "app.llm.scripted_provider",
-]
+forbidden_modules = ["app.llm"]
+# The one allowed edge; any other app.llm module, today's or a future one, breaks the contract.
+ignore_imports = ["app.tools.** -> app.llm.base"]
 
 [[tool.importlinter.contracts]]
 name = "Agent permissions come from the validated registry, never agent_profiles rows (3.1b AG-13 C3)"

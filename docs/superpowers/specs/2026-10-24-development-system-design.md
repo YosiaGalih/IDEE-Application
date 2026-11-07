@@ -431,6 +431,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
       - `tool_r3`: kedaluwarsa tidak diatur §11.1 (diperlakukan seperti tolak); resume ke `draft` bila diparkir dari `draft` (ADR-021) vs §11.1 "resume → queued"; satu `tool_r3` terbuka per task (index unik parsial); trigger penjaga status `approvals` (tambahan).
       - Batas konteks 64 KB / 256 KB / 60 KB (konflik 12) diputuskan sebagai tiga ukuran berbeda: satu `tool_result`, file yang tidak pernah dikirim, paket konteks per request.
       - MVP tidak punya tool R3 yang hidup (P2 `disabled`, registry melarang R3 untuk agent llm/profile); jalur `tool_r3` diuji dengan tool R3 uji.
+      - Kontrak Python lain vs ARCHITECTURE §4.2: `ToolSpec` tanpa `capability` dengan `write_paths`, `ToolOutput` tanpa `artifacts`, `tool_defs_for(grant)`, `execute(raw_input: object)`; trigger `approvals` juga membekukan kolom isi approval; R3 hanya dari agent run dan tanpa secret di input. Semua dicatat sebagai **ADR-070 (Proposed)**.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

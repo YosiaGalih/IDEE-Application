@@ -109,21 +109,6 @@ def test_risky_tools_must_be_side_effects(name: str) -> None:
         bare().register(spec(name, Recorder(), side_effect=False))
 
 
-def test_a_secret_cut_at_the_window_edge_never_reaches_the_model() -> None:
-    # AG-13 LOW: heavy redaction can shrink the window below 64 KB, bringing its cut edge into the output.
-    from app.core.audit import AuditWriter
-    from app.core.redaction import Redactor
-    from app.tools.gateway import REDACT_WINDOW_CHARS
-
-    literal = "lit-" + "q7" * 98  # 200 characters, shrinks to [REDACTED]
-    built = ToolGateway(sessions=async_sessionmaker(), audit=AuditWriter(Redactor([literal])), ports=None)  # type: ignore[arg-type]
-    unit = literal + " "
-    content = unit * (REDACT_WINDOW_CHARS // len(unit) + 5)
-    text = built._model_text(content)  # pyright: ignore[reportPrivateUsage]
-    assert literal[:12] not in text
-    assert "truncated" in text
-
-
 def test_an_r3_input_model_cannot_exclude_fields() -> None:
     from pydantic import ConfigDict, Field
 
@@ -134,3 +119,13 @@ def test_an_r3_input_model_cannot_exclude_fields() -> None:
 
     with pytest.raises(ValueError, match="exclude"):
         bare().register(spec("test.r3", Recorder(), input_model=Hiding))
+
+
+def test_tool_statuses_match_the_table() -> None:
+    # The model statuses are the table's, minus the claim ("running") that never reaches a caller.
+    from typing import get_args
+
+    from app.models.enums import TOOL_CALL_STATUSES
+    from app.tools.base import ToolStatus
+
+    assert {*get_args(ToolStatus), "running"} == set(TOOL_CALL_STATUSES)

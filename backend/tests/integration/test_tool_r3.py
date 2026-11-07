@@ -37,7 +37,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     workspace_root,
 )
 from tests.integration.test_task_schema import make_project, make_task
-from tests.tool_fakes import AUDIT, SECRET, Recorder, context, gateway, make_run, spec
+from tests.tool_fakes import AUDIT, Recorder, context, gateway, make_run, spec
 
 clean = denials.clean
 sessions = denials.sessions
@@ -401,24 +401,20 @@ async def test_a_cancelled_run_consumes_no_approval(
     assert approval.status == "approved"
 
 
-async def test_an_r3_call_outside_an_agent_run_is_refused(
+async def test_the_request_audit_names_the_agent(
     sessions: async_sessionmaker[AsyncSession], scope: RunScope
 ) -> None:
-    # AG-13: the payload names the run; without one, another agent of the task could use the approval.
-    built = gateway(sessions, spec("test.r3", Recorder()))
-    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.r3"])
-    result = await built.execute(ctx, "test.r3", {"target": "a"}, tool_use_id="toolu_1")
-    assert (result.status, result.content) == ("denied", DENIALS["r3_needs_agent_run"])
-    assert await approvals_of(sessions, scope.task_id) == []
+    # Spec Goal 5: requested_by is system:tool_gateway; the agent is in the audit metadata.
+    from app.models.audit import AuditEvent
 
-
-async def test_an_r3_input_carrying_a_secret_is_refused(
-    sessions: async_sessionmaker[AsyncSession], scope: RunScope
-) -> None:
-    # AG-13: an approval payload is stored and shown as is; it cannot be redacted without breaking its hash.
     built = gateway(sessions, spec("test.r3", Recorder()))
-    result = await built.execute(
-        r3_context(scope), "test.r3", {"target": f"x {SECRET}"}, tool_use_id="toolu_1"
-    )
-    assert (result.status, result.content) == ("denied", DENIALS["secret_in_input"])
-    assert await approvals_of(sessions, scope.task_id) == []
+    await built.execute(r3_context(scope), "test.r3", {"target": "a"}, tool_use_id="toolu_1")
+    [approval] = await approvals_of(sessions, scope.task_id)
+    async with sessions() as session:
+        requested = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.resource_id == str(approval.id), AuditEvent.action == "approval.requested"
+            )
+        )
+    assert requested is not None
+    assert (requested.actor_id, requested.metadata_["agent_id"]) == ("tool_gateway", "B14")

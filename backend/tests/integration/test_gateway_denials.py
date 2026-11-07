@@ -255,3 +255,29 @@ async def test_a_refusal_comes_before_input_validation(
     built = gateway(sessions, spec("test.read", handler))
     ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=[], offered=["test.read"])
     await assert_denied(sessions, built, ctx, "test.read", {"bogus": 1}, "not_allowed", handler)
+
+
+async def test_calls_that_never_started_do_not_use_the_quota(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope
+) -> None:
+    # /code-review (spec c1): an invalid input or a call cancelled before it started ran no handler.
+    from app.core.cancel import CancelToken
+
+    handler = Recorder()
+    built = gateway(sessions, spec("test.read", handler))
+    ctx = context(
+        task_id=scope.task_id, project_id=scope.project_id, tools=["test.read"], quota={"test.read": 1}
+    )
+    cancelled = CancelToken()
+    cancelled.cancel()
+    stopped = context(
+        task_id=scope.task_id,
+        project_id=scope.project_id,
+        tools=["test.read"],
+        quota={"test.read": 1},
+        cancel=cancelled,
+    )
+    assert (await built.execute(ctx, "test.read", {"bogus": 1})).status == "error"
+    assert (await built.execute(stopped, "test.read", {})).status == "cancelled"
+    assert (await built.execute(ctx, "test.read", {})).status == "ok"
+    assert len(handler.calls) == 1

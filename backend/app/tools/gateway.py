@@ -25,10 +25,10 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter, json_safe
@@ -75,13 +75,14 @@ INVALID_NAME = "<invalid>"
 FINISHED_TASK_STATUSES = frozenset({"completed", "failed", "cancelled", "rejected"})
 # Rows that reached a handler count against a quota.
 _EXECUTED = ("running", "ok", "error", "timeout", "cancelled")
+# ...except calls that ended before any handler: an invalid input, or a run cancelled before the tool started.
+_NOT_STARTED = ("invalid_input", "not_started")
 _TOOL_USE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _KEY_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
 _INPUT_STRING_MAX = 1024
 _INPUT_ITEMS_MAX = 50
 _INPUT_DEPTH_MAX = 6
 _EVENT_SUMMARY_MAX = 200
-_R3_REQUESTER = "system:tool_gateway"
 
 # The text the model receives for each refusal: fixed strings, never an echo of its input.
 DENIALS: Mapping[str, str] = {
@@ -106,7 +107,8 @@ UNKNOWN_OUTCOME = (
     "error: this tool use was started before; it is still running or was interrupted, so its outcome is "
     "unknown. It is not run again."
 )
-_STATUSES: frozenset[str] = frozenset(get_args(ToolStatus))
+# A replayed call reports the status its original row ended with.
+_REPLAYED: Mapping[str, ToolStatus] = {s: s for s in ("ok", "error", "timeout", "cancelled")}
 
 
 class TaskMissing(LookupError):
@@ -115,7 +117,7 @@ class TaskMissing(LookupError):
 
 @dataclass(frozen=True, slots=True)
 class _Outcome:
-    status: str
+    status: ToolStatus
     content: str
     error_code: str | None = None
 
@@ -139,6 +141,11 @@ def _clean_text(text: str) -> str:
     except UnicodeEncodeError:
         text = text.encode("utf-8", "replace").decode()
     return text
+
+
+def _unknown_outcome(spec: ToolSpec) -> str:
+    """Said whenever a side-effect handler was stopped: it may have acted before it stopped."""
+    return " The outcome is unknown: the action may have been applied." if spec.side_effect else ""
 
 
 class _TooDeep(Exception):
@@ -392,7 +399,9 @@ class ToolGateway:
             return await self._finish_now(session, ctx, row, outcome, started)
         if ctx.cancel.cancelled:
             # Before any approval is consumed and before the handler could start (S1/M5).
-            outcome = _Outcome("cancelled", "cancelled: the run was cancelled before the tool started")
+            outcome = _Outcome(
+                "cancelled", "cancelled: the run was cancelled before the tool started", "not_started"
+            )
             return await self._finish_now(session, ctx, row, outcome, started)
         if spec.risk is RiskLevel.R3:
             return await self._authorize_r3(session, ctx, row, spec, validated, started)
@@ -458,7 +467,12 @@ class ToolGateway:
         used = await session.scalar(
             select(func.count())
             .select_from(ToolCall)
-            .where(scope, ToolCall.tool_name == spec.name, ToolCall.status.in_(_EXECUTED))
+            .where(
+                scope,
+                ToolCall.tool_name == spec.name,
+                ToolCall.status.in_(_EXECUTED),
+                or_(ToolCall.error_code.is_(None), ToolCall.error_code.not_in(_NOT_STARTED)),
+            )
         )
         return "quota_exceeded" if (used or 0) >= quota else None
 
@@ -540,15 +554,14 @@ class ToolGateway:
             f"this tool use already ran (status {status}); it is not run again. "
             f"Recorded result{cut}: {summary}"
         )
-        known = status if status in _STATUSES and status != "approval_required" else "error"
-        return ToolResult(call_id, known, content, is_error=known != "ok")  # pyright: ignore[reportArgumentType]
+        return ToolResult(call_id, _REPLAYED.get(status, "error"), content, is_error=status != "ok")
 
     async def _run(self, ctx: ToolContext, spec: ToolSpec, validated: BaseModel | None) -> _Outcome:
         """The handler under its timeout and the cancel token. If the caller is cancelled, the handler is
         stopped and the cancellation propagates (``execute`` records it)."""
         handler = asyncio.ensure_future(spec.handler(ctx, validated))
         cancelled = asyncio.ensure_future(ctx.cancel.wait())
-        unknown = " The outcome is unknown: the action may have been applied." if spec.side_effect else ""
+        unknown = _unknown_outcome(spec)
         try:
             try:
                 async with asyncio.timeout(spec.timeout_s):
@@ -607,7 +620,7 @@ class ToolGateway:
     async def _settle_cancelled(self, ctx: ToolContext, row: ToolCall, spec: ToolSpec) -> None:
         """The caller was cancelled after the claim: record ``cancelled`` (shielded). If that fails the row
         stays ``running`` (a replay closes it as unknown) and the cancellation still propagates."""
-        unknown = " The outcome is unknown: the action may have been applied." if spec.side_effect else ""
+        unknown = _unknown_outcome(spec)
         outcome = _Outcome("cancelled", f"cancelled: the run was cancelled.{unknown}")
         try:
             await asyncio.shield(self._record_detached(ctx, row, spec, outcome))
@@ -712,7 +725,7 @@ class ToolGateway:
         await session.flush()
         await self._event(session, ctx, row, "tool.call_finished", row.output_summary)
         await self._commit(session)
-        return ToolResult(row.id, outcome.status, content, is_error=True)  # type: ignore[arg-type]
+        return ToolResult(row.id, outcome.status, content, is_error=True)
 
     async def _record(
         self,
@@ -746,7 +759,7 @@ class ToolGateway:
             await self._audit_call(session, ctx, row, "tool.executed", result, {"status": outcome.status})
         await self._event(session, ctx, row, "tool.call_finished", summary)
         await self._commit(session)
-        return ToolResult(row.id, outcome.status, content, is_error=outcome.status != "ok")  # type: ignore[arg-type]
+        return ToolResult(row.id, outcome.status, content, is_error=outcome.status != "ok")
 
     async def _audit_call(
         self,

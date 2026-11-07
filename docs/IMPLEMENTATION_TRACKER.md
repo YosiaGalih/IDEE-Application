@@ -2069,7 +2069,39 @@ Keputusan Lead (rinci di spec "Keputusan Lead 3.1d1"):
 Bagian WP-INT yang terpenuhi oleh 3.1d1 (bukti untuk keputusan PO atas #71; status baris WP-INT tidak diubah): ToolPorts untuk approval R3 (ADR-022), jam handler sesudah lock (ADR-024), matriks §11.1 untuk `tool_r3` (ADR-034).
 
 Temuan saat implementasi (sebelum review):
-- **`core/redaction.py` kuadratik** pada deretan huruf panjang: pola kredensial URL mencoba skema dari setiap posisi (64 KB `a` = 2,8 dtk, 1 MB ± 12 mnt [Menebak, ekstrapolasi kuadratik]). Gateway meredaksi output handler sebelum dipotong, jadi output tool bisa memblokir event loop worker (T4). Diperbaiki: skema hanya di awal deretan dan ≤ 32 karakter (1 MB = 64 ms), plus jendela redaksi 256 K karakter di gateway.
+- **`core/redaction.py` kuadratik** pada deretan huruf panjang: pola kredensial URL mencoba skema dari setiap posisi (64 KB `a` = 2,8 dtk, 1 MB ± 12 mnt [Menebak, ekstrapolasi kuadratik]). Gateway meredaksi output handler sebelum dipotong, jadi output tool bisa memblokir event loop worker (T4). Diperbaiki: skema ≤ 32 karakter (1 MB = 64 ms), plus jendela redaksi 256 K karakter di gateway. Versi pertama perbaikan ini (d26ec35) juga memakai lookbehind dan membuat regresi redaksi (AG-13 HIGH, lihat review); lookbehind dihapus di 5b5b28a.
 - **NUL** di input/output membuat baris `tool_calls` tidak bisa ditulis (PostgreSQL menolak `\x00`), sehingga hasil menjadi "tidak diketahui". NUL diganti U+FFFD.
 - **Replay** membaca baris sesudah `rollback()` (objek kedaluwarsa) → `MissingGreenlet`. Ditemukan test, diperbaiki sebelum commit.
 - Mutan G7 (potong sebelum redaksi) awalnya `SURVIVED`: test pertama tidak menaruh secret di garis potong. Test diganti 16 offset di sekitar garis potong.
+
+#### Review WP-3.1d1 @ 622d199
+
+Hasil awal (reviewer tidak menjalankan test DB; DB uji dipakai suite penuh Lead):
+- `kk-backend-reviewer`: **BLOCK**, 1 blocker (B1), 5 should, 4 nit.
+- `kk-silent-failure-hunter`: 0 HIGH, 5 MEDIUM, 7 LOW.
+- `kk-security-reviewer` (AG-13): **NOT SIGNED OFF**, 1 HIGH, 4 LOW, 5 INFO. Syarat warisan dinyatakan TERTUTUP: 3.1a I2/T1 dan L3, 3.1b C3 (untuk gateway; 3.1f wajib memakai `grant_for`), 3.1c1 C3 [Kemungkinan Besar, bukti trigger di test DB], LOW-A, LOW-E.
+
+| Temuan | Penutupan (5b5b28a) | Bukti (test; mutan) |
+|---|---|---|
+| AG-13 HIGH: lookbehind di pola kredensial URL (d26ec35) membuat URL sesudah `+`, `-`, `.`, angka, atau > 32 huruf tidak diredaksi, termasuk baris unified diff | lookbehind dihapus; batas skema `{0,31}` saja sudah linear | `tests/security/test_url_credential_redaction.py` (9 bentuk; 7 merah sebelum perbaikan); G31 |
+| AG-13 INFO 1: `ruff format --check` gagal di 0008 | diformat | `227 files already formatted` |
+| backend B1 + silent M2: input bersarang dalam (`RecursionError` di `redact_obj`), surrogate tunggal (`UnicodeEncodeError` di hash), NUL di payload R3 (jsonb) → `execute` melempar tanpa baris | input dinormalisasi sekali (NUL → U+FFFD, surrogate → `?`, maksimal 32 tingkat); lebih dalam = `invalid_input` dengan baris | `test_a_deeply_nested_input_is_recorded_as_invalid`, `..._to_a_refused_tool_still_leaves_a_denial`, `test_lone_surrogates_never_break_the_record`, `test_nul_in_an_r3_input_still_asks_for_an_approval`; G32, G33 |
+| silent M1: `_record` gagal sesudah handler jalan → baris tetap `running`, tanpa jejak | baris ditandai `error`/`record_failed`, kegagalan diteruskan; pencatatan hasil di-shield | `test_a_failed_record_leaves_an_error_not_a_running_row`; G36 |
+| backend S1 + silent M5: token sudah cancel → handler tetap mulai, approval R3 terkonsumsi | dicek sebelum approval dan klaim → `cancelled` tanpa handler | `test_a_cancelled_run_starts_no_handler`, `test_a_cancelled_run_consumes_no_approval`; G34 |
+| backend S2 + silent M4: `_stop` menelan cancel pemanggil dan menunggu handler tanpa batas | `asyncio.wait({handler}, timeout=STOP_GRACE_S)` (5 dtk) | `test_a_caller_cancelled_while_the_handler_stops_stays_cancelled`, `test_a_handler_that_ignores_cancellation_cannot_hold_the_call`; G35 |
+| backend S3 + silent L4: semua `ValueError` dari port → `input_not_canonical` | hanya `R3InputNotCanonical` | `test_an_approval_store_failure_is_not_reported_as_a_bad_input`; G38 |
+| backend S4: DATA_MODEL belum mencatat 0008 | catatan realisasi `tool_calls` dan `approvals` | `docs/DATA_MODEL.md` |
+| backend S5 + silent M3: baris `running` yatim | replay menutupnya `error`/`outcome_unknown` + audit + event; sweep umum untuk baris yatim tanpa replay = syarat 3.1f (recovery) | `test_replaying_a_running_row_closes_it_as_outcome_unknown`; G37 |
+| silent L1: cancel di antara commit klaim dan handler | klaim + handler dalam satu `try`; cancel sesudah klaim selalu dicatat `cancelled` (shielded) | `test_a_cancelled_caller_still_records_the_call` |
+| silent L2: teks replay | "still running or was interrupted"; ringkasan terpotong diberi penanda | `test_replaying_a_running_row_closes_it_as_outcome_unknown` |
+| silent L3 + AG-13 LOW (b): tool R1+ tanpa `side_effect` bisa jalan dua kali | `register` menolak | `test_risky_tools_must_be_side_effects` ×3; G39 |
+| silent L6: log tanpa korelasi; redaksi `exc_info` | `correlation_id`/`task_id` di log gateway; [Pasti] `format_exc_info` berjalan sebelum `_redact` di structlog | review kode `app/core/logging.py` |
+| silent L7: waiter token gagal dianggap cancel | hanya `ctx.cancel.cancelled` = cancel; selain itu `error`/`internal` + log | review kode |
+| AG-13 LOW: awalan secret di tepi jendela redaksi | 4096 karakter terakhir jendela yang terpotong dibuang | `test_a_secret_cut_at_the_window_edge_never_reaches_the_model`; G40 |
+| AG-13 LOW: payload R3 menyimpan secret | input R3 yang berubah oleh redaksi → `secret_in_input` | `test_an_r3_input_carrying_a_secret_is_refused`; G42 |
+| AG-13 LOW (a): R3 tanpa `agent_run_id` tidak terikat agent | R3 wajib dari agent run → `r3_needs_agent_run` | `test_an_r3_call_outside_an_agent_run_is_refused`; G41 |
+| AG-13 LOW: trigger hanya menjaga `status` | trigger juga membekukan `project_id`, `task_id`, `action_type`, `risk_level`, `payload`, `payload_hash`, `requested_by`, `created_at` sesudah insert | `test_what_was_approved_never_changes` ×5; G43 |
+| AG-13 INFO 5: field `exclude=True` tidak ikut hash R3 | `register` menolak model input R3 dengan field `exclude` | `test_an_r3_input_model_cannot_exclude_fields`; G44 |
+| backend N1: penanda menutupi flush liar | bukan bug: `begin_nested()` melakukan autoflush sebelum savepoint, jadi tulisan liar ditolak trigger | `test_a_stray_status_change_is_not_flushed_under_the_marker` (lulus tanpa perubahan kode) |
+| backend N2–N4 | hash atas input ternormalisasi (tanpa `default=repr`); status replay lewat himpunan `ToolStatus`; komentar `consumed` di handler `tool_r3` | — |
+| Diterima / dibawa | silent L5 + AG-13 INFO 2: gateway tidak memarkir task dan `approval_required` tidak dihitung kuota → engine (3.2) memarkir dan runtime (3.1f) menghentikan run pada `approval_required`; handler `tool_r3` yang `gave_up` meninggalkan task menunggu → engine/RUNBOOK. AG-13 INFO 3: replay tidak menulis baris baru (docstring diperbaiki). AG-13 INFO 4: trigger adalah pengaman tambahan; batas sebenarnya tidak adanya tool approval (R4 ditolak `register`) | spec "Syarat warisan → pemilik" |

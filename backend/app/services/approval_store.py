@@ -146,10 +146,11 @@ async def create(
     actor_ip: str | None = None,
     audit_actor: str | None = None,
     renewed_from: uuid.UUID | None = None,
+    metadata: Mapping[str, object] | None = None,
     now: datetime | None = None,
 ) -> Approval:
     """A ``pending`` approval bound to the hash of exactly this action, expiring per §11.1. ``audit_actor``:
-    who caused this request when it is not the requester (a renewal)."""
+    who caused this request when it is not the requester (a renewal); ``metadata``: more for its audit."""
     if action_type not in EXPIRY or action_type not in REQUESTABLE:
         raise ValueError(f"{action_type} cannot be requested as an approval (no handler)")
     at = _now(now)
@@ -176,6 +177,7 @@ async def create(
             "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
             "requested_by": requested_by,
             **({"renewed_from": str(renewed_from)} if renewed_from else {}),
+            **(metadata or {}),
         },
         ip=actor_ip,
     )

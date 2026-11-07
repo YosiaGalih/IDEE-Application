@@ -347,6 +347,17 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 **Keputusan:** Build iOS/macOS (Flutter/React Native iOS), Windows/.NET Framework, dan emulator Android untuk E2E tidak dijalankan di sandbox VPS; KodeKantor menandainya dan membaca status CI eksternal (runner macOS/Windows milik pengguna) sebagai bukti. Build Android dan web Flutter tetap di sandbox.
 **Konsekuensi:** Tidak ada janji build iOS dari KodeKantor; PO memutuskan runner eksternal bila dibutuhkan (OQ-05).
 
+## ADR-070 — ToolGateway inti (WP-3.1d1)
+**Status:** Proposed (keputusan Lead di bawah mandat PO "jalankan P2, P3 dan P4"; konflik #72 butir 3.1d). Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md`.
+**Konteks:** ARCHITECTURE §4.2 dan DATA_MODEL `tool_calls` ditulis sebelum ada gateway yang harus menjamin bukti saat crash, replay sesudah worker restart, dan pembatalan. Review AG-13 WP-3.1c1 (C3) meminta penulis status approval dijaga.
+**Keputusan:**
+1. Kontrak Python (beda dari §4.2): `ToolContext(task_id, project_id, agent_run_id, grant, offered, correlation_id, cancel, workspace)` tanpa `db` dan tanpa `agent_id`/`permissions` (diganti `grant: AgentGrant` dari registry tervalidasi) dan dengan `offered`; gateway memegang `ToolPorts` dan sesi sendiri. `ToolSpec` tanpa `capability`, dengan `write_paths`; `ToolOutput` tanpa `artifacts` (menyusul bersama tabel `artifacts`); `ToolResult.status` tambah `cancelled`; `tool_defs_for(grant)`; `execute(raw_input: object)` (input model belum tentu objek).
+2. `tool_calls`: status tambah `running` (klaim di-commit sebelum handler) dan `cancelled`; kolom `agent_id`, `tool_use_id`, `error_code`, `updated_at`; idempotensi hanya untuk tool side effect; setiap tool R1+ wajib side effect.
+3. Urutan cek: kuota (dan replay tool use yang sama) sebelum risk/approval.
+4. `tool_r3`: satu terbuka per task; dikonsumsi gateway saat tool dijalankan; hanya dari agent run; input yang berubah oleh redaksi ditolak; model input R3 tidak boleh mengecualikan field.
+5. Trigger `approvals_status_guard`: insert hanya `pending`; status hanya lewat `approval_store` dan sepanjang siklus; kolom isi approval tidak berubah sesudah insert.
+**Konsekuensi:** ARCHITECTURE §4.2 dan DATA_MODEL perlu diselaraskan saat ADR ini diterima (DATA_MODEL sudah diberi catatan realisasi). AgentRuntime (3.1f) membangun `ToolContext` dari `grant_for` dan tidak memegang lock baris task selama `execute`.
+
 ## Pengecualian keamanan (SECURITY_MODEL §11)
 
 Temuan audit yang belum dapat diperbaiki dicatat di sini: siapa, alasan, mitigasi, tanggal kedaluwarsa. Job CI yang mengabaikan temuan hanya mengabaikannya sampai tanggal kedaluwarsa, lalu merah lagi.

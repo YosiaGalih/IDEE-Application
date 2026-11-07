@@ -18,10 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit import AuditWriter
 from app.models.approvals import Approval
 from app.services import approval_store
-from app.tools.base import R3InputNotCanonical, R3Ticket
+from app.tools.base import R3InputNotCanonical, R3Ticket, RiskLevel
 
 REQUESTER = "system:tool_gateway"
-RISK_LEVEL = 3
 
 
 class ToolR3Approvals:
@@ -81,8 +80,9 @@ class ToolR3Approvals:
             action_type=approval_store.TOOL_R3,
             payload=payload,
             summary=summary,
-            risk_level=RISK_LEVEL,
+            risk_level=int(RiskLevel.R3),
             requested_by=REQUESTER,
+            metadata={"agent_id": agent_id},  # spec Goal 5: the agent is named in the audit
             now=now,
         )
         return R3Ticket(created.id, consumed=False)

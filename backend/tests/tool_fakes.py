@@ -93,7 +93,7 @@ def spec(
 
 
 def permissions(**overrides: str) -> PermissionProfile:
-    values = {
+    values: dict[str, str] = {
         "filesystem": "scoped_write",
         "sandbox": "allow",
         "git": "branch_commit",

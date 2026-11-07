@@ -84,7 +84,11 @@ async def allow_approval_status_writes(conn: AsyncSession | AsyncConnection) -> 
     Outside tests only ``app.services.approval_store`` sets this marker; the ``approvals_status_guard``
     trigger (migration 0008) refuses every other status write, and still refuses moves outside the cycle.
     """
-    await conn.execute(text("SELECT set_config('kk.approval_status_writer', 'approval_store', true)"))
+    from sqlalchemy import func, select
+
+    from app.models.approvals import APPROVAL_WRITER, APPROVAL_WRITER_SETTING
+
+    await conn.execute(select(func.set_config(APPROVAL_WRITER_SETTING, APPROVAL_WRITER, True)))
 
 
 async def reset_data(engine: AsyncEngine) -> None:

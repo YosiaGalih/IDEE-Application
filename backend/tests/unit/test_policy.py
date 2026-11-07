@@ -148,3 +148,55 @@ def test_finished_task_statuses_match_the_state_machine() -> None:
     from app.workflow.states import FINISHED
 
     assert {status.value for status in FINISHED} == FINISHED_TASK_STATUSES
+
+
+# The full matrix: every catalog tool against each of its preconditions (TEST_STRATEGY §2 test_policy.py).
+SATISFY: dict[str, dict[str, str]] = {
+    "fs_read": {"filesystem": "read_only"},
+    "fs_write": {"filesystem": "test_only"},
+    "fs_scoped_write": {"filesystem": "scoped_write"},
+    "git_read": {"git": "read"},
+    "git_branch_commit": {"git": "branch_commit"},
+    "network_allowlist": {"network": "allowlist"},
+    "provider_web": {"network": "provider_web"},
+    "deployment": {"deployment": "staging_with_approval"},
+    "portfolio_draft": {"portfolio": "draft"},
+    "not_confidential": {"data_sensitivity_max": "internal"},
+    "moderation": {},
+}
+VIOLATE: dict[str, dict[str, str]] = {
+    "fs_read": {"filesystem": "none"},
+    "fs_write": {"filesystem": "read_only"},
+    "fs_scoped_write": {"filesystem": "docs_only"},
+    "git_read": {"git": "none"},
+    "git_branch_commit": {"git": "read"},
+    "network_allowlist": {"network": "deny"},
+    "provider_web": {"network": "deny"},
+    "deployment": {"deployment": "deny"},
+    "portfolio_draft": {"portfolio": "none"},
+    "not_confidential": {"data_sensitivity_max": "confidential"},
+    "moderation": {},
+}
+MATRIX = [(name, pre) for name, tool in TOOL_CATALOG.items() for pre in (*tool.preconditions, "-")]
+
+
+@pytest.mark.parametrize(("name", "pre"), MATRIX, ids=[f"{n}:{p}" for n, p in MATRIX])
+def test_every_catalog_precondition_is_enforced(name: str, pre: str) -> None:
+    from tests.tool_fakes import permissions
+
+    tool = TOOL_CATALOG[name]
+    base: dict[str, str] = {"sandbox": "allow", "filesystem": "none", "git": "none"}
+    for needed in tool.preconditions:
+        base.update(SATISFY[needed])
+    tools = frozenset({name, "moderation.check_image_prompt"})
+    assert unmet_preconditions(tool, permissions(**base), tools) == []  # every precondition met: allowed
+    if pre == "-":
+        if tool.risk == "R2":
+            assert unmet_preconditions(tool, permissions(**{**base, "sandbox": "deny"}), tools) == [
+                "sandbox_allow"
+            ]
+        return
+    if pre == "moderation":
+        assert pre in unmet_preconditions(tool, permissions(**base), frozenset({name}))
+        return
+    assert pre in unmet_preconditions(tool, permissions(**{**base, **VIOLATE[pre]}), tools)
