@@ -69,7 +69,7 @@ Prinsip:
 
 | Service | Image | User | Network | Hak / hardening | Limit (CPU / RAM / PID) | Healthcheck |
 |---|---|---|---|---|---|---|
-| `caddy` | `kodekantor/caddy` (dibangun dari sumber: Caddy 2.11.9, Go 1.26.10; `infra/caddy/Dockerfile`) | root tanpa cap (hanya `NET_BIND_SERVICE`) | public, edge | read-only, tmpfs `/tmp` | 0.5 / 256M / 256 | admin API `:2019/config/` |
+| `caddy` | `kodekantor/caddy` (dibangun dari sumber: Caddy 2.11.7, Go 1.26.10; `infra/caddy/Dockerfile`) | root tanpa cap (hanya `NET_BIND_SERVICE`) | public, edge | read-only, tmpfs `/tmp` | 0.5 / 256M / 256 | admin API `:2019/config/` |
 | `web` | `kodekantor/web` (build `frontend/`) | 101 | edge | cap_drop ALL, read-only | 0.25 / 128M / 128 | `GET :8080/healthz` |
 | `api` | `kodekantor/backend` (build root, `backend/Dockerfile`) | 10001 | edge, app | cap_drop ALL, read-only, tmpfs `/tmp` 512M (upload spool), init | 1.0 / 1.5G / 512 | `GET :8000/api/v1/health/ready` |
 | `migrate` | `kodekantor/backend` | 10001 | app | idem, `restart: "no"` | 0.5 / 512M / 256 | — (one-shot; api/worker/scheduler menunggu `service_completed_successfully`) |

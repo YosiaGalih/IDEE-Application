@@ -76,6 +76,12 @@ jobs:
         run: docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" up -d --build --wait --wait-timeout 300
       - name: Health through Caddy
         run: scripts/healthcheck.sh --wait 120
+      # ADR-026 (3) with the image this repo builds (AG-13 PR #23 M2): from sandbox-manager, the proxy answers what
+      # the manager needs and refuses everything else with 403.
+      - name: Socket proxy allowlist
+        run: |
+          docker compose -f infra/compose.yml --env-file "$KK_ENV_FILE" exec -T sandbox-manager python - \
+            < infra/tests/socket_proxy_probe.py
       # WP-2.1a: a project created through Caddy has its repository and first commit in the workspace volume
       # (git in the backend image, workspace writable by uid 10001).
       - name: Create a project

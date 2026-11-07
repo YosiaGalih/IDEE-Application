@@ -417,13 +417,17 @@ class DockerDriver:
         finally:
             watchdog.cancel()
             await asyncio.gather(watchdog, return_exceptions=True)
-        state = await self.engine.inspect(record.container_id) or {}
+        inspected = await self.engine.inspect(record.container_id)
+        state = inspected or {}
         record.image_digest = state.get("Image")
         oom_killed = bool((state.get("State") or {}).get("OOMKilled"))
         if breach:  # the watchdog killed the container
             return ("error", exit_code, breach[0])
+        state_unknown = False
         if not oom_killed and exit_code == SIGKILL_EXIT and status not in ("timeout", "killed"):
-            oom_killed = await self._late_oom(record.container_id)
+            late = await self._late_oom(record.container_id)
+            oom_killed = late is True
+            state_unknown = late is None and inspected is None  # no inspect answered (AG-13 PR #23 L3)
         await asyncio.to_thread(self._collect_artifacts, record, artifacts)
         try:
             grown = await asyncio.to_thread(tree_bytes, artifacts)  # read-only runs can still write here
@@ -437,6 +441,8 @@ class DockerDriver:
             return ("error", exit_code, "DISK_LIMIT")  # written faster than the watchdog looked
         if oom_killed and status not in ("timeout", "killed"):
             return ("error", exit_code, "OOM_KILLED")
+        if state_unknown:
+            return ("error", exit_code, "DOCKER_ERROR")  # SIGKILLed for a reason the engine never told
         if status == "succeeded":
             for name in run.profile.artifacts:
                 state_of = record.artifact_status.get(name, "missing")
@@ -445,16 +451,21 @@ class DockerDriver:
                     return ("error", exit_code, code)
         return (status, exit_code, None)
 
-    async def _late_oom(self, container_id: str) -> bool:
-        """Whether the engine records an OOM kill within OOM_SETTLE_S of a SIGKILL exit."""
+    async def _late_oom(self, container_id: str) -> bool | None:
+        """Whether the engine records an OOM kill within OOM_SETTLE_S of a SIGKILL exit; ``None`` when no
+        inspect in that window answered at all."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + OOM_SETTLE_S
+        answered = False
         while loop.time() < deadline:
             await asyncio.sleep(OOM_POLL_S)
-            state = await self.engine.inspect(container_id) or {}
+            state = await self.engine.inspect(container_id)
+            if state is None:
+                continue
+            answered = True
             if (state.get("State") or {}).get("OOMKilled"):
                 return True
-        return False
+        return False if answered else None
 
     async def _watch(self, record: RunRecord, container_id: str, artifacts: Path, breach: list[str]) -> None:
         """Kill the container once its artefact folder outgrows its bound; the code goes to ``breach``."""

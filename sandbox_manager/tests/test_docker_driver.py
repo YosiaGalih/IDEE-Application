@@ -434,6 +434,18 @@ async def test_a_sigkill_without_an_oom_stays_the_code_s_own_exit(
     assert 2 <= fake.inspects <= 10  # looked again, but not forever
 
 
+async def test_a_sigkill_whose_state_cannot_be_read_is_not_the_code_s_failure(
+    settings: Settings, profiles: dict[str, Profile], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AG-13 PR #23 L3: no inspect answered, so nobody knows why the run was SIGKILLed; "failed" would blame
+    # the code.
+    monkeypatch.setattr("sandbox_manager.docker_driver.OOM_SETTLE_S", 0.3)
+    task_workspace(settings)
+    fake = FakeEngine(exit_code=137, fail={rf"/containers/{CID}/json": 404})
+    record = await execute(settings, fake, a_run(settings, profiles))
+    assert (record.status, record.exit_code, record.error_code) == ("error", 137, "DOCKER_ERROR")
+
+
 async def test_an_ordinary_exit_is_inspected_once(settings: Settings, profiles: dict[str, Profile]) -> None:
     task_workspace(settings)
     fake = FakeEngine(exit_code=1)
