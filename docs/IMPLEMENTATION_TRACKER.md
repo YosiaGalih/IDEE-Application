@@ -2266,3 +2266,50 @@ $ uv run pytest -q -p no:cacheprovider          # suite penuh, sendirian, DB kod
 - **3.1f/3.2:** membuat worktree task + `base_commit`/`branch_name`; satu panggilan tool per task pada satu waktu (TOCTOU, Keputusan Lead 3.1d2 #5); `test_prompt_injection.py` dan `test_secret_redaction.py` ujung-ke-ujung.
 - **WP `tests.run` (R2):** kode sandbox bisa menyalin berkas tersembunyi ke nama terlihat (SECURITY_MODEL §13).
 - **Utang performa (backend M4, diterima):** `.agentignore` dibaca ulang per operasi berkas; dibatasi `MAX_FILES`/`MAX_SCAN_BYTES`.
+
+### WP-3.1d2b (🔒 tulis worktree, commit git, port DB) — `code.write_file`, `code.apply_patch`, `code.delete_file`, `git.commit_task`, `repo.search_symbol` (FR-059–062 bagian builtin; T2, T5; syarat warisan WP-2.1c I-b dan I-6)
+
+Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md` (Goals 3.1d2b, Keputusan Lead 3.1d2b #1–#7, Review Focus 3.1d2b). Plan: `docs/superpowers/plans/2026-11-07-wp-3.1d2b-write-builtins.md`.
+
+**Syarat WP-3.1d2a yang dicatat di sini [Pasti]:** PR #25 CI 9/9 `success` di 547d489 (backend-lint, backend-types, backend-test, sandbox-test, sandbox-isolation, frontend, infra-config, clean-install, security-scan). Run pertama di 8f98fbd merah di `security-scan`: gitleaks `jwt` menandai token contoh publik jwt.io pada empat baris test. Ditutup dengan fingerprint di `.gitleaksignore` dan fixture yang dirakit dengan `+`. Pada saat bagian ini ditulis, PR #25 sudah siap merge dan menunggu PO.
+
+**Keterbatasan nyata:** sama dengan 3.1d2a. Belum ada kode yang membuat worktree task, jadi builtin ini diuji dengan worktree fixture dan baru dipakai produk setelah runtime/engine (3.1f/3.2).
+
+**Bukti:**
+
+```text
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports   # @ b77f949
+All checks passed! · 254 files already formatted · 0 errors · Contracts: 5 kept, 0 broken
+$ uv run pytest -q -p no:cacheprovider          # suite penuh, sendirian, DB kodekantor_test_wt2
+2735 passed in 364.50s (0:06:04)
+```
+
+- Test per bagian:
+  - integrasi: `tests/integration/test_builtin_code.py`, `test_builtin_commit.py` (lock selama staging + commit, nama non-UTF-8 dan yang tidak sempat dicek, berkas diganti folder), `test_builtin_symbols.py`;
+  - keamanan simbol: `tests/security/test_builtin_symbols_policy.py` (hit tersembunyi tanpa jejak, folder symlink tidak diikuti, setiap jawaban terbungkus dan teredaksi);
+  - keamanan tulis/commit: `tests/security/test_builtin_writes.py` (path terlindung tidak pernah dibuat, diubah, atau dihapus, juga lewat patch; patch `test_only` yang menyentuh `src/` ditolak utuh; commit tidak pernah membawa yang ditolak AGENT_READ atau AGENT_WRITE, termasuk workflow yang ditanam atau dihapus dan `.agentignore` yang dikosongkan; folder `.github` atau folder lain yang diganti berkas ditolak; repo bersarang dan submodule tracked tidak pernah di-commit);
+  - adapter: `tests/integration/test_git_adapter.py` (commit berkas persis, 18 000 nama lewat stdin, perubahan di luar berkas → ditolak dan index kembali ke HEAD, bukti keempat `_landed` dengan tree lain, bukti yang tidak terbaca, stdin yang tidak dibaca git, timeout saat stdin masih ditulis);
+  - unit: `tests/unit/test_paths.py` (`.kk/` AGENT_WRITE), `tests/unit/test_tool_catalog.py` (`implemented` = terdaftar).
+- Mutan C1–C16 (plan + review) merah satu per satu pada kode akhir; skrip dan keluarannya tersimpan [Pasti]:
+  - **C6a** (cek awalan `kk/task-` dihapus) awalnya bertahan. Test lama memakai `branch="main"` sementara worktree ada di `kk/task-…`, sehingga yang menolak adalah cek kecocokan branch. Ditutup dengan `test_a_worktree_on_a_non_task_branch_takes_no_commit`, lalu C6a merah.
+  - C14 (commit mengambil nama yang ditolak AGENT_WRITE), C15 (gitlink di-commit) dan C16 (folder induk symlink diukur) ditambahkan dari review, semuanya merah.
+
+**Penyimpangan proses:** `code.py` ditulis sesudah berkas test-nya, tetapi test belum dijalankan merah sebelum kode ada (merahnya hanya karena modul belum ada). Kompensasinya mutan C1–C4.
+
+**Review:**
+
+| Review | Hasil | Penutupan |
+|---|---|---|
+| `kk-backend-reviewer` | **APPROVE WITH NITS**, tanpa CRITICAL/HIGH | MEDIUM: diff di-parse tiga kali di event loop. Parse di handler dipindah ke thread; parse di `write_paths` tetap sinkron (kontrak gateway), diukur 53 ms untuk 200 berkas di batas 1 MiB, diterima. MEDIUM: jalur `_feed` tanpa test langsung, kini dua test. LOW: feeder yang dibatalkan kini di-await |
+| `kk-silent-failure-hunter` | 3 MEDIUM, 4 LOW | M1: bukti keempat `_landed` di luar `try`, sehingga errornya menelan error asli dan melewati reset index; kini di dalam, kode keluar selain 0/1 = tidak terbukti (test merah dulu). M2: jawaban commit dari `commit_files(sha)`, bukan daftar permintaan. M3: `repo.search_symbol` menyebut bila indeks dari commit lain atau worktree kotor. L1: hit yang tidak sempat dicek dipisah dari yang tersembunyi. L3: stdin yang tidak dibaca git dicatat di log. L4: `head:` saat tidak ada yang di-commit. L2 (tidak ada baris `Repository` sama dengan belum diindeks) diterima |
+| AG-13 @ 113e396/3874cc4 | **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH. MEDIUM-1: `git.commit_task` hanya menyaring AGENT_READ, sehingga workflow/action yang ditanam atau dihapus kode sandbox dan `.agentignore` yang dikosongkan ikut ter-commit. PoC: `['.agentignore', '.github/actions/setup/action.yml', '.github/workflows/ci.yml', '.github/workflows/evil.yml', 'src/a.py']`; test lama malah mengunci perilaku itu. LOW-1: jumlah hit tersembunyi di `repo.search_symbol` adalah oracle; PoC memulihkan nama simbol tersembunyi `acquire_bank_xk9` dalam 264 panggilan. LOW-2: penolakan di handler tercatat `error`, bukan `denied`. INFO-1..6 | 87ac985: nama yang ditolak AGENT_READ **atau** AGENT_WRITE tidak di-commit; hit tersembunyi tanpa jejak; tanpa `git status` per panggilan. e099492 + b77f949: ADR-072, SECURITY_MODEL §13 (hard link/salinan ke nama terlihat, LOW-2, residual `truncated`, parse `write_paths`, `.KK`) dan baris R1. LOW-2 dibawa (di bawah). INFO-2 (newline di nama memalsukan baris, tetap di dalam `<untrusted_content>`) diterima seperti LOW-5 3.1d2a |
+| AG-13 delta @ 87ac985 | Syarat 1 (MEDIUM-1) dan 2 (LOW-1) **terpenuhi**: PoC write-protected meng-commit `['src/a.py']` saja; `.github` diganti berkas → `hidden_paths_affected`; PoC oracle gagal di langkah pertama; residual `truncated` (> 5000 kandidat) disetujui bila dicatat di §13. Syarat 3 menunggu dokumen dan tracker. INFO baru: setiap folder dianggap repo bersarang, sehingga berkas yang diganti folder biasa ditolak | b77f949: hanya folder berisi `.git` yang dianggap repo bersarang (`test_a_file_replaced_by_a_folder_is_an_ordinary_change`; C15 tetap merah); dokumen §13/R1 di e099492 dan b77f949; tracker ini |
+| `/code-review` (Standards + Spec) | Standards: tracker belum ada; keputusan yang mengubah kontrak tanpa ADR; test Review Focus 4 bukan di `tests/security/`; smell (aturan hapus menyalin precondition, batas pesan commit disalin, `_symbol_rows` mengembalikan tuple, `.kk` di banyak tempat, label `[Menebak]`). Spec: gitlink tracked ikut ter-commit (direproduksi); fixture repo bersarang palsu (`nested/.git/HEAD` bukan repo); test lock lemah; `lstat` di `search_symbol` mengikuti symlink induk; tidak ada test redaksi nama simbol | 87ac985 dan e099492: ADR-072; test simbol di `tests/security/`; precondition `fs_scoped_write` dari katalog, `MESSAGE_MAX` adapter, `SymbolRow`, `SANDBOX_OUTPUT_DIR`; gitlink dan repo bersarang sungguhan; test tulis-saat-commit; `below_a_non_folder` di `_readable`; redaksi nama simbol. Tidak dikerjakan (penilaian): salinan cache `lstat`, argumen `commit(paths, files)`, `ToolPorts.symbols` sebagai pembawa port |
+
+**Status sign-off AG-13 WP-3.1d2b: SIGNED OFF 🔒 dengan syarat yang terpenuhi di PR ini**: (1) MEDIUM-1 ditutup dengan test (delta @ 87ac985); (2) LOW-1 ditutup, residual `truncated` dicatat di §13; (3) LOW-2 dicatat di bawah dengan pemilik. Menurut AG-13, sign-off penuh berlaku begitu dokumen dan tracker ini masuk PR, tanpa review ulang kode.
+
+**Syarat yang dibawa:**
+- **3.1f (AG-13 3.1d2b LOW-2):** gateway mengenal penolakan kebijakan dari handler (`path_denied`, `delete_not_allowed`, `not_task_branch`) sebagai `denied` + audit `tool.denied`, sebelum agent pertama berjalan.
+- **3.1f/3.2:** membuat worktree task + `base_commit`; satu panggilan tool per task (commit dan sandbox tidak bersamaan); `test_prompt_injection.py` ujung-ke-ujung memakai `code.write_file` dengan path `/etc/passwd` (fixture SECURITY_MODEL T1).
+- **WP `tests.run` (R2):** laporan test di `.kk/` dibaca sebagai bukti hanya dari run sandbox itu sendiri (agent tidak dapat menulis `.kk/`, tetapi kode sandbox dapat).
+- **Review-first:** diff task, termasuk berkas di atas `AGENT_READ_LIMIT` yang ikut commit, ditinjau manusia sebelum apply (SECURITY_MODEL §13).
