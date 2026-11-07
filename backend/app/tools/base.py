@@ -78,11 +78,23 @@ ToolStatus = Literal["ok", "error", "denied", "timeout", "approval_required", "c
 
 
 @dataclass(frozen=True, slots=True)
+class Untrusted:
+    """Where an output's content comes from when it is data the model must not obey (T1, SECURITY_MODEL
+    §9): ``source`` is the tool, ``path`` the file or folder it read (untrusted text too, escaped by the
+    gateway)."""
+
+    source: str
+    path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ToolOutput:
-    """What a handler returns: text or a JSON object for the model, and references to real evidence."""
+    """What a handler returns: text or a JSON object for the model, and references to real evidence.
+    ``untrusted``: the gateway wraps the content in ``<untrusted_content>`` after redaction and cutting."""
 
     content: str | Mapping[str, Any]
     evidence_refs: tuple[str, ...] = ()
+    untrusted: Untrusted | None = None
 
 
 class ToolError(Exception):

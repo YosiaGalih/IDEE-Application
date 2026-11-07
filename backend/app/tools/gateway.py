@@ -48,10 +48,12 @@ from app.tools.base import (
     ToolResult,
     ToolSpec,
     ToolStatus,
+    Untrusted,
 )
 from app.tools.catalog import TOOL_CATALOG, ToolInfo
 from app.tools.policy import is_r4, unmet_preconditions, write_allowed
 from app.tools.scope import TaskScope, lock_task_scope
+from app.tools.untrusted import CLOSE_TAG, neutralise, open_tag
 
 logger = get_logger(__name__)
 
@@ -129,6 +131,7 @@ class _Outcome:
     status: ToolStatus
     content: str
     error_code: str | None = None
+    untrusted: Untrusted | None = None
 
 
 def _canonical_name(tool_name: object) -> str | None:
@@ -608,7 +611,7 @@ class ToolGateway:
             )
             return _Outcome("error", "error: the tool failed with an internal error", "internal")
         try:
-            return _Outcome("ok", _content_text(output))
+            return _Outcome("ok", _content_text(output), untrusted=output.untrusted)
         except (TypeError, ValueError):
             logger.warning("tool_output_not_json", tool=spec.name)
             return _Outcome("error", "error: the tool returned an unreadable result", "internal")
@@ -688,13 +691,24 @@ class ToolGateway:
 
     # --- recording ----------------------------------------------------------------------------------------
 
-    def _model_text(self, content: str) -> str:
-        """Redacted first, then cut: a cut must never split a secret so that its pattern no longer matches."""
+    def _model_text(self, content: str, untrusted: Untrusted | None = None) -> str:
+        """Redacted first, then cut: a cut must never split a secret so that its pattern no longer matches.
+        Untrusted content is neutralised and cut to what fits beside its wrapper, then wrapped (3.1d2a)."""
+        if untrusted is None:
+            return self._redacted_cut(content, MAX_RESULT_BYTES, lambda text: text)
+        redact = self._audit.redactor.redact
+        path = None if untrusted.path is None else redact(_clean_text(untrusted.path))
+        opening = open_tag(untrusted.source, path)
+        budget = MAX_RESULT_BYTES - len(opening.encode()) - len(CLOSE_TAG.encode())
+        return opening + self._redacted_cut(content, budget, neutralise) + CLOSE_TAG
+
+    def _redacted_cut(self, content: str, limit: int, after_redaction: Callable[[str], str]) -> str:
+        redact = self._audit.redactor.redact
         if len(content) <= REDACT_WINDOW_CHARS:
-            return _truncate(self._audit.redactor.redact(_clean_text(content)), MAX_RESULT_BYTES)
+            return _truncate(after_redaction(redact(_clean_text(content))), limit)
         total = len(_clean_text(content).encode())
-        redacted = self._audit.redactor.redact(_clean_text(content[:REDACT_WINDOW_CHARS]))
-        return _truncate(redacted[:-WINDOW_EDGE_CHARS], MAX_RESULT_BYTES, total)
+        redacted = after_redaction(redact(_clean_text(content[:REDACT_WINDOW_CHARS])))
+        return _truncate(redacted[:-WINDOW_EDGE_CHARS], limit, total)
 
     def _duration(self, started: float) -> int:
         return max(0, int((self._clock() - started) * 1000))
@@ -745,7 +759,7 @@ class ToolGateway:
         outcome: _Outcome,
         started: float,
     ) -> ToolResult:
-        content = self._model_text(outcome.content)
+        content = self._model_text(outcome.content, outcome.untrusted)
         summary = content[:SUMMARY_MAX]
         updated = await session.scalar(
             update(ToolCall)
