@@ -269,6 +269,8 @@ PRD §17 meminta ASVS sebagai baseline dan memilih versi yang berlaku saat basel
 | Data yang dikirim ke provider eksternal | Diterima dengan pernyataan + kill switch (ADR-011) | Verifikasi kebijakan retensi akun Claude Platform saat deployment |
 | Biaya tak terkendali bila harga berubah | `pricing.yaml` berversi, ditandai *perlu verifikasi* (ADR-004) | Verifikasi tarif terhadap halaman resmi saat deployment |
 | Egress untuk install dependency (P1) memperluas permukaan supply-chain | Default off (ADR-007) | Aktifkan hanya dengan allowlist + `--ignore-scripts`; tinjau lockfile |
+| Policy AGENT_READ (denylist, `.agentignore`) bukan batas terhadap **kode sandbox**: kode yang ditulis agent lalu dijalankan (R2, `tests.run`) bisa menyalin berkas tersembunyi worktree ke nama yang terlihat, lalu builtin R0 membacanya (review AG-13 WP-3.1d2a INFO-1) | Diterima untuk P3 (belum ada tool R2 yang hidup); `.agentignore` `repo/` tetap berlaku untuk akses agent sehingga sandbox tidak bisa menghapus penyembunyian | WP `tests.run` (R2): pindai keluaran/worktree sesudah run dengan `security.scan_secrets` dan tandai berkas yang muncul sesudah run; secret sungguhan tidak pernah ada di worktree (ADR-053) |
+| `*.env` adalah nama secret juga untuk tulis user (WP-3.1d2a): `config/prod.env` tidak bisa dibuat/diedit lewat IDE, folder bernama `*.env` tersembunyi seluruhnya untuk agent | Disengaja, sama dengan `.env*` | Pesan UI yang menjelaskan penolakan (WP layar IDE berikutnya) |
 
 
 ## Lampiran — Ancaman perluasan platform (ADR-045, Proposed)
