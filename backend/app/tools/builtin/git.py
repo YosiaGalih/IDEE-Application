@@ -71,25 +71,29 @@ async def status(ctx: ToolContext, raw: StatusInput) -> ToolOutput:
 
 
 def _select(root: Path, names: list[str]) -> tuple[list[str], list[str], int]:
-    """(to diff, over AGENT_READ_LIMIT, deferred): a working-tree file over the limit is never diffed for the
-    agent (ARCHITECTURE §7); past STAGE_MAX_BYTES the rest waits for another call, because the scratch index
-    lives on the worker's tmpfs (AG-13 WP-3.1d2a MEDIUM-4). A deleted file stages nothing."""
+    """(to diff, over AGENT_READ_LIMIT or unreadable, deferred): a working-tree file over the limit is never
+    diffed for the agent (ARCHITECTURE §7); past STAGE_MAX_BYTES the rest waits for another call, because the
+    scratch index lives on the worker's tmpfs (AG-13 WP-3.1d2a MEDIUM-4). A deleted file stages nothing."""
     wanted: list[str] = []
-    large: list[str] = []
+    refused: list[str] = []
+    deferred = 0
     staged = 0
-    for index, name in enumerate(names):
+    for name in names:
         try:
             size = os.lstat(root / name).st_size
-        except OSError:
+        except FileNotFoundError:
             size = 0  # deleted in the working tree: its old content is checked after the diff
-        if size > AGENT_READ_LIMIT:
-            large.append(name)
+        except OSError:
+            refused.append(name)
             continue
-        if staged + size > STAGE_MAX_BYTES and wanted:
-            return wanted, large, len(names) - index
-        staged += size
-        wanted.append(name)
-    return wanted, large, 0
+        if size > AGENT_READ_LIMIT:
+            refused.append(name)
+        elif wanted and staged + size > STAGE_MAX_BYTES:
+            deferred += 1
+        else:
+            staged += size
+            wanted.append(name)
+    return wanted, refused, deferred
 
 
 def _block(file: DiffFile) -> list[str]:
@@ -151,14 +155,15 @@ async def diff(ctx: ToolContext, raw: DiffInput) -> ToolOutput:
     in_scope = [n for n in kept.shown if within(n, scopes)]
     wanted, large, deferred = await asyncio.to_thread(_select, workspace.root, in_scope)
     notes = counted_notes(kept.hidden, kept.unchecked, names.skipped, "changed paths")
-    notes += [f"[{n} not shown: larger than the agent read limit]" for n in large]
+    notes += [f"[{n} not shown: larger than the agent read limit, or unreadable]" for n in large]
     if deferred:
         notes.append(f"[{deferred} more changed files not diffed in one call; pass paths to see them]")
     if not wanted:
         outside = len(kept.shown) - len(in_scope)
-        head = (
-            f"[no changes within paths; {outside} changed paths outside them]" if outside else "[no changes]"
-        )
+        if outside:
+            head = f"[no changes within paths; {outside} changed paths outside them]"
+        else:
+            head = "[no changes shown]" if large or deferred else "[no changes]"
         return ToolOutput("\n".join([head, *notes]), untrusted=Untrusted("git.diff"))
     with workspace_errors():
         got: Diff = await git.diff(
@@ -166,7 +171,8 @@ async def diff(ctx: ToolContext, raw: DiffInput) -> ToolOutput:
         )
     allowed = set(wanted)
     files = [f for f in got.files if f.path in allowed and (f.old_path is None or f.old_path in allowed)]
-    return ToolOutput("\n".join(_render(files, got.truncated) + notes), untrusted=Untrusted("git.diff"))
+    body = _render(files, got.truncated) if files else ["[no text diff for the requested paths]"]
+    return ToolOutput("\n".join(body + notes), untrusted=Untrusted("git.diff"))
 
 
 async def log(ctx: ToolContext, raw: LogInput) -> ToolOutput:

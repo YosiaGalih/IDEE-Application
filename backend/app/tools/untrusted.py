@@ -15,12 +15,16 @@ import re
 TAG = "untrusted_content"
 # Characters a renderer or a tokenizer may drop or ignore inside a tag (Cf format characters and friends).
 _INVISIBLE = (
-    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e"
-    "\u2060-\u206f\ufe00-\ufe0f\ufeff\ufffd]*"
+    "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e"
+    "\u2060-\u206f\ufe00-\ufe0f\ufeff\ufffd"
 )
-_NAME = _INVISIBLE.join(re.escape(ch) for ch in TAG)
-_SLASH = rf"{_INVISIBLE}\s*{_INVISIBLE}[/\uff0f]?{_INVISIBLE}\s*{_INVISIBLE}"
-_FORGED = re.compile(rf"[<\uff1c\ufe64](?={_SLASH}{_NAME})", re.IGNORECASE)
+# Linear by construction (delta reviews WP-3.1d2a: four adjacent overlapping quantifiers made 400 invisible
+# characters take 9 s on the event loop): ONE bounded class for the gap after the bracket (invisible, space,
+# "/", fullwidth "/"), then the name with at most a few invisible characters between letters. Neither class
+# holds "<" or a letter, so every character is scanned from at most one start.
+_GAP = rf"[{_INVISIBLE}\s/\uff0f]{{0,256}}"
+_NAME = f"[{_INVISIBLE}]{{0,8}}".join(re.escape(ch) for ch in TAG)
+_FORGED = re.compile(rf"[<\uff1c\ufe64](?={_GAP}{_NAME})", re.IGNORECASE)
 ATTRIBUTE_MAX = 512
 _ATTRIBUTE_ESCAPES = {"&": "&amp;", '"': "&quot;", "<": "&lt;", ">": "&gt;"}
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")

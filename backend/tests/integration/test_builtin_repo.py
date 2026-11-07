@@ -154,4 +154,12 @@ async def test_folders_cut_by_depth_are_marked(
     deep.mkdir(parents=True)
     (deep / "test_calc.py").write_text("x\n")
     related = await run(sessions, scope, worktree, "repo.find_related_tests", {"path": "src/calc.py"})
-    assert "[some folders were not searched: deeper than 10 levels]" in related, related
+    assert "[some folders were not searched: deeper than 10 levels, or symlinks]" in related, related
+
+
+async def test_read_file_says_where_the_file_ends(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, worktree: TaskWorkspace
+) -> None:
+    raw = {"path": "src/calc.py", "start_line": 2, "end_line": 9}
+    out = await run(sessions, scope, worktree, "repo.read_file", raw)
+    assert "\n2\t    return a + b\n" in out and "[the file ends at line 2]" in out, out

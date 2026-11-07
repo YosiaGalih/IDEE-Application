@@ -112,6 +112,8 @@ async def read_file(ctx: ToolContext, raw: ReadFileInput) -> ToolOutput:
             break
         out.append(numbered)
         used += size
+    if raw.end_line is not None and raw.end_line > len(lines) and out:
+        out.append(f"[the file ends at line {len(lines)}]\n")
     return ToolOutput("".join(out) or "[empty file]", untrusted=Untrusted("repo.read_file", got.path))
 
 
@@ -167,7 +169,7 @@ async def find_related_tests(ctx: ToolContext, raw: FindRelatedTestsInput) -> To
     if tree.truncated:
         lines.append("[the worktree is larger than one scan: some folders were not searched]")
     elif any(p.endswith(UNLISTED) for p in paths):
-        lines.append(f"[some folders were not searched: deeper than {RELATED_DEPTH} levels]")
+        lines.append(f"[some folders were not searched: deeper than {RELATED_DEPTH} levels, or symlinks]")
     return ToolOutput("\n".join(lines) or "[none found]", untrusted=Untrusted("repo.find_related_tests", rel))
 
 

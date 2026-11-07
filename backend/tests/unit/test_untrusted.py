@@ -36,3 +36,24 @@ def test_attributes_are_one_safe_bounded_line() -> None:
         open_tag("repo.read_file", 'x".py')
         == '<untrusted_content source="repo.read_file" path="x&quot;.py">\n'
     )
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "<" + ZWSP * 50_000 + "x",
+        "<" + " " * 50_000 + "x",
+        "<" + chr(0xFFFD) * 50_000 + "x",
+        ("<" + ZWSP * 300) * 200,
+        ("<" + "/ " * 150) * 200,
+        "<" + (ZWSP + " ") * 25_000 + "untrusted_conten",
+    ],
+    ids=["zwsp-run", "space-run", "replacement-run", "many-starts", "slash-space", "almost-a-tag"],
+)
+def test_neutralise_is_linear_on_hostile_text(hostile: str) -> None:
+    # Delta reviews WP-3.1d2a N0/HIGH: adjacent overlapping quantifiers made 400 ZWSP take 9 s.
+    import time
+
+    started = time.perf_counter()
+    neutralise(hostile)
+    assert time.perf_counter() - started < 0.2
