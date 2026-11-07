@@ -656,8 +656,8 @@ class GitAdapter:
             objects = Path(scratch) / "objects"
             await asyncio.to_thread(objects.mkdir)
             with contextlib.suppress(FileNotFoundError):
-                # copy2 keeps the index's mtime: git tells a racily clean entry (written in the index's own
-                # second) by it, and with a fresh mtime it would skip hashing a same-size edit (silent failure).
+                # copy2 keeps the index's mtime: git tells a racily clean entry (written in the index's
+                # own second) by it; with a fresh mtime it would skip hashing a same-size edit.
                 await asyncio.to_thread(shutil.copy2, git_dir / "index", index)
             env = {
                 "GIT_INDEX_FILE": str(index),

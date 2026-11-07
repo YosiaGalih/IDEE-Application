@@ -854,10 +854,9 @@ async def test_a_same_size_edit_in_the_second_of_the_checkout_is_in_the_exact_di
     edit made right after the checkout vanished from git.diff ("[no text diff]")."""
     base = await git.current_commit(repo)
     assert base is not None
-    while time.time() % 1 > 0.3:  # start early in a second: index and edit share it
-        await asyncio.sleep(0.01)
+    await asyncio.sleep(1.05 - time.time() % 1)  # start early in a second: checkout and edit share it
     (repo.repo / "f.txt").unlink()
-    raw_git(repo, "checkout", "--", "f.txt")  # git writes the file and records its stat now, as a worktree add
+    raw_git(repo, "checkout", "--", "f.txt")  # git writes the file and records its stat, as worktree add
     write(repo.repo / "f.txt", "x\ny\nz\n")  # same size as "a\nb\nc\n", same second
     await asyncio.sleep(1.1)  # the diff runs in a later second
     got = await git.diff(repo, base=base, paths=["f.txt"], exact_files=True)
