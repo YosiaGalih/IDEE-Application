@@ -2187,3 +2187,19 @@ Tetap terbuka (bukan bagian keputusan ini): cakupan scan #57; EX-02, EX-04, EX-0
 | INFO I2: kalimat SECURITY_MODEL §3 | `invalid_tool_use_id` disebut; "setiap penolakan → `tool.denied`" dibatasi ke penolakan kebijakan (input tak valid = `error` tanpa audit); BudgetGuard ditandai rencana WP-3.1f | – |
 | INFO I5: build Go tanpa jaringan | `RUN GOPROXY=off go build` | build lokal lulus |
 | INFO I1, I4, I6, I7, I8 | Tidak ada tindakan; I8 (dua pytest pada DB uji yang sama saling mencemari) juga dialami Lead: worktree WP-3.1d2 kini memakai DB `kodekantor_test_wt` dan Redis index 14 | – |
+
+#### Delta AG-13 @ 0cc6045 dan PR lanjutan
+
+**Fakta merge [Pasti]:** PR #23 di-merge PO di head ef377bd (merge commit f9a9584, 07:31:45 UTC 7 Nov), sesudah CI 9/9 hijau tetapi **sebelum** syarat M1 ditutup. Akibatnya `main` sempat memuat Caddy 2.11.9 tanpa pengecualian umur tertulis. Commit 0cc6045 di-push ke branch sesudah merge, sehingga tidak memicu CI (semua workflow hanya `pull_request` dan `push` ke `main`). Branch dimulai ulang dari `main` f9a9584; commit itu di-rebase (5db3aca) dan dibawa PR lanjutan.
+
+`kk-security-reviewer` (delta): **SIGNED OFF WITH CONDITIONS** untuk isi 0cc6045. M1, M2, L1, L3 ditutup isinya; L2 dibawa. Syarat: PR baru dengan CI 9/9 hijau, termasuk langkah clean-install "Socket proxy allowlist" (4×200, 12×403 terhadap `kodekantor/socket-proxy`; **gagal = sign-off batal**), infra-config membangun caddy dengan `GOPROXY=off`, dan security-scan `gate: PASS` untuk image 2.11.7; lalu merge segera.
+
+| Temuan delta | Penutupan | Bukti |
+|---|---|---|
+| L4: Caddy 2.11.7 membawa kembali chi v5.3.2 (CVE-2026-114437 MEDIUM, spoofing IP di `ClientIPFromXFF`, kemungkinan besar tidak terjangkau) | `github.com/go-chi/chi/v5` v5.4.0 (rilis 2026-10-12, lolos aturan umur); `go mod tidy` tidak mengubah modul lain | Trivy lokal (DB 7 Nov) semua severity atas image baru: chi tidak ada lagi; sisa zlib CVE-2026-4738 MEDIUM (base, dipakai apk-tools), go-jose v3 1 HIGH tanpa fix (EX-02) + 2 MEDIUM, GO-2026-5932 UNKNOWN |
+| L5: kalimat `invalid_tool_use_id` di SECURITY_MODEL §3 salah urutan | "Untuk tool side effect … sesudah validasi skema dan sebelum cek path; tool tanpa side effect menyimpannya sebagai null" | dicocokkan dengan `gateway.py` `execute` (cek `spec.side_effect and use_id is None` sesudah `model_validate`, sebelum `_path_refusal`) |
+| INFO: `x/sync` juga naik lewat MVS | disebut di komentar `infra/caddy/Dockerfile` | – |
+| INFO: `EXEC=0` tidak memblokir `POST /containers/<id>/exec` (hanya `/exec/*`); kontrol T3 yang sebenarnya adalah network `exec` + HostConfig buatan manager | Dibawa: catatan di ADR-026/SECURITY_MODEL bersama L2 | probe reviewer terhadap image upstream |
+| P2: tidak ada CI untuk commit sesudah merge | PR lanjutan | – |
+
+Catatan suite lokal (bukan temuan review): `tests/security/test_search_inputs.py::test_a_large_search_output_never_blocks_the_loop` (ambang jeda event loop 0,5 dtk) gagal 2 kali di suite penuh lokal pada Python 3.12, setiap kali bersamaan dengan build Go/Docker, Trivy, atau subagent. Lulus sendiri 3/3, lulus di bawah 8 proses CPU penuh 3/3, lulus di `tests/security` (397 passed), lulus sesudah semua test integrasi (885 passed), dan lulus di CI (2509 passed). Hipotesis CPU, waktu fork, dan GC diuji dan gugur; akar pastinya belum terbukti [Kemungkinan Besar: gangguan I/O atau memori dari pekerjaan paralel]. Suite penuh diulang saat mesin idle sebelum PR lanjutan dinyatakan selesai.

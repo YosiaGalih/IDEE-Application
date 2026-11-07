@@ -5,9 +5,10 @@
 #
 # infra/caddy/build/ is the official entry point (caddy v2.11.7 cmd/caddy/main.go) with the standard modules.
 # go.mod and go.sum pin Caddy 2.11.7 and every dependency at the versions Caddy asks for, except the security fixes
-# golang.org/x/net 0.62.0 (with the x/crypto, x/sys, x/term, x/text it needs) and go-jose v4 4.1.6. x/net 0.62.0 is
-# younger than the two-week rule: a recorded exception (tracker, PR #23). -mod=readonly refuses anything not in
-# go.sum, and the build itself runs with GOPROXY=off: only `go mod download` reaches the network.
+# golang.org/x/net 0.62.0 (with the x/crypto, x/sync, x/sys, x/term, x/text it needs), go-jose v4 4.1.6 and chi v5.4.0
+# (CVE-2026-114437; AG-13 PR #23 L4). x/net 0.62.0 is younger than the two-week rule: a recorded exception
+# (tracker, review AG-13 PR #23). -mod=readonly refuses anything not in go.sum, and the build itself runs with
+# GOPROXY=off: only `go mod download` reaches the network.
 # To move Caddy or a dependency: `go get <module>@<version> && go mod tidy` in infra/caddy/build/, check every module's
 # release date (two-week rule), then build and scan again (RUNBOOK §12.1).
 #
