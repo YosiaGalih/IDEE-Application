@@ -57,9 +57,15 @@ POLICY_CASES = [
             "putty.ppk",
             ".pgpass",
             ".htpasswd",
+            # "*.env" names (WP-1.2 hand-off, Lead decision 3.1d2 #7): the .env* contract is a prefix only
+            "config/prod.env",
+            "APP.ENV",
         )
         for case in expect(secret, SECRET_DENIED)
     ],
+    *expect("src/env.py", ()),
+    *expect("docs/dotenv.md", ()),
+    *expect("environment.yml", ()),
     *expect(".agentignore", (Access.AGENT_WRITE,)),
     *expect("node_modules/a/index.js", (Access.AGENT_READ,)),
     *expect("dist/app.js", (Access.AGENT_READ,)),

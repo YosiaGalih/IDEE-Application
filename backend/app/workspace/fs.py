@@ -40,7 +40,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from app.core.errors import AppError
 from app.core.logging import get_logger
@@ -58,6 +58,9 @@ from app.workspace.errors import (
 from app.workspace.patches import FilePatch, HunkConflict, apply_hunks, parse_unified_diff
 from app.workspace.paths import open_parent, open_root, resolve
 from app.workspace.policy import AGENTIGNORE, Access, AgentignoreInvalid, Budget, Policy, PolicyBudgetExceeded
+
+if TYPE_CHECKING:
+    from app.workspace.stack import Stack
 
 logger = get_logger(__name__)
 
@@ -300,8 +303,13 @@ def _read_limit(access: Access) -> int:
 
 
 class Workspace:
-    def __init__(self, root: Path, *, lock_dir: Path | None = None) -> None:
+    def __init__(
+        self, root: Path, *, lock_dir: Path | None = None, shared_policy_root: Path | None = None
+    ) -> None:
         self.root = root
+        # A task worktree also obeys the project's repo/ .agentignore (Lead decision 3.1d2 #9): sandboxed code
+        # can rewrite the worktree's copy but not repo/'s, so it can add hiding, never remove it.
+        self.shared_policy_root = shared_policy_root
         # Outside the root: sandboxed code that can write the root must not be able to hold the lock.
         self.lock_dir = lock_dir if lock_dir is not None else root.parent / LOCKS_DIRNAME
 
@@ -443,7 +451,22 @@ class Workspace:
             os.close(lock_fd)  # releases the lock
 
     def _policy(self, root_fd: int, access: Access) -> Policy:
-        """The project policy; an unreadable or over-cap ``.agentignore`` denies agent access."""
+        """The project policy; an unreadable or over-cap ``.agentignore`` denies agent access. Agent access
+        also obeys ``shared_policy_root``'s ``.agentignore``: a path either file hides stays hidden."""
+        own = self._agentignore_at(root_fd, access)
+        if self.shared_policy_root is None or access not in (Access.AGENT_READ, Access.AGENT_WRITE):
+            return own
+        try:
+            shared_fd, _ = open_root(self.shared_policy_root)
+        except WorkspaceNotFound:
+            return _invalid_policy(access)  # fail closed: the trusted copy must be readable
+        try:
+            shared = self._agentignore_at(shared_fd, access)
+        finally:
+            os.close(shared_fd)
+        return Policy(own.agentignore + shared.agentignore)
+
+    def _agentignore_at(self, root_fd: int, access: Access) -> Policy:
         try:
             fd = _open_file(root_fd, AGENTIGNORE)
         except WorkspaceNotFound:
@@ -677,10 +700,50 @@ def _names(dir_fd: int) -> list[str]:
 
 
 class TaskWorkspace:
-    """The agent's view of a task worktree (ARCHITECTURE §4.2): every call is AGENT_READ or AGENT_WRITE."""
+    """The agent's view of a task worktree (ARCHITECTURE §4.2): every call is AGENT_READ or AGENT_WRITE.
 
-    def __init__(self, root: Path, *, lock_dir: Path | None = None) -> None:
-        self._workspace = Workspace(root, lock_dir=lock_dir)
+    It also carries the task's git context as plain values (``app.workspace`` cannot import ``app.gitops``):
+    ``repo`` (the project's main working tree with the trusted ``.git``), ``branch`` and ``base_commit``.
+    Builtins build ``GitTarget(repo, worktree=root)`` from them (spec 3.1d2a Goal 1)."""
+
+    __slots__ = ("_base_commit", "_branch", "_repo", "_workspace")
+
+    def __init__(
+        self, root: Path, *, repo: Path, branch: str, base_commit: str | None, lock_dir: Path | None = None
+    ) -> None:
+        self._workspace = Workspace(root, lock_dir=lock_dir, shared_policy_root=repo)
+        self._repo = repo
+        self._branch = branch
+        self._base_commit = base_commit
+
+    @property
+    def root(self) -> Path:
+        return self._workspace.root
+
+    @property
+    def repo(self) -> Path:
+        return self._repo
+
+    @property
+    def branch(self) -> str:
+        return self._branch
+
+    @property
+    def base_commit(self) -> str | None:
+        return self._base_commit
+
+    async def policy(self) -> Policy:
+        """What the agent may not read: built-in denials + the worktree's and repo/'s ``.agentignore``."""
+        return await self._workspace.policy(Access.AGENT_READ)
+
+    def exclusive(self) -> contextlib.AbstractAsyncContextManager[None]:
+        """The worktree lock every write takes (WP-2.1c I-b: a commit holds it)."""
+        return self._workspace.exclusive()
+
+    async def detect_stack(self) -> Stack:
+        from app.workspace.stack import detect_stack  # stack imports this module
+
+        return await detect_stack(self._workspace)
 
     async def read_text(
         self,

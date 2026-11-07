@@ -40,6 +40,7 @@ DENY_BUDGET = 50_000  # [Menebak] matching cells per denied() call; a few ms of 
 
 _SECRET_PATTERNS = (
     ".env*",
+    "*.env",  # config/prod.env: the .env* contract is a prefix only (WP-1.2, Lead decision 3.1d2 #7)
     "*.pem",
     "*.key",
     "id_rsa*",

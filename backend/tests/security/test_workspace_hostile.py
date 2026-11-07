@@ -158,9 +158,15 @@ async def test_agent_cannot_raise_its_read_limit(root: Path) -> None:
     assert (got.too_large, got.content) == (True, None)
 
 
+def task_of(worktree: Path, repo: Path | None = None) -> TaskWorkspace:
+    repo = repo if repo is not None else worktree.parent / "repo"
+    repo.mkdir(exist_ok=True)
+    return TaskWorkspace(worktree, repo=repo, branch="kk/task-1", base_commit="a" * 40)
+
+
 async def test_task_workspace_is_agent_bound(root: Path) -> None:
     (root / ".env").write_text("TOKEN=synthetic\n")
-    task = TaskWorkspace(root)
+    task = task_of(root)
     change = await task.write_text("src/new.py", "print('hi')\n")
     assert change.change == "added"
     assert (await task.read_text("src/new.py", start_line=1, end_line=1)).content == "print('hi')\n"
@@ -302,3 +308,48 @@ async def test_tree_budget_keeps_entries_already_checked(root: Path) -> None:
     result = await Workspace(root).tree(".", Access.AGENT_READ, depth=1, max_entries=5000)
     assert result.truncated is True
     assert result.entries  # the entries checked before the budget ran out are returned
+
+
+async def test_task_workspace_carries_its_git_context(tmp_path: Path) -> None:
+    worktree, repo = tmp_path / "tasks" / "t1", tmp_path / "repo"
+    worktree.mkdir(parents=True)
+    task = task_of(worktree, repo)
+    assert (task.root, task.repo, task.branch, task.base_commit) == (worktree, repo, "kk/task-1", "a" * 40)
+    with pytest.raises(AttributeError):
+        task.branch = "main"  # type: ignore[misc]
+
+
+async def test_a_sandbox_cannot_unhide_files_by_emptying_the_worktree_agentignore(tmp_path: Path) -> None:
+    """Lead decision 3.1d2 #9: repo/'s .agentignore also applies; the sandbox writes the worktree only."""
+    worktree, repo = tmp_path / "tasks" / "t1", tmp_path / "repo"
+    (worktree / "private").mkdir(parents=True)
+    repo.mkdir()
+    (repo / ".agentignore").write_text("private/\n")
+    (worktree / ".agentignore").write_text("")  # what sandboxed code left behind
+    (worktree / "private" / "notes.txt").write_text("hidden by the user\n")
+    task = task_of(worktree, repo)
+    with pytest.raises(PathViolation):
+        await task.read_text("private/notes.txt")
+    assert "private" not in [e.name for e in (await task.tree()).entries]
+    assert (await task.policy()).denied(("private", "notes.txt"), Access.AGENT_READ)
+
+
+async def test_the_worktree_agentignore_still_adds_its_own_patterns(tmp_path: Path) -> None:
+    worktree, repo = tmp_path / "tasks" / "t1", tmp_path / "repo"
+    worktree.mkdir(parents=True)
+    repo.mkdir()
+    (worktree / ".agentignore").write_text("scratch/\n")
+    policy = await task_of(worktree, repo).policy()
+    assert policy.denied(("scratch", "a.txt"), Access.AGENT_READ)
+    assert not policy.denied(("src", "a.txt"), Access.AGENT_READ)
+
+
+async def test_an_invalid_repo_agentignore_denies_agent_access(tmp_path: Path) -> None:
+    worktree, repo = tmp_path / "tasks" / "t1", tmp_path / "repo"
+    worktree.mkdir(parents=True)
+    repo.mkdir()
+    (worktree / "a.txt").write_text("x\n")
+    (repo / ".agentignore").write_text("*\n" * (MAX_PATTERNS + 1))
+    with pytest.raises(PathViolation) as caught:
+        await task_of(worktree, repo).read_text("a.txt")
+    assert caught.value.reason == "agentignore"
