@@ -47,7 +47,7 @@ async def run(sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: Task
 @pytest.fixture
 async def ws(tmp_path: Path) -> TaskWorkspace:
     return await task_worktree(
-        tmp_path, {"src/calc.py": "def add(): pass\n", "private/keys.py": "def add_key(): pass\n"},
+        tmp_path, {"src/calc.py": "def add(): pass\n", "private/keys.py": "def add_hidden(): pass\n"},
         repo_agentignore="private/\n",
     )  # fmt: skip
 
@@ -84,13 +84,13 @@ async def test_the_production_index_reads_the_project_rows(
             RepoIndexEntry(project_id=scope.project_id, path="src/calc.py", kind="symbol", symbol="Adder",
                            symbol_kind="class", line=3, commit=COMMIT),
             RepoIndexEntry(project_id=scope.project_id, path="private/keys.py", kind="symbol",
-                           symbol="add_key", symbol_kind="function", line=1, commit=COMMIT),
+                           symbol="add_hidden", symbol_kind="function", line=1, commit=COMMIT),
         ])  # fmt: skip
         await session.commit()
     status, out = await run(sessions, scope, ws, RepoSymbolIndex(sessions), name="add", kind="function")
     assert status == "ok", out
     assert f"index: {COMMIT}" in out and "src/calc.py:1: function add" in out, out
-    assert "Adder" not in out and "add_key" not in out, out
+    assert "Adder" not in out and "add_hidden" not in out, out
 
 
 async def test_an_index_of_the_worktree_head_needs_no_warning(

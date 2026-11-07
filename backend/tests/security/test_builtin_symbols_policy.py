@@ -47,7 +47,7 @@ async def run(sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: Task
 @pytest.fixture
 async def ws(tmp_path: Path) -> TaskWorkspace:
     return await task_worktree(
-        tmp_path, {"src/calc.py": "def add(): pass\n", "private/keys.py": "def add_key(): pass\n"},
+        tmp_path, {"src/calc.py": "def add(): pass\n", "private/keys.py": "def add_hidden(): pass\n"},
         repo_agentignore="private/\n",
     )  # fmt: skip
 
@@ -56,14 +56,23 @@ async def test_hidden_hits_leave_no_trace(
     sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace
 ) -> None:
     hidden = [
-        SymbolRow("private/keys.py", 1, "add_key", "function"),  # repo/'s .agentignore
+        SymbolRow("private/keys.py", 1, "add_hidden", "function"),  # repo/'s .agentignore
         SymbolRow("config/prod.env", 1, "add_env", "function"),  # a secret name
         SymbolRow(".kk/gen.py", 1, "add_gen", "function"),  # sandbox output
     ]
     only_hidden = await run(sessions, scope, ws, SymbolRows(hidden, False, COMMIT, False))
     nothing = await run(sessions, scope, ws, SymbolRows([], False, COMMIT, False))
     assert only_hidden == nothing, (only_hidden, nothing)  # the same answer as no candidate at all
-    for text in ("add_key", "private", "add_env", "prod.env", "add_gen", ".kk", "not shown", "may not read"):
+    for text in (
+        "add_hidden",
+        "private",
+        "add_env",
+        "prod.env",
+        "add_gen",
+        ".kk",
+        "not shown",
+        "may not read",
+    ):
         assert text not in only_hidden, (text, only_hidden)
     visible = SymbolRow("src/calc.py", 1, "add", "function")
     mixed = await run(sessions, scope, ws, SymbolRows([visible, *hidden], False, COMMIT, False))

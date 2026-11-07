@@ -15,3 +15,6 @@ f7f21facaceaadc9e585ab77009ac29b6146b208:frontend/src/features/auth/__tests__/Pa
 c5f0382370d519f7a1032e5a17e6de5fa63791a0:backend/tests/unit/test_redaction.py:jwt:289
 c5f0382370d519f7a1032e5a17e6de5fa63791a0:backend/tests/security/test_hostile_output_text.py:jwt:15
 9f015aa9a07b052e3e19159fdb3f20ca926a80c3:backend/tests/security/test_builtin_policy.py:jwt:292
+# False positive (WP-3.1d2b): generic-api-key matched the symbol name "add_key" followed by `symbol_kind=` in an
+# index-row fixture; there is no secret. The fixture now names the symbol "add_hidden".
+6079ff60d2fb6de74b67322ea67031858b758636:backend/tests/integration/test_builtin_symbols.py:generic-api-key:110
