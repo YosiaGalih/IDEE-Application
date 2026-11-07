@@ -87,6 +87,7 @@ DENIALS: Mapping[str, str] = {
     "project_not_active": "denied: the project is not active",
     "quota_exceeded": "denied: the quota for this tool in this run is used up",
     "input_not_canonical": "denied: an R3 action input must be plain JSON without decimals",
+    "tool_use_id_reused": "denied: this tool use id already belongs to another call",
 }
 
 
@@ -280,7 +281,11 @@ class ToolGateway:
                 previous = await session.scalar(
                     select(ToolCall).where(ToolCall.idempotency_key == row.idempotency_key)
                 )
-                if previous is not None:
+                if previous is not None and (
+                    previous.tool_name != row.tool_name or previous.input_hash != row.input_hash
+                ):
+                    refusal = "tool_use_id_reused"  # never answer one call with another call's result
+                elif previous is not None:
                     replay = self._replay(previous)  # read before the rollback expires the row
                     await session.rollback()
                     return replay

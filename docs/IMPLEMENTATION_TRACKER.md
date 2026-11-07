@@ -2052,3 +2052,24 @@ Mutan putaran code-review (satu per run, dipulihkan): N1 riwayat menawarkan `pen
 
 **C1 terpenuhi (7 Nov 2026).** [Pasti] Check run PR #21 di head 68db3db (`get_check_runs`): 9 dari 9 `success` (backend-lint, backend-types, backend-test, frontend, security-scan, sandbox-test, sandbox-isolation, infra-config, clean-install; selesai 13:10–13:16 UTC 6 Nov). `backend-test` menjalankan suite penuh termasuk `tests/integration/test_approvals_api.py` dengan assertion `project_name`. PR #21 di-merge PO ke `main` (2137385) pada 6 Nov 14:20 UTC. **Status sign-off AG-13 WP-3.1c2: SIGNED OFF**, tanpa syarat terbuka.
 
+
+### WP-3.1d1 (🔒 ToolGateway dan approval R3) — gateway inti, `tool_calls`, approval `tool_r3` (FR-059–062, FR-064, FR-066, FR-067; AC-06, AC-13 bagian tool; T1, T5, T7, T10)
+
+Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md` (WP-3.1d dibagi: 3.1d1 gateway + `tool_calls` + `tool_r3`, 3.1d2 builtin + pembungkus). Plan: `docs/superpowers/plans/2026-11-07-wp-3.1d1-tool-gateway.md`. Konflik: #72 butir 3.1d. Branch `claude/tender-maxwell-wbmsrg` (branch sesi ini) dari `main` 2137385 sesudah PR #21 di-merge.
+
+Keputusan Lead (rinci di spec "Keputusan Lead 3.1d1"):
+- Gateway memakai sesi sendiri; klaim `running` di-commit sebelum handler; `ToolContext` tanpa `db`, dengan `grant` (registry tervalidasi) dan `offered`.
+- Status `tool_calls` + `running`/`cancelled`; idempotensi hanya untuk tool `side_effect`; replay tidak menjalankan handler lagi.
+- Batas konteks: 64 KB per `tool_result`, 256 KB file yang tidak dikirim, 60 KB paket konteks per request (tiga ukuran berbeda).
+- Audit `tool.denied` (setiap penolakan) dan `tool.executed` (R1+); input tidak valid = `error` tanpa audit; event `tool.call_started/finished` disimpan.
+- Kuota diperiksa sebelum approval; project tidak `active` / task selesai → `denied`.
+- `tool_r3`: satu terbuka per task, dikonsumsi gateway saat tool dijalankan, handler hanya memindahkan task (resume ke `draft` bila diparkir dari `draft`, selain itu `queued`; tolak/kedaluwarsa → `failed`).
+- Penulis status approval dijaga trigger DB `approvals_status_guard` (pola `tasks_status_guard`) + penjaga AST pemanggil `decide`.
+
+Bagian WP-INT yang terpenuhi oleh 3.1d1 (bukti untuk keputusan PO atas #71; status baris WP-INT tidak diubah): ToolPorts untuk approval R3 (ADR-022), jam handler sesudah lock (ADR-024), matriks §11.1 untuk `tool_r3` (ADR-034).
+
+Temuan saat implementasi (sebelum review):
+- **`core/redaction.py` kuadratik** pada deretan huruf panjang: pola kredensial URL mencoba skema dari setiap posisi (64 KB `a` = 2,8 dtk, 1 MB ± 12 mnt [Menebak, ekstrapolasi kuadratik]). Gateway meredaksi output handler sebelum dipotong, jadi output tool bisa memblokir event loop worker (T4). Diperbaiki: skema hanya di awal deretan dan ≤ 32 karakter (1 MB = 64 ms), plus jendela redaksi 256 K karakter di gateway.
+- **NUL** di input/output membuat baris `tool_calls` tidak bisa ditulis (PostgreSQL menolak `\x00`), sehingga hasil menjadi "tidak diketahui". NUL diganti U+FFFD.
+- **Replay** membaca baris sesudah `rollback()` (objek kedaluwarsa) → `MissingGreenlet`. Ditemukan test, diperbaiki sebelum commit.
+- Mutan G7 (potong sebelum redaksi) awalnya `SURVIVED`: test pertama tidak menaruh secret di garis potong. Test diganti 16 offset di sekitar garis potong.

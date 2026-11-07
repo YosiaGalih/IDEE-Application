@@ -83,3 +83,20 @@ def test_a_huge_output_is_redacted_within_a_window_then_cut() -> None:
     assert len(text.encode()) <= MAX_RESULT_BYTES
     assert SECRET not in text and "[REDACTED]" in text
     assert f"truncated: {len(content.encode())} bytes" in text
+
+
+def test_redaction_cost_is_bounded_by_the_window() -> None:
+    from app.core.audit import AuditWriter
+    from app.core.redaction import Redactor
+    from app.tools.gateway import REDACT_WINDOW_CHARS
+
+    seen: list[int] = []
+
+    class Measuring(Redactor):
+        def redact(self, text: str) -> str:
+            seen.append(len(text))
+            return super().redact(text)
+
+    built = ToolGateway(sessions=async_sessionmaker(), audit=AuditWriter(Measuring()), ports=None)  # type: ignore[arg-type]
+    built._model_text("z" * (3 * REDACT_WINDOW_CHARS))  # pyright: ignore[reportPrivateUsage]
+    assert seen and max(seen) <= REDACT_WINDOW_CHARS

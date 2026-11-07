@@ -17,7 +17,7 @@ from app.core.errors import AppError
 from app.models.audit import AuditEvent
 from app.models.tools import ToolCall
 from app.tools.base import ToolError, ToolOutput
-from app.tools.gateway import MAX_RESULT_BYTES, TaskMissing
+from app.tools.gateway import DENIALS, MAX_RESULT_BYTES, TaskMissing, _input_hash  # pyright: ignore[reportPrivateUsage]
 from tests.integration import test_gateway_denials as denials
 from tests.integration.test_gateway_denials import Scope, audits, calls, timeline
 from tests.tool_fakes import SECRET, Recorder, context, gateway, spec
@@ -109,7 +109,7 @@ async def test_a_side_effect_whose_outcome_is_unknown_is_not_run_again(
                 tool_use_id="toolu_9",
                 risk_level=1,
                 idempotency_key=key,
-                input_hash="0" * 64,
+                input_hash=_input_hash({"path": "src/a.py"}),
                 sanitized_input={},
                 status="running",
             )
@@ -282,3 +282,15 @@ async def test_a_cancelled_caller_stays_cancelled_when_recording_fails(
     running.cancel()
     with pytest.raises(asyncio.CancelledError):
         await running
+
+
+async def test_a_reused_tool_use_id_for_another_call_is_refused(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope
+) -> None:
+    handler = Recorder()
+    built = gateway(sessions, spec("test.write", handler))
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.write"])
+    await built.execute(ctx, "test.write", {"path": "src/a.py"}, tool_use_id="toolu_1")
+    other = await built.execute(ctx, "test.write", {"path": "src/b.py"}, tool_use_id="toolu_1")
+    assert (other.status, other.content) == ("denied", DENIALS["tool_use_id_reused"])
+    assert len(handler.calls) == 1
