@@ -15,6 +15,9 @@
 !sandbox_manager/sandbox_manager/
 !infra/egress-proxy/tinyproxy.conf
 !infra/egress-proxy/allowlist
+!infra/caddy/build/go.mod
+!infra/caddy/build/go.sum
+!infra/caddy/build/main.go
 !frontend/package.json
 !frontend/package-lock.json
 !frontend/.npmrc

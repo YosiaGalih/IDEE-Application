@@ -93,9 +93,15 @@ x-backend-volumes: &backend-volumes
     read_only: true
 
 services:
+  # Built from source (infra/caddy/Dockerfile): Go and golang.org/x/net with their security fixes (DECISIONS EX-03).
   caddy:
     <<: *hardened
-    image: caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+    image: kodekantor/caddy:${KK_IMAGE_TAG:-dev}
+    build:
+      context: ..
+      dockerfile: infra/caddy/Dockerfile
+      secrets: [build_ca]
+    pull_policy: never
     cap_add: [NET_BIND_SERVICE]
     ports:
       - "80:80"
@@ -350,9 +356,15 @@ services:
       resources:
         limits: {cpus: "0.5", memory: 512M, pids: 256}
 
+  # tecnativa/docker-socket-proxy v0.5.0 with fixed Alpine packages (infra/socket-proxy/Dockerfile, DECISIONS EX-03).
   docker-socket-proxy:
     <<: *hardened
-    image: tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
+    image: kodekantor/socket-proxy:${KK_IMAGE_TAG:-dev}
+    build:
+      context: ..
+      dockerfile: infra/socket-proxy/Dockerfile
+      secrets: [build_ca]
+    pull_policy: never
     # ADR-026 (3): the minimum the manager is shown to need (test_only_allowed_endpoints). Everything else 0.
     environment:
       CONTAINERS: "1"

@@ -330,6 +330,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - CVE baru di image upstream membuat PR merah sampai digest dinaikkan atau exception ditulis.
 
     Keputusan PO: pertahankan cakupan ini, atau batasi ke daftar §11.
+    - **Catatan 7 Nov 2026 (keputusan PO atas EX-03):** caddy dan docker-socket-proxy kini dibangun sendiri (`kodekantor/caddy`, `kodekantor/socket-proxy`), sehingga entri EX-03 keduanya dihapus; yang tersisa hanya npm bawaan `kodekantor/sandbox-node`. Pertanyaan cakupan scan di atas tetap terbuka.
 58. **Redis 7.4 di OS end of life (WP-1.5d):** `redis:7.4.11-alpine`, dan image 7.4 terbaru (7.4.12, 26 Okt), dibangun di Alpine 3.21. Dukungan Alpine 3.21 berakhir 1 Nov 2026 [Kemungkinan Besar], sehingga gate Trivy memblokir image itu (EOSL). Sementara ini dicatat sebagai EX-06 sampai 2026-11-30. Pilihannya:
     - Redis 8.x (lisensi tri: AGPLv3/SSPLv1/RSALv2);
     - Valkey (fork BSD dari Redis 7.2/7.4; API kompatibel untuk broker Celery dan cache);
@@ -364,16 +365,19 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
       - tambah job 3.13 dan perbaiki perilakunya, atau
       - hapus "CI juga 3.13" dari aturan dan pin `.python-version` 3.12.
     - Sampai diputuskan, `uv sync` tanpa pin dapat memilih 3.13 dan memberi hasil T2 yang berbeda.
+    - **Diputuskan PO (7 Nov 2026):** pin `.python-version` 3.12 (`backend/` ditambahkan, `sandbox_manager/` sudah ada); "CI juga 3.13" dihapus dari `.claude/rules/backend.md`. Bukti: `tests/unit/test_paths.py` 201 passed di 3.12.3. Perilaku T2 di 3.13 diselesaikan saat Python dinaikkan (bukan sekarang).
 67. **Sumber `upload` untuk project dari arsip (WP-2.1b).**
     - API_CONTRACTS §3 `POST /projects` hanya mencantumkan sumber `blank`, `template`, `git_https`. Endpoint `POST /projects/{id}/imports` butuh project yang sudah ada, dan DATA_MODEL `repositories.provider` sudah punya nilai `upload`.
     - Keputusan Lead: tambah `{type:"upload"}`. Project dibuat dengan `sync_state = importing` tanpa folder workspace, lalu arsip diunggah ke `/imports`.
     - Import ke project blank/template ditolak (409 `repository_not_empty`, FR-015 "tanpa overwrite").
     - Usulan perubahan kontrak: tambahkan sumber `upload` di §3, dan `error` repository berisi kode (`archive_rejected:<reason>`, `import_git_failed`, `import_failed`, `import_not_started`, `import_expired`, `import_incomplete`). Alasan 409 route import: `repository_not_empty`, `not_an_upload_project`, `import_running`, `project_archived`, `import_expired`, `cleanup_failed`.
     - Jawaban 202 route import: `{repository, job_id, upload: {filename, size, sha256}}` (§11 #14), sedangkan §3 hanya menyebut `{repository}`. Usulan: §3 mengikuti §11 #14.
+    - **Diputuskan PO (7 Nov 2026):** usulan Lead diterima; API_CONTRACTS §3 memuat sumber `upload`, kode `repository.error`, alasan 409 route import, dan bentuk 202 §11 #14.
 68. **HTTP 408 untuk unggahan yang macet atau putus (WP-2.1b).**
     - Tabel error API_CONTRACTS §1 tidak punya 408. Route `/imports` menjawab 408 dengan kode yang sudah ada, `BAD_REQUEST`, dan `details.reason` ∈ `upload_stalled` (tidak ada byte 60 detik), `upload_too_slow` (belum selesai setelah 30 menit) atau `client_disconnected`.
     - Alasannya: middleware idempotency tidak menyimpan 408 (§1 "respons transien"), sehingga retry dengan key yang sama berjalan lagi. Jawaban 400 akan tersimpan 24 jam dan memutar ulang penolakan untuk unggahan yang sebenarnya sah.
     - Usulan perubahan kontrak: tambahkan baris `408 | BAD_REQUEST` (atau kode baru `REQUEST_TIMEOUT`) di §1. Keputusan Lead.
+    - **Diputuskan PO (7 Nov 2026):** baris `408 | BAD_REQUEST` dengan `details[0].reason` ditambahkan di API_CONTRACTS §1 (tanpa kode baru).
 
 69. **Indeks dan pencarian (WP-2.1d).** Spec: `docs/superpowers/specs/2026-11-04-wp-2.1d-index-search-design.md`.
     - `GET /projects/{id}/search`: API_CONTRACTS §3 hanya punya `q`, `mode`, `glob`. FR-020 meminta literal **dan** regex serta batas hasil, dan TOOL_CATALOG `repo.search_text` punya `regex`/`max_results`. Ditambahkan `regex`, `ignore_case`, `kind` (mode symbol), dan `limit` (≤ 200), plus `meta: {truncated, index_commit, indexed_at}`. Regex = POSIX ERE. Usulan: §3 mencantumkan parameter ini.
@@ -397,6 +401,7 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
     - **Chat dan terminal pindah WP:** WBS WP-2.2 memuat chat (FR-033–040) dan terminal read-only (FR-077–083), tetapi backend keduanya belum ada (conversations, task, SSE task: WP-3.1/3.2; API run sandbox: WP-4.1). Keputusan Lead, dengan prinsip #63: chat dibangun bersama WP-3.2, terminal bersama WP-4.1. WP-2.2 menjadi 2.2a (explorer + editor + cari) dan 2.2b (panel git).
     - **Simpan eksplisit:** tanpa autosave. Konflik `VERSION_CONFLICT` diselesaikan lewat dialog (lihat perbedaan / muat versi server / timpa dengan sha server yang baru dibaca).
     - **Dependensi WBS di luar mandat:** WP-SEC-01 (prasyarat WP-4.3/G4) bergantung pada WP-INT-03 (ports, handler approval) dan WP-INT-05 (redaksi). Keduanya tidak termasuk mandat "P2, P3, P4". Perlu keputusan PO sebelum P4: masukkan keduanya ke mandat, atau kurangi syarat SEC-01.
+    - **Diputuskan PO (7 Nov 2026):** bagian WP-INT-03 yang dipenuhi WP-3.1c1 (transaksi handler approval ADR-024) dan WP-3.1d1 (ToolPorts ADR-022, kontrak import-linter) dihitung sebagai pemenuhan; WP-INT-05 (redaksi ADR-030) diverifikasi sebelum P4. Verifikasi 7 Nov 2026: setiap butir ADR-030 punya test positif dan negatif di `tests/unit/test_redaction.py` (20 kasus, lulus); rincian di tracker.
 
 72. **Agentic core (WP-3.1).** Spec: `docs/superpowers/specs/2026-11-05-wp-3.1-agentic-core-design.md` (bagian "Konflik kontrak", 14 butir).
     - **Pembagian:** WP-3.1 dipecah menjadi 3.1a–3.1f (port LLM; registry agent; approval + hapus project; ToolGateway + builtin; pengaturan provider + readiness + kill switch; runtime + budget + usage). Layar ikut WP backend-nya (#63).
@@ -431,7 +436,8 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
       - `tool_r3`: kedaluwarsa tidak diatur §11.1 (diperlakukan seperti tolak); resume ke `draft` bila diparkir dari `draft` (ADR-021) vs §11.1 "resume → queued"; satu `tool_r3` terbuka per task (index unik parsial); trigger penjaga status `approvals` (tambahan).
       - Batas konteks 64 KB / 256 KB / 60 KB (konflik 12) diputuskan sebagai tiga ukuran berbeda: satu `tool_result`, file yang tidak pernah dikirim, paket konteks per request.
       - MVP tidak punya tool R3 yang hidup (P2 `disabled`, registry melarang R3 untuk agent llm/profile); jalur `tool_r3` diuji dengan tool R3 uji.
-      - Kontrak Python lain vs ARCHITECTURE §4.2: `ToolSpec` tanpa `capability` dengan `write_paths`, `ToolOutput` tanpa `artifacts`, `tool_defs_for(grant)`, `execute(raw_input: object)`; trigger `approvals` juga membekukan kolom isi approval; R3 hanya dari agent run dan tanpa secret di input. Semua dicatat sebagai **ADR-070 (Proposed)**.
+      - Kontrak Python lain vs ARCHITECTURE §4.2: `ToolSpec` tanpa `capability` dengan `write_paths`, `ToolOutput` tanpa `artifacts`, `tool_defs_for(grant)`, `execute(raw_input: object)`; trigger `approvals` juga membekukan kolom isi approval; R3 hanya dari agent run dan tanpa secret di input. Semua dicatat sebagai **ADR-070**.
+      - **Diputuskan PO (7 Nov 2026):** ADR-070 Accepted; ARCHITECTURE §4.2/§6.1, SECURITY_MODEL §3 dan DATA_MODEL `tool_calls` diselaraskan. Catatan: "R3 hanya dari agent run" ditinjau ulang di WP-9.0 (approval diikat ke `job_id` untuk job tool-mode).
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 

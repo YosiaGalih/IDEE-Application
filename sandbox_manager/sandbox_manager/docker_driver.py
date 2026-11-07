@@ -62,6 +62,12 @@ MAX_ARTIFACT_DIR_BYTES = 8 * 1024 * 1024  # [Menebak] junit + coverage (1 MiB ea
 REMOVE_ATTEMPTS = 3
 WATCH_INTERVAL_S = 1.0
 REAP_INTERVAL_S = 60.0
+# containerd reports a container's exit and its OOM kill as two events, and dockerd may set
+# State.OOMKilled after `wait` has returned. A SIGKILL exit is looked at again for this long before it
+# counts as the code's own exit (CI sandbox-isolation, 7 Nov 2026); any other exit is inspected once.
+OOM_SETTLE_S = 2.0
+OOM_POLL_S = 0.1
+SIGKILL_EXIT = 137
 _STREAMS = {1: "stdout", 2: "stderr"}
 _UUID_DIR = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -416,6 +422,8 @@ class DockerDriver:
         oom_killed = bool((state.get("State") or {}).get("OOMKilled"))
         if breach:  # the watchdog killed the container
             return ("error", exit_code, breach[0])
+        if not oom_killed and exit_code == SIGKILL_EXIT and status not in ("timeout", "killed"):
+            oom_killed = await self._late_oom(record.container_id)
         await asyncio.to_thread(self._collect_artifacts, record, artifacts)
         try:
             grown = await asyncio.to_thread(tree_bytes, artifacts)  # read-only runs can still write here
@@ -436,6 +444,17 @@ class DockerDriver:
                     code = "ARTIFACT_MISSING" if state_of == "missing" else "ARTIFACT_REJECTED"
                     return ("error", exit_code, code)
         return (status, exit_code, None)
+
+    async def _late_oom(self, container_id: str) -> bool:
+        """Whether the engine records an OOM kill within OOM_SETTLE_S of a SIGKILL exit."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + OOM_SETTLE_S
+        while loop.time() < deadline:
+            await asyncio.sleep(OOM_POLL_S)
+            state = await self.engine.inspect(container_id) or {}
+            if (state.get("State") or {}).get("OOMKilled"):
+                return True
+        return False
 
     async def _watch(self, record: RunRecord, container_id: str, artifacts: Path, breach: list[str]) -> None:
         """Kill the container once its artefact folder outgrows its bound; the code goes to ``breach``."""

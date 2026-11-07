@@ -48,11 +48,13 @@ jobs:
         run: git ls-files -z '*.sh' | xargs -0 docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK"
       - name: Workflows (actionlint)
         run: docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT" -no-color
+      # The Caddy that runs in the stack (infra/caddy/Dockerfile, DECISIONS EX-03), not the official image.
       - name: Caddyfile
         run: |
+          docker build --file infra/caddy/Dockerfile --tag kodekantor/caddy:validate .
           docker run --rm -v "$PWD/infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
             -e APP_DOMAIN=localhost -e CADDY_EMAIL=ops@kodekantor.test \
-            caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f \
+            kodekantor/caddy:validate \
             caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
   # AC-20: the stack from a clean checkout, all containers healthy, /health/ready ok through Caddy.

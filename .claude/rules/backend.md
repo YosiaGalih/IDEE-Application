@@ -10,7 +10,7 @@ Kontrak: `docs/ARCHITECTURE.md` §3–§11, `docs/IMPLEMENTATION_DESIGN_V2.md` �
 
 ## Toolchain (ADR-001, ADR-017, ADR-049)
 
-- Python 3.12 (CI juga 3.13), `uv` dengan `uv.lock`. Ruff untuk lint dan format, Pyright untuk tipe, import-linter untuk layer.
+- Python 3.12, dipin di `backend/.python-version` dan `sandbox_manager/.python-version` serta `UV_PYTHON: "3.12"` di CI (konflik #66, keputusan PO 7 Nov 2026). `uv` dengan `uv.lock`. Ruff untuk lint dan format, Pyright untuk tipe, import-linter untuk layer.
 - Library baru: rilis berumur ≥ 2 minggu dan audit dependensi bersih. Versi dipin di `uv.lock`.
 
 ## Struktur dan layer

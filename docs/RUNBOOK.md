@@ -440,7 +440,9 @@ Exception ada di `infra/security/scan-exceptions.toml` (Trivy) atau di komentar 
 
 1. Baca log langkah "Image scan (Trivy) and gate" atau "SAST (Semgrep)". Setiap baris `BLOCKING:` menyebut image, CVE, paket, dan versi perbaikan.
 2. **Temuan punya perbaikan dan image dibangun sendiri** (`kodekantor/*`): naikkan digest base di Dockerfile, atau kunci ulang dependensinya. Lalu build dan scan ulang (`make sandbox-images`, `docker compose ... build`, `infra/security/scan-images.sh <folder>`).
-3. **Image pihak ketiga** (caddy, nginx-unprivileged, postgres, redis, docker-socket-proxy):
+   - `kodekantor/caddy`: modul Go di `infra/caddy/build/` (`go get <modul>@<versi> && go mod tidy`); toolchain Go lewat digest image `golang` di `infra/caddy/Dockerfile` (samakan baris `go` di `go.mod`).
+   - `kodekantor/socket-proxy`: paket Alpine dengan versi minimum di `infra/socket-proxy/Dockerfile`; naikkan digest tecnativa bila upstream merilis versi baru (flag ADR-026 tetap di compose).
+3. **Image pihak ketiga** (base nginx-unprivileged dan node, postgres, redis):
    - cek apakah upstream sudah merilis digest dengan perbaikan, lalu naikkan pin di `infra/compose.yml`;
    - bila belum, tambahkan CVE-nya ke entri EX-03 image itu, dengan alasan mengapa tidak tereksploitasi di stack ini.
 4. **Exception tidak lagi cocok**: hapus CVE atau entrinya. Ini tanda upstream sudah memperbaiki.
@@ -448,7 +450,7 @@ Exception ada di `infra/security/scan-exceptions.toml` (Trivy) atau di komentar 
 6. **HIGH tanpa perbaikan** tidak memblokir selama EX-02 berlaku. Daftarnya tercetak di setiap run. Begitu distro merilis perbaikan, temuan itu memblokir sehingga langkah 2 berlaku.
 7. **Evaluasi ulang EX-03** bila:
    - profil sandbox node dengan network (deps_install, ADR-007) ditambahkan. Entri npm (`ip-address`, SSRF) tidak lagi "tanpa network";
-   - stack akan dideploy publik. CVE-2026-78669 di caddy (HTTP/2) harus ditutup lebih dulu, dengan caddy hasil build ulang atau `protocols h1 h3` sementara.
+   - stack akan dideploy publik: pastikan `kodekantor/caddy` tetap dibangun dengan Go dan x/net yang membawa perbaikan CVE-2026-78669 (HTTP/2, dapat dipicu di :443 publik); sejak 7 Nov 2026 tertutup oleh Go 1.26.10 + x/net 0.62.0.
 8. `infra/security/scan-images.sh` hanya untuk CI dan mesin pengembang, **tidak pernah di host produksi**: container Trivy memegang socket Docker (setara root) dan cache yang persisten.
 
 ---

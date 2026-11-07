@@ -51,6 +51,8 @@ class FakeEngine:
     run_forever: bool = False
     fail: dict[str, int] = field(default_factory=dict)  # path regex → status
     oom: bool = False
+    oom_from_inspect: int = 1  # dockerd may record the OOM after the exit: OOMKilled from this inspect on
+    inspects: int = 0
     break_logs: bool = False
     listed: list[dict[str, Any]] = field(
         default_factory=lambda: [{"Id": "0dd1", "Labels": {}}, {"Id": "0dd2", "Labels": {}}]
@@ -88,7 +90,9 @@ class FakeEngine:
         if path.endswith("/logs"):
             return httpx.Response(200, content=self._log_stream())
         if path.endswith("/json") and path.startswith("/containers/") and path != "/containers/json":
-            return httpx.Response(200, json={"Image": "sha256:abc", "State": {"OOMKilled": self.oom}})
+            self.inspects += 1
+            oom = self.oom and self.inspects >= self.oom_from_inspect
+            return httpx.Response(200, json={"Image": "sha256:abc", "State": {"OOMKilled": oom}})
         if path.endswith("/kill"):
             self.killed.set()
             return httpx.Response(204)
@@ -403,6 +407,38 @@ async def test_oom_is_not_a_test_failure(settings: Settings, profiles: dict[str,
     task_workspace(settings)
     record = await execute(settings, FakeEngine(exit_code=137, oom=True), a_run(settings, profiles))
     assert (record.status, record.exit_code, record.error_code) == ("error", 137, "OOM_KILLED")
+
+
+async def test_an_oom_recorded_after_the_exit_is_still_an_oom(
+    settings: Settings, profiles: dict[str, Profile]
+) -> None:
+    # containerd sends the exit and the OOM event separately; dockerd can set OOMKilled after `wait` returned
+    # (CI sandbox-isolation, 7 Nov 2026). Reported as a failing test, an OOM would be a claim the code failed.
+    task_workspace(settings)
+    fake = FakeEngine(exit_code=137, oom=True, oom_from_inspect=3)
+    record = await execute(settings, fake, a_run(settings, profiles))
+    assert (record.status, record.exit_code, record.error_code) == ("error", 137, "OOM_KILLED")
+
+
+async def test_a_sigkill_without_an_oom_stays_the_code_s_own_exit(
+    settings: Settings, profiles: dict[str, Profile], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Code may SIGKILL itself; only an OOM the engine records within the settle window makes 137 an error.
+    monkeypatch.setattr("sandbox_manager.docker_driver.OOM_SETTLE_S", 0.3)
+    task_workspace(settings)
+    fake = FakeEngine(exit_code=137)
+    started = asyncio.get_running_loop().time()
+    record = await execute(settings, fake, a_run(settings, profiles))
+    assert (record.status, record.exit_code, record.error_code) == ("failed", 137, None)
+    assert asyncio.get_running_loop().time() - started < 2.0
+    assert 2 <= fake.inspects <= 10  # looked again, but not forever
+
+
+async def test_an_ordinary_exit_is_inspected_once(settings: Settings, profiles: dict[str, Profile]) -> None:
+    task_workspace(settings)
+    fake = FakeEngine(exit_code=1)
+    record = await execute(settings, fake, a_run(settings, profiles))
+    assert (record.status, record.exit_code, fake.inspects) == ("failed", 1, 1)
 
 
 async def test_broken_log_stream_is_flagged(settings: Settings, profiles: dict[str, Profile]) -> None:

@@ -77,7 +77,7 @@ flowchart TB
 | `postgres` | PostgreSQL 16 | private | source of truth |
 | `redis` | Redis 7 | private, password | broker + pub/sub + rate-limit |
 | `sandbox-manager` | `uvicorn sandbox_manager.main:app` | akses Docker **hanya via** `docker-socket-proxy` | menjalankan **profil tetap**, bukan argv bebas |
-| `docker-socket-proxy` | tecnativa/docker-socket-proxy | socket ro | hanya endpoint `containers`, `images`, `exec`=0, `volumes`=0, `networks`=0 dsb. (ADR-009) |
+| `docker-socket-proxy` | `kodekantor/socket-proxy` (tecnativa/docker-socket-proxy v0.5.0 + paket Alpine diperbaiki) | socket ro | hanya endpoint `containers`, `images`, `exec`=0, `volumes`=0, `networks`=0 dsb. (ADR-009) |
 | task container | image `kodekantor/sandbox-python` / `-node` | uid 10001, no caps | per run; dihapus setelah log dikumpulkan |
 
 **Keanggotaan network (mengikat):** `caddy` → `public`+`edge`; `web` → `edge`; `api` → `edge`+`app`; `worker` → `app`+`outbound` (HTTPS ke Claude API); `scheduler`, `migrate`, `postgres`, `redis` → `app`; `sandbox-manager` → `app`+`exec`; `docker-socket-proxy` → `exec` saja; `egress-proxy` → `kk-egress`+`egress-out`. Tidak ada service selain sandbox-manager yang boleh bergabung ke `exec`, karena proxy Docker tidak berautentikasi dan dapat membuat container (setara root host, ADR-009).
@@ -197,27 +197,33 @@ class LLMProvider(Protocol):
 # LLMError(kind: rate_limited|overloaded|transient|timeout|refusal|bad_request|auth|malformed|cancelled|max_tokens,
 #          retry_after_s: float|None, retryable: bool)
 
-# app/tools/base.py
-class RiskLevel(IntEnum): R0=0; R1=1; R2=2; R3=3; R4=4
-@dataclass
+# app/tools/base.py  (ADR-070)
+class RiskLevel(IntEnum): R0=0; R1=1; R2=2; R3=3; R4=4          # R4 tidak pernah bisa didaftarkan
+@dataclass(frozen=True)
+class AgentGrant:   # dari registry tervalidasi (app/agents/grants.py grant_for), bukan dari DB
+    agent_id: str; tools: frozenset[str]; permissions: PermissionView; tool_quota: Mapping[str, int]
+@dataclass(frozen=True)
 class ToolSpec:
-    name: str; description: str; input_model: type[BaseModel]; risk: RiskLevel
-    handler: Callable[[ToolContext, BaseModel], Awaitable[ToolOutput]]
-    timeout_s: int = 60; side_effect: bool = False; capability: str | None = None
-@dataclass
-class ToolContext:  # dibangun oleh AgentRuntime, read-only bagi handler
-    task_id: UUID; project_id: UUID; agent_run_id: UUID | None; agent_id: str; actor_user_id: UUID
-    workspace: TaskWorkspace            # akses file HANYA lewat ini (safe paths)
-    permissions: PermissionProfile; correlation_id: str; cancel: CancelToken; db: AsyncSession
-@dataclass
-class ToolOutput: content: str | dict; evidence_refs: list[str] = []; artifacts: list[UUID] = []
-@dataclass
-class ToolResult: tool_call_id: UUID; status: Literal["ok","error","denied","timeout","approval_required"]; content: str; is_error: bool
+    name: str; description: str; input_model: type[BaseModel]   # extra="forbid"
+    risk: RiskLevel; handler: Callable[[ToolContext, Any], Awaitable[ToolOutput]]
+    timeout_s: float = 60; side_effect: bool = False           # setiap tool R1+ wajib side_effect
+    write_paths: Callable[[Any], Iterable[str]] | None = None  # wajib untuk tool yang menulis file
+@dataclass(frozen=True)
+class ToolContext:  # dibangun oleh AgentRuntime, read-only bagi handler; tanpa sesi DB
+    task_id: UUID; project_id: UUID; agent_run_id: UUID | None
+    grant: AgentGrant; offered: frozenset[str]                  # yang ditawarkan ke model di turn ini
+    correlation_id: str; cancel: CancelToken
+    workspace: TaskWorkspace | None = None                      # akses file HANYA lewat ini (safe paths)
+@dataclass(frozen=True)
+class ToolOutput: content: str | Mapping[str, Any]; evidence_refs: tuple[str, ...] = ()   # artifacts menyusul
+@dataclass(frozen=True)
+class ToolResult: tool_call_id: UUID; status: Literal["ok","error","denied","timeout","approval_required","cancelled"]; content: str; is_error: bool
 
-# app/tools/gateway.py
+# app/tools/gateway.py  (memegang ToolPorts dan sesi DB sendiri; domain lewat port, ADR-022)
 class ToolGateway:
-    async def execute(self, ctx: ToolContext, tool_name: str, raw_input: dict, *, tool_use_id: str | None = None) -> ToolResult
-    def tool_defs_for(self, profile: AgentProfileSpec) -> list[ToolDef]   # hanya tools di allowlist profile
+    def register(self, spec: ToolSpec) -> None                 # menolak R4, submit_result, tool di luar katalog mvp
+    def tool_defs_for(self, grant: AgentGrant) -> list[ToolDef]   # allowlist ∩ terdaftar ∩ prasyarat izin terpenuhi
+    async def execute(self, ctx: ToolContext, tool_name: str, raw_input: object, *, tool_use_id: str | None = None) -> ToolResult
 
 # app/agents/runtime.py
 class AgentRuntime:
@@ -380,7 +386,7 @@ sequenceDiagram
     P-->>R: content + usage (usage_records)
     alt tool_use blocks
       R->>G: execute(ctx, name, input)
-      G->>G: allowlist → schema → scope/path → risk/approval → quota
+      G->>G: offered+allowlist → izin → schema → scope/path → replay → quota → risk/approval
       G->>S: handler (timeout)
       S-->>G: real output
       G-->>R: tool_result (redacted, truncated) + tool_calls row + audit
