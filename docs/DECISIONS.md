@@ -363,7 +363,7 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 **Konteks:** builtin pertama yang membaca repo untuk model butuh tiga hal yang belum ada di kontrak. Pertama, konteks git task tanpa memberi `app.workspace` akses ke `app.gitops`. Kedua, cara menandai isi repo sebagai data, bukan perintah (T1). Ketiga, denylist yang menutup `prod.env`, karena kontrak `.env*` hanya mencocokkan awalan.
 **Keputusan:**
 1. `TaskWorkspace(root, *, repo, branch, base_commit)` membawa konteks git sebagai nilai polos; builtin membangun `GitTarget` sendiri. `ToolContext` tidak berubah.
-2. `ToolOutput.untrusted: Untrusted(source, path) | None`. Gateway yang menulis `<untrusted_content>`, dengan urutan redaksi → potong agar muat bersama tag → bungkus. Tag tiruan di isi dinetralkan, dan atribut di-escape lalu diredaksi.
+2. `ToolOutput.untrusted: Untrusted(source, path) | None`. Gateway yang menulis `<untrusted_content>`, dengan urutan redaksi → potong agar muat bersama tag → bungkus. Tag tiruan di isi dinetralkan. Atribut dibersihkan dari karakter kontrol, diredaksi, lalu di-escape.
 3. `*.env` adalah nama secret, sama seperti `.env*`: ditolak untuk `AGENT_READ`, `AGENT_WRITE` dan `USER_WRITE`.
 4. Akses agent ke worktree task mematuhi `.agentignore` worktree **dan** `repo/`. Kode sandbox hanya dapat menambah penyembunyian, tidak menghapusnya. `.agentignore` `repo/` yang tidak valid menolak akses agent.
 **Konsekuensi:** ARCHITECTURE §4.2 (`TaskWorkspace`, `ToolOutput`) dan §7 (denylist) diselaraskan; SECURITY_MODEL §13 mencatat risiko sisa (sandbox dapat menyalin berkas tersembunyi ke nama terlihat; user tidak dapat menulis `*.env` lewat IDE). Builtin 3.1d2b (`code.*`, `git.commit_task`) memakai keputusan yang sama.
