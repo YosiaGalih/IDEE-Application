@@ -522,11 +522,14 @@ async def test_a_commit_that_landed_is_returned_though_git_was_stopped(
     assert await git.commit_files(repo, sha) == ["a.txt"]
 
 
-@pytest.mark.parametrize("foreign", ["another_author", "another_message", "same_identity_other_parent"])
+@pytest.mark.parametrize(
+    "foreign", ["another_author", "another_message", "same_identity_other_parent", "same_identity_other_tree"]
+)
 async def test_a_head_moved_by_another_writer_is_not_taken_as_this_commit(
     git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch, foreign: str
 ) -> None:
-    """AG-13 delta2 LOW: only a commit proven to be this one (parent, author, message) answers a failure."""
+    """AG-13 delta2 LOW: only a commit proven to be this one (parent, author, message, and the index equal to
+    its tree: WP-2.1c I-6, spec 3.1d2b Goal 2) answers a failure."""
     write(repo.repo / "mine.txt", "mine\n")
     before = await git.current_commit(repo)
     run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
@@ -539,6 +542,11 @@ async def test_a_head_moved_by_another_writer_is_not_taken_as_this_commit(
         elif foreign == "another_message":
             raw_git(repo, "-c", f"user.name={ME.name}", "-c", f"user.email={ME.email}",
                     "commit", "-q", "--allow-empty", "-m", "foreign")  # fmt: skip
+        elif foreign == "same_identity_other_tree":  # parent, author and message match; the tree does not
+            empty = raw_git(repo, "mktree")  # stdin is empty: the empty tree
+            other = raw_git(repo, "-c", f"user.name={ME.name}", "-c", f"user.email={ME.email}",
+                            "commit-tree", empty, "-p", before or "", "-m", "mine")  # fmt: skip
+            raw_git(repo, "update-ref", "HEAD", other)
         else:  # our author and message, but not on top of ``before``
             tree = raw_git(repo, "write-tree")
             orphan = raw_git(repo, "-c", f"user.name={ME.name}", "-c", f"user.email={ME.email}",
@@ -861,3 +869,50 @@ async def test_a_same_size_edit_in_the_second_of_the_checkout_is_in_the_exact_di
     await asyncio.sleep(1.1)  # the diff runs in a later second
     got = await git.diff(repo, base=base, paths=["f.txt"], exact_files=True)
     assert [f.path for f in got.files] == ["f.txt"], got
+
+
+# --- commit of exact files (spec 3.1d2b Goal 2, Lead decision 3.1d2b #4) ------------------------------------
+
+
+async def test_commit_files_takes_only_the_named_files(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / "f.txt", "changed\n")
+    write(repo.repo / "new.txt", "new\n")
+    write(repo.repo / "other.txt", "left alone\n")
+    (repo.repo / "keep.md").unlink()
+    sha = await git.commit(repo, "named", ME, files=["f.txt", "new.txt", "keep.md"])
+    assert sha is not None
+    assert sorted(await git.commit_files(repo, sha)) == ["f.txt", "keep.md", "new.txt"]
+    assert "?? other.txt" in raw_git(repo, "status", "--porcelain")
+
+
+async def test_commit_files_takes_the_names_on_stdin(git: GitAdapter, repo: GitTarget) -> None:
+    """More than ARG_MAX (2 MiB) of names: on a command line this is E2BIG (AG-13 WP-3.1d2a LOW-D2)."""
+    names = [f"d/{'n' * 120}{i:05}.txt" for i in range(18_000)]
+    for name in names:
+        write(repo.repo / name, "x\n")
+    sha = await git.commit(repo, "many", ME, files=names)
+    assert sha is not None and len(await git.commit_files(repo, sha)) == len(names)
+
+
+async def test_a_change_outside_the_named_files_refuses_the_commit(git: GitAdapter, repo: GitTarget) -> None:
+    """A folder replaced by a file drops every entry below it from the index, hidden ones included: the
+    commit is refused and the index goes back to HEAD (Lead decision 3.1d2b #4)."""
+    import shutil
+
+    write(repo.repo / "config" / "prod.env", "S=1\n")
+    write(repo.repo / "config" / "x.txt", "x\n")
+    before = await git.commit_all(repo, "config", ME)
+    shutil.rmtree(repo.repo / "config")
+    write(repo.repo / "config", "now a file\n")
+    with pytest.raises(GitError) as raised:
+        await git.commit(repo, "swap", ME, files=["config", "config/x.txt"])
+    assert raised.value.reason == "staged_outside_files"
+    assert await git.current_commit(repo) == before
+    assert raw_git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_commit_files_never_takes_sandbox_output(git: GitAdapter, repo: GitTarget) -> None:
+    write(repo.repo / ".kk" / "junit.xml", "<x/>\n")
+    write(repo.repo / "f.txt", "changed\n")
+    sha = await git.commit(repo, "with kk", ME, files=[".kk/junit.xml", "f.txt"])
+    assert sha is not None and await git.commit_files(repo, sha) == ["f.txt"]

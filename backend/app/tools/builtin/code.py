@@ -66,13 +66,13 @@ def _write_errors() -> Iterator[None]:
             f"{detail.get('path')}"
             + (f" hunk {int(detail['hunk']) + 1}" if isinstance(detail.get("hunk"), int) else "")
             + f" ({detail.get('reason')})"
-            for detail in exc.details
+            for detail in exc.details or []
         )
         raise ToolError("patch_conflict", f"the patch does not apply, nothing was written: {where}") from None
     except PatchRejected as exc:
         raise ToolError("invalid_patch", f"the patch cannot be applied ({exc.reason})") from None
     except PatchRollbackFailed as exc:
-        paths = ", ".join(str(detail.get("path")) for detail in exc.details)
+        paths = ", ".join(str(detail.get("path")) for detail in exc.details or [])
         raise ToolError(
             "patch_partly_applied", f"the patch was partly applied and could not be rolled back: {paths}"
         ) from None

@@ -316,10 +316,12 @@ class GitAdapter:
         timeout_s: float | None = None,
         max_output: int | None = None,
         memory_limit: int | None = None,
+        stdin: bytes | None = None,
     ) -> _Result:
         """Run git. ``truncate``: past ``max_output`` stop reading and return what was read (no error).
         ``timeout_s`` and ``max_output`` override the adapter's limits for this call. ``memory_limit``: git
-        runs under ``prlimit --as`` (bytes); a git that cannot start under it fails like any git error."""
+        runs under ``prlimit --as`` (bytes); a git that cannot start under it fails like any git error.
+        ``stdin``: written to git while its output is read (names that would not fit on a command line)."""
         argv = [self.git]
         if memory_limit is not None:
             argv = [self.prlimit, f"--as={memory_limit}", "--", self.git]
@@ -335,7 +337,7 @@ class GitAdapter:
                 *argv,
                 cwd=cwd,
                 env={**_BASE_ENV, **(env or {})},
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,  # its own process group, so a timeout kills every child too
@@ -346,7 +348,7 @@ class GitAdapter:
             raise
         try:
             stdout, stderr, cut = await asyncio.wait_for(
-                self._collect(proc, truncate, self.max_output if max_output is None else max_output),
+                self._collect(proc, truncate, self.max_output if max_output is None else max_output, stdin),
                 self.timeout_s if timeout_s is None else timeout_s,
             )
         except TimeoutError:
@@ -365,10 +367,13 @@ class GitAdapter:
         return result
 
     async def _collect(
-        self, proc: asyncio.subprocess.Process, truncate: bool, limit: int
+        self, proc: asyncio.subprocess.Process, truncate: bool, limit: int, stdin: bytes | None = None
     ) -> tuple[bytes, bytes, bool]:
         assert proc.stdout is not None and proc.stderr is not None
         stdout_stream, stderr_stream = proc.stdout, proc.stderr
+        feeder = None
+        if stdin is not None and proc.stdin is not None:
+            feeder = asyncio.ensure_future(_feed(proc.stdin, stdin))  # written while the output is read
 
         async def out() -> tuple[bytes, bool]:
             chunks: list[bytes] = []
@@ -395,8 +400,12 @@ class GitAdapter:
             if cut:
                 await _kill(proc)  # stop git; the rest of its output is not wanted
             stderr = await err_task
+            if feeder is not None:
+                await feeder
         finally:
             err_task.cancel()
+            if feeder is not None:
+                feeder.cancel()
         await proc.wait()
         return stdout, stderr, cut
 
@@ -670,29 +679,26 @@ class GitAdapter:
                 await self._stage_exact(git_dir, tree, files, env)
             yield env
 
-    async def _stage_exact(self, git_dir: Path, tree: Path, files: list[str], env: dict[str, str]) -> None:
+    async def _stage_exact(
+        self, git_dir: Path, tree: Path, files: list[str], env: dict[str, str] | None
+    ) -> None:
         """Make each index entry of ``files`` what the working tree holds at that exact path: added, updated,
-        removed when gone, a file replacing a folder included; a path below a symlink or a file is gone."""
+        removed when gone, a file replacing a folder included; a path below a symlink or a file is gone. The
+        names go to git on stdin (NUL-separated): any number of them, never E2BIG."""
         checked = [_pathspec(name) for name in files]
         gone = await asyncio.to_thread(below_a_non_folder, tree, checked)
         removed = [name for name in checked if name in gone]
         present = [name for name in checked if name not in gone]
-        if removed:
-            await self._run(
-                ["update-index", "--force-remove", "--", *removed],
-                git_dir=git_dir,
-                work_tree=tree,
-                cwd=tree,
-                env=env,
-            )
-        if present:
-            await self._run(
-                ["update-index", "--add", "--remove", "--replace", "--", *present],
-                git_dir=git_dir,
-                work_tree=tree,
-                cwd=tree,
-                env=env,
-            )
+        for flags, names in ((["--force-remove"], removed), (["--add", "--remove", "--replace"], present)):
+            if names:
+                await self._run(
+                    ["update-index", *flags, "-z", "--stdin"],
+                    git_dir=git_dir,
+                    work_tree=tree,
+                    cwd=tree,
+                    env=env,
+                    stdin=b"".join(os.fsencode(name) + b"\0" for name in names),
+                )
 
     async def changed_paths(self, target: GitTarget, *, base: str) -> NameList:
         """The paths whose content differs between ``base`` and the working tree, untracked (not ignored)
@@ -862,20 +868,34 @@ class GitAdapter:
         author: Author,
         *,
         paths: list[str] | None = None,
+        files: list[str] | None = None,
         exclude: tuple[str, ...] = (".kk",),
     ) -> str | None:
         """Stage ``paths`` (everything when ``None``), unstage ``exclude``, and commit; ``None`` when nothing
         is staged. Paths are literal pathspecs (``GIT_LITERAL_PATHSPECS``), never options or magic.
+
+        ``files`` (agent commits, spec 3.1d2b Goal 2) instead stages exactly those file names, on stdin; when
+        the index then differs from HEAD anywhere else (a folder replaced by a file drops the entries below
+        it), nothing is committed: ``GitError("staged_outside_files")`` and the index goes back to HEAD.
 
         ``exclude`` defaults to ``.kk``: sandbox artefacts never enter git (SECURITY_MODEL §4), not even
         when an imported archive already tracked them (their index entries go back to HEAD's).
         """
         _message(message)
         _author(author)
-        if paths is not None and not paths:
+        if (paths is not None and not paths) or (paths is not None and files is not None):
             raise GitInputError("path")
         selected = [_pathspec(path) for path in paths] if paths is not None else []
         excluded = [_pathspec(path) for path in exclude]
+        exact = None
+        if files is not None:
+            exact = [
+                _pathspec(name)
+                for name in files
+                if not any(name == out or name.startswith(f"{out}/") for out in excluded)
+            ]
+            if not exact:
+                return None
         git_dir, tree = await self._adirs(target)
         if target.worktree is None:
             await asyncio.to_thread(_ensure_excludes, git_dir)
@@ -885,9 +905,14 @@ class GitAdapter:
             # The commit holds exactly what this call stages: whatever an earlier, failed run left in the
             # index is put back to HEAD first.
             await self._reset_index(git_dir, tree, born=born)
-            await self._run(["add", "-A", "--", *selected], git_dir=git_dir, work_tree=tree, cwd=tree)
-            for path in excluded:
-                await self._unstage(git_dir, tree, path, born=born)
+            if exact is None:
+                await self._run(["add", "-A", "--", *selected], git_dir=git_dir, work_tree=tree, cwd=tree)
+                for path in excluded:
+                    await self._unstage(git_dir, tree, path, born=born)
+            else:
+                await self._stage_exact(git_dir, tree, exact, None)
+                if set(await self._staged_names(git_dir, tree, before)) - set(exact):
+                    raise GitError("staged_outside_files")
             staged = await self._run(
                 ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"],
                 git_dir=git_dir,
@@ -962,6 +987,7 @@ class GitAdapter:
             parents.split() == ([before] if before is not None else [])
             and email == author.email
             and body.split() == message.split()  # git trims and collapses the message's whitespace
+            and await self._index_is_tree_of(git_dir, tree, after)  # WP-2.1c I-6: what this call staged
         )
         if not mine:
             # Another writer moved HEAD: callers must serialise writers of one index (the workspace lock).
@@ -969,6 +995,28 @@ class GitAdapter:
             return None
         logger.warning("git_commit_landed_despite_error", reason=reason)
         return after
+
+    async def _staged_names(self, git_dir: Path, tree: Path, head: str | None) -> list[str]:
+        """Every path whose index entry differs from ``head`` (the empty tree before the first commit)."""
+        result = await self._run(
+            ["diff", "--cached", "--name-only", "--no-renames", "-z", head or EMPTY_TREE, "--"],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+        )
+        return [name for name in result.stdout.decode("utf-8", "surrogateescape").split("\0") if name]
+
+    async def _index_is_tree_of(self, git_dir: Path, tree: Path, commit: str) -> bool:
+        """Whether the index holds exactly ``commit``'s tree: a commit this call wrote leaves it so; another
+        writer's commit with the same parent, author and message but other content does not."""
+        result = await self._run(
+            ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", commit, "--"],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+            check=False,
+        )
+        return result.returncode == 0
 
     async def _reset_index(self, git_dir: Path, tree: Path, *, born: bool) -> None:
         """Put the whole index back to HEAD (empty before the first commit); no-op when nothing is staged."""
@@ -1184,6 +1232,18 @@ def _remove_index_lock(git_dir: Path) -> None:
     with contextlib.suppress(FileNotFoundError):
         (git_dir / "index.lock").unlink()
         logger.error("git_index_lock_removed", git_dir=git_dir.name)
+
+
+async def _feed(stream: asyncio.StreamWriter, data: bytes) -> None:
+    """Write ``data`` to git's stdin and close it. git stopping early is not an error here: its exit status
+    says what happened."""
+    try:
+        stream.write(data)
+        await stream.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        stream.close()
 
 
 async def _kill(proc: asyncio.subprocess.Process) -> None:

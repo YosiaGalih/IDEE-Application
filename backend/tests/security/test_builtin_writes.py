@@ -90,3 +90,66 @@ async def test_a_patch_cannot_reach_outside_the_filesystem_mode(
     assert status == "denied", out
     assert not (ws.root / "tests" / "test_new.py").exists()
     assert (ws.root / "src" / "a.py").read_text() == "a\n"
+
+
+# --- git.commit_task (spec 3.1d2b Review Focus 2) -------------------------------------------------------
+
+
+async def commit_out(sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace,
+                     message: str) -> tuple[str, str]:  # fmt: skip
+    from app.tools.builtin import commit
+
+    built = gateway(sessions, *commit.specs())
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["git.commit_task"], workspace=ws)
+    result = await built.execute(
+        ctx, "git.commit_task", {"message": message}, tool_use_id=f"toolu_w_{next(_uses)}"
+    )
+    return result.status, result.content
+
+
+async def test_a_commit_never_takes_what_agents_may_not_read(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    """Hidden changes stay out of the commit (and in the worktree): untracked secrets, a tracked secret the
+    sandbox changed, .agentignore'd files of repo/ and of the worktree, sandbox output, a nested repo."""
+    from app.gitops.adapter import GitAdapter
+    from app.tools.builtin._common import git_target
+
+    ws = await task_worktree(
+        tmp_path, {"config/prod.env": "OLD=1\n", "src/a.py": "a\n"}, repo_agentignore="private/\n"
+    )
+    for rel in (".env", "private/notes.md", ".kk/junit.xml", "scratch/x.txt", "config/prod.env"):
+        write(ws.root / rel, "HIDDEN-MARK\n")
+    write(ws.root / ".agentignore", "private/\nscratch/\n")  # the task's own addition
+    write(ws.root / "nested" / ".git" / "HEAD", "ref: refs/heads/main\n")  # a repository inside the worktree
+    write(ws.root / "src" / "a.py", "visible\n")
+    status, out = await commit_out(sessions, scope, ws, "visible only")
+    assert status == "ok", out
+    git, target = GitAdapter(), git_target(ws)
+    sha = await git.current_commit(target)
+    committed = await git.commit_files(target, sha or "")
+    assert sorted(committed) == [".agentignore", "src/a.py"], committed
+    assert "HIDDEN-MARK" not in out and "prod.env" not in out and "private/" not in out, out
+    assert "not committed" in out, out
+    assert (ws.root / "config" / "prod.env").read_text() == "HIDDEN-MARK\n"  # left in the worktree
+
+
+async def test_a_visible_change_that_drags_hidden_paths_is_refused(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    """Lead decision 3.1d2b #4: a folder holding a secret, replaced by a file, would commit the secret's
+    deletion: nothing is committed and the index is back at HEAD."""
+    import shutil
+
+    from app.gitops.adapter import GitAdapter
+    from app.tools.builtin._common import git_target
+
+    ws = await task_worktree(tmp_path, {"config/prod.env": "S=1\n", "config/x.txt": "x\n"})
+    git, target = GitAdapter(), git_target(ws)
+    before = await git.current_commit(target)
+    shutil.rmtree(ws.root / "config")
+    write(ws.root / "config", "now a file\n")
+    status, out = await commit_out(sessions, scope, ws, "swap")
+    assert status == "error" and "nothing was committed" in out, out
+    assert await git.current_commit(target) == before
+    assert (await git.status(target)).changes  # the worktree change is still there, unstaged
