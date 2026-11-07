@@ -100,6 +100,11 @@ def _is_secret(segment: str) -> bool:
     return any(fnmatchcase(lowered, pattern) for pattern in _SECRET_PATTERNS)
 
 
+def is_secret_name(parts: tuple[str, ...]) -> bool:
+    """Whether any segment of a path is a secret name (``.env*``, ``*.env``, ``*.pem``, ``.ssh``, ...)."""
+    return any(_is_secret(segment) for segment in parts)
+
+
 class PolicyBudgetExceeded(Exception):
     """A caller-supplied ``Budget`` ran out (``tree`` stops listing and reports a truncated result)."""
 

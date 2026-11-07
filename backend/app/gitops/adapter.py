@@ -636,6 +636,26 @@ class GitAdapter:
                 continue
         return sorted(names)
 
+    async def worktree_files(self, target: GitTarget) -> list[str]:
+        """What a commit of the working tree could take: tracked files plus untracked ones that are not
+        ignored (``.gitignore``, ``info/exclude``), sorted, names only. Non-UTF-8 paths are left out."""
+        git_dir, tree = await self._adirs(target)
+        result = await self._run(
+            ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+        )
+        names: set[str] = set()
+        for raw in result.stdout.split(b"\0"):
+            if not raw:
+                continue
+            try:
+                names.add(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                continue
+        return sorted(names)
+
     async def list_files(self, target: GitTarget, commit: str) -> TreeListing:
         """The regular files of ``commit``'s tree, read from the object database (no working tree, no symlink
         followed). Symlinks and submodules are left out; paths that are not UTF-8 are counted, not listed."""
