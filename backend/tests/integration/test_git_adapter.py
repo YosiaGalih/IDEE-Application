@@ -620,6 +620,21 @@ async def test_grep_finds_text_in_the_working_tree_including_untracked(
     assert not result.truncated
 
 
+async def test_changed_paths_lists_names_against_a_base_without_reading_them(
+    git: GitAdapter, repo: GitTarget
+) -> None:
+    """WP-3.1d2a git.diff: names first (committed, staged, worktree, untracked), so a caller can filter
+    them before any content is diffed."""
+    base = await git.current_commit(repo)
+    assert base is not None
+    write(repo.repo / "f.txt", "a\nB\nc\n")
+    await git.commit_all(repo, "change", ME)
+    write(repo.repo / "keep.md", "changed\n")
+    write(repo.repo / "new" / "u.txt", "untracked\n")
+    assert await git.changed_paths(repo, base=base) == ["f.txt", "keep.md", "new/u.txt"]
+    assert await git.changed_paths(repo, base=await git.current_commit(repo)) == ["keep.md", "new/u.txt"]
+
+
 async def test_grep_runs_under_a_hard_memory_limit(
     git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
 ) -> None:

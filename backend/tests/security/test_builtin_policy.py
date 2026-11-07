@@ -160,3 +160,39 @@ async def test_one_text_search_per_task_at_a_time(
     finally:
         release.set()
     assert "a.txt:1: needle" in await first
+
+
+# --- git.status / git.diff: hidden names and contents never reach the model (WP-1.2 hand-off) ---
+
+
+async def git_out(sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace, name: str,
+                  **raw: object) -> str:  # fmt: skip
+    from app.tools.builtin import git as git_tools
+
+    built = gateway(sessions, *git_tools.specs())
+    tools = ["git.status", "git.diff"]
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=tools, workspace=ws)
+    return (await built.execute(ctx, name, raw)).content
+
+
+async def test_git_never_shows_hidden_files(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    from tests.worktree_fakes import task_worktree, write
+
+    ws = await task_worktree(tmp_path, {"src/app.py": "v\n"}, repo_agentignore="private/\nscratch/\n")
+    for rel in HIDDEN:
+        write(ws.root / rel, f"{MARK}\n")  # untracked: what a sandboxed install or the agent left
+    write(ws.root / "src" / "app.py", "visible change\n")
+    (ws.root / ".agentignore").write_text("")
+    outputs = [
+        await git_out(sessions, scope, ws, "git.status"),
+        await git_out(sessions, scope, ws, "git.diff"),
+        await git_out(sessions, scope, ws, "git.diff", paths=[".env"]),
+        await git_out(sessions, scope, ws, "git.diff", paths=["config/prod.env", "private", "."]),
+    ]
+    for out in outputs:
+        assert MARK not in out, out
+        for rel in HIDDEN:
+            assert rel not in out, (rel, out)
+    assert "src/app.py" in outputs[0] and "+visible change" in outputs[1]
