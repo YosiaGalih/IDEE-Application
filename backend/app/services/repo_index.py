@@ -296,6 +296,9 @@ async def _collect(env: ProjectEnv, target: GitTarget, head: str | None) -> _Col
         timeout_s=INDEX_GIT_TIMEOUT_S,
         max_output=SYMBOL_OUTPUT_MAX,
         max_matches=MAX_SYMBOL_MATCHES,
+        # Our own SYMBOL_PATTERNS, not a user's or an agent's regex: no address-space limit, which a
+        # multi-threaded git grep over a large pack could hit (backend review WP-3.1d2a M1).
+        memory_limit=None,
     )
     truncated = listing.truncated or found.truncated
     skipped = listing.skipped_paths  # paths left out; grep's count is of matches in those same files

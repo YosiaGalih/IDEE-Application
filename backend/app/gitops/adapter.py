@@ -307,15 +307,20 @@ class GitAdapter:
         if work_tree is not None:
             argv.append(f"--work-tree={work_tree}")
         argv += args
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=cwd,
-            env={**_BASE_ENV, **(env or {})},
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,  # its own process group, so a timeout kills every child too
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=cwd,
+                env={**_BASE_ENV, **(env or {})},
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # its own process group, so a timeout kills every child too
+            )
+        except FileNotFoundError:
+            if memory_limit is not None:  # the image lacks util-linux: fail visibly, never run unbounded
+                raise GitError("prlimit_missing") from None
+            raise
         try:
             stdout, stderr, cut = await asyncio.wait_for(
                 self._collect(proc, truncate, self.max_output if max_output is None else max_output),
@@ -712,7 +717,7 @@ class GitAdapter:
         max_output: int,
         max_matches: int | None = None,
         threads: int | None = None,
-        memory_limit: int = GREP_MEMORY_LIMIT,
+        memory_limit: int | None = GREP_MEMORY_LIMIT,
     ) -> GrepResult:
         """``git grep`` over the working tree with untracked files (``commit=None``: ignored files and
         ``.git`` are never read, symlinks are not followed) or over ``commit``'s tree. Patterns follow ``-e``

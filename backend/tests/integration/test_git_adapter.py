@@ -667,6 +667,18 @@ async def test_a_grep_over_its_memory_limit_fails_loudly(git: GitAdapter, repo: 
                        timeout_s=10, max_output=1 << 20, memory_limit=4 << 20)  # fmt: skip
 
 
+async def test_a_missing_prlimit_is_a_git_error_not_a_crash(repo: GitTarget) -> None:
+    # Backend review WP-3.1d2a M1: an image without util-linux fails the search visibly, as a GitError.
+    broken = GitAdapter(prlimit="/nonexistent/prlimit")
+    with pytest.raises(GitError) as caught:
+        await broken.grep(repo, ["a"], commit=None, fixed=True, ignore_case=False, only_matching=False,
+                          timeout_s=10, max_output=1 << 20)  # fmt: skip
+    assert caught.value.reason == "prlimit_missing"
+    found = await broken.grep(repo, ["a"], commit=None, fixed=True, ignore_case=False, only_matching=False,
+                              timeout_s=10, max_output=1 << 20, memory_limit=None)  # fmt: skip
+    assert found.matches  # trusted callers (the symbol indexer) run git directly
+
+
 async def test_grep_is_literal_unless_regex(git: GitAdapter, repo: GitTarget) -> None:
     write(repo.repo / "x.txt", "axb\n")
     literal = await git.grep(repo, ["a.b"], commit=None, fixed=True, ignore_case=False,

@@ -53,7 +53,7 @@ from app.tools.base import (
 from app.tools.catalog import TOOL_CATALOG, ToolInfo
 from app.tools.policy import is_r4, unmet_preconditions, write_allowed
 from app.tools.scope import TaskScope, lock_task_scope
-from app.tools.untrusted import CLOSE_TAG, neutralise, open_tag
+from app.tools.untrusted import CLOSE_TAG, CUT_MARKER, neutralise, open_tag, strip_controls
 
 logger = get_logger(__name__)
 
@@ -219,6 +219,14 @@ def _where(loc: tuple[int | str, ...]) -> str:
 def _invalid_input(error: ValidationError) -> str:
     problems = "; ".join(f"{_where(e['loc'])}: {e['type']}" for e in error.errors()[:10])
     return f"invalid input: {problems}"
+
+
+def _summary(content: str, untrusted: Untrusted | None) -> str:
+    """What the tool_calls row keeps (and a replay returns): a wrapped output cut to SUMMARY_MAX keeps its
+    closing tag (AG-13 WP-3.1d2a LOW-3)."""
+    if untrusted is None or len(content) <= SUMMARY_MAX:
+        return content[:SUMMARY_MAX]
+    return content[: SUMMARY_MAX - len(CUT_MARKER) - len(CLOSE_TAG)] + CUT_MARKER + CLOSE_TAG
 
 
 def _content_text(output: ToolOutput) -> str:
@@ -697,7 +705,7 @@ class ToolGateway:
         if untrusted is None:
             return self._redacted_cut(content, MAX_RESULT_BYTES, lambda text: text)
         redact = self._audit.redactor.redact
-        path = None if untrusted.path is None else redact(_clean_text(untrusted.path))
+        path = None if untrusted.path is None else redact(strip_controls(_clean_text(untrusted.path)))
         opening = open_tag(untrusted.source, path)
         budget = MAX_RESULT_BYTES - len(opening.encode()) - len(CLOSE_TAG.encode())
         return opening + self._redacted_cut(content, budget, neutralise) + CLOSE_TAG
@@ -760,7 +768,7 @@ class ToolGateway:
         started: float,
     ) -> ToolResult:
         content = self._model_text(outcome.content, outcome.untrusted)
-        summary = content[:SUMMARY_MAX]
+        summary = _summary(content, outcome.untrusted)
         updated = await session.scalar(
             update(ToolCall)
             .where(ToolCall.id == row.id, ToolCall.status == "running")
