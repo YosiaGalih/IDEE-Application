@@ -74,3 +74,6 @@ APPROVAL_ACTION_TYPES = (
 APPROVAL_STATUSES = ("pending", "approved", "rejected", "expired", "consumed", "superseded")
 # ADR-024: a decision is committed before its handler runs; these track the handler.
 HANDLER_STATUSES = ("pending", "succeeded", "failed", "not_required")
+# DATA_MODEL tool_calls + running (the claim before a side-effect handler) and cancelled (spec WP-3.1d,
+# Keputusan Lead 4).
+TOOL_CALL_STATUSES = ("running", "ok", "error", "denied", "timeout", "approval_required", "cancelled")

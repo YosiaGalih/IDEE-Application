@@ -4,17 +4,17 @@ File ini ditulis untuk melanjutkan pembangunan KodeKantor setelah kredit cloud h
 
 Aturan kerja dan antrian unit lengkap ada di `docs/superpowers/plans/2026-10-24-continuation-under-usage-limits.md`. File ini hanya memuat posisi terakhir dan langkah berikutnya.
 
-## Status (5 Nov 2026)
+## Status (7 Nov 2026)
 
 | | |
 |---|---|
-| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9), WP-2.1a projects core (PR #10), WP-2.1b import arsip (PR #11), WP-2.1c API workspace dan git (PR #12), WP-2.1d indeks dan pencarian (PR #13), WP-2.1e dashboard (PR #14), WP-2.2a layar IDE (PR #15), WP-2.2b panel git (PR #16), bukti G2 (PR #17; keputusan gate di PO). WP-3.1a port LLM (PR #18), WP-3.1b registry agent (PR #19), WP-3.1c1 approval + hapus project backend (PR #20) |
+| `main` | WP-1.1, WP-1.2 (PR #1, #2), WP-1.3 + ADR-026 (4) (PR #3), WP-1.5a (PR #4), WP-1.5b + uv 0.13.4 (PR #5), WP-1.5c (PR #6), WP-1.5d (PR #7), WP-1.4a (PR #8), WP-1.4b layar auth (PR #9), WP-2.1a projects core (PR #10), WP-2.1b import arsip (PR #11), WP-2.1c API workspace dan git (PR #12), WP-2.1d indeks dan pencarian (PR #13), WP-2.1e dashboard (PR #14), WP-2.2a layar IDE (PR #15), WP-2.2b panel git (PR #16), bukti G2 (PR #17; keputusan gate di PO). WP-3.1a port LLM (PR #18), WP-3.1b registry agent (PR #19), WP-3.1c1 approval + hapus project backend (PR #20), WP-3.1c2 layar `/approvals` (PR #21; AG-13 C1 terpenuhi, CI 9/9 di 68db3db) |
 | Mandat PO | "jalankan P2, P3 dan P4" (2 Nov): WP-2.1, 2.2, 3.1, 3.2, 4.1, 4.2, 4.3 (berhenti di gate G4 untuk PO), SEC-01, bukti G2. Satu sub-WP = satu PR |
-| Branch kerja | `claude/gracious-goodall-3hjh19` |
-| Sedang dikerjakan | **WP-3.1c2** (layar `/approvals`, badge tertunda yang polling hanya saat pengguna aktif, aksi "Hapus" di `/projects`, `project_name` di respons Approval): PR dibuka sesudah PR #20 di-merge. Review backend/frontend/silent-failure/AG-13/`/code-review` sudah ditutup; AG-13 SIGNED OFF WITH CONDITIONS, sisa C1 = CI hijau di PR |
-| Berikutnya | 3.1d ToolGateway + builtin (syarat warisan: 3.1b C3, 3.1c C3/LOW-A/LOW-E, lihat tracker); 3.1e pengaturan provider + readiness + kill switch; 3.1f runtime + budget + usage (3.1b C4: penulis `agent_runs` meredaksi). Lalu WP-3.2 (termasuk chat; pembuatan task mengunci project dan menolak project tidak aktif), P4 (WP-4.1 termasuk terminal, WP-4.2, SEC-01, WP-4.3 berhenti di G4). Di luar cakupan: shell aplikasi belum responsif di ponsel |
+| Branch kerja | `claude/tender-maxwell-wbmsrg` (branch sesi cloud 7 Nov, dari `main` 2137385; `claude/gracious-goodall-3hjh19` berisi PR #21 yang sudah di-merge) |
+| Sedang dikerjakan | **WP-3.1d1** di PR #22 (draft): ToolGateway inti, `tool_calls`, approval `tool_r3`, trigger penjaga approval, redaksi linear. Review backend/silent-failure/AG-13/`/code-review` selesai dan ditutup (tracker bagian WP-3.1d1). AG-13 SIGNED OFF WITH CONDITIONS; syarat gate tersisa **C1 = CI hijau di PR #22**. ADR-070 (Proposed) menunggu PO |
+| Berikutnya | **3.1d2** builtin R0/R1 (`repo.*`, `git.status/diff/log`, `code.*`, `git.commit_task`, `repo.detect_stack`, `repo.find_related_tests`, `security.scan_secrets`) + pembungkus `<untrusted_content>`; syarat warisan WP-1.2 (`git.diff` disaring `AGENT_READ`, `*.env`), WP-2.1c (I-b `exclusive()`, I-6 index = tree), WP-2.1d (Budget `.agentignore`, `AGENT_READ_LIMIT` preview, redaksi preview/simbol, TOCTOU worktree, D1/D3 memori git). Lalu 3.1e pengaturan provider + readiness + kill switch; 3.1f runtime + budget + usage (3.1b C4; syarat 3.1d1 untuk runtime: tidak memegang lock baris task selama `execute`, resume `tool_r3` melanjutkan `agent_run` yang sama, engine memarkir hanya bila approval masih `pending`, sweep baris `tool_calls` yang macet `running`). Lalu WP-3.2, P4 (WP-4.1, WP-4.2, SEC-01, WP-4.3 berhenti di G4). Di luar cakupan: shell aplikasi belum responsif di ponsel |
 | Utang terbuka | sign-off formal AG-13 untuk WP-1.2 dan WP-1.3 (U4). Dari WP-1.5a: role owner non-superuser untuk migrate. Dari WP-1.4b: token reset dipindah ke fragment sebelum ada jalur pengiriman tautan; stream task berhenti di status terminal. Dari WP-1.6: access log uvicorn rusak (`RedactingFilter`), healthcheck `scheduler` |
-| Menunggu PO | konflik #36–#68 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; EX-02..EX-06 di DECISIONS (EX-02 kini juga mencakup 5 HIGH tanpa fix dari git di image backend); role global di project yang diberi grant (tracker WP-2.1a); konflik #66 (Python 3.13), #67 (sumber `upload`), #68 (HTTP 408); M2 egress sebelum G4; konflik #71 (WP-SEC-01 bergantung pada WP-INT-03/05 yang di luar mandat; perlu keputusan sebelum P4); konflik #72 (agentic core: registry v1/v2, kontrak agent, skenario, tarif awal); gate G0/G1/G2 |
+| Menunggu PO | konflik #36–#68 di `docs/superpowers/specs/2026-10-24-development-system-design.md` §8; EX-02..EX-06 di DECISIONS (EX-02 kini juga mencakup 5 HIGH tanpa fix dari git di image backend); role global di project yang diberi grant (tracker WP-2.1a); konflik #66 (Python 3.13), #67 (sumber `upload`), #68 (HTTP 408); M2 egress sebelum G4; konflik #71 (WP-SEC-01 bergantung pada WP-INT-03/05 yang di luar mandat; perlu keputusan sebelum P4); konflik #72 (agentic core: registry v1/v2, kontrak agent, skenario, tarif awal; butir 3.1d: kolom/status `tool_calls`, `ToolContext`, urutan kuota, `tool_r3` kedaluwarsa/resume ke `draft`); gate G0/G1/G2 |
 
 ### WP-1.5a: yang sudah ada (di branch kerja)
 
@@ -70,7 +70,7 @@ docker compose -f infra/compose.yml --env-file infra/tests/ci.env up -d --no-bui
 
 1. **Di mesin sendiri (disarankan; tanpa biaya cloud).**
    - Pasang git, Docker Engine ≥ 27 + Compose, uv 0.13.x, Python 3.12, PostgreSQL 16, dan Redis 7 (atau jalankan keduanya sebagai container).
-   - Clone repo, `git checkout claude/gracious-goodall-3hjh19`, `git pull`.
+   - Clone repo, `git checkout claude/tender-maxwell-wbmsrg` (atau branch WP berikutnya), `git pull`.
    - Login Claude Code dengan akun langganan, lalu jalankan `claude` di folder repo. Pemakaian dihitung ke limit sesi dan limit mingguan, bukan kredit.
 2. **Cek kuota di awal sesi** (`/usage` atau `/status`), lalu pilih satu unit yang muat (rencana §3).
 3. **Satu sesi = satu unit, ditutup dengan commit + push hijau.** Bila limit hampir habis, commit `wip: ...` lalu push. Itu lebih baik daripada pekerjaan hilang.

@@ -17,7 +17,7 @@ from app.models.approvals import Approval
 from app.models.audit import AuditEvent
 from app.services import approval_handlers as handlers
 from app.services import approval_store as store
-from tests.conftest import reset_data
+from tests.conftest import allow_approval_status_writes, reset_data
 from tests.integration.test_task_schema import make_project
 
 AUDIT = AuditWriter(Redactor())
@@ -74,6 +74,10 @@ async def decided(
             requested_by=f"user:{project.owner_id}",
             now=created,
         )
+        await allow_approval_status_writes(session)
+        if status == "consumed":  # only an approved approval can be consumed (approvals_status_guard)
+            approval.status = "approved"
+            await session.flush()
         approval.status = status
         await session.commit()
         return approval.id
@@ -211,7 +215,7 @@ async def test_superseded_while_running_stays_not_required(
             async with sessions() as session:
                 row = await session.get(Approval, approval_id)
                 assert row is not None
-                row.status, row.handler_status = "superseded", "not_required"
+                await store.supersede(session, AUDIT, row, actor="system:test")
                 await session.commit()
 
     await handlers.dispatch(

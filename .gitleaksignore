@@ -7,3 +7,5 @@
 5cb94ead09c5dfaf7b1d43a694dfbc4d000d550b:backend/tests/security/test_workspace_hostile.py:generic-api-key:155
 # Synthetic reset token in a screen test (WP-1.4b), committed before it could carry an inline allow comment.
 f7f21facaceaadc9e585ab77009ac29b6146b208:frontend/src/features/auth/__tests__/PasswordReset.test.tsx:generic-api-key:72
+# Synthetic password in the URL-credential redaction regressions (WP-3.1d1, AG-13 HIGH); not a real credential.
+5b5b28ae192877c9da1c698d8d4a5664ab2e5f10:backend/tests/security/test_url_credential_redaction.py:generic-api-key:15

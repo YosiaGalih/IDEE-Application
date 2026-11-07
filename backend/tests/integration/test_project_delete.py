@@ -20,7 +20,8 @@ from app.models.audit import AuditEvent
 from app.models.identity import UserRole
 from app.models.projects import Project
 from app.models.tasks import Task
-from app.services import project_delete, projects
+from app.services import approval_store, project_delete, projects
+from tests.conftest import allow_approval_status_writes
 from tests.integration.test_dashboard_api import add_task
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     app,
@@ -55,6 +56,7 @@ async def gone(engine: AsyncEngine, model: type, row_id: uuid.UUID) -> bool:
 
 async def approve(engine: AsyncEngine, approval_id: uuid.UUID, status: str = "approved") -> None:
     async with engine.begin() as conn:
+        await allow_approval_status_writes(conn)
         await conn.execute(update(Approval).where(Approval.id == approval_id).values(status=status))
 
 
@@ -191,6 +193,37 @@ async def test_approved_but_expired_before_consume_restores(
     assert (await load(engine, Project, project_id)).status == "active"
 
 
+async def test_the_handler_reads_the_clock_after_the_lock(
+    env: projects.ProjectEnv,
+    engine: AsyncEngine,
+    owner_id: uuid.UUID,  # noqa: F811
+) -> None:
+    # 3.1c1 AG-13 LOW-A: an approval that expires while the handler waits on a lock must not be used.
+    actor = owner_actor(owner_id)
+    project_id = await blank(env, actor)
+    approval, _ = await project_delete.request_delete(env, actor, project_id)
+    await approve(engine, approval.id)
+    locked = False
+    late = NOW + timedelta(days=8)  # past the 7-day expiry
+
+    def clock() -> datetime:
+        return late if locked else NOW
+
+    handler = project_delete.ProjectDeleteHandler(sessions=env.sessions, audit=env.audit, clock=clock)
+    take_locks = handler._locked  # pyright: ignore[reportPrivateUsage]
+
+    async def locked_then_flagged(session: object, approval_id: uuid.UUID) -> object:
+        nonlocal locked
+        result = await take_locks(session, approval_id)  # type: ignore[arg-type]
+        locked = True
+        return result
+
+    handler._locked = locked_then_flagged  # type: ignore[method-assign]
+    await handler.approved(approval.id, now=None)
+    assert (await load(engine, Approval, approval.id)).status == "expired"
+    assert (await load(engine, Project, project_id)).status == "active"
+
+
 @pytest.mark.parametrize(
     ("status", "path", "action"),
     [
@@ -227,13 +260,27 @@ async def test_a_corrupt_previous_status_restores_to_archived(
     ``active``: it comes back archived, and the audit says so."""
     actor = owner_actor(owner_id)
     project_id = await blank(env, actor)
-    approval, _ = await project_delete.request_delete(env, actor, project_id)
-    async with engine.begin() as conn:
-        await conn.execute(
-            update(Approval)
-            .where(Approval.id == approval.id)
-            .values(status="rejected", payload={**approval.payload, "previous_status": "deleted"})
+    requested, _ = await project_delete.request_delete(env, actor, project_id)
+    # A payload cannot be edited after the request (approvals_status_guard), so the corrupt request is a new
+    # row replacing the real one, as a hand-made insert would be.
+    async with make_sessionmaker(engine)() as session:
+        original = await session.get(Approval, requested.id)
+        assert original is not None
+        await approval_store.supersede(session, env.audit, original, actor="system:test")
+        approval = await approval_store.create(
+            session,
+            env.audit,
+            project_id=project_id,
+            task_id=None,
+            action_type=project_delete.ACTION,
+            payload={**original.payload, "previous_status": "deleted"},
+            summary=original.summary,
+            risk_level=3,
+            requested_by=original.requested_by,
         )
+        await allow_approval_status_writes(session)
+        approval.status = "rejected"
+        await session.commit()
     await handler.rejected(approval.id, now=NOW)
     assert (await load(engine, Project, project_id)).status == "archived"
     async with make_sessionmaker(engine)() as session:
@@ -392,6 +439,7 @@ async def test_repeat_delete_after_a_failed_deletion_is_409(
     project_id = await blank(env, actor)
     approval, _ = await project_delete.request_delete(env, actor, project_id)
     async with engine.begin() as conn:
+        await allow_approval_status_writes(conn)
         await conn.execute(
             update(Approval)
             .where(Approval.id == approval.id)
@@ -413,6 +461,7 @@ async def test_a_first_failure_is_not_yet_delete_failed(
     project_id = await blank(env, actor)
     approval, _ = await project_delete.request_delete(env, actor, project_id)
     async with engine.begin() as conn:
+        await allow_approval_status_writes(conn)
         await conn.execute(
             update(Approval)
             .where(Approval.id == approval.id)

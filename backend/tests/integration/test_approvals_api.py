@@ -13,6 +13,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.models.approvals import Approval
+from tests.conftest import allow_approval_status_writes
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     PROJECTS,
     app,
@@ -54,6 +55,11 @@ async def decide(
 
 async def set_status(engine: AsyncEngine, approval_id: object, **values: object) -> None:
     async with engine.begin() as conn:
+        await allow_approval_status_writes(conn)
+        if values.get("status") == "consumed":  # only an approved approval can be consumed
+            await conn.execute(
+                update(Approval).where(Approval.id == uuid.UUID(str(approval_id))).values(status="approved")
+            )
         await conn.execute(
             update(Approval).where(Approval.id == uuid.UUID(str(approval_id))).values(**values)
         )
@@ -274,6 +280,7 @@ async def test_a_decision_waits_for_a_concurrent_change(
         decision = asyncio.create_task(decide(owner, approval))  # type: ignore[arg-type]
         assert await waiting_on_a_lock(engine), "the decision never waited on the row lock"
         assert not decision.done()
+        await allow_approval_status_writes(conn)
         await conn.execute(update(Approval).where(Approval.id == approval_id).values(status="rejected"))
         await transaction.commit()
     response = await decision

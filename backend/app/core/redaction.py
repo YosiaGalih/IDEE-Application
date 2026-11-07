@@ -41,7 +41,12 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 # scheme://user:pass@host and scheme://<token-like userinfo>@host → scheme://[REDACTED]@host
-_URL_CREDENTIALS = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{8,})@")
+# The scheme is at most 32 characters: an unbounded one was retried from every position of a long run of
+# letters (64 KB of "a" took 2.8 s; WP-3.1d1, tool outputs). No lookbehind: a URL right after "+", "-", ".",
+# a digit or other letters (a diff line, a list) must still be redacted (AG-13, WP-3.1d1).
+_URL_CREDENTIALS = re.compile(
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]{0,31}://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{8,})@"
+)
 
 # Header-like pairs anywhere in a line, also inside JSON/repr: Authorization: Bearer x / "x-api-key": "y".
 _HEADERS = re.compile(

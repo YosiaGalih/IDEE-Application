@@ -3,6 +3,11 @@
 The only writer of ``approvals.status``. Callers decide who may act; this module decides what an action does
 to an approval: create it bound to a payload hash, supersede it when the payload changes, consume it once,
 expire it. Every function works in the caller's transaction and never commits.
+
+Every status write runs in a savepoint with the transaction-local writer marker set, which the database
+trigger ``approvals_status_guard`` requires (spec WP-3.1d Goal 6, 3.1c1 AG-13 C3): code anywhere else that
+changes a status fails, and a failed write also rolls the marker back. Writes that must only happen from one
+state (``decide``, ``consume``) are conditional UPDATEs that check their own preconditions.
 """
 
 from __future__ import annotations
@@ -10,16 +15,17 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import AuditWriter
-from app.models.approvals import Approval
+from app.models.approvals import APPROVAL_WRITER, APPROVAL_WRITER_SETTING, Approval
 
 # API_CONTRACTS §11.1, bound by ADR-034. waive_criterion has no entry: "bukan approval", never created.
 EXPIRY: Mapping[str, timedelta] = MappingProxyType(
@@ -35,12 +41,24 @@ EXPIRY: Mapping[str, timedelta] = MappingProxyType(
 )
 OPEN = ("pending", "approved")
 PROJECT_DELETE = "project_delete"
-# The action types that can be requested today: each has a handler (approval_registry). 3.1d adds tool_r3.
-REQUESTABLE = frozenset({PROJECT_DELETE})
+TOOL_R3 = "tool_r3"
+# The action types that can be requested today: exactly those with a handler (approval_registry; a test
+# keeps the two equal, 3.1c1 AG-13 LOW-E).
+REQUESTABLE = frozenset({PROJECT_DELETE, TOOL_R3})
 
 
 def _now(now: datetime | None) -> datetime:
     return now if now is not None else datetime.now(UTC)
+
+
+@asynccontextmanager
+async def _status_writer(session: AsyncSession) -> AsyncIterator[None]:
+    """The only way to change ``approvals.status``: the marker the guard trigger checks, set inside a
+    savepoint so that it is cleared on success and rolled back with a failed write."""
+    async with session.begin_nested():
+        await session.execute(select(func.set_config(APPROVAL_WRITER_SETTING, APPROVAL_WRITER, True)))
+        yield
+        await session.execute(select(func.set_config(APPROVAL_WRITER_SETTING, "", True)))
 
 
 def _check(value: object, where: str) -> None:
@@ -128,10 +146,11 @@ async def create(
     actor_ip: str | None = None,
     audit_actor: str | None = None,
     renewed_from: uuid.UUID | None = None,
+    metadata: Mapping[str, object] | None = None,
     now: datetime | None = None,
 ) -> Approval:
     """A ``pending`` approval bound to the hash of exactly this action, expiring per §11.1. ``audit_actor``:
-    who caused this request when it is not the requester (a renewal)."""
+    who caused this request when it is not the requester (a renewal); ``metadata``: more for its audit."""
     if action_type not in EXPIRY or action_type not in REQUESTABLE:
         raise ValueError(f"{action_type} cannot be requested as an approval (no handler)")
     at = _now(now)
@@ -158,6 +177,7 @@ async def create(
             "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
             "requested_by": requested_by,
             **({"renewed_from": str(renewed_from)} if renewed_from else {}),
+            **(metadata or {}),
         },
         ip=actor_ip,
     )
@@ -196,10 +216,7 @@ async def renew_open(
     old = await find_open(session, project_id=project_id, action_type=action_type, lock=True)
     if old is None:
         return None
-    old.status = "superseded"
-    old.handler_status = "not_required"  # nothing was decided, so nothing has to run
-    await session.flush()  # before the insert: one open approval per action is enforced by an index
-    await audit_event(session, audit, old, "approval.superseded", actor=actor_id, ip=actor_ip)
+    await supersede(session, audit, old, actor=actor_id, ip=actor_ip)
     return await create(
         session,
         audit,
@@ -217,24 +234,41 @@ async def renew_open(
     )
 
 
+async def supersede(
+    session: AsyncSession, audit: AuditWriter, approval: Approval, *, actor: str, ip: str | None = None
+) -> None:
+    """An open (locked) approval no longer matches the action asked for: ``superseded``, and nothing has to
+    run for it. Flushed before the caller inserts the replacement (one open approval per action is an
+    index)."""
+    if approval.status not in OPEN:
+        raise ValueError(f"only an open approval can be superseded, not a {approval.status} one")
+    async with _status_writer(session):
+        approval.status = "superseded"
+        approval.handler_status = "not_required"  # nothing was decided, so nothing has to run
+        await session.flush()
+    await audit_event(session, audit, approval, "approval.superseded", actor=actor, ip=ip)
+
+
 async def consume(
     session: AsyncSession, approval_id: uuid.UUID, *, payload_hash: str, now: datetime | None = None
 ) -> bool:
     """One use of an approved action with this exact hash, before it expires (SECURITY_MODEL §5). ``False``:
     the action must not run."""
     at = _now(now)
-    consumed = await session.scalar(
-        update(Approval)
-        .where(
-            Approval.id == approval_id,
-            Approval.status == "approved",
-            Approval.payload_hash == payload_hash,
-            # NULL: never expires (ARCHITECTURE §10)
-            or_(Approval.expires_at.is_(None), Approval.expires_at > at),
+    async with _status_writer(session):
+        consumed = await session.scalar(
+            update(Approval)
+            .where(
+                Approval.id == approval_id,
+                Approval.status == "approved",
+                Approval.payload_hash == payload_hash,
+                # NULL: never expires (ARCHITECTURE §10)
+                or_(Approval.expires_at.is_(None), Approval.expires_at > at),
+            )
+            .values(status="consumed", consumed_at=at)
+            .returning(Approval.id)
+            .execution_options(synchronize_session=False)
         )
-        .values(status="consumed", consumed_at=at)
-        .returning(Approval.id)
-    )
     return consumed is not None
 
 
@@ -244,18 +278,40 @@ async def decide(
     approval: Approval,
     *,
     approve: bool,
+    payload_hash: str,
     user_id: uuid.UUID,
     note: str | None,
     ip: str | None = None,
     now: datetime | None = None,
-) -> None:
-    """Record a person's decision on a locked, ``pending``, unexpired approval whose hash the caller checked.
-    The handler runs after the caller commits (ADR-024)."""
+) -> bool:
+    """Record a person's decision. Writes only if the approval is still ``pending``, unexpired at ``now`` and
+    bound to ``payload_hash`` (the hash the person reviewed); ``False`` means nothing was written. Only
+    ``app.services.approvals`` calls this (a static test holds that). The handler runs after the caller
+    commits (ADR-024)."""
     at = _now(now)
-    approval.status = "approved" if approve else "rejected"
-    approval.decided_by, approval.decided_at, approval.decision_note = user_id, at, note
-    approval.handler_status, approval.updated_at = "pending", at
-    await session.flush()
+    async with _status_writer(session):
+        decided = await session.scalar(
+            update(Approval)
+            .where(
+                Approval.id == approval.id,
+                Approval.status == "pending",
+                Approval.payload_hash == payload_hash,
+                or_(Approval.expires_at.is_(None), Approval.expires_at > at),
+            )
+            .values(
+                status="approved" if approve else "rejected",
+                decided_by=user_id,
+                decided_at=at,
+                decision_note=note,
+                handler_status="pending",
+                updated_at=at,
+            )
+            .returning(Approval.id)
+            .execution_options(synchronize_session=False)
+        )
+    if decided is None:
+        return False
+    await session.refresh(approval)
     await audit_event(
         session,
         audit,
@@ -265,6 +321,7 @@ async def decide(
         metadata={"decision": "approve" if approve else "reject"},
         ip=ip,
     )
+    return True
 
 
 async def expire(
@@ -272,9 +329,12 @@ async def expire(
 ) -> None:
     """``pending`` (or approved but not consumed) past its time: ``expired``, with its handler still to run so
     the action's owner can undo what the request did (a pending delete restores the project)."""
-    approval.status = "expired"
-    approval.handler_status, approval.updated_at = "pending", _now(now)
-    await session.flush()
+    if approval.status not in OPEN:
+        raise ValueError(f"only an open approval can expire, not a {approval.status} one")
+    async with _status_writer(session):
+        approval.status = "expired"
+        approval.handler_status, approval.updated_at = "pending", _now(now)
+        await session.flush()
     await audit_event(session, audit, approval, "approval.expired", actor=actor)
 
 

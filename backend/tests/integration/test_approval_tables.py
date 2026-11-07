@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from app.models.approvals import Approval
 from app.models.identity import User
 from app.models.projects import Project
-from tests.conftest import reset_data
+from tests.conftest import allow_approval_status_writes, reset_data
 from tests.integration.test_task_schema import make_project
 
 
@@ -53,6 +53,7 @@ def approval(project: Project, **overrides: object) -> Approval:
 )
 async def test_enum_checks(session: AsyncSession, field: str, value: object, constraint: str) -> None:
     project = await make_project(session)
+    await allow_approval_status_writes(session)  # "done" must reach the CHECK, not stop at the guard
     session.add(approval(project, **{field: value}))
     with pytest.raises(IntegrityError, match=constraint):
         await session.flush()
@@ -76,6 +77,7 @@ async def test_system_requester_is_accepted(session: AsyncSession) -> None:
 
 async def test_one_open_project_delete_per_project(session: AsyncSession) -> None:
     project = await make_project(session)
+    await allow_approval_status_writes(session)
     session.add(approval(project, status="superseded"))
     session.add(approval(project))
     await session.flush()  # one superseded + one pending is fine
@@ -110,6 +112,7 @@ async def test_decided_by_user_is_restricted(session: AsyncSession) -> None:
     decider = User(email="decider@example.test", display_name="D", password_hash="x")
     session.add(decider)
     await session.flush()
+    await allow_approval_status_writes(session)
     session.add(approval(project, status="approved", decided_by=decider.id, decided_at=func.now()))
     await session.flush()
     with pytest.raises(IntegrityError, match="fk_approvals_decided_by_users"):
