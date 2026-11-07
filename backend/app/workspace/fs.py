@@ -625,17 +625,23 @@ class Workspace:
             budget = Budget(TREE_POLICY_BUDGET)
             start = resolve(real, rel, access, policy)
             top: list[TreeEntry] = []
-            queue: deque[tuple[tuple[str, ...], list[TreeEntry], int]] = deque([(start, top, 1)])
+            # (folder parts, its children list, level, the list holding its entry, the entry's index there)
+            queue: deque[tuple[tuple[str, ...], list[TreeEntry], int, list[TreeEntry], int]] = deque(
+                [(start, top, 1, top, -1)]
+            )
             count = 0
             first = True
             while queue:
-                parts, into, level = queue.popleft()
+                parts, into, level, holder, index = queue.popleft()
                 try:
                     listed, exhausted = _list_dir(root_fd, real, parts, access, policy, budget)
                 except (WorkspaceNotFound, PathViolation):
                     if first:
                         raise
-                    continue  # a sub-folder that vanished or was swapped for a link mid-listing
+                    # Vanished or swapped for a link mid-listing: "not listed", never an empty folder (N4).
+                    gone = holder[index]
+                    holder[index] = TreeEntry(gone.path, gone.name, "dir", None, None)
+                    continue
                 first = False
                 for entry, child_parts in listed:
                     if count == max_entries:
@@ -643,7 +649,7 @@ class Workspace:
                     if entry.type == "dir" and child_parts is not None and level < depth and not exhausted:
                         children: list[TreeEntry] = []
                         entry = TreeEntry(entry.path, entry.name, "dir", None, children)
-                        queue.append((child_parts, children, level + 1))
+                        queue.append((child_parts, children, level + 1, into, len(into)))
                     into.append(entry)
                     count += 1
                 if exhausted:
