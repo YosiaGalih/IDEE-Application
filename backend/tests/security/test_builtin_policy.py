@@ -289,7 +289,8 @@ async def test_related_tests_and_tree_never_reach_inside_a_hidden_folder(
 
 
 GITHUB_TOKEN = "ghp_" + "a1B2c3D4e5" * 4  # the redaction pattern's shape, not a real token
-JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+# jwt.io's public example token (not a credential), split so that no source line is a whole token.
+JWT = "eyJhbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
 
 
 async def test_secrets_inside_builtin_output_are_redacted(

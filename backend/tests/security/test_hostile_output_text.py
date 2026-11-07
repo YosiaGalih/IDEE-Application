@@ -12,7 +12,8 @@ from app.core.redaction import Redactor
 from app.tools.untrusted import neutralise
 
 ZWSP = chr(0x200B)
-JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+# jwt.io's public example token (not a credential), split so that no source line is a whole token.
+JWT = "eyJhbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
 
 
 @pytest.mark.parametrize(

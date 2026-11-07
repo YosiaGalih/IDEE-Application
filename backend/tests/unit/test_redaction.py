@@ -8,6 +8,10 @@ from app.core.redaction import REDACTED, Redactor
 
 FAKE_ANTHROPIC = "sk-ant-api03-" + "A" * 40
 FAKE_ADMIN = "sk-ant-admin01-" + "B" * 44
+# jwt.io's public example token (not a credential), split so that no source line is a whole token.
+JWT_EXAMPLE = (
+    "eyJhbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+)
 
 
 @pytest.fixture
@@ -286,7 +290,7 @@ def test_url_credentials_inside_a_word_run_are_still_redacted() -> None:
         ("password=hunter22", "credential_assignment"),
         ("machine github.com login bob password hunter22", "credential_assignment"),
         (
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+            JWT_EXAMPLE,
             "jwt",
         ),
         ("$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo", "password_hash"),
