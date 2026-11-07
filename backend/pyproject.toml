@@ -103,5 +103,24 @@ source_modules = ["app.services", "app.workflow", "app.llm"]
 forbidden_modules = ["fastapi", "starlette"]
 allow_indirect_imports = true
 
+[[tool.importlinter.contracts]]
+name = "Tools reach only the LLM port app.llm.base (spec WP-3.1 conflict 5, WP-3.1d Goal 8)"
+type = "forbidden"
+source_modules = ["app.tools"]
+forbidden_modules = [
+    "app.llm.anthropic_provider",
+    "app.llm.factory",
+    "app.llm.pricing",
+    "app.llm.retry",
+    "app.llm.scenarios",
+    "app.llm.scripted_provider",
+]
+
+[[tool.importlinter.contracts]]
+name = "Agent permissions come from the validated registry, never agent_profiles rows (3.1b AG-13 C3)"
+type = "forbidden"
+source_modules = ["app.tools", "app.agents"]
+forbidden_modules = ["app.models.agents"]
+
 [tool.ruff.lint.isort]
 known-third-party = ["alembic"]

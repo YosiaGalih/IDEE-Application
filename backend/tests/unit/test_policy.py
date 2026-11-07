@@ -1,6 +1,6 @@
-"""Risk policy of the registry and the tool catalog (SECURITY_MODEL §3, T7; AC-10).
+"""Risk policy of the registry, the tool catalog and the gateway (SECURITY_MODEL §3, T7; AC-06, AC-10).
 
-The gateway's own policy checks arrive with the ToolGateway (WP-3.1d); this pins what it will read.
+The registry loader and the ToolGateway share ``app.tools.policy``; this pins the rules both enforce.
 """
 
 from __future__ import annotations
@@ -13,30 +13,9 @@ import yaml
 
 from app.agents.registry import RegistryError, load_registry, parse_registry
 from app.tools.catalog import R3_OWNERS, TOOL_CATALOG
+from app.tools.policy import R4_FRAGMENTS, R4_NAMES, R4_PREFIXES, is_r4, unmet_preconditions, write_allowed
 
 REGISTRY = Path(__file__).resolve().parents[3] / "agents" / "registry.v2.yaml"
-
-# R4, never registered (SECURITY_MODEL §3, T19): host shell or terminal, Docker, reading .env/keys/secrets,
-# changing audit or policy, creating or approving approvals, direct DB access, admin keys, SSO/SCIM,
-# force-push.
-R4_PREFIXES = (
-    "shell.",
-    "terminal.",
-    "host.",
-    "docker.",
-    "audit.",
-    "policy.",
-    "approval.",
-    "approvals.",
-    "db.",
-    "sql.",
-    "admin.",
-    "sso.",
-    "scim.",
-    "secrets.",
-)
-R4_NAMES = {"env.read", "env.read_file", "git.force_push", "git.push_force", "github.force_push"}
-R4_FRAGMENTS = ("force_push", "approve", "exec_host", "sudo", "read_secret", "read_env", "read_key")
 
 
 def test_r4_never_registered() -> None:
@@ -85,3 +64,87 @@ def test_a_reviewer_given_write_or_commit_is_refused(field: str, value: str, too
     with pytest.raises(RegistryError) as raised:
         parse_registry(copy.deepcopy(data))
     assert f"D22: permissions.{field} must be" in "; ".join(raised.value.problems)
+
+
+# --- the gateway's policy (app/tools/policy.py; spec WP-3.1d Goal 2) --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tool", "perms", "unmet"),
+    [
+        ("repo.read_file", {"filesystem": "none"}, ["fs_read"]),
+        ("repo.read_file", {"filesystem": "read_only"}, []),
+        ("code.write_file", {"filesystem": "read_only"}, ["fs_write"]),
+        ("code.write_file", {"filesystem": "test_only"}, []),
+        ("code.delete_file", {"filesystem": "docs_only"}, ["fs_scoped_write"]),
+        ("code.delete_file", {"filesystem": "scoped_write"}, []),
+        ("git.diff", {"git": "none"}, ["git_read"]),
+        ("git.diff", {"git": "read"}, []),
+        ("git.commit_task", {"git": "read"}, ["git_branch_commit"]),
+        ("tests.run", {"sandbox": "deny"}, ["sandbox_allow"]),
+        ("tests.run", {"sandbox": "allow"}, []),
+        ("deps.install", {"sandbox": "deny", "network": "deny"}, ["network_allowlist", "sandbox_allow"]),
+        ("repo.detect_stack", {"filesystem": "none", "git": "none", "sandbox": "deny"}, []),
+    ],
+)
+def test_permission_matrix(tool: str, perms: dict[str, str], unmet: list[str]) -> None:
+    from tests.tool_fakes import permissions
+
+    assert unmet_preconditions(TOOL_CATALOG[tool], permissions(**perms), frozenset({tool})) == unmet
+
+
+def test_an_unknown_precondition_is_unmet() -> None:
+    from app.tools.catalog import ToolInfo
+    from tests.tool_fakes import permissions
+
+    odd = ToolInfo("x.y", "R0", "backend", ("telepathy",), "mvp")
+    assert unmet_preconditions(odd, permissions(), frozenset()) == ["telepathy"]
+
+
+@pytest.mark.parametrize(
+    ("filesystem", "path", "allowed"),
+    [
+        ("test_only", "tests/test_a.py", True),
+        ("test_only", "tests/deep/fixture.json", True),
+        ("test_only", "test_a.py", True),
+        ("test_only", "pkg/test_a.py", True),
+        ("test_only", "pkg/a_test.py", True),
+        ("test_only", "web/src/App.test.tsx", True),
+        ("test_only", "web/src/App.spec.ts", True),
+        ("test_only", "web/src/__tests__/x.js", True),
+        ("test_only", "src/app.py", False),
+        ("test_only", "pkg/test_a.pyc", False),
+        ("test_only", "Tests/test_a.txt", False),
+        ("test_only", "../tests/test_a.py", False),
+        ("test_only", "/tests/test_a.py", False),
+        ("test_only", "tests/../src/app.py", False),
+        ("test_only", "tests/./x.py", False),
+        ("test_only", "tests\\x.py", False),
+        ("test_only", "", False),
+        ("docs_only", "README.md", True),
+        ("docs_only", "docs/guide.txt", True),
+        ("docs_only", "a/b/notes.md", True),
+        ("docs_only", "src/app.py", False),
+        ("docs_only", "docs/../app.py", False),
+        ("scoped_write", "src/app.py", True),
+        ("scoped_write", "../outside.py", False),
+        ("scoped_write", "a\x00b", False),
+        ("read_only", "README.md", False),
+        ("none", "README.md", False),
+    ],
+)
+def test_write_path_rules(filesystem: str, path: str, allowed: bool) -> None:
+    assert write_allowed(filesystem, path) is allowed
+
+
+def test_r4_lists_are_one_source() -> None:
+    assert is_r4("shell.exec") and is_r4("approval.decide") and is_r4("git.force_push")
+    assert is_r4("anything.approve_all") and is_r4("env.read")
+    assert not any(is_r4(name) for name in TOOL_CATALOG)
+
+
+def test_finished_task_statuses_match_the_state_machine() -> None:
+    from app.tools.gateway import FINISHED_TASK_STATUSES
+    from app.workflow.states import FINISHED
+
+    assert {status.value for status in FINISHED} == FINISHED_TASK_STATUSES

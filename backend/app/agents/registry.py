@@ -24,6 +24,7 @@ import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 
 from app.tools.catalog import CITATION_SOURCE_TOOLS, R3_OWNERS, TOOL_CATALOG
+from app.tools.policy import SANDBOX, unmet_preconditions
 
 SCHEMA_VERSION = 2
 Group = Literal[
@@ -371,28 +372,14 @@ def _tool_label(name: str) -> str:
 
 
 def _precondition_problems(name: str, agent: AgentSpec) -> list[str]:
-    tool, perms = TOOL_CATALOG[name], agent.permissions
-    checks = {
-        "fs_read": perms.filesystem != "none",
-        "fs_write": perms.filesystem in {"test_only", "docs_only", "scoped_write"},
-        "fs_scoped_write": perms.filesystem == "scoped_write",
-        "git_read": perms.git in {"read", "branch_commit"},
-        "git_branch_commit": perms.git == "branch_commit",
-        "network_allowlist": perms.network == "allowlist",
-        "provider_web": perms.network == "provider_web",
-        "deployment": perms.deployment == "staging_with_approval",
-        "portfolio_draft": perms.portfolio == "draft",
-        "not_confidential": perms.data_sensitivity_max != "confidential",
-        "moderation": "moderation.check_image_prompt" in agent.tools,
-    }
-    problems = [
-        f"requires {pre} (permissions inconsistent with allowlist)"
-        for pre in tool.preconditions
-        if not checks[pre]
+    # The same rules the ToolGateway enforces at run time (app.tools.policy).
+    unmet = unmet_preconditions(TOOL_CATALOG[name], agent.permissions, frozenset(agent.tools))
+    return [
+        "requires sandbox allow (R2)"
+        if pre == SANDBOX
+        else f"requires {pre} (permissions inconsistent with allowlist)"
+        for pre in unmet
     ]
-    if tool.risk == "R2" and perms.sandbox != "allow":
-        problems.append("requires sandbox allow (R2)")
-    return problems
 
 
 def _submit_problems(agent: AgentSpec) -> list[str]:

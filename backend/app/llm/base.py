@@ -54,9 +54,14 @@ class ToolDef:
     input_schema: dict[str, Any]
 
     def __post_init__(self) -> None:
-        encoded_length = len(self.name) + self.name.count(".")
-        if not _TOOL_NAME.fullmatch(self.name) or encoded_length > _MAX_ENCODED_TOOL_NAME:
+        if not is_canonical_tool_name(self.name):
             raise ValueError(f"invalid tool name {self.name!r}")
+
+
+def is_canonical_tool_name(name: str) -> bool:
+    """A dotted catalog name the provider can carry once encoded (ADR-023). The ToolGateway checks every
+    decoded name from a model with this before it looks anything up or records it."""
+    return bool(_TOOL_NAME.fullmatch(name)) and len(name) + name.count(".") <= _MAX_ENCODED_TOOL_NAME
 
 
 @dataclass(frozen=True, slots=True)
