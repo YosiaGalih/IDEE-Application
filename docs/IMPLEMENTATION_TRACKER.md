@@ -2137,9 +2137,9 @@ Mutan (satu perubahan per run, dipulihkan; skrip di scratchpad, dijalankan di gi
 
 | Pemeriksaan @ c52ca30 | Hasil aktual |
 |---|---|
-| Suite backend penuh (sendirian, 02:38:47–02:43:35 UTC 8 Nov) | [Pasti] `1 failed, 2508 passed in 284.89s`. Satu-satunya kegagalan `tests/unit/test_paths.py::test_deep_symlink_chain_is_a_violation` juga gagal di `main` 2137385 pada container ini (baseline: `1 failed, 1652 passed` dengan `-x`, lalu suite penuh `2183 passed` + kegagalan yang sama), jadi tidak terkait WP ini; di CI `backend-test` PR #21 lulus |
+| Suite backend penuh (sendirian, 02:38:47–02:43:35 UTC 7 Nov) | [Pasti] `1 failed, 2508 passed in 284.89s`. Satu-satunya kegagalan `tests/unit/test_paths.py::test_deep_symlink_chain_is_a_violation` juga gagal di `main` 2137385 pada container ini (baseline: `1 failed, 1652 passed` dengan `-x`, lalu suite penuh `2183 passed` + kegagalan yang sama), jadi tidak terkait WP ini; di CI `backend-test` PR #21 lulus |
 | `-v` atas 14 file DB (syarat C1 AG-13): `tests/security/test_approval_guard.py`, `test_cancel_token.py`, `test_tool_gateway_security.py`, `test_url_credential_redaction.py`, `test_project_delete_security.py`, `tests/integration/test_tool_tables.py`, `test_tool_gateway.py`, `test_tool_r3.py`, `test_gateway_denials.py`, `test_approval_store.py`, `test_approval_tables.py`, `test_project_delete.py`, `test_approval_handlers.py`, `test_approvals_api.py` | [Pasti] `243 passed in 32.13s`, 243 baris `PASSED`, termasuk `test_denied_tool_recorded_and_audited` (AC-06), `test_migration_round_trip` (0008), `test_what_was_approved_never_changes` ×5, `test_url_credentials_are_redacted_whatever_precedes_them` ×9, `test_tampered_payload_is_not_consumed`, `test_a_person_decides_a_tool_r3_through_the_api`, `test_cancel_from_another_thread_wakes_the_waiter` |
-| `ruff check .`, `ruff format --check .`, `pyright`, `lint-imports` | [Pasti] `All checks passed!`, `230 files already formatted`, `0 errors`, `Contracts: 5 kept, 0 broken` |
+| `ruff check .`, `ruff format --check .`, `pyright`, `lint-imports` | [Pasti] `All checks passed!`, `229 files already formatted`, `0 errors`, `Contracts: 5 kept, 0 broken` |
 | Mutan G1–G48 (worktree terpisah) | [Pasti] semua `RED` (G5, G45–G48 di batch tambahan @ c52ca30) |
 | CI PR #22 | menunggu head c52ca30 (dicatat sesudah selesai) |
 
