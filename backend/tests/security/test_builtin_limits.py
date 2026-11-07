@@ -99,6 +99,13 @@ async def test_a_huge_line_is_redacted_before_it_is_cut(
     (worktree.root / "token.js").write_text(token + "\n")
     out = await run(sessions, scope, worktree, "repo.read_file", path="token.js")
     assert "longer than one read" in out and "Z9q" not in out, out[-300:]
+    # A token longer than the dropped edge (a JWT with a 6 KB payload): only redacting before the cut hides
+    # the part of it that the edge drop leaves.
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ" + "SeCrEtClAiM" * 600 + "." + "s" * 50
+    long_token = "x" * (edge - 5000) + " " + jwt + " tail"
+    (worktree.root / "jwt.js").write_text(long_token + "\n")
+    out = await run(sessions, scope, worktree, "repo.read_file", path="jwt.js")
+    assert "longer than one read" in out and "SeCrEtClAiM" not in out, out[-300:]
 
 
 async def test_a_file_over_the_agent_read_limit_in_the_base_is_named_not_diffed(
