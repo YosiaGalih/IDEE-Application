@@ -217,3 +217,20 @@ async def test_the_answer_names_what_the_commit_holds_not_what_was_asked(
     assert status == "ok", out
     assert "files: 1\nsrc/a.py\n" in out and "\nsrc/old.py\n" not in out, out
     assert "[1 listed paths had no change and are not in the commit]" in out, out
+
+
+async def test_a_file_replaced_by_a_folder_is_an_ordinary_change(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace
+) -> None:
+    """AG-13 3.1d2b delta INFO: only a folder holding a repository (.git) is a nested repository; a file
+    that became a plain folder is committed as the file's deletion plus the folder's files."""
+    (ws.root / "src" / "old.py").unlink()
+    write(ws.root / "src" / "old.py" / "inner.py", "now a package\n")
+    status, out = await run(sessions, scope, ws, "file to folder")
+    assert status == "ok", out
+    sha = await head(ws)
+    assert sorted(await GitAdapter().commit_files(git_target(ws), sha or "")) == [
+        "src/old.py",
+        "src/old.py/inner.py",
+    ]
+    assert "nested repositories" not in out, out

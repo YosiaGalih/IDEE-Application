@@ -63,15 +63,16 @@ def _agent_may_not_touch(policy: Policy) -> Callable[[tuple[str, ...], Budget], 
 
 def _repositories(root: Path, names: list[str]) -> set[str]:
     """Nested repositories among changed names: untracked ones (``name/``) and tracked gitlinks, whose path
-    is a folder in the worktree. Committing one would point the project at another repository's commit
-    (Lead decision 3.1d2b #5). Parents are not followed (``below_a_non_folder``)."""
+    is a folder holding a repository (``.git``). Committing one would point the project at another
+    repository's commit (Lead decision 3.1d2b #5). A file that became a plain folder is an ordinary change
+    (``update-index --remove`` drops the file's entry). Parents are not followed (``below_a_non_folder``)."""
     gone = below_a_non_folder(root, names)
     found = {name for name in names if name.endswith("/")}
     for name in names:
         if name in found or name in gone:
             continue
         try:
-            if stat.S_ISDIR(os.lstat(root / name).st_mode):
+            if stat.S_ISDIR(os.lstat(root / name).st_mode) and os.path.lexists(root / name / ".git"):
                 found.add(name)
         except OSError:
             continue  # deleted: an ordinary change
