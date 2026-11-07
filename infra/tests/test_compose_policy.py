@@ -298,7 +298,8 @@ class ComposePolicy(unittest.TestCase):
         listed = subprocess.run(
             ["git", "ls-files", "*Dockerfile*"], cwd=ROOT, check=True, capture_output=True, text=True
         ).stdout.split()
-        self.assertIn("infra/egress-proxy/Dockerfile", listed)
+        for expected in ("infra/egress-proxy/Dockerfile", "infra/caddy/Dockerfile", "infra/socket-proxy/Dockerfile"):
+            self.assertIn(expected, listed)
         for path in listed:
             for line in (ROOT / path).read_text().splitlines():
                 if line.startswith("FROM "):

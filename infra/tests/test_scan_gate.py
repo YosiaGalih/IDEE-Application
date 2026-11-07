@@ -386,9 +386,8 @@ class StackImages(unittest.TestCase):
              "config", "--format", "json"], cwd=ROOT, check=True, capture_output=True, text=True).stdout
         images = gate.stack_images(json.loads(config))
         for expected in ("kodekantor/backend:dev", "kodekantor/egress-proxy:dev", "kodekantor/sandbox-python:1",
-                         "kodekantor/sandbox-node:1"):
+                         "kodekantor/sandbox-node:1", "kodekantor/caddy:dev", "kodekantor/socket-proxy:dev"):
             self.assertIn(expected, images)
-        self.assertTrue(any(name.startswith("caddy:") for name in images), images)
         self.assertEqual(len(images), 10, images)
 
 

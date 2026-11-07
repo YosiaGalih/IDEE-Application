@@ -77,7 +77,7 @@ flowchart TB
 | `postgres` | PostgreSQL 16 | private | source of truth |
 | `redis` | Redis 7 | private, password | broker + pub/sub + rate-limit |
 | `sandbox-manager` | `uvicorn sandbox_manager.main:app` | akses Docker **hanya via** `docker-socket-proxy` | menjalankan **profil tetap**, bukan argv bebas |
-| `docker-socket-proxy` | tecnativa/docker-socket-proxy | socket ro | hanya endpoint `containers`, `images`, `exec`=0, `volumes`=0, `networks`=0 dsb. (ADR-009) |
+| `docker-socket-proxy` | `kodekantor/socket-proxy` (tecnativa/docker-socket-proxy v0.5.0 + paket Alpine diperbaiki) | socket ro | hanya endpoint `containers`, `images`, `exec`=0, `volumes`=0, `networks`=0 dsb. (ADR-009) |
 | task container | image `kodekantor/sandbox-python` / `-node` | uid 10001, no caps | per run; dihapus setelah log dikumpulkan |
 
 **Keanggotaan network (mengikat):** `caddy` → `public`+`edge`; `web` → `edge`; `api` → `edge`+`app`; `worker` → `app`+`outbound` (HTTPS ke Claude API); `scheduler`, `migrate`, `postgres`, `redis` → `app`; `sandbox-manager` → `app`+`exec`; `docker-socket-proxy` → `exec` saja; `egress-proxy` → `kk-egress`+`egress-out`. Tidak ada service selain sandbox-manager yang boleh bergabung ke `exec`, karena proxy Docker tidak berautentikasi dan dapat membuat container (setara root host, ADR-009).

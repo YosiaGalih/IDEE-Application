@@ -1,6 +1,6 @@
 # KodeKantor — Deployment topology (single-node VPS)
 
-> Sumber: `infra/compose.yml` (production), `infra/compose.dev.yml` (dev lokal), `infra/caddy/Caddyfile`, `infra/egress-proxy/`. Prosedur operasional: `docs/RUNBOOK.md`. Kontrak: ARCHITECTURE §2/§12/§13, PRD §7.5–§7.7, ADR-005/007/008/009/010/019.
+> Sumber: `infra/compose.yml` (production), `infra/compose.dev.yml` (dev lokal), `infra/caddy/` (Caddyfile, Dockerfile, modul build), `infra/socket-proxy/`, `infra/egress-proxy/`. Prosedur operasional: `docs/RUNBOOK.md`. Kontrak: ARCHITECTURE §2/§12/§13, PRD §7.5–§7.7, ADR-005/007/008/009/010/019.
 
 ## 1. Topologi
 
@@ -69,7 +69,7 @@ Prinsip:
 
 | Service | Image | User | Network | Hak / hardening | Limit (CPU / RAM / PID) | Healthcheck |
 |---|---|---|---|---|---|---|
-| `caddy` | `caddy:2.11.7-alpine` | root tanpa cap (hanya `NET_BIND_SERVICE`) | public, edge | read-only, tmpfs `/tmp` | 0.5 / 256M / 256 | admin API `:2019/config/` |
+| `caddy` | `kodekantor/caddy` (dibangun dari sumber: Caddy 2.11.9, Go 1.26.10; `infra/caddy/Dockerfile`) | root tanpa cap (hanya `NET_BIND_SERVICE`) | public, edge | read-only, tmpfs `/tmp` | 0.5 / 256M / 256 | admin API `:2019/config/` |
 | `web` | `kodekantor/web` (build `frontend/`) | 101 | edge | cap_drop ALL, read-only | 0.25 / 128M / 128 | `GET :8080/healthz` |
 | `api` | `kodekantor/backend` (build root, `backend/Dockerfile`) | 10001 | edge, app | cap_drop ALL, read-only, tmpfs `/tmp` 512M (upload spool), init | 1.0 / 1.5G / 512 | `GET :8000/api/v1/health/ready` |
 | `migrate` | `kodekantor/backend` | 10001 | app | idem, `restart: "no"` | 0.5 / 512M / 256 | — (one-shot; api/worker/scheduler menunggu `service_completed_successfully`) |
@@ -78,7 +78,7 @@ Prinsip:
 | `postgres` | `postgres:16.15-alpine` | 70 | app | cap_drop ALL, read-only + tmpfs socket, scram-sha-256 | 1.0 / 2G / 512 | `pg_isready` |
 | `redis` | `redis:7.4.11-alpine` | 999 | app | cap_drop ALL, read-only, `requirepass` (file 0600 di tmpfs), AOF, `noeviction` | 0.5 / 512M / 128 | `redis-cli ping` (`REDISCLI_AUTH`) |
 | `sandbox-manager` | `kodekantor/sandbox-manager` (build `sandbox_manager/`) | 10001 (image) | app, exec | cap_drop ALL, read-only, **tanpa docker.sock** | 0.5 / 512M / 256 | `GET :8100/healthz` |
-| `docker-socket-proxy` | `tecnativa/docker-socket-proxy:v0.5.0` | root tanpa cap | exec | read-only, socket `:ro`, allowlist env | 0.25 / 128M / 128 | `GET :2375/_ping` |
+| `docker-socket-proxy` | `kodekantor/socket-proxy` (tecnativa/docker-socket-proxy v0.5.0 + paket Alpine diperbaiki; `infra/socket-proxy/Dockerfile`) | root tanpa cap | exec | read-only, socket `:ro`, allowlist env | 0.25 / 128M / 128 | `GET :2375/_ping` |
 | `egress-proxy` (profil `egress`) | `kodekantor/egress-proxy` (tinyproxy, alpine 3.24) | 100 | kk-egress, egress-out | cap_drop ALL, read-only, default-deny | 0.25 / 128M / 128 | `nc -z :3128` |
 
 Semua service: `restart: unless-stopped` (kecuali `migrate`), `security_opt: no-new-privileges:true`, log `json-file` 10 MB × 5 terkompresi. Total limit control plane ±7,5 GB; container task: `SANDBOX_MAX_CONCURRENT_RUNS` (4) × `SANDBOX_MEMORY_LIMIT` (1 GB) — muat di VPS 16 GB (ADR-010).
@@ -142,7 +142,7 @@ Header: HSTS (`CADDY_HSTS_MAX_AGE`, 0 di dev), CSP `default-src 'self'; script-s
 - `.env` (dibuat `scripts/gen-secrets.sh`, mode 600, tidak di-commit) adalah satu-satunya sumber. Compose membacanya via `--env-file` dan memberikan ke tiap service **hanya** variabel yang dibutuhkan (anchor `x-backend-env`, daftar eksplisit untuk sandbox-manager/postgres/redis/caddy).
 - `DATABASE_URL`, `REDIS_URL`, `WORKSPACE_ROOT`, `SANDBOX_MANAGER_URL`, `DOCKER_HOST`, `SANDBOX_PROFILES_PATH`, `AGENT_REGISTRY_PATH` diturunkan compose (tidak bisa salah ketik).
 - `ANTHROPIC_API_KEY` nyata hanya untuk `worker` (+`api`, ADR-004). `migrate`/`scheduler` menerima placeholder non-rahasia karena validator Settings mewajibkan nilai tidak kosong di production.
-- Build: image backend/web/sandbox-manager/egress-proxy dibangun lokal (`pull_policy: never`: dibangun bila belum ada, `make up` selalu `--build`; tidak pernah di-pull dari registry publik). CA proxy korporat opsional via BuildKit secret `build_ca` (`KK_BUILD_CA_FILE`), tidak tersimpan di layer.
+- Build: image backend/web/sandbox-manager/egress-proxy/caddy/socket-proxy dibangun lokal (`pull_policy: never`: dibangun bila belum ada, `make up` selalu `--build`; tidak pernah di-pull dari registry publik). CA proxy korporat opsional via BuildKit secret `build_ca` (`KK_BUILD_CA_FILE`), tidak tersimpan di layer.
 
 ## 8. Scale-out (PRD §7.7, ARCHITECTURE §13)
 
