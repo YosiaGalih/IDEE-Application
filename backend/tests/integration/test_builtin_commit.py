@@ -86,6 +86,23 @@ async def test_only_the_task_branch_takes_commits(
     assert await head(ws) == before
 
 
+async def test_a_worktree_on_a_non_task_branch_takes_no_commit(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace
+) -> None:
+    """Mutant C6a: the worktree and the task agree on a branch, but it is not a kk/task-* branch."""
+    import asyncio
+    import subprocess
+
+    switch = ["git", "-C", str(ws.root), "switch", "-q", "-c", "feature"]
+    await asyncio.to_thread(subprocess.run, switch, check=True)  # test setup only
+    on_feature = TaskWorkspace(ws.root, repo=ws.repo, branch="feature", base_commit=ws.base_commit)
+    write(ws.root / "src" / "a.py", "changed\n")
+    before = await head(on_feature)
+    status, out = await run(sessions, scope, on_feature, "not a task branch")
+    assert status == "error" and "task branch" in out, out
+    assert await head(on_feature) == before
+
+
 async def test_the_commit_holds_the_worktree_lock(
     sessions: async_sessionmaker[AsyncSession],
     scope: Scope,
