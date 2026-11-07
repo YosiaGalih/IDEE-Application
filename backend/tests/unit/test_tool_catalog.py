@@ -45,9 +45,14 @@ def test_registry_tables_match_the_ci_validator() -> None:
 
 def test_implemented_is_exactly_what_production_registers() -> None:
     # WP-3.1d2a: readiness (3.1b) must never call a tool implemented that the gateway does not register.
+    from app.tools.base import SymbolRows
     from app.tools.builtin import builtin_specs
 
-    specs = builtin_specs()
+    class NoIndex:
+        async def candidates(self, project_id: object, name: str, kind: str | None) -> SymbolRows:
+            return SymbolRows([], False, None, None)
+
+    specs = builtin_specs(NoIndex())  # type: ignore[arg-type]
     assert {name for name, tool in TOOL_CATALOG.items() if tool.implemented} == {s.name for s in specs}
     assert all(TOOL_CATALOG[s.name].status == "mvp" and TOOL_CATALOG[s.name].risk == f"R{int(s.risk)}"
                for s in specs)  # fmt: skip

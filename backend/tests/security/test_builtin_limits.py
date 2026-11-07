@@ -124,4 +124,4 @@ async def test_a_file_over_the_agent_read_limit_in_the_base_is_named_not_diffed(
         out = await run(sessions, scope, ws, "git.diff")
     assert "OLD-MARK" not in out, out[:400]
     assert "[data/big.txt not shown: larger than the agent read limit, or unreadable]" in out, out
-    assert "+b" in out
+    assert "+b" in out, out

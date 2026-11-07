@@ -183,7 +183,32 @@ class R3Approvals(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class SymbolRow:
+    path: str
+    line: int
+    name: str
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolRows:
+    """Candidates from the project's symbol index (``repo/`` HEAD), before any agent policy is applied."""
+
+    rows: list[SymbolRow]
+    truncated: bool  # more candidates matched than were read
+    index_commit: str | None  # None: the project was never indexed
+    index_truncated: bool | None  # the index itself stopped at a limit
+
+
+class SymbolIndex(Protocol):
+    """Symbol search over the project index (ADR-022 port; implemented in ``app.services.repo_index``)."""
+
+    async def candidates(self, project_id: uuid.UUID, name: str, kind: str | None) -> SymbolRows: ...
+
+
+@dataclass(frozen=True, slots=True)
 class ToolPorts:
     """Domain functions the gateway and builtins use without importing ``app.services`` (ADR-022)."""
 
     approvals: R3Approvals
+    symbols: SymbolIndex | None = None

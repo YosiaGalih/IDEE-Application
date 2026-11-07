@@ -27,6 +27,7 @@ from typing import Any, Literal
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import case, delete, func, insert, select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.errors import AppError
 from app.core.logging import get_logger
@@ -37,6 +38,7 @@ from app.services import index_lock
 from app.services.job_queue import JobQueue
 from app.services.projects import Actor, ProjectEnv, enforce_rate, repo_path
 from app.services.workspace_api import SANDBOX_DIR, open_repo
+from app.tools.base import SymbolRow, SymbolRows
 from app.workspace.index import (
     SYMBOL_PATTERNS,
     check_glob,
@@ -654,16 +656,11 @@ def _like_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-async def _search_symbols(
-    env: ProjectEnv,
-    project_id: uuid.UUID,
-    policy: Policy,
-    access: Access,
-    q: str,
-    glob: str | None,
-    kind: str | None,
-    limit: int,
-) -> SearchResult:
+async def _symbol_rows(
+    sessions: async_sessionmaker[AsyncSession], project_id: uuid.UUID, q: str, kind: str | None
+) -> tuple[list[SymbolRow], bool, Repository | None]:
+    """Symbol candidates, best match first, at most ``SYMBOL_CANDIDATES``; whether
+    more exist; and the repository row they come from. No policy applied: callers filter."""
     needle = q.lower()
     pattern = _like_escape(needle)
     name = func.lower(RepoIndexEntry.symbol)
@@ -683,21 +680,35 @@ async def _search_symbols(
     )
     if kind is not None:
         query = query.where(RepoIndexEntry.symbol_kind == kind)
-    async with env.sessions() as session:
+    async with sessions() as session:
         # One snapshot for the hits and the commit they are reported under: an index swapped in between the
         # two reads must not label old hits with the new commit (backend N4).
         await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
         repository = await session.scalar(select(Repository).where(Repository.project_id == project_id))
         rows = (await session.execute(query)).all()
+    found = [SymbolRow(path, line or 0, symbol or "", kind_ or "") for path, line, symbol, kind_ in rows]
+    return found[:SYMBOL_CANDIDATES], len(rows) > SYMBOL_CANDIDATES, repository
+
+
+async def _search_symbols(
+    env: ProjectEnv,
+    project_id: uuid.UUID,
+    policy: Policy,
+    access: Access,
+    q: str,
+    glob: str | None,
+    kind: str | None,
+    limit: int,
+) -> SearchResult:
+    rows, truncated, repository = await _symbol_rows(env.sessions, project_id, q, kind)
     hits: list[SearchHit] = []
-    truncated = len(rows) > SYMBOL_CANDIDATES
-    for path, line, symbol, symbol_kind in rows[:SYMBOL_CANDIDATES]:
-        if not _visible(path, glob, policy, access):
+    for row in rows:
+        if not _visible(row.path, glob, policy, access):
             continue
         if len(hits) >= limit:
             truncated = True
             break
-        hits.append(SearchHit(path, line or 0, f"{symbol_kind} {symbol}", symbol, symbol_kind))
+        hits.append(SearchHit(row.path, row.line, f"{row.kind} {row.name}", row.name, row.kind))
     return SearchResult(
         hits,
         truncated,
@@ -705,3 +716,20 @@ async def _search_symbols(
         repository.last_indexed_at if repository is not None else None,
         index_truncated=repository.index_truncated if repository is not None else None,
     )
+
+
+@dataclass(frozen=True)
+class RepoSymbolIndex:
+    """``ToolPorts.symbols`` (ADR-022): the agent's ``repo.search_symbol`` reads the same index as the user's
+    symbol search; the builtin applies the task's agent policy to the candidates."""
+
+    sessions: async_sessionmaker[AsyncSession]
+
+    async def candidates(self, project_id: uuid.UUID, name: str, kind: str | None) -> SymbolRows:
+        rows, truncated, repository = await _symbol_rows(self.sessions, project_id, name, kind)
+        return SymbolRows(
+            rows,
+            truncated,
+            repository.index_commit if repository is not None else None,
+            repository.index_truncated if repository is not None else None,
+        )
