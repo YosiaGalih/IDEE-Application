@@ -3,8 +3,11 @@
 # 31 Oct-7 Nov 2026). Build context: the repository root (infra/compose.yml).
 #
 # Nothing else changes: the same HAProxy binary, haproxy.cfg template, entrypoint and environment flags (ADR-026 (3),
-# set in compose and checked by infra/tests/test_compose_policy.py). The upgrades stay within the same release
-# series (OpenSSL 3.5, PCRE2 10, zlib 1.3, musl 1.2), whose ABI HAProxy already links against.
+# set in compose and checked by infra/tests/test_compose_policy.py, which also keeps this file to ARG/FROM/RUN so the
+# image's ALLOW_*/SOCKET_PATH defaults stay upstream's). HAProxy links libssl/libcrypto, pcre2 and musl (not zlib).
+# Minimum versions, not exact pins: Alpine drops old revisions from the v3.24 index, so an exact pin breaks the build.
+# apk takes the newest revision in the branch (CI 7 Nov 2026: OpenSSL 3.5.9-r0, zlib 1.4-r0), and security-scan
+# scans what was built; clean-install probes the allowlist (infra/tests/socket_proxy_probe.py).
 #
 # The base is pinned by digest. BASE_REPO may name a mirror; the digest stays the same.
 # build_ca (optional BuildKit secret): CA bundle of a TLS-intercepting proxy, trusted only while apk runs and

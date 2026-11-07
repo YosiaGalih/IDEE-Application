@@ -3,9 +3,13 @@
 # CVE-2026-78669 HTTP/2 SETTINGS DoS on the public :443, CVE-2026-78661). Build context: the repository root
 # (infra/compose.yml). The Caddyfile is mounted read-only by compose, not baked in.
 #
-# infra/caddy/build/ is the official entry point (caddy/cmd/caddy/main.go) with the standard modules; go.mod and go.sum
-# pin Caddy and every dependency, -mod=readonly refuses anything not already in go.sum. To move Caddy or a dependency:
-# `go get <module>@<version> && go mod tidy` in infra/caddy/build/, then build and scan again (RUNBOOK §12.1).
+# infra/caddy/build/ is the official entry point (caddy v2.11.7 cmd/caddy/main.go) with the standard modules.
+# go.mod and go.sum pin Caddy 2.11.7 and every dependency at the versions Caddy asks for, except the security fixes
+# golang.org/x/net 0.62.0 (with the x/crypto, x/sys, x/term, x/text it needs) and go-jose v4 4.1.6. x/net 0.62.0 is
+# younger than the two-week rule: a recorded exception (tracker, PR #23). -mod=readonly refuses anything not in
+# go.sum, and the build itself runs with GOPROXY=off: only `go mod download` reaches the network.
+# To move Caddy or a dependency: `go get <module>@<version> && go mod tidy` in infra/caddy/build/, check every module's
+# release date (two-week rule), then build and scan again (RUNBOOK §12.1).
 #
 # Both bases are pinned by digest: golang 1.26.10-alpine (builder only) and alpine 3.24 (the egress-proxy base).
 # *_REPO may name a mirror; the digests stay the same.
@@ -27,7 +31,7 @@ RUN --mount=type=secret,id=build_ca,required=false \
     && go mod download \
     && rm -f /tmp/ca.pem
 COPY infra/caddy/build/main.go ./
-RUN go build -trimpath -ldflags='-s -w' -o /out/caddy . \
+RUN GOPROXY=off go build -trimpath -ldflags='-s -w' -o /out/caddy . \
     && /out/caddy version
 
 FROM ${BASE_REPO}@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a

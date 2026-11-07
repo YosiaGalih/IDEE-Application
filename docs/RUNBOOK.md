@@ -441,7 +441,8 @@ Exception ada di `infra/security/scan-exceptions.toml` (Trivy) atau di komentar 
 1. Baca log langkah "Image scan (Trivy) and gate" atau "SAST (Semgrep)". Setiap baris `BLOCKING:` menyebut image, CVE, paket, dan versi perbaikan.
 2. **Temuan punya perbaikan dan image dibangun sendiri** (`kodekantor/*`): naikkan digest base di Dockerfile, atau kunci ulang dependensinya. Lalu build dan scan ulang (`make sandbox-images`, `docker compose ... build`, `infra/security/scan-images.sh <folder>`).
    - `kodekantor/caddy`: modul Go di `infra/caddy/build/` (`go get <modul>@<versi> && go mod tidy`); toolchain Go lewat digest image `golang` di `infra/caddy/Dockerfile` (samakan baris `go` di `go.mod`).
-   - `kodekantor/socket-proxy`: paket Alpine dengan versi minimum di `infra/socket-proxy/Dockerfile`; naikkan digest tecnativa bila upstream merilis versi baru (flag ADR-026 tetap di compose).
+   - `kodekantor/socket-proxy`: paket Alpine dengan versi minimum di `infra/socket-proxy/Dockerfile`; naikkan digest tecnativa bila upstream merilis versi baru (flag ADR-026 tetap di compose). Versi minimum berarti apk memasang revisi terbaru di cabang v3.24 saat build: image yang dibangun di host bisa lebih baru dari yang di-scan CI. Scan ulang di host dengan `infra/security/scan-images.sh` tidak boleh (langkah 8), jadi bangun dari commit yang CI-nya hijau dan pada hari yang sama bila memungkinkan.
+   - Modul Go baru untuk `kodekantor/caddy` mengikuti aturan umur dua minggu; pengecualian (perbaikan keamanan, mis. x/net 0.62.0) dicatat di tracker per modul.
 3. **Image pihak ketiga** (base nginx-unprivileged dan node, postgres, redis):
    - cek apakah upstream sudah merilis digest dengan perbaikan, lalu naikkan pin di `infra/compose.yml`;
    - bila belum, tambahkan CVE-nya ke entri EX-03 image itu, dengan alasan mengapa tidak tereksploitasi di stack ini.

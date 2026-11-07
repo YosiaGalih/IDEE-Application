@@ -307,6 +307,14 @@ class ComposePolicy(unittest.TestCase):
                         self.assertRegex(line.split()[1], r"@sha256:[0-9a-f]{64}$")
 
 
+    def test_socket_proxy_image_changes_packages_only(self) -> None:
+        """AG-13 PR #23 M2: the derived image may only upgrade packages. An ENV, CMD, ENTRYPOINT, USER, COPY or
+        EXPOSE would change what upstream's image does (its ALLOW_*, SOCKET_PATH and haproxy.cfg defaults)."""
+        text = (ROOT / "infra" / "socket-proxy" / "Dockerfile").read_text()
+        logical = text.replace("\\\n", " ").splitlines()
+        instructions = {line.split()[0].upper() for line in logical if line.strip() and not line.lstrip().startswith("#")}
+        self.assertEqual(instructions, {"ARG", "FROM", "RUN"})
+
 class EgressOffByDefault(unittest.TestCase):
     """RUNBOOK §11, ADR-007: without the egress profile there is no proxy and no kk-egress at all."""
 
