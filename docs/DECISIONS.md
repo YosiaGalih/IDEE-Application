@@ -368,6 +368,17 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 4. Akses agent ke worktree task mematuhi `.agentignore` worktree **dan** `repo/`. Kode sandbox hanya dapat menambah penyembunyian, tidak menghapusnya. `.agentignore` `repo/` yang tidak valid menolak akses agent.
 **Konsekuensi:** ARCHITECTURE §4.2 (`TaskWorkspace`, `ToolOutput`) dan §7 (denylist) diselaraskan; SECURITY_MODEL §13 mencatat risiko sisa (sandbox dapat menyalin berkas tersembunyi ke nama terlihat; user tidak dapat menulis `*.env` lewat IDE). Builtin 3.1d2b (`code.*`, `git.commit_task`) memakai keputusan yang sama.
 
+## ADR-072 — Builtin agent R1: tulis worktree, commit task, port simbol (WP-3.1d2b)
+**Status:** Proposed (Lead, 7 Nov 2026, di bawah mandat PO yang sama dengan ADR-071; Keputusan Lead 3.1d2b #1–#7). Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md`.
+**Konteks:** builtin pertama yang mengubah sesuatu: berkas worktree (`code.*`) dan branch task (`git.commit_task`). Selain itu `repo.search_symbol` membaca tabel indeks, sehingga ia butuh pintu DB yang tidak melanggar layering (`app.tools` tidak mengimpor `app.services`).
+**Keputusan:**
+1. `.kk/` di root ditolak untuk `AGENT_WRITE`: keluaran sandbox dibaca sebagai bukti test (CLAUDE.md #1).
+2. Penghapusan lewat `code.apply_patch` butuh precondition `fs_scoped_write`, sama dengan `code.delete_file`.
+3. `git.commit_task` men-stage berkas persis (stdin `update-index`) yang lolos `AGENT_READ` **dan** `AGENT_WRITE`, di bawah lock worktree. Repo bersarang (termasuk gitlink) tidak pernah di-commit. Bila index lalu berbeda dari HEAD di tempat lain, commit ditolak dan index dikembalikan. Author agent tetap `KodeKantor Agent <agent@kodekantor.invalid>`.
+4. `_landed` menerima commit yang mendarat walau git gagal hanya bila keempat bukti terpenuhi: parent, author, pesan, dan index sama dengan tree commit (WP-2.1c I-6). Bukti yang tidak terbaca berarti tidak terbukti.
+5. `ToolPorts.symbols: SymbolIndex` (ADR-022) dengan implementasi `RepoSymbolIndex` di `app.services.repo_index`. Builtin menerapkan policy task; hit tersembunyi tidak meninggalkan jejak.
+**Konsekuensi:** ARCHITECTURE §7 (denylist `.kk/` untuk agent) dan SECURITY_MODEL baris R1 serta §13 diselaraskan. Penolakan kebijakan di handler tetap berstatus `error` sampai gateway mengenal penolakan dari handler (3.1f).
+
 ## Pengecualian keamanan (SECURITY_MODEL §11)
 
 Temuan audit yang belum dapat diperbaiki dicatat di sini: siapa, alasan, mitigasi, tanggal kedaluwarsa. Job CI yang mengabaikan temuan hanya mengabaikannya sampai tanggal kedaluwarsa, lalu merah lagi.
