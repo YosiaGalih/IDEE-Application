@@ -22,6 +22,7 @@ from app.services.tool_gateway import build_tool_gateway
 from app.tools.base import AgentGrant, RiskLevel, ToolContext, ToolOutput, ToolSpec
 from app.tools.catalog import TOOL_CATALOG, ToolInfo
 from app.tools.gateway import ToolGateway
+from app.workspace.fs import TaskWorkspace
 
 SECRET = "kk-test-secret-literal-0123456789"
 REDACTOR = Redactor([SECRET])
@@ -124,6 +125,7 @@ def context(
     cancel: CancelToken | None = None,
     quota: dict[str, int] | None = None,
     perms: dict[str, str] | None = None,
+    workspace: TaskWorkspace | None = None,
     **more_perms: str,
 ) -> ToolContext:
     tools = list(tools)
@@ -135,6 +137,7 @@ def context(
         offered=frozenset(tools if offered is None else offered),
         correlation_id=f"task:{task_id}",
         cancel=cancel or CancelToken(),
+        workspace=workspace,
     )
 
 

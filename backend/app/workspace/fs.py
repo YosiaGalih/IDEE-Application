@@ -765,8 +765,8 @@ class TaskWorkspace:
     async def delete(self, rel: str) -> FileChange:
         return await self._workspace.delete_file(rel, Access.AGENT_WRITE, expected_sha256=ANY_VERSION)
 
-    async def tree(self, rel: str = ".", depth: int = 3) -> TreeResult:
-        return await self._workspace.tree(rel, Access.AGENT_READ, depth=depth)
+    async def tree(self, rel: str = ".", depth: int = 3, max_entries: int = 500) -> TreeResult:
+        return await self._workspace.tree(rel, Access.AGENT_READ, depth=depth, max_entries=max_entries)
 
 
 @dataclass
