@@ -123,14 +123,15 @@ def context(
     agent_run_id: uuid.UUID | None = None,
     cancel: CancelToken | None = None,
     quota: dict[str, int] | None = None,
-    **perms: str,
+    perms: dict[str, str] | None = None,
+    **more_perms: str,
 ) -> ToolContext:
     tools = list(tools)
     return ToolContext(
         task_id=task_id,
         project_id=project_id,
         agent_run_id=agent_run_id,
-        grant=grant(tools, quota=quota, **perms),
+        grant=grant(tools, quota=quota, **(perms or {}), **more_perms),
         offered=frozenset(tools if offered is None else offered),
         correlation_id=f"task:{task_id}",
         cancel=cancel or CancelToken(),

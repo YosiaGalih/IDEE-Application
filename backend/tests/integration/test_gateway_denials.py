@@ -148,7 +148,9 @@ async def test_name_allowlist_and_permission_refusals(
 ) -> None:
     handler = Recorder()
     built = gateway(sessions, *(spec(name, handler) for name in all_tools()))
-    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=granted, offered=offered, **perms)
+    ctx = context(
+        task_id=scope.task_id, project_id=scope.project_id, tools=granted, offered=offered, perms=perms
+    )
     row = await assert_denied(sessions, built, ctx, tool, {}, reason, handler)
     if reason == "invalid_name":
         assert (row.tool_name, row.risk_level) == ("<invalid>", 4)

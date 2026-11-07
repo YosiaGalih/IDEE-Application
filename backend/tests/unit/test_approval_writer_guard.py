@@ -8,6 +8,7 @@ A static scan of app/: only ``app/services/approvals.py`` (a signed-in person wi
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from pathlib import Path
 
 APP = Path(__file__).resolve().parents[2] / "app"
@@ -68,8 +69,7 @@ def marker_uses(source: str) -> list[int]:
     return lines
 
 
-def _scan(check: object, allowed: set[Path]) -> dict[str, list[int]]:
-    assert callable(check)
+def _scan(check: Callable[[str], list[int]], allowed: set[Path]) -> dict[str, list[int]]:
     return {
         str(path.relative_to(APP)): hits
         for path in APP.rglob("*.py")
