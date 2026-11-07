@@ -247,13 +247,18 @@ class EventBus(Protocol):
 async def emit_task_event(db, bus, task_id, type: str, payload: dict, *, ephemeral=False) -> int | None  # returns seq
 
 # app/workspace/fs.py
-class TaskWorkspace:   # root = WORKSPACE_ROOT/<project_id>/tasks/<task_id>  (git worktree)
-    def resolve(self, rel: str, *, for_write: bool = False) -> Path        # raises PathViolation
-    async def read_text(self, rel, start_line=None, end_line=None, max_bytes=...) -> str
-    async def write_text(self, rel, content) -> FileChange
+class TaskWorkspace:   # root = WORKSPACE_ROOT/<project_id>/tasks/<task_id>  (git worktree); WP-3.1d2a
+    def __init__(self, root, *, repo: Path, branch: str, base_commit: str | None, lock_dir=None)
+    root / repo / branch / base_commit      # baca-saja; builtin membangun GitTarget(repo, worktree=root)
+    async def policy(self) -> Policy        # AGENT_READ: denylist + .agentignore worktree DAN repo/ (gabungan)
+    def exclusive(self)                     # lock worktree (commit memegangnya, WP-2.1c I-b)
+    async def detect_stack(self) -> Stack
+    async def read_text(self, rel, start_line=None, end_line=None, max_bytes=None) -> FileContent   # AGENT_READ
+    async def write_text(self, rel, content) -> FileChange                                        # AGENT_WRITE
     async def apply_unified_diff(self, diff: str) -> list[FileChange]
     async def delete(self, rel) -> FileChange
-    def tree(self, rel=".", depth=3) -> list[TreeEntry]
+    async def tree(self, rel=".", depth=3, max_entries=500) -> TreeResult
+    # Tidak ada resolve() publik: setiap akses lewat Workspace (fd-relative, AGENT_READ/AGENT_WRITE).
 
 # app/gitops/adapter.py
 class GitAdapter:
