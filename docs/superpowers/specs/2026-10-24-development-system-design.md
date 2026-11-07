@@ -424,6 +424,13 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
       - Izin keputusan: `approval:decide` (§8) vs "izin sesuai `action_type`" (§11.1, ARCHITECTURE): keduanya diterapkan, di service (route hanya menuntut sesi). Aturan SECURITY_MODEL §5 "requester … role lebih rendah" tidak jelas dan tidak diterapkan; `four_eyes` (P1) belum ada, owner tunggal boleh memutus permintaannya sendiri.
       - Replay keputusan atas hapus project yang sudah dijalankan menjawab 404 (project dan approval-nya tidak terlihat lagi), bukan 409 `consumed`.
       - 3.1c2: `Approval` di respons ditambah `project_name` (nama project sekarang; payload menyimpan nama yang ditinjau), di luar bentuk API §8. Approval milik project yang sudah dihapus hilang dari riwayat `/approvals` bersama project-nya; jejaknya hanya di audit. `summary` server untuk `project_delete` berbahasa Inggris; layar menyusun ringkasan dari payload dalam bahasa UI.
+    - **3.1d** (spec `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md`, bagian "Konflik"; 3.1d1 = gateway + `tool_calls` + `tool_r3`, 3.1d2 = builtin + pembungkus):
+      - `tool_calls` di luar DATA_MODEL: status `running`/`cancelled`, kolom `agent_id`, `tool_use_id`, `error_code`, `updated_at`; `output_ref` tanpa FK sampai `artifacts` ada.
+      - `ToolContext` beda dari ARCHITECTURE §4.2: tanpa `db` (gateway punya sesi sendiri), `grant` (registry tervalidasi) menggantikan `agent_id`/`permissions`, tambah `offered`; `ToolResult.status` tambah `cancelled`.
+      - Urutan SECURITY_MODEL §3: kuota diperiksa sebelum risk/approval, supaya panggilan yang pasti ditolak tidak meminta keputusan manusia.
+      - `tool_r3`: kedaluwarsa tidak diatur §11.1 (diperlakukan seperti tolak); resume ke `draft` bila diparkir dari `draft` (ADR-021) vs §11.1 "resume → queued"; satu `tool_r3` terbuka per task (index unik parsial); trigger penjaga status `approvals` (tambahan).
+      - Batas konteks 64 KB / 256 KB / 60 KB (konflik 12) diputuskan sebagai tiga ukuran berbeda: satu `tool_result`, file yang tidak pernah dikirim, paket konteks per request.
+      - MVP tidak punya tool R3 yang hidup (P2 `disabled`, registry melarang R3 untuk agent llm/profile); jalur `tool_r3` diuji dengan tool R3 uji.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
