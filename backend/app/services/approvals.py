@@ -25,7 +25,9 @@ from app.services.approval_handlers import Handlers
 from app.services.projects import Actor, ProjectEnv, not_found, permissions_for, visible_projects_filter
 
 # The permission an action needs on top of approval:decide (API §11.1, ADR-034).
-DECIDE_PERMISSION: Mapping[str, str] = MappingProxyType({project_delete.ACTION: "project:delete"})
+DECIDE_PERMISSION: Mapping[str, str] = MappingProxyType(
+    {project_delete.ACTION: "project:delete", approval_store.TOOL_R3: "approval:decide"}
+)
 ListStatus = Literal["pending", "approved", "rejected", "expired", "consumed", "superseded", "all"]
 Decision = Literal["approve", "reject"]
 
@@ -167,21 +169,24 @@ async def decide(
                 "The approval no longer matches the action you reviewed",
                 http_status=409,
             )
-        else:
-            await approval_store.decide(
-                session,
-                env.audit,
-                approval,
-                approve=decision == "approve",
-                user_id=actor.user_id,
-                note=note,
-                ip=actor.ip,
-                now=at,
-            )
+        elif not await approval_store.decide(
+            session,
+            env.audit,
+            approval,
+            approve=decision == "approve",
+            payload_hash=payload_hash,
+            user_id=actor.user_id,
+            note=note,
+            ip=actor.ip,
+            now=at,
+        ):
+            # Checked above under the lock; decide() checks again and wrote nothing.
+            raise AppError("INVALID_TRANSITION", "The approval could not be decided", http_status=409)
         await session.commit()
-    # ADR-024: the decision (or the lapse) is committed; the handler runs on its own transactions.
+    # ADR-024: the decision (or the lapse) is committed; the handler runs on its own transactions, reading
+    # its own clock after its locks (``now`` stays None in production).
     await approval_handlers.dispatch(
-        sessions=env.sessions, audit=env.audit, handlers=handlers, approval_id=approval_id, now=at
+        sessions=env.sessions, audit=env.audit, handlers=handlers, approval_id=approval_id, now=now
     )
     if lapsed:
         raise _not_pending("expired")

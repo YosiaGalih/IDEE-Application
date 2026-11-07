@@ -36,11 +36,15 @@ _PATHS = {"approved": "approved", "consumed": "approved", "rejected": "rejected"
 
 
 class ApprovalHandler(Protocol):
-    """The action behind one ``action_type``. Each path opens its own session, is idempotent, and commits."""
+    """The action behind one ``action_type``. Each path opens its own session, is idempotent, and commits.
 
-    async def approved(self, approval_id: uuid.UUID, *, now: datetime) -> None: ...
-    async def rejected(self, approval_id: uuid.UUID, *, now: datetime) -> None: ...
-    async def expired(self, approval_id: uuid.UUID, *, now: datetime) -> None: ...
+    ``now`` is a fixed clock from a test, or ``None``: the handler then reads the clock itself **after**
+    taking its locks, so a wait on a lock never lets it act on an approval that expired meanwhile (3.1c1 AG-13
+    LOW-A)."""
+
+    async def approved(self, approval_id: uuid.UUID, *, now: datetime | None) -> None: ...
+    async def rejected(self, approval_id: uuid.UUID, *, now: datetime | None) -> None: ...
+    async def expired(self, approval_id: uuid.UUID, *, now: datetime | None) -> None: ...
 
 
 Handlers = Mapping[str, ApprovalHandler]
@@ -121,8 +125,8 @@ async def dispatch(
     now: datetime | None = None,
 ) -> str:
     """Run the handler path the approval's status calls for; return the resulting ``handler_status``. Never
-    raises: a failure is recorded and left to the sweep; a failure to record is logged and retried there."""
-    at = _now(now)
+    raises: a failure is recorded and left to the sweep; a failure to record is logged and retried there.
+    ``now`` is passed to the handler as given (``None`` outside tests)."""
     try:
         async with sessions() as session:
             approval = await session.get(Approval, approval_id)
@@ -143,7 +147,7 @@ async def dispatch(
             run = {"approved": handler.approved, "rejected": handler.rejected, "expired": handler.expired}[
                 path
             ]
-            await run(approval_id, now=at)
+            await run(approval_id, now=now)
         except Exception as exc:  # recorded and retried, never lost: ADR-024
             logger.warning(
                 "approval_handler_failed",
@@ -151,8 +155,8 @@ async def dispatch(
                 error_type=type(exc).__name__,
                 exc_info=True,
             )
-            return await _record(sessions, audit, approval_id, error=_error_text(exc), at=at)
-        return await _record(sessions, audit, approval_id, error=None, at=at)
+            return await _record(sessions, audit, approval_id, error=_error_text(exc), at=_now(now))
+        return await _record(sessions, audit, approval_id, error=None, at=_now(now))
     except Exception:  # the database itself failed: nothing could be recorded; the sweep will see it again
         logger.error("approval_dispatch_unrecorded", approval_id=str(approval_id), exc_info=True)
         return "failed"

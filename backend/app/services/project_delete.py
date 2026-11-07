@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -110,9 +111,19 @@ async def request_delete(
 class ProjectDeleteHandler:
     """The ``project_delete`` handler (ADR-024): idempotent, one transaction per path, commits itself."""
 
-    def __init__(self, *, sessions: async_sessionmaker[AsyncSession], audit: AuditWriter) -> None:
+    def __init__(
+        self,
+        *,
+        sessions: async_sessionmaker[AsyncSession],
+        audit: AuditWriter,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
         self._sessions = sessions
         self._audit = audit
+        self._read_clock = clock
+
+    def _clock(self, now: datetime | None) -> datetime:
+        return now if now is not None else self._read_clock()
 
     async def _locked(self, session: AsyncSession, approval_id: uuid.UUID) -> tuple[Approval, Project] | None:
         """Project first, then approval: the order a rename takes too, so the two never deadlock."""
@@ -163,12 +174,13 @@ class ProjectDeleteHandler:
             session, approval, action, {"restored_status": project.status, "fallback": fallback}
         )
 
-    async def approved(self, approval_id: uuid.UUID, *, now: datetime) -> None:
+    async def approved(self, approval_id: uuid.UUID, *, now: datetime | None) -> None:
         async with self._sessions() as session:
             locked = await self._locked(session, approval_id)
             if locked is None:
                 return
             approval, project = locked
+            now = self._clock(now)  # after the locks (3.1c1 AG-13 LOW-A)
             if approval.status != "approved":
                 return  # consumed by an earlier run, or superseded: nothing to do
             if project.status != "deleting_pending_approval":
@@ -209,10 +221,10 @@ class ProjectDeleteHandler:
             await self._audit_event(session, approval, "project.deleted", {"cancelled_tasks": cancelled})
             await session.commit()
 
-    async def rejected(self, approval_id: uuid.UUID, *, now: datetime) -> None:
+    async def rejected(self, approval_id: uuid.UUID, *, now: datetime | None) -> None:
         await self._settle(approval_id, "project.delete_rejected")
 
-    async def expired(self, approval_id: uuid.UUID, *, now: datetime) -> None:
+    async def expired(self, approval_id: uuid.UUID, *, now: datetime | None) -> None:
         await self._settle(approval_id, "project.delete_expired")
 
     async def _settle(self, approval_id: uuid.UUID, action: str) -> None:

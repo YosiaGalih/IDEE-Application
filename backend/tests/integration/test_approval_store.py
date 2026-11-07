@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.audit import AuditWriter
@@ -14,7 +14,7 @@ from app.models.approvals import Approval
 from app.models.audit import AuditEvent
 from app.models.projects import Project
 from app.services import approval_store as store
-from tests.conftest import reset_data
+from tests.conftest import allow_approval_status_writes, reset_data
 from tests.integration.test_task_schema import make_project
 
 AUDIT = AuditWriter(Redactor())
@@ -80,6 +80,7 @@ async def test_waive_criterion_is_never_created(session: AsyncSession) -> None:
 async def test_consume_once(session: AsyncSession) -> None:
     project = await make_project(session)
     approval = await new(session, project)
+    await allow_approval_status_writes(session)
     approval.status = "approved"
     await session.flush()
     assert await store.consume(session, approval.id, payload_hash=approval.payload_hash, now=NOW) is True
@@ -92,6 +93,7 @@ async def test_consume_refuses_another_hash(session: AsyncSession) -> None:
     # Consumed only with the hash the decider saw: any other payload is another action.
     project = await make_project(session)
     approval = await new(session, project)
+    await allow_approval_status_writes(session)
     approval.status = "approved"
     await session.flush()
     assert await store.consume(session, approval.id, payload_hash="b" * 64, now=NOW) is False
@@ -102,6 +104,7 @@ async def test_consume_refuses_another_hash(session: AsyncSession) -> None:
 async def test_consume_refuses_after_expiry(session: AsyncSession) -> None:
     project = await make_project(session)
     approval = await new(session, project)
+    await allow_approval_status_writes(session)
     approval.status = "approved"
     await session.flush()
     assert (
@@ -171,6 +174,7 @@ async def test_expire_due_only_past_pending(session: AsyncSession) -> None:
     gone = await new(session, past, now=NOW - timedelta(days=8))
     await new(session, future, now=NOW)
     approved = await new(session, decided, now=NOW - timedelta(days=8))
+    await allow_approval_status_writes(session)
     approved.status = "approved"
     await session.flush()
     expired = await store.expire_due(session, AUDIT, now=NOW)
@@ -189,7 +193,7 @@ async def test_only_action_types_with_a_handler_can_be_requested(session: AsyncS
             AUDIT,
             project_id=project.id,
             task_id=None,
-            action_type="tool_r3",
+            action_type="budget_increase",
             payload={},
             summary="x",
             risk_level=3,
@@ -202,7 +206,58 @@ async def test_an_approval_without_expiry_never_expires(session: AsyncSession) -
     # ARCHITECTURE §10: expires_at IS NULL OR expires_at > now() (v1 always sets one; NULL stays consistent).
     project = await make_project(session)
     approval = await new(session, project)
+    await allow_approval_status_writes(session)
     approval.status, approval.expires_at = "approved", None
     await session.flush()
     later = NOW + timedelta(days=365)
     assert await store.consume(session, approval.id, payload_hash=approval.payload_hash, now=later) is True
+
+
+# --- decide checks its own preconditions (3.1c1 AG-13 C3, LOW-B) ---------------------------------------
+
+
+async def _decide(session: AsyncSession, approval: Approval, **overrides: object) -> bool:
+    values: dict[str, object] = {
+        "approve": True,
+        "payload_hash": approval.payload_hash,
+        "user_id": approval.project_id,  # any uuid; decided_by has no FK check until flush of a real user
+        "note": None,
+        "now": NOW,
+    }
+    values.update(overrides)
+    return await store.decide(session, AUDIT, approval, **values)  # type: ignore[arg-type]
+
+
+async def test_decide_writes_only_a_pending_unexpired_matching_approval(session: AsyncSession) -> None:
+    project = await make_project(session)
+    approval = await new(session, project)
+    assert await _decide(session, approval, payload_hash="b" * 64, user_id=project.owner_id) is False
+    assert await _decide(session, approval, now=NOW + timedelta(days=7), user_id=project.owner_id) is False
+    await session.refresh(approval)
+    assert approval.status == "pending"
+    assert await _decide(session, approval, user_id=project.owner_id) is True
+    assert (approval.status, approval.decided_by, approval.decided_at) == ("approved", project.owner_id, NOW)
+    # a second decision on the same row writes nothing
+    assert await _decide(session, approval, approve=False, user_id=project.owner_id) is False
+    await session.refresh(approval)
+    assert approval.status == "approved"
+    assert (await actions(session, project)).count("approval.decided") == 1
+
+
+async def test_supersede_and_expire_refuse_a_closed_approval(session: AsyncSession) -> None:
+    project = await make_project(session)
+    approval = await new(session, project)
+    assert await _decide(session, approval, approve=False, user_id=project.owner_id) is True
+    with pytest.raises(ValueError, match="only an open approval"):
+        await store.supersede(session, AUDIT, approval, actor="system:test")
+    with pytest.raises(ValueError, match="only an open approval"):
+        await store.expire(session, AUDIT, approval, actor="system:test", now=NOW)
+
+
+async def test_a_failed_write_leaves_no_writer_marker_behind(session: AsyncSession) -> None:
+    # The marker lives in a savepoint: once a write is done (or failed), a direct status write is refused.
+    project = await make_project(session)
+    approval = await new(session, project)
+    assert await _decide(session, approval, user_id=project.owner_id) is True
+    marker = await session.scalar(select(func.current_setting("kk.approval_status_writer", True)))
+    assert marker in ("", None)

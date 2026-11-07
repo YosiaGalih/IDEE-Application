@@ -1,7 +1,8 @@
 """Approvals: one human decision about one exact R3 action (DATA_MODEL approvals, ADR-024, ADR-034).
 
 ``payload_hash`` binds the decision to the payload; ``consumed`` makes it single use. Only
-``app.services.approval_store`` writes ``status``.
+``app.services.approval_store`` writes ``status``: the ``approvals_status_guard`` trigger (migration 0008)
+refuses any other writer and any move outside the approval cycle.
 """
 
 from __future__ import annotations
@@ -29,6 +30,10 @@ from app.models.base import Base, Timestamps, UUIDPrimaryKey, in_values
 from app.models.enums import APPROVAL_ACTION_TYPES, APPROVAL_STATUSES, HANDLER_STATUSES
 
 NOTE_MAX = 2000
+# The approvals_status_guard trigger (migration 0008) accepts a status change only when this transaction-local
+# setting holds APPROVAL_WRITER; approval_store sets it around each write.
+APPROVAL_WRITER_SETTING = "kk.approval_status_writer"
+APPROVAL_WRITER = "approval_store"
 REQUESTED_BY_PATTERN = r"^(user:[0-9a-f-]{36}|system:[a-z_]{1,40})$"
 
 
@@ -52,6 +57,13 @@ class Approval(UUIDPrimaryKey, Timestamps, Base):
                 "handler_status IN ('pending', 'failed') "
                 "AND status IN ('approved', 'consumed', 'rejected', 'expired')"
             ),
+        ),
+        # One open tool_r3 per task: a new R3 input supersedes the open one (spec WP-3.1d Goal 5).
+        Index(
+            "uq_approvals_open_tool_r3",
+            "task_id",
+            unique=True,
+            postgresql_where=text("action_type = 'tool_r3' AND status IN ('pending', 'approved')"),
         ),
         # Two concurrent DELETEs of one project open one approval, never two.
         Index(

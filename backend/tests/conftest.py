@@ -8,7 +8,13 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.core.config import Settings, load_settings
 
@@ -70,6 +76,15 @@ async def engine(migrated_database: str) -> AsyncIterator[AsyncEngine]:
 async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     async with async_sessionmaker(engine, expire_on_commit=False)() as session:
         yield session
+
+
+async def allow_approval_status_writes(conn: AsyncSession | AsyncConnection) -> None:
+    """Test seam: lets the current transaction set ``approvals.status`` directly, to arrange a decided row.
+
+    Outside tests only ``app.services.approval_store`` sets this marker; the ``approvals_status_guard``
+    trigger (migration 0008) refuses every other status write, and still refuses moves outside the cycle.
+    """
+    await conn.execute(text("SELECT set_config('kk.approval_status_writer', 'approval_store', true)"))
 
 
 async def reset_data(engine: AsyncEngine) -> None:
