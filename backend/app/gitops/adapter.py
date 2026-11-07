@@ -236,16 +236,24 @@ def _identity_env(author: Author, committer: Author) -> dict[str, str]:
     }
 
 
+# WP-2.1d D1: git grep runs a user's or agent's regex inside git; a hard address-space limit (prlimit, from
+# util-linux in the backend image) keeps a pathological pattern from taking the host's memory.
+# [Menebak] 512 MiB.
+GREP_MEMORY_LIMIT = 512 * 1024 * 1024
+
+
 class GitAdapter:
     def __init__(
         self,
         git: str = "git",
         *,
+        prlimit: str = "prlimit",
         timeout_s: float = 60.0,  # [Menebak]
         max_output: int = 16 * 1024 * 1024,  # [Menebak]
         committer: Author = Author("KodeKantor", "kodekantor@localhost"),  # noqa: B008 - frozen value
     ) -> None:
         self.git = git
+        self.prlimit = prlimit
         self.timeout_s = timeout_s
         self.max_output = max_output
         self.committer = _author(committer)
@@ -264,10 +272,14 @@ class GitAdapter:
         truncate: bool = False,
         timeout_s: float | None = None,
         max_output: int | None = None,
+        memory_limit: int | None = None,
     ) -> _Result:
         """Run git. ``truncate``: past ``max_output`` stop reading and return what was read (no error).
-        ``timeout_s`` and ``max_output`` override the adapter's limits for this call."""
+        ``timeout_s`` and ``max_output`` override the adapter's limits for this call. ``memory_limit``: git
+        runs under ``prlimit --as`` (bytes); a git that cannot start under it fails like any git error."""
         argv = [self.git]
+        if memory_limit is not None:
+            argv = [self.prlimit, f"--as={memory_limit}", "--", self.git]
         for setting in _CONFIG:
             argv += ["-c", setting]
         if git_dir is not None:
@@ -633,6 +645,7 @@ class GitAdapter:
         max_output: int,
         max_matches: int | None = None,
         threads: int | None = None,
+        memory_limit: int = GREP_MEMORY_LIMIT,
     ) -> GrepResult:
         """``git grep`` over the working tree with untracked files (``commit=None``: ignored files and
         ``.git`` are never read, symlinks are not followed) or over ``commit``'s tree. Patterns follow ``-e``
@@ -666,6 +679,7 @@ class GitAdapter:
             truncate=True,
             timeout_s=timeout_s,
             max_output=max_output,
+            memory_limit=memory_limit,
         )
         if result.returncode not in (0, 1) and not result.truncated:
             stderr = result.stderr.decode("utf-8", "replace")

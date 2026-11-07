@@ -39,6 +39,7 @@ RUN apt-get update \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app \
     && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
+    && prlimit --version  # git grep runs under prlimit --as (WP-2.1d D1): the build fails without it
 COPY --from=build /opt/venv /opt/venv
 WORKDIR /app
 COPY backend/alembic.ini ./alembic.ini

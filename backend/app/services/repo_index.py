@@ -37,7 +37,15 @@ from app.services import index_lock
 from app.services.job_queue import JobQueue
 from app.services.projects import Actor, ProjectEnv, enforce_rate, repo_path
 from app.services.workspace_api import SANDBOX_DIR, open_repo
-from app.workspace.index import SYMBOL_PATTERNS, check_glob, classify, glob_matches, language_for, preview
+from app.workspace.index import (
+    SYMBOL_PATTERNS,
+    check_glob,
+    check_regex,
+    classify,
+    glob_matches,
+    language_for,
+    preview,
+)
 from app.workspace.policy import Access, Policy
 
 logger = get_logger(__name__)
@@ -530,22 +538,6 @@ def _text_slot(user_id: uuid.UUID) -> Any:
         _text_running.pop(user_id, None)
 
 
-def check_regex(q: str) -> None:
-    """Refuse what makes git's (glibc) ERE explode (AG-13 M1): backreferences (``\\1``..``\\9``, exponential
-    matching) and bounded repetition (``{m,n}``, compiled to gigabytes when nested). ``\\{`` stays a plain
-    brace. Everything else runs inside git, killed at the timeout."""
-    escaped = False
-    for char in q:
-        if escaped:
-            if char in "123456789":
-                raise _invalid("q", "backreferences are not supported", "regex_unsupported")
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == "{":
-            raise _invalid("q", "bounded repetition {m,n} is not supported", "regex_unsupported")
-
-
 def _invalid(field: str, message: str, reason: str | None = None) -> AppError:
     detail: dict[str, Any] = {"loc": ["query", field], "msg": message}
     if reason is not None:
@@ -575,7 +567,10 @@ async def search(
         except ValueError as exc:
             raise _invalid("glob", str(exc)) from None
     if mode == "text" and regex:
-        check_regex(q)
+        try:
+            check_regex(q)
+        except ValueError as exc:
+            raise _invalid("q", str(exc), "regex_unsupported") from None
     limit = min(max(limit, 1), SEARCH_LIMIT_MAX)
     repo = await open_repo(env, actor, project_id, "workspace:read", write=False)
     policy = await repo.workspace.policy(access)

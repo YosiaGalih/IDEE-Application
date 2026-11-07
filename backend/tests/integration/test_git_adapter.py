@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from app.gitops.adapter import Author, GitAdapter, GitTarget
+from app.gitops.adapter import GREP_MEMORY_LIMIT, Author, GitAdapter, GitTarget
 from app.gitops.errors import GitError, GitInputError
 
 ME = Author("Dev", "dev@example.test")
@@ -618,6 +618,32 @@ async def test_grep_finds_text_in_the_working_tree_including_untracked(
         ("new.txt", 2, 5, "say Hello there")
     ]
     assert not result.truncated
+
+
+async def test_grep_runs_under_a_hard_memory_limit(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP-2.1d D1: every git grep gets RLIMIT_AS through prlimit (the regex runs inside git)."""
+    seen: list[tuple[str, ...]] = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def spy(*argv: str, **kwargs: object) -> asyncio.subprocess.Process:
+        seen.append(argv)
+        return await spawn(*argv, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    await git.grep(repo, ["a"], commit=None, fixed=True, ignore_case=False,
+                   only_matching=False, timeout_s=10, max_output=1 << 20)  # fmt: skip
+    [argv] = [a for a in seen if "grep" in a]
+    assert argv[:3] == ("prlimit", f"--as={GREP_MEMORY_LIMIT}", "--") and argv[3] == "git"
+    assert all(a[0] == "git" for a in seen if "grep" not in a)  # only grep needs the limit
+
+
+async def test_a_grep_over_its_memory_limit_fails_loudly(git: GitAdapter, repo: GitTarget) -> None:
+    # The limit is real: with a few MiB git cannot even map itself, and the search fails, never "no hits".
+    with pytest.raises(GitError):
+        await git.grep(repo, ["a"], commit=None, fixed=True, ignore_case=False, only_matching=False,
+                       timeout_s=10, max_output=1 << 20, memory_limit=4 << 20)  # fmt: skip
 
 
 async def test_grep_is_literal_unless_regex(git: GitAdapter, repo: GitTarget) -> None:
