@@ -247,6 +247,29 @@ def _pathspec(path: str) -> str:
     return path
 
 
+def below_a_non_folder(tree: Path, names: list[str]) -> set[str]:
+    """The names with a parent that is not a real folder in ``tree`` (a symlink, a file, or missing). git
+    takes such a path as deleted, and staging it as a file fails ("beyond a symbolic link"). Parents are read
+    with ``lstat``, never followed (AG-13 WP-3.1d2a LOW-D1/LOW-D3). File system work: call it in a thread."""
+    folders: dict[str, bool] = {}
+    gone: set[str] = set()
+    for name in names:
+        parts = name.split("/")[:-1]
+        for depth in range(1, len(parts) + 1):
+            parent = "/".join(parts[:depth])
+            real = folders.get(parent)
+            if real is None:
+                try:
+                    real = stat.S_ISDIR(os.lstat(tree / parent).st_mode)
+                except OSError:
+                    real = False
+                folders[parent] = real
+            if not real:
+                gone.add(name)
+                break
+    return gone
+
+
 def _identity_env(author: Author, committer: Author) -> dict[str, str]:
     return {
         "GIT_AUTHOR_NAME": author.name,
@@ -640,12 +663,34 @@ class GitAdapter:
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(target.repo / ".git" / "objects"),
             }
             if files is None:
-                stage = ["add", "-A"]
+                await self._run(["add", "-A"], git_dir=git_dir, work_tree=tree, cwd=tree, env=env)
             else:
-                stage = ["update-index", "--add", "--remove", "--replace", "--", *map(_pathspec, files)]
-            if files != []:
-                await self._run(stage, git_dir=git_dir, work_tree=tree, cwd=tree, env=env)
+                await self._stage_exact(git_dir, tree, files, env)
             yield env
+
+    async def _stage_exact(self, git_dir: Path, tree: Path, files: list[str], env: dict[str, str]) -> None:
+        """Make each index entry of ``files`` what the working tree holds at that exact path: added, updated,
+        removed when gone, a file replacing a folder included; a path below a symlink or a file is gone."""
+        checked = [_pathspec(name) for name in files]
+        gone = await asyncio.to_thread(below_a_non_folder, tree, checked)
+        removed = [name for name in checked if name in gone]
+        present = [name for name in checked if name not in gone]
+        if removed:
+            await self._run(
+                ["update-index", "--force-remove", "--", *removed],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                env=env,
+            )
+        if present:
+            await self._run(
+                ["update-index", "--add", "--remove", "--replace", "--", *present],
+                git_dir=git_dir,
+                work_tree=tree,
+                cwd=tree,
+                env=env,
+            )
 
     async def changed_paths(self, target: GitTarget, *, base: str) -> NameList:
         """The paths whose content differs between ``base`` and the working tree, untracked (not ignored)

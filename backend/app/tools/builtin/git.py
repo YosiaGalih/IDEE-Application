@@ -18,7 +18,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.gitops.adapter import GitAdapter
+from app.gitops.adapter import GitAdapter, below_a_non_folder
 from app.gitops.diffparse import Diff, DiffFile
 from app.tools.base import RiskLevel, ToolContext, ToolError, ToolOutput, ToolSpec, Untrusted
 from app.tools.builtin._common import (
@@ -36,6 +36,8 @@ from app.workspace.fs import AGENT_READ_LIMIT
 DIFF_MAX_BYTES = 60 * 1024  # below the 64 KB tool_result: the gateway never has to cut the diff
 DIFF_READ_BYTES = 1024 * 1024  # what git may produce before the text is cut
 STAGE_MAX_BYTES = 8 * 1024 * 1024  # [Menebak] working-tree bytes one diff stages on the worker's tmpfs
+DIFF_MAX_FILES = 2000  # [Menebak] far more than DIFF_MAX_BYTES of text can show
+ARGV_MAX_BYTES = 256 * 1024  # names on one git command line, well below ARG_MAX (2 MiB with the environment)
 LOG_MAX = 50
 _SIGN = {"context": " ", "add": "+", "del": "-"}
 
@@ -72,26 +74,36 @@ async def status(ctx: ToolContext, raw: StatusInput) -> ToolOutput:
 
 def _select(root: Path, names: list[str]) -> tuple[list[str], list[str], int]:
     """(to diff, over AGENT_READ_LIMIT or unreadable, deferred): a working-tree file over the limit is never
-    diffed for the agent (ARCHITECTURE §7); past STAGE_MAX_BYTES the rest waits for another call, because the
-    scratch index lives on the worker's tmpfs (AG-13 WP-3.1d2a MEDIUM-4). A deleted file stages nothing."""
+    diffed for the agent (ARCHITECTURE §7). One call stages at most STAGE_MAX_BYTES, because the scratch index
+    lives on the worker's tmpfs (AG-13 WP-3.1d2a MEDIUM-4), and passes git at most DIFF_MAX_FILES names and
+    ARGV_MAX_BYTES of them (LOW-D2: never E2BIG); the rest waits for another call. A deleted file, or one
+    below a symlink or a file (git sees it as deleted, LOW-D1/LOW-D3), stages nothing."""
+    gone = below_a_non_folder(root, names)
     wanted: list[str] = []
     refused: list[str] = []
     deferred = 0
     staged = 0
+    argv = 0
     for name in names:
-        try:
-            size = os.lstat(root / name).st_size
-        except FileNotFoundError:
-            size = 0  # deleted in the working tree: its old content is checked after the diff
-        except OSError:
-            refused.append(name)
-            continue
+        size = 0  # deleted in the working tree: its old content is checked after the diff
+        if name not in gone:
+            try:
+                size = os.lstat(root / name).st_size
+            except FileNotFoundError:
+                pass
+            except OSError:
+                refused.append(name)
+                continue
+        cost = len(os.fsencode(name)) + 1
         if size > AGENT_READ_LIMIT:
             refused.append(name)
-        elif wanted and staged + size > STAGE_MAX_BYTES:
+        elif wanted and (
+            staged + size > STAGE_MAX_BYTES or len(wanted) >= DIFF_MAX_FILES or argv + cost > ARGV_MAX_BYTES
+        ):
             deferred += 1
         else:
             staged += size
+            argv += cost
             wanted.append(name)
     return wanted, refused, deferred
 

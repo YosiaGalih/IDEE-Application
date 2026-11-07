@@ -13,6 +13,7 @@ from pathlib import PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.redaction import Redactor
 from app.tools.base import RiskLevel, ToolContext, ToolError, ToolOutput, ToolSpec, Untrusted
 from app.tools.builtin._common import relative, workspace_errors, workspace_of
 from app.tools.policy import TEST_ONLY_PATTERNS, matches_any
@@ -24,6 +25,7 @@ READ_MAX_BYTES = 60 * 1024  # below the 64 KB tool_result, so the gateway never 
 RELATED_SCAN_ENTRIES = 5000
 RELATED_MAX = 50
 RELATED_DEPTH = 10
+CUT_EDGE_CHARS = 4096  # as the gateway's WINDOW_EDGE_CHARS: a cut drops the token it lands in, up to this
 
 
 class _Input(BaseModel):
@@ -47,6 +49,20 @@ class DetectStackInput(_Input):
 
 class FindRelatedTestsInput(_Input):
     path: str = Field(min_length=1, max_length=1000)
+
+
+_BOUNDARY = re.compile(r"[\s\"'`<>()\[\]{},;]")
+
+
+def _cut_line(line: str, max_bytes: int) -> str:
+    """The start of a line longer than one read. Pattern secrets are redacted on the whole line before the
+    cut, because a cut secret no longer matches its pattern; the token the cut lands in is dropped whole, as
+    the gateway does at its own window edge, because a configured literal is known only to the gateway
+    (AG-13 WP-3.1d2a LOW-D4)."""
+    head = Redactor().redact(line).encode()[:max_bytes].decode(errors="ignore")
+    edge = max(len(head) - CUT_EDGE_CHARS, 0)
+    end = max((found.end() for found in _BOUNDARY.finditer(head, edge)), default=edge)
+    return head[:end]
 
 
 UNLISTED = " (contents not listed)"  # a folder the walk did not open (depth or entry limit), not an empty one
@@ -104,7 +120,7 @@ async def read_file(ctx: ToolContext, raw: ReadFileInput) -> ToolOutput:
         if used + size > READ_MAX_BYTES:
             resume = number
             if not out:  # one line longer than a whole read: show its start, say so
-                head = numbered.encode()[: READ_MAX_BYTES - 200].decode(errors="ignore")
+                head = _cut_line(numbered, READ_MAX_BYTES - 200)
                 out.append(f"{head}\n[line {number} is longer than one read; the rest of it is not shown]\n")
                 resume = number + 1
             if resume <= last:
