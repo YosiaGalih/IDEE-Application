@@ -916,3 +916,52 @@ async def test_commit_files_never_takes_sandbox_output(git: GitAdapter, repo: Gi
     write(repo.repo / "f.txt", "changed\n")
     sha = await git.commit(repo, "with kk", ME, files=[".kk/junit.xml", "f.txt"])
     assert sha is not None and await git.commit_files(repo, sha) == ["f.txt"]
+
+
+async def test_an_unreadable_fourth_proof_leaves_the_original_error_and_resets_the_index(
+    git: GitAdapter, repo: GitTarget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silent-failure 3.1d2b M1: when the index-equals-tree check itself fails, the commit is not proven
+    ours: the original error stands (not the check's), it is logged, and nothing stays staged."""
+    write(repo.repo / "a.txt", "a\n")
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+
+    async def stopped(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        proof = args[:3] == ["diff", "--cached", "--quiet"] and len(args[-2]) == 40 and args[-1] == "--"
+        if proof:
+            raise GitError("index_check_failed")  # the fourth proof cannot be read
+        result = await run(self, args, **kwargs)  # type: ignore[arg-type]
+        if args[0] == "commit":
+            raise GitError("timeout")  # git killed after it wrote the ref
+        return result
+
+    monkeypatch.setattr(GitAdapter, "_run", stopped)
+    with pytest.raises(GitError) as raised:
+        await git.commit(repo, "unproven", ME)
+    monkeypatch.undo()
+    assert raised.value.reason == "timeout"
+    assert raw_git(repo, "diff", "--cached", "--name-only") == ""
+
+
+async def test_stdin_that_git_does_not_read_is_not_an_error(git: GitAdapter, repo: GitTarget) -> None:
+    """Backend review 3.1d2b: git may exit before reading its stdin (a broken pipe); its exit status
+    decides, and nothing is left running."""
+    result = await git._run(  # pyright: ignore[reportPrivateUsage]
+        ["version"], git_dir=None, work_tree=None, cwd=repo.repo, stdin=b"x" * 5_000_000
+    )
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+
+
+async def test_a_timeout_while_stdin_is_written_kills_git_and_the_writer(
+    git: GitAdapter, repo: GitTarget
+) -> None:
+    before = {task for task in asyncio.all_tasks() if not task.done()}
+    with pytest.raises(GitError) as raised:
+        await git._run(  # pyright: ignore[reportPrivateUsage]
+            ["hash-object", "--stdin"], git_dir=repo.repo / ".git", work_tree=repo.repo, cwd=repo.repo,
+            stdin=b"y" * 200_000_000, timeout_s=0.05,
+        )  # fmt: skip
+    assert raised.value.reason == "timeout"
+    await asyncio.sleep(0)
+    left = {task for task in asyncio.all_tasks() if not task.done()} - before - {asyncio.current_task()}
+    assert not left, left

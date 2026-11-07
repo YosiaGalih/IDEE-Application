@@ -400,12 +400,13 @@ class GitAdapter:
             if cut:
                 await _kill(proc)  # stop git; the rest of its output is not wanted
             stderr = await err_task
-            if feeder is not None:
-                await feeder
+            if feeder is not None and not await feeder:
+                logger.info("git_stdin_not_read", returncode=proc.returncode)  # its exit status decides
         finally:
             err_task.cancel()
-            if feeder is not None:
+            if feeder is not None and not feeder.done():
                 feeder.cancel()
+                await asyncio.wait({feeder})  # never raises: the writer is gone before git is waited for
         await proc.wait()
         return stdout, stderr, cut
 
@@ -979,7 +980,10 @@ class GitAdapter:
                 work_tree=tree,
                 cwd=tree,
             )
+            # WP-2.1c I-6: the index holds what this call staged, so it equals the tree of our commit.
+            same_tree = await self._index_is_tree_of(git_dir, tree, after)
         except Exception:
+            # Unreadable proof: not this commit as far as anyone can show; the original error stands.
             logger.exception("git_head_unknown_after_failure", reason=reason)
             return None
         parents, email, body = [*shown.stdout.decode("utf-8", "replace").split("\0", 2), "", ""][:3]
@@ -987,7 +991,7 @@ class GitAdapter:
             parents.split() == ([before] if before is not None else [])
             and email == author.email
             and body.split() == message.split()  # git trims and collapses the message's whitespace
-            and await self._index_is_tree_of(git_dir, tree, after)  # WP-2.1c I-6: what this call staged
+            and same_tree
         )
         if not mine:
             # Another writer moved HEAD: callers must serialise writers of one index (the workspace lock).
@@ -1016,6 +1020,8 @@ class GitAdapter:
             cwd=tree,
             check=False,
         )
+        if result.returncode not in (0, 1):  # 1: they differ; anything else: git could not tell
+            raise GitError("index_check_failed")
         return result.returncode == 0
 
     async def _reset_index(self, git_dir: Path, tree: Path, *, born: bool) -> None:
@@ -1234,14 +1240,15 @@ def _remove_index_lock(git_dir: Path) -> None:
         logger.error("git_index_lock_removed", git_dir=git_dir.name)
 
 
-async def _feed(stream: asyncio.StreamWriter, data: bytes) -> None:
-    """Write ``data`` to git's stdin and close it. git stopping early is not an error here: its exit status
-    says what happened."""
+async def _feed(stream: asyncio.StreamWriter, data: bytes) -> bool:
+    """Write ``data`` to git's stdin and close it; ``False`` when git closed its end first. That is not an
+    error here: git's exit status says what happened."""
     try:
         stream.write(data)
         await stream.drain()
+        return True
     except (BrokenPipeError, ConnectionResetError):
-        pass
+        return False
     finally:
         stream.close()
 

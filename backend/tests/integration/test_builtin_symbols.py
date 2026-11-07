@@ -60,6 +60,8 @@ async def test_hits_name_the_index_commit_and_are_wrapped(
     assert status == "ok" and out.startswith('<untrusted_content source="repo.search_symbol">'), out
     assert f"index: {COMMIT}" in out and "src/calc.py:1: function add" in out, out
     assert index.asked == [(scope.project_id, "add", "function")]
+    # silent-failure 3.1d2b M3: an index of another commit than the worktree is said
+    assert "the worktree is at" in out and "line numbers may differ" in out, out
 
 
 async def test_a_project_without_an_index_says_so(
@@ -114,3 +116,35 @@ async def test_the_production_index_reads_the_project_rows(
     assert status == "ok", out
     assert f"index: {COMMIT}" in out and "src/calc.py:1: function add" in out, out
     assert "Adder" not in out and "add_key" not in out, out
+
+
+async def test_an_index_of_the_worktree_head_needs_no_warning(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace
+) -> None:
+    from app.gitops.adapter import GitAdapter
+    from app.tools.builtin._common import git_target
+
+    head = await GitAdapter().current_commit(git_target(ws))
+    index = FakeIndex(SymbolRows([SymbolRow("src/calc.py", 1, "add", "function")], False, head, False))
+    _, out = await run(sessions, scope, ws, index, name="add")
+    assert "src/calc.py:1: function add" in out and "line numbers may differ" not in out, out
+    write(ws.root / "src" / "calc.py", "def add(): pass\ndef added(): pass\n")  # uncommitted edit
+    _, out = await run(sessions, scope, ws, index, name="add")
+    assert "uncommitted changes" in out, out
+
+
+async def test_hits_not_checked_against_the_policy_are_said_apart(
+    sessions: async_sessionmaker[AsyncSession],
+    scope: Scope,
+    ws: TaskWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silent-failure 3.1d2b L1: a hit left out because the policy check stopped is not "may not read"."""
+    from app.tools.builtin import _common
+
+    monkeypatch.setattr(_common, "MAX_NAMES", 1)
+    rows = [SymbolRow("src/calc.py", 1, "add", "function"), SymbolRow("README.md", 1, "add_doc", "function")]
+    _, out = await run(sessions, scope, ws, FakeIndex(SymbolRows(rows, False, COMMIT, False)), name="add")
+    assert "src/calc.py:1: function add" in out and "add_doc" not in out, out
+    assert "[1 hits not checked against the agent policy (too many, too costly): not shown]" in out, out
+    assert "agents may not read them" not in out, out

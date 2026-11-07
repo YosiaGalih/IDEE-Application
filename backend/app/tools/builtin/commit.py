@@ -72,11 +72,17 @@ async def commit_task(ctx: ToolContext, raw: CommitTaskInput) -> ToolOutput:
             files = [name for name in names.paths if not name.endswith("/")]
             kept = await asyncio.to_thread(partition, files, agent_cannot_read(policy))
             sha = await _commit(git, target, raw.message, kept.shown) if kept.shown else None
-    lines = ["[nothing to commit]"]
+            # What the commit holds, read back from git: the answer is evidence, not the request.
+            committed = await git.commit_files(target, sha) if sha else []
     if sha:
-        lines = [f"commit: {sha}", f"files: {len(kept.shown)}", *kept.shown[:LIST_MAX]]
-    if sha and len(kept.shown) > LIST_MAX:
-        lines.append(f"[{len(kept.shown) - LIST_MAX} more committed files not named]")
+        lines = [f"commit: {sha}", f"files: {len(committed)}", *committed[:LIST_MAX]]
+        if len(committed) > LIST_MAX:
+            lines.append(f"[{len(committed) - LIST_MAX} more committed files not named]")
+    else:
+        lines = ["[nothing to commit]", f"head: {state.head}"]
+    unchanged = len(set(kept.shown) - set(committed)) if sha else 0
+    if unchanged:
+        lines.append(f"[{unchanged} listed paths had no change and are not in the commit]")
     lines += _not_committed(kept.hidden, "agents may not read them, or sandbox output")
     lines += _not_committed(kept.unchecked, "not checked against the agent policy (too many, too costly)")
     lines += _not_committed(len(nested), "nested repositories")

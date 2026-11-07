@@ -10,6 +10,7 @@ and reason codes, never file content.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from collections.abc import Iterator
@@ -94,7 +95,8 @@ async def delete_file(ctx: ToolContext, raw: DeleteFileInput) -> ToolOutput:
 
 async def apply_patch(ctx: ToolContext, raw: ApplyPatchInput) -> ToolOutput:
     workspace = workspace_of(ctx)
-    deletes = any(patch.new_path is None for patch in _patches(raw.diff))
+    patches = await asyncio.to_thread(_patches, raw.diff)  # up to 1 MiB of diff: off the loop
+    deletes = any(patch.new_path is None for patch in patches)
     if deletes and ctx.grant.permissions.filesystem != DELETE_MODE:
         raise ToolError(
             "delete_not_allowed", f"deleting a file needs filesystem {DELETE_MODE}, as code.delete_file does"

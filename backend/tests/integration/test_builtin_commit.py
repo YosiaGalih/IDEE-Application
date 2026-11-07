@@ -72,6 +72,7 @@ async def test_nothing_to_commit_is_said(
     status, out = await run(sessions, scope, ws, "nothing")
     assert status == "ok" and "[nothing to commit]" in out, out
     assert await head(ws) == before
+    assert f"head: {before}" in out, out  # silent-failure 3.1d2b L4: what the branch holds is said
 
 
 async def test_only_the_task_branch_takes_commits(
@@ -139,3 +140,27 @@ async def test_an_invalid_message_is_refused(
         status, out = await run(sessions, scope, ws, message)
         assert status == "error", (message[:10], out)
     assert await head(ws) == before
+
+
+async def test_the_answer_names_what_the_commit_holds_not_what_was_asked(
+    sessions: async_sessionmaker[AsyncSession],
+    scope: Scope,
+    ws: TaskWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silent-failure 3.1d2b M2: the file list and count come from the commit itself; a listed path that
+    changed nothing is said, not counted as committed."""
+    from app.gitops.adapter import NameList
+
+    changed_paths = GitAdapter.changed_paths
+
+    async def with_an_unchanged_path(self: GitAdapter, target: object, *, base: str) -> NameList:
+        found = await changed_paths(self, target, base=base)  # type: ignore[arg-type]
+        return NameList([*found.paths, "src/old.py"], found.skipped)  # unchanged against HEAD
+
+    monkeypatch.setattr(GitAdapter, "changed_paths", with_an_unchanged_path)
+    write(ws.root / "src" / "a.py", "changed\n")
+    status, out = await run(sessions, scope, ws, "one real change")
+    assert status == "ok", out
+    assert "files: 1\nsrc/a.py\n" in out and "\nsrc/old.py\n" not in out, out
+    assert "[1 listed paths had no change and are not in the commit]" in out, out

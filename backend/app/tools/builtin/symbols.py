@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from app.gitops.adapter import GitAdapter
 from app.tools.base import (
     RiskLevel,
     SymbolIndex,
@@ -28,6 +29,7 @@ from app.tools.base import (
 from app.tools.builtin._common import (
     StrictInput,
     agent_cannot_read,
+    git_target,
     partition,
     workspace_errors,
     workspace_of,
@@ -81,12 +83,26 @@ def specs(index: SymbolIndex) -> list[ToolSpec]:
         paths = list(dict.fromkeys(row.path for row in found.rows))
         allowed = await asyncio.to_thread(partition, paths, agent_cannot_read(policy))
         shown = set(allowed.shown)
-        hidden = sum(1 for row in found.rows if row.path not in shown)
+        not_checked = set(paths[len(paths) - allowed.unchecked :]) if allowed.unchecked else set()
+        unchecked = sum(1 for row in found.rows if row.path in not_checked)
+        hidden = sum(1 for row in found.rows if row.path not in shown) - unchecked
         kept, large, gone = await asyncio.to_thread(_readable, workspace.root, found.rows, shown)
+        with workspace_errors():
+            state = await GitAdapter().status(git_target(workspace))
         lines = [f"index: {found.index_commit}"]
+        if state.head != found.index_commit or not state.clean:
+            lines.append(
+                f"[the index is of commit {found.index_commit}; the worktree is at {state.head or '(none)'}"
+                + ("" if state.clean else ", with uncommitted changes")
+                + ": line numbers may differ and new symbols are missing]"
+            )
         lines += [f"{row.path}:{row.line}: {row.kind} {row.name}" for row in kept[:SYMBOL_MAX_RESULTS]]
         if not kept:
-            lines.append("[no symbols shown]" if hidden or large or gone else "[no symbols]")
+            lines.append("[no symbols shown]" if hidden or unchecked or large or gone else "[no symbols]")
+        if unchecked:
+            lines.append(
+                f"[{unchecked} hits not checked against the agent policy (too many, too costly): not shown]"
+            )
         if hidden:
             lines.append(f"[{hidden} hits not shown: agents may not read them, or sandbox output]")
         if large:
