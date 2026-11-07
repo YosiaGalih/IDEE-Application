@@ -12,7 +12,7 @@ import pytest
 
 from app.core.redaction import Redactor
 
-SECRET = "Pw0rdXyzSecret"
+SECRET = "Pw0rdXyzSecret"  # gitleaks:allow (synthetic)
 
 
 @pytest.mark.parametrize(

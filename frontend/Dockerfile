@@ -24,11 +24,14 @@ RUN npx vite build
 FROM ${NGINX_REPO}@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03
 # The base still carries brotli-libs with CVE-2026-111497 and curl with CVE-2026-92392 (Trivy, 31 Oct 2026),
 # and libexpat 2.9.0-r0 with CVE-2026-113351, CVE-2026-117610 and CVE-2026-118370 (Trivy, 4 Nov 2026), and zlib
-# 1.3.2-r0 with CVE-2026-85091 (Trivy, 6 Nov 2026; nginx links zlib for gzip).
+# 1.3.2-r0 with CVE-2026-85091 (Trivy, 6 Nov 2026; nginx links zlib for gzip), and musl 1.2.6-r2 with
+# CVE-2026-107891 (Trivy, 7 Nov 2026; every binary links musl).
 # We build this stage ourselves, so we fix them here instead of excepting them: curl is not used (the
-# healthcheck runs busybox wget), and brotli-libs (needed by freetype), libexpat and zlib move to the fixed release.
+# healthcheck runs busybox wget), and brotli-libs (needed by freetype), libexpat, zlib and musl move to the fixed
+# release.
 USER root
 RUN apk add --no-cache 'brotli-libs>=1.2.1-r0' 'libexpat>=2.10.0-r0' 'zlib>=1.3.2-r1' \
+        'musl>=1.2.6-r3' 'musl-utils>=1.2.6-r3' \
     && apk del --no-cache curl
 USER 101:101
 COPY frontend/nginx/default.conf /etc/nginx/conf.d/default.conf
