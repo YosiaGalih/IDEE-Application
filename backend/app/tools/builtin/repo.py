@@ -11,11 +11,12 @@ import re
 from dataclasses import asdict
 from pathlib import PurePosixPath
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.core.redaction import Redactor
 from app.tools.base import RiskLevel, ToolContext, ToolError, ToolOutput, ToolSpec, Untrusted
-from app.tools.builtin._common import relative, workspace_errors, workspace_of
+from app.tools.builtin._common import StrictInput, relative, workspace_errors, workspace_of
+from app.tools.gateway import WINDOW_EDGE_CHARS
 from app.tools.policy import TEST_ONLY_PATTERNS, matches_any
 from app.workspace.fs import AGENT_READ_LIMIT, LINE_PATTERN, TreeEntry
 from app.workspace.policy import Access
@@ -25,29 +26,24 @@ READ_MAX_BYTES = 60 * 1024  # below the 64 KB tool_result, so the gateway never 
 RELATED_SCAN_ENTRIES = 5000
 RELATED_MAX = 50
 RELATED_DEPTH = 10
-CUT_EDGE_CHARS = 4096  # as the gateway's WINDOW_EDGE_CHARS: a cut drops the token it lands in, up to this
 
 
-class _Input(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class GetTreeInput(_Input):
+class GetTreeInput(StrictInput):
     path: str = Field(".", max_length=1000)
     depth: int = Field(3, ge=1, le=10)
 
 
-class ReadFileInput(_Input):
+class ReadFileInput(StrictInput):
     path: str = Field(min_length=1, max_length=1000)
     start_line: int | None = Field(None, ge=1)
     end_line: int | None = Field(None, ge=1)
 
 
-class DetectStackInput(_Input):
+class DetectStackInput(StrictInput):
     pass
 
 
-class FindRelatedTestsInput(_Input):
+class FindRelatedTestsInput(StrictInput):
     path: str = Field(min_length=1, max_length=1000)
 
 
@@ -60,7 +56,7 @@ def _cut_line(line: str, max_bytes: int) -> str:
     the gateway does at its own window edge, because a configured literal is known only to the gateway
     (AG-13 WP-3.1d2a LOW-D4)."""
     head = Redactor().redact(line).encode()[:max_bytes].decode(errors="ignore")
-    edge = max(len(head) - CUT_EDGE_CHARS, 0)
+    edge = max(len(head) - WINDOW_EDGE_CHARS, 0)
     end = max((found.end() for found in _BOUNDARY.finditer(head, edge)), default=edge)
     return head[:end]
 

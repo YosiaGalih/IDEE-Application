@@ -16,12 +16,20 @@ from __future__ import annotations
 import asyncio
 from pathlib import PurePosixPath
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
 from app.tools.base import RiskLevel, ToolContext, ToolOutput, ToolSpec, Untrusted
-from app.tools.builtin._common import git_target, partition, relative, within, workspace_errors, workspace_of
+from app.tools.builtin._common import (
+    StrictInput,
+    git_target,
+    partition,
+    relative,
+    within,
+    workspace_errors,
+    workspace_of,
+)
 from app.workspace.errors import PathViolation, WorkspaceNotFound
 from app.workspace.policy import Access, Budget, Policy, is_secret_name
 
@@ -32,14 +40,12 @@ MAX_SCAN_BYTES = (
 )  # [Menebak] bytes matched per scan (the loop is never held: matching runs in a thread)
 
 
-class ScanSecretsInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class ScanSecretsInput(StrictInput):
     paths: list[str] | None = Field(None, max_length=100)
 
 
-def _plural(count: int, what: str) -> str:
-    return f"[{count} files not scanned: {what}]"
+def _not_scanned(count: int, why: str) -> str:
+    return f"[{count} files not scanned: {why}]"
 
 
 async def scan_secrets(ctx: ToolContext, raw: ScanSecretsInput) -> ToolOutput:
@@ -83,16 +89,20 @@ async def scan_secrets(ctx: ToolContext, raw: ScanSecretsInput) -> ToolOutput:
         lines.append("[nothing scanned: no file within paths]")
     elif not findings:
         lines.append(f"[no secrets found in {scanned} scanned files]" if scanned else "[nothing scanned]")
+    else:
+        lines.append(f"[{scanned} files scanned]")
     if kept.hidden:
-        lines.append(_plural(kept.hidden, "agents may not read them"))
+        lines.append(_not_scanned(kept.hidden, "agents may not read them"))
     if kept.unchecked:
-        lines.append(_plural(kept.unchecked, "not checked against the agent policy (too many, too costly)"))
+        lines.append(
+            _not_scanned(kept.unchecked, "not checked against the agent policy (too many, too costly)")
+        )
     if listing.skipped:
         lines.append(f"[{listing.skipped} files with names that are not UTF-8: not scanned]")
     if unread:
-        lines.append(_plural(unread, "binary, over the agent read limit, gone, or not regular files"))
+        lines.append(_not_scanned(unread, "binary, over the agent read limit, gone, or not regular files"))
     if over_budget:
-        lines.append(_plural(over_budget, "over the byte budget of one scan; narrow with paths"))
+        lines.append(_not_scanned(over_budget, "over the byte budget of one scan; narrow with paths"))
     return ToolOutput("\n".join(lines), untrusted=Untrusted("security.scan_secrets"))
 
 

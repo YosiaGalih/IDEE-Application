@@ -85,8 +85,8 @@ _TEMP_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXE
 _NOT_A_FILE = (errno.ENXIO, errno.ENODEV, errno.EOPNOTSUPP)  # sockets, devices without a driver, ...
 _READS = (Access.USER_READ, Access.AGENT_READ)
 _WRITES = (Access.USER_WRITE, Access.AGENT_WRITE)
-_LINES = re.compile(r"[^\n]*\n|[^\n]+")  # "\n" only: editor, diff and agent line numbers must agree
-LINE_PATTERN = _LINES  # the same rule for agent tools (repo.read_file)
+# "\n" only: editor, diff and agent line numbers (repo.read_file) must agree.
+LINE_PATTERN = re.compile(r"[^\n]*\n|[^\n]+")
 
 
 class AnyVersion:
@@ -522,7 +522,7 @@ class Workspace:
                 os.close(fd)
         content, encoding = _decode(head, size, limit)
         if content is not None and (start_line is not None or end_line is not None):
-            lines = _LINES.findall(content)
+            lines = LINE_PATTERN.findall(content)
             content = "".join(lines[(start_line or 1) - 1 : end_line])
         return FileContent("/".join(parts), content, encoding, size, digest, size > limit)
 

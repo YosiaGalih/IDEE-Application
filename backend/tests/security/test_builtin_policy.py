@@ -269,3 +269,74 @@ async def test_a_hostile_agentignore_cannot_stall_name_filtering(
     ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=[tool], workspace=ws)
     out = (await built.execute(ctx, tool, {})).content
     assert "not checked against the agent policy" in out, out[-400:]
+
+
+async def test_related_tests_and_tree_never_reach_inside_a_hidden_folder(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, worktree: TaskWorkspace
+) -> None:
+    """/code-review WP-3.1d2a spec, Review Focus 1: tests below a hidden folder are not related tests, and the
+    tree of a hidden folder is refused, not listed."""
+    for hidden_test in ("private/test_app.py", "scratch/app_test.py", "node_modules/lib/app.test.ts"):
+        (worktree.root / hidden_test).write_text(f"{MARK}\n")
+    (worktree.root / "tests").mkdir()
+    (worktree.root / "tests" / "test_app.py").write_text("visible\n")
+    related = await call(sessions, scope, worktree, "repo.find_related_tests", {"path": "src/app.py"})
+    assert "tests/test_app.py" in related, related
+    assert "private/" not in related and "scratch/" not in related and "node_modules/" not in related
+    for folder in ("private", "scratch", "node_modules", "node_modules/lib"):
+        out = await call(sessions, scope, worktree, "repo.get_tree", {"path": folder})
+        assert out.startswith("error:") and MARK not in out and "notes.md" not in out, (folder, out)
+
+
+GITHUB_TOKEN = "ghp_" + "a1B2c3D4e5" * 4  # the redaction pattern's shape, not a real token
+JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+
+
+async def test_secrets_inside_builtin_output_are_redacted(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    """Review Focus 2: what a builtin reads from the repo is redacted before it is wrapped, in every shape
+    the builtins print (a numbered line, a search hit, a removed and an added diff line)."""
+    from app.tools.builtin import git as git_tools
+    from app.tools.builtin import search
+    from tests.worktree_fakes import task_worktree, write
+
+    ws = await task_worktree(tmp_path, {"src/conf.py": f"{JWT}\nkeep = 1\n"})
+    write(ws.root / "src" / "conf.py", f"keep = 1\ntoken = '{GITHUB_TOKEN}'\n")
+    specs = [*repo.specs(), *search.specs(), *git_tools.specs()]
+    built = gateway(sessions, *specs)
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=[s.name for s in specs],
+                  workspace=ws)  # fmt: skip
+    outputs = [
+        await built.execute(ctx, "repo.read_file", {"path": "src/conf.py"}),
+        await built.execute(ctx, "repo.search_text", {"query": "token"}),
+        await built.execute(ctx, "git.diff", {}),
+    ]
+    for result in outputs:
+        assert result.status == "ok", result.content
+        assert GITHUB_TOKEN not in result.content and JWT not in result.content, result.content
+        assert "[REDACTED]" in result.content, result.content
+    assert "\n-[REDACTED]" in outputs[2].content, outputs[2].content  # the removed line, sign kept
+
+
+async def test_the_agent_text_search_runs_git_under_the_memory_limit(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review Focus 5 through the builtin, not only the adapter default: repo.search_text's git grep gets
+    GREP_MEMORY_LIMIT (2.1d D1)."""
+    from app.gitops.adapter import GREP_MEMORY_LIMIT, GitAdapter
+    from tests.worktree_fakes import task_worktree
+
+    ws = await task_worktree(tmp_path, {"src/app.py": "needle\n"})
+    run = GitAdapter._run  # pyright: ignore[reportPrivateUsage]
+    limits: list[object] = []
+
+    async def spy(self: GitAdapter, args: list[str], **kwargs: object) -> object:
+        if args[0] == "grep":
+            limits.append(kwargs.get("memory_limit"))
+        return await run(self, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "_run", spy)
+    out = await search_out(sessions, scope, ws, query="needle")
+    assert "src/app.py:1:" in out, out
+    assert limits and all(limit == GREP_MEMORY_LIMIT for limit in limits), limits

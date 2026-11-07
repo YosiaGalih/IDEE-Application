@@ -8,6 +8,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+from pydantic import BaseModel, ConfigDict
+
 from app.gitops.adapter import GitTarget
 from app.gitops.errors import GitError, GitInputError
 from app.tools.base import ToolContext, ToolError
@@ -16,6 +18,12 @@ from app.workspace.fs import TaskWorkspace
 from app.workspace.policy import Access, Budget, Policy, PolicyBudgetExceeded
 
 PATH_MAX_CHARS = 1000
+
+
+class StrictInput(BaseModel):
+    """Every builtin's input: unknown fields are an invalid input, never ignored."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 def workspace_of(ctx: ToolContext) -> TaskWorkspace:
@@ -82,7 +90,7 @@ def partition(
     cap: int | None = None,
 ) -> Partition:
     """Split ``names`` with one ``Budget`` for the whole call (AG-13 WP-3.1d2a HIGH-2). CPU work over many
-    names: callers run it in a thread. ``.kk/`` is dropped without counting (it is never in git)."""
+    names: callers run it in a thread. ``.kk/`` is hidden like a denied name."""
     budget = Budget(POLICY_BUDGET if budget_units is None else budget_units)
     cap = MAX_NAMES if cap is None else cap
     shown: list[str] = []
@@ -91,7 +99,10 @@ def partition(
         if index >= cap:
             return Partition(shown, hidden, len(names) - index)
         parts = PurePosixPath(name).parts
-        if not parts or parts[0] == SANDBOX_DIR:
+        if not parts:
+            continue
+        if parts[0] == SANDBOX_DIR:
+            hidden += 1  # sandbox output: never shown to the model, counted (spec 3.1d2a Goal 8)
             continue
         try:
             if refused(parts, budget):

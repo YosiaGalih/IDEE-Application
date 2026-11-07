@@ -16,12 +16,13 @@ import asyncio
 import os
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.gitops.adapter import GitAdapter, below_a_non_folder
 from app.gitops.diffparse import Diff, DiffFile
 from app.tools.base import RiskLevel, ToolContext, ToolError, ToolOutput, ToolSpec, Untrusted
 from app.tools.builtin._common import (
+    StrictInput,
     agent_cannot_read,
     counted_notes,
     git_target,
@@ -42,19 +43,15 @@ LOG_MAX = 50
 _SIGN = {"context": " ", "add": "+", "del": "-"}
 
 
-class _Input(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class StatusInput(_Input):
+class StatusInput(StrictInput):
     pass
 
 
-class DiffInput(_Input):
+class DiffInput(StrictInput):
     paths: list[str] | None = Field(None, max_length=100)
 
 
-class LogInput(_Input):
+class LogInput(StrictInput):
     limit: int = Field(10, ge=1, le=LOG_MAX)
 
 
@@ -166,6 +163,11 @@ async def diff(ctx: ToolContext, raw: DiffInput) -> ToolOutput:
     kept = await asyncio.to_thread(partition, names.paths, agent_cannot_read(policy))
     in_scope = [n for n in kept.shown if within(n, scopes)]
     wanted, large, deferred = await asyncio.to_thread(_select, workspace.root, in_scope)
+    with workspace_errors():
+        # The limit holds on both sides: a base version over it is named, never diffed (spec review 3.1d2a).
+        old_sizes = await git.blob_sizes(target, workspace.base_commit, wanted)
+    large += [name for name in wanted if old_sizes.get(name, 0) > AGENT_READ_LIMIT]
+    wanted = [name for name in wanted if old_sizes.get(name, 0) <= AGENT_READ_LIMIT]
     notes = counted_notes(kept.hidden, kept.unchecked, names.skipped, "changed paths")
     notes += [f"[{n} not shown: larger than the agent read limit, or unreadable]" for n in large]
     if deferred:
@@ -191,7 +193,7 @@ async def log(ctx: ToolContext, raw: LogInput) -> ToolOutput:
     workspace = workspace_of(ctx)
     with workspace_errors():
         entries = await GitAdapter().log(git_target(workspace), raw.limit)
-    lines = [f"{e.commit[:12]}  {e.date}  {e.author}  {e.message}" for e in entries] or ["[no commits]"]
+    lines = [f"{e.commit}  {e.date}  {e.author}  {e.message}" for e in entries] or ["[no commits]"]
     return ToolOutput("\n".join(lines), untrusted=Untrusted("git.log"))
 
 

@@ -206,7 +206,7 @@ class Policy:
             return True
         if access is Access.USER_READ:
             return False
-        if any(_is_secret(segment) for segment in parts):
+        if is_secret_name(parts):
             return True
         return self.hides(parts, access, budget)
 

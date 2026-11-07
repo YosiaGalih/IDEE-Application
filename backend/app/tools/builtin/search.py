@@ -21,11 +21,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.gitops.adapter import GitAdapter, GrepResult
 from app.tools.base import RiskLevel, ToolContext, ToolError, ToolOutput, ToolSpec, Untrusted
-from app.tools.builtin._common import SANDBOX_DIR, git_target, workspace_errors, workspace_of
+from app.tools.builtin._common import SANDBOX_DIR, StrictInput, git_target, workspace_errors, workspace_of
 from app.workspace.fs import AGENT_READ_LIMIT
 from app.workspace.index import GLOB_MAX_CHARS, check_glob, check_regex, glob_matches, preview
 from app.workspace.policy import Access, Budget, Policy, PolicyBudgetExceeded
@@ -39,9 +39,7 @@ MAX_AGENT_TEXT_SEARCHES = 2  # [Menebak] agent greps at once in this process; a 
 _running: dict[uuid.UUID, int] = {}
 
 
-class SearchTextInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class SearchTextInput(StrictInput):
     query: str = Field(min_length=1, max_length=500)
     glob: str | None = Field(None, max_length=GLOB_MAX_CHARS)
     max_results: int = Field(50, ge=1, le=200)

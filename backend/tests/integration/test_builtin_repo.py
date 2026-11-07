@@ -163,20 +163,3 @@ async def test_read_file_says_where_the_file_ends(
     raw = {"path": "src/calc.py", "start_line": 2, "end_line": 9}
     out = await run(sessions, scope, worktree, "repo.read_file", raw)
     assert "\n2\t    return a + b\n" in out and "[the file ends at line 2]" in out, out
-
-
-async def test_a_huge_line_is_redacted_before_it_is_cut(
-    sessions: async_sessionmaker[AsyncSession], scope: Scope, worktree: TaskWorkspace
-) -> None:
-    """AG-13 delta LOW-D4: a secret across the cut of a huge line must not survive as a prefix that no
-    pattern recognises any more; a token cut at the edge (a configured literal) is dropped whole."""
-    edge = repo.READ_MAX_BYTES - 200 - len("1\t")
-    url = "x" * (edge - 20) + " https://user:hunter2secretpw@host/x " + "y" * 100_000
-    (worktree.root / "url.js").write_text(url + "\n")
-    out = await run(sessions, scope, worktree, "repo.read_file", {"path": "url.js"})
-    assert out.startswith("ok|") and "longer than one read" in out, out[:200]
-    assert "hunter" not in out and "user:" not in out
-    token = "x" * (edge - 20) + " " + "Z9q" * 1000 + " tail"
-    (worktree.root / "token.js").write_text(token + "\n")
-    out = await run(sessions, scope, worktree, "repo.read_file", {"path": "token.js"})
-    assert "longer than one read" in out and "Z9q" not in out, out[-300:]

@@ -749,6 +749,32 @@ class GitAdapter:
                 skipped += 1
         return TreeListing(files, result.truncated, skipped)
 
+    async def blob_sizes(self, target: GitTarget, commit: str, paths: list[str]) -> dict[str, int]:
+        """The size of each of ``paths`` that is a regular file in ``commit``, read from the object database.
+        Exact names only: a pathspec ``config`` also matches ``config/**``, and those entries are dropped."""
+        if not _SHA.fullmatch(commit):
+            raise GitInputError("ref")
+        if not paths:
+            return {}
+        wanted = {_pathspec(path) for path in paths}
+        git_dir, tree = await self._adirs(target)
+        result = await self._run(
+            ["ls-tree", "-z", "--long", "--full-tree", commit, "--", *sorted(wanted)],
+            git_dir=git_dir,
+            work_tree=tree,
+            cwd=tree,
+        )
+        sizes: dict[str, int] = {}
+        for record in result.stdout.split(b"\0"):
+            meta, _, raw_path = record.partition(b"\t")
+            fields = meta.split()
+            if len(fields) != 4 or fields[1] != b"blob" or not fields[3].isdigit():
+                continue  # a tree, a submodule, or the empty tail after the last NUL
+            name = raw_path.decode("utf-8", "replace")
+            if name in wanted:
+                sizes[name] = int(fields[3])
+        return sizes
+
     async def grep(
         self,
         target: GitTarget,
