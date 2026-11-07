@@ -41,7 +41,11 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 # scheme://user:pass@host and scheme://<token-like userinfo>@host → scheme://[REDACTED]@host
-_URL_CREDENTIALS = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{8,})@")
+# The scheme starts only where a run of scheme characters starts, and is short: retrying it from every
+# position of a long run of letters was quadratic (64 KB of "a" took 2.8 s; WP-3.1d1, tool outputs).
+_URL_CREDENTIALS = re.compile(
+    r"(?<![A-Za-z0-9+.\-])(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]{0,31}://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{8,})@"
+)
 
 # Header-like pairs anywhere in a line, also inside JSON/repr: Authorization: Bearer x / "x-api-key": "y".
 _HEADERS = re.compile(

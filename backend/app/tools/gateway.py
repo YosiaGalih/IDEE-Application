@@ -55,6 +55,9 @@ logger = get_logger(__name__)
 
 TERMINAL_TOOL = "submit_result"
 MAX_RESULT_BYTES = 64 * 1024  # one tool_result to the model (TOOL_CATALOG, SECURITY_MODEL §3; Keputusan 6)
+# Only this much of a handler's output is redacted (then cut to MAX_RESULT_BYTES): the redaction cost stays
+# bounded whatever a handler returns, and a secret that reaches the final window lies wholly inside this one.
+REDACT_WINDOW_CHARS = 4 * MAX_RESULT_BYTES
 INVALID_NAME = "<invalid>"
 # The finished task statuses (app.workflow.states.FINISHED; tools may not import workflow, a test keeps
 # the two equal).
@@ -107,28 +110,37 @@ def _input_hash(raw_input: object) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _no_nul(text: str) -> str:
+    """PostgreSQL refuses NUL in text and jsonb: one NUL from a model or a file must not make a call's outcome
+    unrecordable. U+FFFD marks where it was."""
+    return text.replace("\x00", "\ufffd")
+
+
 def _bounded(value: Any, depth: int = 0) -> Any:
     """Long strings, long lists and deep nesting cut: ``sanitized_input`` keeps what identifies a call."""
     if depth >= _INPUT_DEPTH_MAX:
         return "<nested>"
     if isinstance(value, str):
+        value = _no_nul(value)
         return (
             value if len(value) <= _INPUT_STRING_MAX else f"{value[:_INPUT_STRING_MAX]}…[{len(value)} chars]"
         )
     if isinstance(value, dict):
         items = list(value.items())[:_INPUT_ITEMS_MAX]  # pyright: ignore[reportUnknownArgumentType]
-        return {str(k): _bounded(v, depth + 1) for k, v in items}  # pyright: ignore[reportUnknownVariableType]
+        return {_no_nul(str(k)): _bounded(v, depth + 1) for k, v in items}  # pyright: ignore[reportUnknownVariableType]
     if isinstance(value, list):
         return [_bounded(v, depth + 1) for v in value[:_INPUT_ITEMS_MAX]]  # pyright: ignore[reportUnknownVariableType]
     return value
 
 
-def _truncate(text: str, limit: int) -> str:
-    """At most ``limit`` UTF-8 bytes, cut on a character boundary, with a marker saying how much was cut."""
+def _truncate(text: str, limit: int, total_bytes: int | None = None) -> str:
+    """At most ``limit`` UTF-8 bytes, cut on a character boundary, with a marker saying how much was cut.
+    ``total_bytes``: the size before an earlier cut, reported in the marker."""
     data = text.encode()
-    if len(data) <= limit:
+    total = max(len(data), total_bytes or 0)
+    if total <= limit:
         return text
-    marker = f"\n[truncated: {len(data)} bytes, showing the first {{}}]"
+    marker = f"\n[truncated: {total} bytes, showing the first {{}}]"
     keep = limit - len(marker.format(limit)) - 8
     head = data[:keep].decode(errors="ignore")
     return head + marker.format(len(head.encode()))
@@ -434,7 +446,11 @@ class ToolGateway:
         except asyncio.CancelledError:
             await self._stop(handler)
             outcome = _Outcome("cancelled", f"cancelled: the run was cancelled.{unknown}")
-            await asyncio.shield(self._record_detached(ctx, row, spec, outcome))
+            try:
+                await asyncio.shield(self._record_detached(ctx, row, spec, outcome))
+            except Exception:
+                # The row stays "running" (a replay reports the outcome as unknown); the cancel still wins.
+                logger.error("tool_call_cancel_unrecorded", tool_call_id=str(row.id), exc_info=True)
             raise
         finally:
             cancelled.cancel()
@@ -473,7 +489,9 @@ class ToolGateway:
 
     def _model_text(self, content: str) -> str:
         """Redacted first, then cut: a cut must never split a secret so that its pattern no longer matches."""
-        return _truncate(self._audit.redactor.redact(content), MAX_RESULT_BYTES)
+        window = content[:REDACT_WINDOW_CHARS]
+        total = len(content.encode()) if len(content) > REDACT_WINDOW_CHARS else None
+        return _truncate(self._audit.redactor.redact(_no_nul(window)), MAX_RESULT_BYTES, total)
 
     def _duration(self, started: float) -> int:
         return max(0, int((self._clock() - started) * 1000))

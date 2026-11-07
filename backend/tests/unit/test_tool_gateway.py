@@ -72,3 +72,14 @@ def test_truncation_is_bounded_and_marked() -> None:
 
 def test_tool_output_defaults() -> None:
     assert ToolOutput("x").evidence_refs == ()
+
+
+def test_a_huge_output_is_redacted_within_a_window_then_cut() -> None:
+    from tests.tool_fakes import SECRET
+
+    built = bare()
+    content = "x" * 100 + SECRET + "y" * (5 * 1024 * 1024)
+    text = built._model_text(content)  # pyright: ignore[reportPrivateUsage]
+    assert len(text.encode()) <= MAX_RESULT_BYTES
+    assert SECRET not in text and "[REDACTED]" in text
+    assert f"truncated: {len(content.encode())} bytes" in text

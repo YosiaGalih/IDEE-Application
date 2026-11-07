@@ -194,18 +194,20 @@ async def test_handler_failures_are_errors_that_never_echo_the_exception(
         assert "/srv/workspaces" not in text and SECRET not in text
 
 
+@pytest.mark.parametrize("offset", range(40, 120, 5))
 async def test_output_is_redacted_before_it_is_cut(
-    sessions: async_sessionmaker[AsyncSession], scope: Scope
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, offset: int
 ) -> None:
-    # The secret straddles the 64 KB cut: cutting first would leave a prefix the redactor no longer matches.
-    filler = "a" * (MAX_RESULT_BYTES - 100)
+    # The secret is placed across the 64 KB cut (the marker takes the last ~60 bytes): cutting first would
+    # keep a prefix of it that the redactor no longer recognises.
+    filler = "a" * (MAX_RESULT_BYTES - offset)
     handler = Recorder(result=lambda _: ToolOutput(filler + SECRET + "b" * 500))
     built = gateway(sessions, spec("test.read", handler))
     ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.read"])
     result = await built.execute(ctx, "test.read", {})
     assert len(result.content.encode()) <= MAX_RESULT_BYTES
     assert "truncated" in result.content
-    assert SECRET[:12] not in result.content
+    assert SECRET[:6] not in result.content
 
 
 async def test_the_recorded_input_is_redacted_and_bounded(
@@ -248,3 +250,35 @@ async def test_denied_audit_never_carries_the_raw_input(
     async with sessions() as session:
         metadata = (await session.scalars(select(AuditEvent.metadata_))).all()
     assert all(SECRET not in str(item) for item in metadata)
+
+
+async def test_nul_characters_never_break_the_record(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope
+) -> None:
+    # PostgreSQL refuses NUL in text and jsonb: a model or a file could make the outcome unrecordable.
+    handler = Recorder(result=lambda _: ToolOutput("before\x00after"))
+    built = gateway(sessions, spec("test.read", handler))
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.read"])
+    result = await built.execute(ctx, "test.read", {"text": "a\x00b"})
+    assert result.status == "ok" and "\x00" not in result.content
+    [row] = await calls(sessions, scope.task_id)
+    assert row.status == "ok" and "\x00" not in (row.output_summary or "")
+    assert "\x00" not in row.sanitized_input["text"]
+
+
+async def test_a_cancelled_caller_stays_cancelled_when_recording_fails(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler = Recorder(delay=30)
+    built = gateway(sessions, spec("test.read", handler))
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.read"])
+
+    async def broken(*_: object) -> None:
+        raise RuntimeError("database gone")
+
+    monkeypatch.setattr(built, "_record_detached", broken)
+    running = asyncio.create_task(built.execute(ctx, "test.read", {}))
+    await asyncio.wait_for(handler.started.wait(), timeout=5)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running

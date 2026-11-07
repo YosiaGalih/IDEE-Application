@@ -245,3 +245,24 @@ def test_argon2_hash_is_redacted(redactor: Redactor) -> None:
     out = redactor.redact(f"params ('a@b.test', '{digest}', 'x')")
     assert "RdescudvJCsgt3ub" not in out
     assert "c29tZXNhbHQ" not in out
+
+
+def test_long_word_runs_redact_in_linear_time() -> None:
+    # A tool can return a long run of letters (minified code, a base64 blob): the URL-credential pattern
+    # must not retry its scheme from every position of the run (WP-3.1d1: 64 KB took 2.8 s before).
+    import time
+
+    redactor = Redactor(["kk-test-secret-literal-0123456789"])
+    started = time.perf_counter()
+    redactor.redact("a" * 131_072)
+    redactor.redact("x9+." * 32_768)
+    assert time.perf_counter() - started < 1.0
+
+
+def test_url_credentials_inside_a_word_run_are_still_redacted() -> None:
+    redactor = Redactor()
+    assert (
+        redactor.redact("prefixhttps://user:hunter2@example.test/x")
+        == "prefixhttps://[REDACTED]@example.test/x"
+    )
+    assert redactor.redact("git+ssh://deploy:hunter2@host") == "git+ssh://[REDACTED]@host"
