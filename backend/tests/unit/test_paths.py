@@ -76,6 +76,10 @@ POLICY_CASES = [
     *expect(".github/workflows/ci.yml", (Access.AGENT_WRITE,)),
     *expect(".GitHub/Actions/x/action.yml", (Access.AGENT_WRITE,)),
     *expect(".github/CODEOWNERS", ()),
+    # sandbox output is test evidence: agents may read it, never write it (Lead decision 3.1d2b #2)
+    *expect(".kk/junit.xml", (Access.AGENT_WRITE,)),
+    *expect(".KK/report.json", (Access.AGENT_WRITE,)),
+    *expect("src/.kk/notes.txt", ()),
 ]
 
 

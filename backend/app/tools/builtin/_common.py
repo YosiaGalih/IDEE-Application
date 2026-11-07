@@ -15,7 +15,7 @@ from app.gitops.errors import GitError, GitInputError
 from app.tools.base import ToolContext, ToolError
 from app.workspace.errors import FileTooLarge, PathViolation, WorkspaceBusy, WorkspaceNotFound
 from app.workspace.fs import TaskWorkspace
-from app.workspace.policy import Access, Budget, Policy, PolicyBudgetExceeded
+from app.workspace.policy import SANDBOX_OUTPUT_DIR, Access, Budget, Policy, PolicyBudgetExceeded
 
 PATH_MAX_CHARS = 1000
 
@@ -65,7 +65,7 @@ def workspace_errors() -> Iterator[None]:
         raise ToolError("git_failed", f"git failed ({exc.reason})") from None
 
 
-SANDBOX_DIR = ".kk"  # sandbox output (SECURITY_MODEL §4): never shown to the model, never in git
+SANDBOX_DIR = SANDBOX_OUTPUT_DIR  # sandbox output (SECURITY_MODEL §4): never listed for the model, never in git
 POLICY_BUDGET = 2_000_000  # [Menebak] .agentignore matching cells for one whole tool call (WP-2.1d hand-off)
 MAX_NAMES = 20_000  # [Menebak] names one tool call checks; the rest is reported as not checked
 

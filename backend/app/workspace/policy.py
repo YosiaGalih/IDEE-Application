@@ -7,6 +7,7 @@
 | ``.agentignore`` patterns | allow | deny | deny | deny |
 | the ``.agentignore`` file itself | allow | allow | allow | deny |
 | ``.github/workflows``, ``.github/actions`` (R4) | allow | allow | allow | deny |
+| ``.kk/`` at the root (sandbox output: test evidence) | allow | allow | allow | deny |
 | dependency / build folders | allow | allow | deny | allow |
 
 **Matching rules**
@@ -65,6 +66,9 @@ _SECRET_PATTERNS = (
     ".gnupg",
 )
 _AGENT_WRITE_PROTECTED = ((".github", "workflows"), (".github", "actions"))  # TOOL_CATALOG R4
+# Sandbox output (SECURITY_MODEL §4): reports and logs read as test evidence, so an agent never writes them
+# (Lead decision 3.1d2b #2). Only at the root, where the sandbox writes it and git excludes it.
+SANDBOX_OUTPUT_DIR = ".kk"
 _DEPENDENCY_DIRS = frozenset(
     {
         "node_modules",
@@ -230,7 +234,7 @@ class Policy:
                 return True
         if access is Access.AGENT_WRITE:
             lowered = tuple(segment.lower() for segment in parts[:2])
-            if own_file or lowered in _AGENT_WRITE_PROTECTED:
+            if own_file or lowered in _AGENT_WRITE_PROTECTED or lowered[:1] == (SANDBOX_OUTPUT_DIR,):
                 return True
         return access is Access.AGENT_READ and any(segment in _DEPENDENCY_DIRS for segment in parts)
 
