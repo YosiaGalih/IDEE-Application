@@ -208,6 +208,17 @@ class Policy:
             return False
         if any(_is_secret(segment) for segment in parts):
             return True
+        return self.hides(parts, access, budget)
+
+    def hides(self, parts: tuple[str, ...], access: Access, budget: Budget | None = None) -> bool:
+        """Whether ``access`` may not touch ``parts`` for a reason other than a secret name: ``.git``,
+        ``.agentignore`` patterns, the policy file itself for writes, dependency folders for agent reads.
+        security.scan_secrets reports a secret name only where nothing else hides it (AG-13 WP-3.1d2a)."""
+        access = Access(access)
+        if any(segment.lower() == ".git" for segment in parts):
+            return True
+        if access is Access.USER_READ:
+            return False
         own_file = parts == (AGENTIGNORE,)
         if not (own_file and access is Access.USER_WRITE):
             try:

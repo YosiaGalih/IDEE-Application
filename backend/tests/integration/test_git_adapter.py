@@ -631,8 +631,14 @@ async def test_changed_paths_lists_names_against_a_base_without_reading_them(
     await git.commit_all(repo, "change", ME)
     write(repo.repo / "keep.md", "changed\n")
     write(repo.repo / "new" / "u.txt", "untracked\n")
-    assert await git.changed_paths(repo, base=base) == ["f.txt", "keep.md", "new/u.txt"]
-    assert await git.changed_paths(repo, base=await git.current_commit(repo)) == ["keep.md", "new/u.txt"]
+    assert (await git.changed_paths(repo, base=base)).paths == ["f.txt", "keep.md", "new/u.txt"]
+    head = await git.current_commit(repo)
+    assert head is not None
+    assert (await git.changed_paths(repo, base=head)).paths == ["keep.md", "new/u.txt"]
+    write_bytes = repo.repo / os.fsdecode(b"bad\xff.txt")
+    write_bytes.write_text("x\n")
+    listed = await git.changed_paths(repo, base=head)
+    assert listed.skipped == 1 and "keep.md" in listed.paths  # counted, never dropped silently
 
 
 async def test_grep_runs_under_a_hard_memory_limit(

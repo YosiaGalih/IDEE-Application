@@ -85,6 +85,5 @@ async def test_a_large_diff_is_cut_at_a_file_boundary(
         write(ws.root / "gen" / f"f{i:02}.txt", "".join(f"line {n} {'x' * 60}\n" for n in range(40)))
     out = await run(sessions, scope, ws, "git.diff")
     assert out.endswith("</untrusted_content>") and len(out.encode()) <= 64 * 1024
-    assert "more files; pass paths to see them]" in out
-    # cut by the tool at a file boundary, not by the gateway mid-hunk
-    assert "[truncated:" not in out.split("more files")[0].rsplit("\n", 1)[0]
+    assert "more changed files not shown; pass paths to see them]" in out and "cut after" in out
+    assert "[truncated:" not in out  # cut by the tool with its own markers, never by the gateway

@@ -196,3 +196,76 @@ async def test_git_never_shows_hidden_files(
         for rel in HIDDEN:
             assert rel not in out, (rel, out)
     assert "src/app.py" in outputs[0] and "+visible change" in outputs[1]
+
+
+async def test_a_folder_replaced_by_a_file_cannot_smuggle_hidden_content_into_git_diff(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    """AG-13 WP-3.1d2a HIGH-1: a literal pathspec ``config`` also matches ``config/**``. Sandboxed code
+    swaps a tracked folder for a file of the same name; its diff must not carry the hidden files below."""
+    import shutil
+
+    from tests.worktree_fakes import task_worktree, write
+
+    ws = await task_worktree(
+        tmp_path,
+        {"config/prod.env": f"{MARK}=1\n", "private/data.txt": f"{MARK} private\n", "src/a.py": "a\n"},
+        repo_agentignore="private/*.txt\n",
+    )
+    for folder in ("config", "private"):
+        shutil.rmtree(ws.root / folder)
+        write(ws.root / folder, "now a file\n")
+    write(ws.root / "new_dir" / "x.txt", "visible\n")  # and the other way: a new folder where nothing was
+    outputs = [
+        await git_out(sessions, scope, ws, "git.diff"),
+        await git_out(sessions, scope, ws, "git.diff", paths=["config"]),
+        await git_out(sessions, scope, ws, "git.diff", paths=["private", "config"]),
+    ]
+    for out in outputs:
+        assert MARK not in out, out
+        assert "prod.env" not in out and "data.txt" not in out, out
+    assert "+now a file" in outputs[0] and "+visible" in outputs[0]
+
+
+async def test_scan_secrets_never_names_a_secret_file_inside_a_hidden_folder(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    """AG-13 WP-3.1d2a MEDIUM-1: `.agentignore` hides the folder, so the secret name inside stays hidden."""
+    from app.tools.builtin import security
+    from tests.worktree_fakes import task_worktree, write
+
+    ws = await task_worktree(tmp_path, {"src/a.py": "x\n"}, repo_agentignore="private/\n")
+    write(ws.root / "private" / "acme-corp-customer.env", "X=1\n")
+    write(ws.root / "node_modules" / "pkg" / "id_rsa", "k\n")
+    write(ws.root / "deploy.pem", "k\n")  # visible place: reported by name
+    built = gateway(sessions, *security.specs())
+    tools = ["security.scan_secrets"]
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=tools, workspace=ws)
+    out = (await built.execute(ctx, "security.scan_secrets", {})).content
+    assert "acme-corp" not in out and "id_rsa" not in out and "private/" not in out, out
+    assert "deploy.pem: secret_file" in out
+
+
+@pytest.mark.parametrize("tool", ["git.status", "git.diff", "security.scan_secrets"])
+async def test_a_hostile_agentignore_cannot_stall_name_filtering(
+    sessions: async_sessionmaker[AsyncSession],
+    scope: Scope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+) -> None:
+    """AG-13 WP-3.1d2a HIGH-2: one Budget per call; past it, the rest is hidden and that is said."""
+    from app.tools.builtin import _common, git, security
+    from app.workspace.policy import MAX_PATTERNS
+    from tests.worktree_fakes import task_worktree, write
+
+    monkeypatch.setattr(_common, "POLICY_BUDGET", 20_000)
+    ws = await task_worktree(tmp_path, {})
+    for i in range(300):
+        write(ws.root / "d" / f"f{i}.txt", "x\n")
+    patterns = [f"**/{'*' * 8}x{i}/**" for i in range(MAX_PATTERNS)]
+    (ws.root / ".agentignore").write_text("\n".join(patterns) + "\n")
+    built = gateway(sessions, *git.specs(), *security.specs())
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=[tool], workspace=ws)
+    out = (await built.execute(ctx, tool, {})).content
+    assert "not checked against the agent policy" in out, out[-400:]

@@ -107,6 +107,25 @@ class Change:
 
 
 @dataclass(frozen=True)
+class NameList:
+    paths: list[str]  # sorted, unique
+    skipped: int  # names that are not UTF-8: not addressable through the API, reported, never hidden silently
+
+
+def _names(raw: bytes) -> NameList:
+    names: set[str] = set()
+    skipped = 0
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        try:
+            names.add(item.decode("utf-8"))
+        except UnicodeDecodeError:
+            skipped += 1
+    return NameList(sorted(names), skipped)
+
+
+@dataclass(frozen=True)
 class GitStatus:
     branch: str | None
     head: str | None
@@ -550,8 +569,11 @@ class GitAdapter:
         head: str | None = None,
         paths: list[str] | None = None,
         max_bytes: int = 1024 * 1024,
+        exact_files: bool = False,
     ) -> Diff:
-        """``base``..``head``; ``head=None`` is the working tree including untracked files."""
+        """``base``..``head``; ``head=None`` is the working tree including untracked files. ``exact_files``
+        (agent tools): ``paths`` are exact file names, and only they are staged for the working-tree diff;
+        otherwise the whole working tree is staged and ``paths`` are pathspecs (folders allowed)."""
         git_dir, tree = await self._adirs(target)
         if base is not None:
             base_sha = await self._resolve(git_dir, tree, base)
@@ -574,7 +596,8 @@ class GitAdapter:
                 max_bytes=max_bytes,
                 output_truncated=result.truncated,
             )
-        async with self._worktree_index(target, git_dir, tree) as env:
+        files = list(paths or []) if exact_files else None
+        async with self._worktree_index(target, git_dir, tree, files) as env:
             result = await self._run(
                 [*_DIFF_FLAGS, "--cached", base_sha, *pathspec],
                 git_dir=git_dir,
@@ -593,11 +616,13 @@ class GitAdapter:
 
     @contextlib.asynccontextmanager
     async def _worktree_index(
-        self, target: GitTarget, git_dir: Path, tree: Path
+        self, target: GitTarget, git_dir: Path, tree: Path, files: list[str] | None = None
     ) -> AsyncIterator[dict[str, str]]:
-        """A copy of the index and a scratch object store with the whole working tree staged (untracked files
-        too): the blobs that creates land in the scratch store, so reading a diff never writes to the
-        repository. Yields the environment that makes git use them."""
+        """A copy of the index and a scratch object store with the working tree staged (untracked files too):
+        everything, or only ``files`` (exact paths: added, updated, or removed when gone, a file replacing
+        a folder included). The blobs that creates land in the scratch store, so reading a diff never adds
+        objects to the repository (git may still freshen the mtime of objects it already has). Yields the
+        environment that makes git use them."""
         with tempfile.TemporaryDirectory(prefix="kk-git-diff-") as scratch:
             index = Path(scratch) / "index"
             objects = Path(scratch) / "objects"
@@ -609,36 +634,33 @@ class GitAdapter:
                 "GIT_OBJECT_DIRECTORY": str(objects),
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(target.repo / ".git" / "objects"),
             }
-            await self._run(["add", "-A"], git_dir=git_dir, work_tree=tree, cwd=tree, env=env)
+            if files is None:
+                stage = ["add", "-A"]
+            else:
+                stage = ["update-index", "--add", "--remove", "--replace", "--", *map(_pathspec, files)]
+            if files != []:
+                await self._run(stage, git_dir=git_dir, work_tree=tree, cwd=tree, env=env)
             yield env
 
-    async def changed_paths(self, target: GitTarget, *, base: str) -> list[str]:
-        """The paths whose content differs between ``base`` and the working tree (untracked included), sorted;
-        names only, so a caller can filter them before any content is read (WP-3.1d2a git.diff). Renames are
-        a deletion plus an addition. Paths that are not UTF-8 are left out."""
+    async def changed_paths(self, target: GitTarget, *, base: str) -> NameList:
+        """The paths whose content differs between ``base`` and the working tree, untracked (not ignored)
+        files included, sorted; names only and without staging anything, so a caller can filter them before
+        any content is read (WP-3.1d2a git.diff). A deletion is listed under the deleted name. Names that
+        are not UTF-8 are counted in ``skipped``, never dropped silently."""
         git_dir, tree = await self._adirs(target)
         base_sha = await self._resolve(git_dir, tree, base)
-        async with self._worktree_index(target, git_dir, tree) as env:
-            result = await self._run(
-                ["diff", "--cached", "--name-only", "--no-renames", "-z", base_sha],
-                git_dir=git_dir,
-                work_tree=tree,
-                cwd=tree,
-                env=env,
-            )
-        names: list[str] = []
-        for raw in result.stdout.split(b"\0"):
-            if not raw:
-                continue
-            try:
-                names.append(raw.decode("utf-8"))
-            except UnicodeDecodeError:
-                continue
-        return sorted(names)
+        tracked = await self._run(
+            ["diff", "--name-only", "--no-renames", "-z", base_sha], git_dir=git_dir, work_tree=tree, cwd=tree
+        )
+        untracked = await self._run(
+            ["ls-files", "-z", "--others", "--exclude-standard"], git_dir=git_dir, work_tree=tree, cwd=tree
+        )
+        return _names(tracked.stdout + b"\0" + untracked.stdout)
 
-    async def worktree_files(self, target: GitTarget) -> list[str]:
+    async def worktree_files(self, target: GitTarget) -> NameList:
         """What a commit of the working tree could take: tracked files plus untracked ones that are not
-        ignored (``.gitignore``, ``info/exclude``), sorted, names only. Non-UTF-8 paths are left out."""
+        ignored (``.gitignore``, ``info/exclude``), sorted, names only. Names that are not UTF-8 are counted
+        in ``skipped``."""
         git_dir, tree = await self._adirs(target)
         result = await self._run(
             ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
@@ -646,15 +668,7 @@ class GitAdapter:
             work_tree=tree,
             cwd=tree,
         )
-        names: set[str] = set()
-        for raw in result.stdout.split(b"\0"):
-            if not raw:
-                continue
-            try:
-                names.add(raw.decode("utf-8"))
-            except UnicodeDecodeError:
-                continue
-        return sorted(names)
+        return _names(result.stdout)
 
     async def list_files(self, target: GitTarget, commit: str) -> TreeListing:
         """The regular files of ``commit``'s tree, read from the object database (no working tree, no symlink

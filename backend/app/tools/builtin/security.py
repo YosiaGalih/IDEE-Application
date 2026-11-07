@@ -1,15 +1,19 @@
 """`security.scan_secrets`: a deterministic scan of what the task would commit (SECURITY_MODEL T5; spec
-3.1d2a Goal 11). No subprocess besides git (``ls-files``), no model, no content in the result.
+3.1d2a Goal 11). No subprocess besides git (``ls-files``), no model, no value in the result.
 
-Scanned: tracked files plus untracked ones git would not ignore (what ``git.commit_task`` stages). A file with
-a secret name (``.env*``, ``*.env``, ``*.pem``, ...) is reported by name and never read. Every other file is
-read through ``TaskWorkspace`` (AGENT_READ, at most ``AGENT_READ_LIMIT``) and matched with the redaction
-patterns (``Redactor.find``). Files the agent may not read for another reason (``.agentignore``, dependency
-folders) are counted, not shown. Findings are ``path:line: rule``; storing them is the review stage's job.
+Scanned: tracked files plus untracked ones git would not ignore (what a commit of the worktree takes). Names
+are filtered first with one policy Budget, in a thread: a path hidden by ``.agentignore`` or a dependency
+folder is counted, never named; a secret name (``.env*``, ``*.env``, ``*.pem``, ...) where nothing else hides
+it is reported by name and never read. Every other file is read through ``TaskWorkspace`` (AGENT_READ, at most
+``AGENT_READ_LIMIT``) and matched in a thread with the redaction patterns (``Redactor.find``), within
+MAX_FILES and MAX_SCAN_BYTES. Configured platform secrets (the gateway's literal list) are not looked for:
+handing their values to a scan would make it an oracle; the gateway still redacts them from every output.
+Everything not scanned is counted in the result, and "no secrets" is only said for what was scanned.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,13 +21,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
 from app.tools.base import RiskLevel, ToolContext, ToolOutput, ToolSpec, Untrusted
-from app.tools.builtin._common import git_target, relative, workspace_errors, workspace_of
+from app.tools.builtin._common import git_target, partition, relative, within, workspace_errors, workspace_of
 from app.workspace.errors import PathViolation, WorkspaceNotFound
-from app.workspace.policy import Access, is_secret_name
+from app.workspace.policy import Access, Budget, Policy, is_secret_name
 
-SANDBOX_DIR = ".kk"
 MAX_FINDINGS = 200
-MAX_FILES = 5000  # [Menebak] files read per scan; the rest is reported as not scanned
+MAX_FILES = 5000  # [Menebak] files read per scan
+MAX_SCAN_BYTES = (
+    32 * 1024 * 1024
+)  # [Menebak] bytes matched per scan (the loop is never held: matching runs in a thread)
 
 
 class ScanSecretsInput(BaseModel):
@@ -32,49 +38,61 @@ class ScanSecretsInput(BaseModel):
     paths: list[str] | None = Field(None, max_length=100)
 
 
-def _within(path: str, scopes: list[str]) -> bool:
-    return any(scope == "." or path == scope or path.startswith(f"{scope}/") for scope in scopes)
+def _plural(count: int, what: str) -> str:
+    return f"[{count} files not scanned: {what}]"
 
 
 async def scan_secrets(ctx: ToolContext, raw: ScanSecretsInput) -> ToolOutput:
     workspace = workspace_of(ctx)
     scopes = [relative(p) for p in raw.paths] if raw.paths else ["."]
     with workspace_errors():
-        policy = await workspace.policy()
-        names = await GitAdapter().worktree_files(git_target(workspace))
+        policy: Policy = await workspace.policy()
+        listing = await GitAdapter().worktree_files(git_target(workspace))
+    names = [n for n in listing.paths if within(n, scopes)]
+
+    def hidden(parts: tuple[str, ...], budget: Budget) -> bool:
+        return policy.hides(parts, Access.AGENT_READ, budget)
+
+    kept = await asyncio.to_thread(partition, names, hidden)
+    secret_files = [n for n in kept.shown if is_secret_name(PurePosixPath(n).parts)]
+    to_read = [n for n in kept.shown if not is_secret_name(PurePosixPath(n).parts)]
     finder = Redactor()
-    findings: list[str] = []
-    hidden = unread = read = 0
-    for name in names:
-        parts = PurePosixPath(name).parts
-        if not parts or parts[0] == SANDBOX_DIR or not _within(name, scopes):
-            continue
-        if is_secret_name(parts):
-            findings.append(f"{name}: secret_file")
-            continue
-        if policy.denied(parts, Access.AGENT_READ):
-            hidden += 1
-            continue
-        if read >= MAX_FILES:
-            unread += 1
-            continue
-        read += 1
+    findings = [f"{name}: secret_file" for name in secret_files]
+    scanned = unread = over_budget = 0
+    used = 0
+    for index, name in enumerate(to_read):
+        if index >= MAX_FILES or used >= MAX_SCAN_BYTES:
+            over_budget = len(to_read) - index
+            break
         try:
             got = await workspace.read_text(name)
         except (PathViolation, WorkspaceNotFound):
-            unread += 1  # a symlink, or gone since git listed it
+            unread += 1  # gone since git listed it, or not a regular file (a symlink)
             continue
         if got.content is None:
-            unread += 1  # binary or over the agent read limit
+            unread += 1  # binary, or over the agent read limit
             continue
-        findings += [f"{name}:{f.line}: {f.rule}" for f in finder.find(got.content)]
-    lines = findings[:MAX_FINDINGS] or ["[no secrets found]"]
+        used += len(got.content.encode())
+        scanned += 1
+        found = await asyncio.to_thread(finder.find, got.content)
+        findings += [f"{name}:{f.line}: {f.rule}" for f in found]
+    lines = findings[:MAX_FINDINGS]
     if len(findings) > MAX_FINDINGS:
         lines.append(f"[truncated: {len(findings) - MAX_FINDINGS} more findings]")
-    if hidden:
-        lines.append(f"[{hidden} files not scanned: agents may not read them]")
+    if not names and listing.paths:
+        lines.append("[nothing scanned: no file within paths]")
+    elif not findings:
+        lines.append(f"[no secrets found in {scanned} scanned files]" if scanned else "[nothing scanned]")
+    if kept.hidden:
+        lines.append(_plural(kept.hidden, "agents may not read them"))
+    if kept.unchecked:
+        lines.append(_plural(kept.unchecked, "not checked against the agent policy (too many, too costly)"))
+    if listing.skipped:
+        lines.append(f"[{listing.skipped} files with names that are not UTF-8: not scanned]")
     if unread:
-        lines.append(f"[{unread} files not scanned: binary, too large, or not regular files]")
+        lines.append(_plural(unread, "binary, over the agent read limit, gone, or not regular files"))
+    if over_budget:
+        lines.append(_plural(over_budget, "over the byte budget of one scan; narrow with paths"))
     return ToolOutput("\n".join(lines), untrusted=Untrusted("security.scan_secrets"))
 
 
