@@ -6,6 +6,7 @@ dependency folders, files over ``AGENT_READ_LIMIT``. Each check reads the worktr
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,7 @@ def worktree(tmp_path: Path) -> TaskWorkspace:
 
 
 async def call(sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace, name: str,
-               raw: dict[str, object]) -> str:  # fmt: skip
+               raw: Mapping[str, object]) -> str:  # fmt: skip
     tools = [s.name for s in repo.specs()]
     built = gateway(sessions, *repo.specs())
     ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=tools, workspace=ws)
@@ -79,3 +80,83 @@ async def test_related_tests_of_a_hidden_path_are_refused(
 ) -> None:
     out = await call(sessions, scope, worktree, "repo.find_related_tests", {"path": "private/notes.md"})
     assert out.startswith("error:") and "not read" in out
+
+
+# --- repo.search_text: hits in hidden files never reach the model (2.1d hand-off, Review Focus 1, 3) ---
+
+
+async def search_out(sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace,
+                     **raw: object) -> str:  # fmt: skip
+    from app.tools.builtin import search
+
+    built = gateway(sessions, *search.specs())
+    ctx = context(
+        task_id=scope.task_id, project_id=scope.project_id, tools=["repo.search_text"], workspace=ws
+    )
+    return (await built.execute(ctx, "repo.search_text", raw)).content
+
+
+async def test_search_never_returns_hits_from_hidden_files(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    from app.workspace.fs import AGENT_READ_LIMIT
+    from tests.worktree_fakes import task_worktree, write
+
+    ws = await task_worktree(tmp_path, {"src/app.py": "visible\n"}, repo_agentignore="private/\nscratch/\n")
+    for rel in HIDDEN:
+        write(ws.root / rel, f"{MARK}\n")
+    write(ws.root / ".kk" / "junit.xml", f"{MARK}\n")  # sandbox output
+    write(ws.root / "big.log", f"{MARK}\n" + "z" * AGENT_READ_LIMIT)  # over the agent read limit
+    (ws.root / ".agentignore").write_text("")  # the sandbox emptied the worktree copy
+    out = await search_out(sessions, scope, ws, query=MARK)
+    assert MARK not in out, out
+    regex = await search_out(sessions, scope, ws, query="HIDDEN-.*", regex=True)
+    assert MARK not in regex, regex
+
+
+async def test_a_hostile_agentignore_cannot_make_search_unbounded(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One Budget for the whole search (2.1d hand-off): when it runs out the search stops and says so; the
+    hits it did not check are never shown (fail closed). A budget per hit would let N hits cost N budgets."""
+    from app.tools.builtin import search
+    from app.workspace.policy import MAX_PATTERNS
+    from tests.worktree_fakes import task_worktree, write
+
+    monkeypatch.setattr(search, "SEARCH_POLICY_BUDGET", 20_000)
+    ws = await task_worktree(tmp_path, {})
+    for i in range(400):
+        write(ws.root / "d" / f"f{i}.txt", "needle\n")
+    patterns = [f"**/{'*' * 8}x{i}/**" for i in range(MAX_PATTERNS)]  # valid, at the cap, costly per path
+    (ws.root / ".agentignore").write_text("\n".join(patterns) + "\n")
+    out = await search_out(sessions, scope, ws, query="needle", max_results=200)
+    assert out.startswith("<untrusted_content"), out[:400]
+    assert "[truncated" in out and out.count("needle") < 200, out[-300:]
+
+
+async def test_one_text_search_per_task_at_a_time(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from app.gitops.adapter import GitAdapter
+    from tests.worktree_fakes import task_worktree
+
+    ws = await task_worktree(tmp_path, {"a.txt": "needle\n"})
+    started, release = asyncio.Event(), asyncio.Event()
+    grep = GitAdapter.grep
+
+    async def held(self: GitAdapter, *args: object, **kwargs: object) -> object:
+        started.set()
+        await release.wait()
+        return await grep(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(GitAdapter, "grep", held)
+    first = asyncio.ensure_future(search_out(sessions, scope, ws, query="needle"))
+    await asyncio.wait_for(started.wait(), 10)
+    try:
+        second = await search_out(sessions, scope, ws, query="needle")
+        assert second.startswith("error:") and "still running" in second
+    finally:
+        release.set()
+    assert "a.txt:1: needle" in await first
