@@ -181,3 +181,27 @@ def test_a_secret_cut_at_the_window_edge_never_reaches_the_model() -> None:
     text_out = built._model_text(unit * (REDACT_WINDOW_CHARS // len(unit) + 5))  # pyright: ignore[reportPrivateUsage]
     assert literal[:12] not in text_out
     assert "truncated" in text_out
+
+
+async def test_a_handler_cannot_take_its_call_out_of_the_quota(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope
+) -> None:
+    # AG-13 delta C2: "invalid_input" and "not_started" mean "no handler ran" to the quota; a handler that
+    # acted and then raised one of those codes must still count.
+    from app.models.tools import ToolCall
+    from app.tools.base import ToolError
+
+    def acted_then_failed(_: object) -> ToolOutput:
+        raise ToolError("invalid_input", "done, then complained")
+
+    handler = Recorder(result=acted_then_failed)
+    built = gateway(sessions, spec("test.read", handler))
+    ctx = context(
+        task_id=scope.task_id, project_id=scope.project_id, tools=["test.read"], quota={"test.read": 1}
+    )
+    assert (await built.execute(ctx, "test.read", {})).status == "error"
+    assert (await built.execute(ctx, "test.read", {})).status == "denied"
+    assert len(handler.calls) == 1
+    async with sessions() as session:
+        codes = (await session.scalars(select(ToolCall.error_code).order_by(ToolCall.created_at))).all()
+    assert codes == ["handler_invalid_input", "quota_exceeded"]

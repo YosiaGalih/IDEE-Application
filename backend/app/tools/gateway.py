@@ -77,6 +77,15 @@ FINISHED_TASK_STATUSES = frozenset({"completed", "failed", "cancelled", "rejecte
 _EXECUTED = ("running", "ok", "error", "timeout", "cancelled")
 # ...except calls that ended before any handler: an invalid input, or a run cancelled before the tool started.
 _NOT_STARTED = ("invalid_input", "not_started")
+# Codes only the gateway writes. A handler's error code that collides is prefixed, so a builtin can never
+# take its call out of the quota or pass for an unrecorded outcome (AG-13 3.1d1 delta C2).
+_GATEWAY_CODES = frozenset({*_NOT_STARTED, "outcome_unknown", "record_failed"})
+
+
+def _handler_code(code: str) -> str:
+    return (f"handler_{code}" if code in _GATEWAY_CODES else code)[:40]
+
+
 _TOOL_USE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _KEY_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
 _INPUT_STRING_MAX = 1024
@@ -586,9 +595,9 @@ class ToolGateway:
         except asyncio.CancelledError:  # the handler cancelled itself; this task was not cancelled
             return _Outcome("error", "error: the tool stopped without a result", "internal")
         except ToolError as exc:
-            return _Outcome("error", f"error: {exc.message}", exc.code[:40])
+            return _Outcome("error", f"error: {exc.message}", _handler_code(exc.code))
         except AppError as exc:
-            return _Outcome("error", f"error: {exc.message}", exc.code[:40])
+            return _Outcome("error", f"error: {exc.message}", _handler_code(exc.code))
         except Exception as exc:
             logger.warning(
                 "tool_handler_failed",

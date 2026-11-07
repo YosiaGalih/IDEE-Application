@@ -11,7 +11,8 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import text, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.models.approvals import Approval
@@ -47,12 +48,21 @@ async def test_tampered_payload_is_not_consumed(
     project_id = await blank(env, actor)
     approval, _ = await project_delete.request_delete(env, actor, project_id)
     await approve(engine, approval.id)
-    async with engine.begin() as conn:  # edited after the decision: the hash no longer describes it
-        await conn.execute(
-            update(Approval)
-            .where(Approval.id == approval.id)
-            .values(payload={**approval.payload, "previous_status": "archived"})
-        )
+    tampered = (
+        update(Approval)
+        .where(Approval.id == approval.id)
+        .values(payload={**approval.payload, "previous_status": "archived"})
+    )
+    # Since migration 0008 the database refuses the edit itself (approvals_status_guard, AG-13 3.1d1)...
+    with pytest.raises(DBAPIError, match="never changes after it is requested"):
+        async with engine.begin() as conn:
+            await conn.execute(tampered)
+    # ...and if the table's owner switches the guard off to edit the row by hand (RUNBOOK §10.7 forbids it),
+    # the handler still recomputes the hash from the project and refuses (AG-13 3.1c1 C1).
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE approvals DISABLE TRIGGER approvals_status_guard"))
+        await conn.execute(tampered)
+        await conn.execute(text("ALTER TABLE approvals ENABLE ALWAYS TRIGGER approvals_status_guard"))
     with pytest.raises(RuntimeError, match="no longer matches what was approved"):
         await handler.approved(approval.id, now=NOW)
     assert (await load(engine, Project, project_id)).status == "deleting_pending_approval"
