@@ -115,3 +115,43 @@ async def test_without_a_worktree_the_tool_says_so(
 ) -> None:
     out = await run(sessions, scope, None, "repo.read_file", {"path": "a.py"})
     assert out.startswith("error|") and "no worktree" in out
+
+
+async def test_read_file_lines_are_newline_lines_like_the_editor_and_git(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, worktree: TaskWorkspace
+) -> None:
+    """Silent-failure M4: only \\n ends a line (a form feed or a lone \\r must not shift the numbers)."""
+    (worktree.root / "odd.txt").write_bytes(b"a\x0cb\nc\rstill c\nd\n")
+    out = await run(sessions, scope, worktree, "repo.read_file", {"path": "odd.txt"})
+    assert "\n1\ta\x0cb\n" in out and "\n2\tc\rstill c\n" in out and "\n3\td\n" in out, repr(out)
+    third = await run(sessions, scope, worktree, "repo.read_file", {"path": "odd.txt", "start_line": 3})
+    assert "\n3\td\n" in third
+
+
+async def test_read_file_past_the_end_and_a_huge_line_are_said(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, worktree: TaskWorkspace
+) -> None:
+    """Silent-failure M5: past the end is not "[empty]"; a line over 60 KB is shown cut, with a marker."""
+    out = await run(sessions, scope, worktree, "repo.read_file", {"path": "src/calc.py", "start_line": 9})
+    assert "[no lines at or after line 9; the file has 2 lines]" in out, out
+    (worktree.root / "min.js").write_text("x" * (100 * 1024) + "\nnext\n")
+    huge = await run(sessions, scope, worktree, "repo.read_file", {"path": "min.js"})
+    assert huge.startswith("ok|") and "\n1\txxxx" in huge, huge[:200]
+    assert "[line 1 is longer than one read; the rest of it is not shown]" in huge
+    assert "read on with start_line=2" in huge
+
+
+async def test_folders_cut_by_depth_are_marked(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, worktree: TaskWorkspace
+) -> None:
+    """Silent-failure L1/L3: a folder past the depth is not an empty folder."""
+    (worktree.root / "empty").mkdir()
+    (worktree.root / "src" / "sub").mkdir()
+    (worktree.root / "src" / "sub" / "x.py").write_text("x\n")
+    out = await run(sessions, scope, worktree, "repo.get_tree", {"depth": 2})
+    assert "src/sub/ (contents not listed)" in out and "\nempty/\n" in out, out  # opened and empty
+    deep = worktree.root.joinpath(*[f"d{i}" for i in range(12)])
+    deep.mkdir(parents=True)
+    (deep / "test_calc.py").write_text("x\n")
+    related = await run(sessions, scope, worktree, "repo.find_related_tests", {"path": "src/calc.py"})
+    assert "[some folders were not searched: deeper than 10 levels]" in related, related

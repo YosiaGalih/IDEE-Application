@@ -18,18 +18,18 @@ import contextlib
 import os
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.gitops.adapter import GitAdapter, GrepResult
 from app.tools.base import RiskLevel, ToolContext, ToolError, ToolOutput, ToolSpec, Untrusted
-from app.tools.builtin._common import git_target, workspace_errors, workspace_of
+from app.tools.builtin._common import SANDBOX_DIR, git_target, workspace_errors, workspace_of
 from app.workspace.fs import AGENT_READ_LIMIT
 from app.workspace.index import GLOB_MAX_CHARS, check_glob, check_regex, glob_matches, preview
 from app.workspace.policy import Access, Budget, Policy, PolicyBudgetExceeded
 
-SANDBOX_DIR = ".kk"
 TEXT_TIMEOUT_S = 10.0  # as the user's search (repo_index): git is killed past this
 TEXT_OUTPUT_MAX = 1024 * 1024
 SEARCH_POLICY_BUDGET = 2_000_000  # [Menebak] the tree's budget: matching cells for one whole search
@@ -59,37 +59,54 @@ def _slot(task_id: uuid.UUID) -> Iterator[None]:
         _running.pop(task_id, None)
 
 
-def _keep(
-    found: GrepResult, root: Path, policy: Policy, glob: str | None, limit: int
-) -> tuple[list[str], bool]:
-    """The hits the agent may see, as ``path:line: preview``. CPU work over many matches: run in a thread."""
+@dataclass
+class _Kept:
+    hits: list[str] = field(default_factory=list)
+    truncated: bool = False
+    large: int = 0  # hits in files over AGENT_READ_LIMIT: left out, and said
+    unreadable: int = 0  # hits in files gone or unreadable since git read them: left out, and said
+
+
+def _keep(found: GrepResult, root: Path, policy: Policy, glob: str | None, limit: int) -> _Kept:
+    """The hits the agent may see, as ``path:line: preview``. CPU work over many matches: run in a thread.
+    The policy is evaluated once per path, all under one Budget (fail closed when it runs out)."""
     budget = Budget(SEARCH_POLICY_BUDGET)
-    sizes: dict[str, bool] = {}
-    hits: list[str] = []
+    denied: dict[str, bool] = {}
+    sizes: dict[str, bool | None] = {}  # True small, False large, None unreadable
+    kept = _Kept()
     for match in found.matches:
         parts = PurePosixPath(match.path).parts
         if not parts or parts[0] == SANDBOX_DIR:
             continue
         if glob is not None and not glob_matches(glob, match.path):
             continue
-        try:
-            if policy.denied(parts, Access.AGENT_READ, budget):
-                continue
-        except PolicyBudgetExceeded:
-            return hits, True  # stop here: what is not checked is not shown
-        small = sizes.get(match.path)
-        if small is None:
+        hidden = denied.get(match.path)
+        if hidden is None:
             try:
-                small = os.lstat(root / match.path).st_size <= AGENT_READ_LIMIT
-            except OSError:
-                small = False  # gone or unreadable since git read it: not shown
-            sizes[match.path] = small
-        if not small:
+                hidden = denied[match.path] = policy.denied(parts, Access.AGENT_READ, budget)
+            except PolicyBudgetExceeded:
+                kept.truncated = True  # stop here: what is not checked is not shown
+                return kept
+        if hidden:
             continue
-        if len(hits) >= limit:
-            return hits, True
-        hits.append(f"{match.path}:{match.line}: {preview(match.text, match.column)}")
-    return hits, found.truncated
+        if match.path not in sizes:
+            try:
+                sizes[match.path] = os.lstat(root / match.path).st_size <= AGENT_READ_LIMIT
+            except OSError:
+                sizes[match.path] = None
+        small = sizes[match.path]
+        if small is None:
+            kept.unreadable += 1
+            continue
+        if not small:
+            kept.large += 1
+            continue
+        if len(kept.hits) >= limit:
+            kept.truncated = True
+            return kept
+        kept.hits.append(f"{match.path}:{match.line}: {preview(match.text, match.column)}")
+    kept.truncated = kept.truncated or found.truncated
+    return kept
 
 
 async def search_text(ctx: ToolContext, raw: SearchTextInput) -> ToolOutput:
@@ -116,11 +133,14 @@ async def search_text(ctx: ToolContext, raw: SearchTextInput) -> ToolOutput:
             max_output=TEXT_OUTPUT_MAX,
             threads=1,
         )
-        hits, truncated = await asyncio.to_thread(
-            _keep, found, workspace.root, policy, raw.glob, raw.max_results
-        )
-    lines = hits or ["[no matches]"]
-    if truncated:
+        kept = await asyncio.to_thread(_keep, found, workspace.root, policy, raw.glob, raw.max_results)
+    partial = kept.large or kept.unreadable or kept.truncated or found.skipped_paths
+    lines = kept.hits or ["[no matches shown]" if partial else "[no matches]"]
+    if kept.large:
+        lines.append(f"[{kept.large} hits in files over the agent read limit were left out]")
+    if kept.unreadable:
+        lines.append(f"[{kept.unreadable} hits in files gone or unreadable since the search were left out]")
+    if kept.truncated:
         lines.append("[truncated: more matches than shown; narrow the query or the glob]")
     if found.skipped_paths:
         lines.append(f"[{found.skipped_paths} hits in files whose names are not UTF-8 were left out]")

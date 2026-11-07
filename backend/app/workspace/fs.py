@@ -86,6 +86,7 @@ _NOT_A_FILE = (errno.ENXIO, errno.ENODEV, errno.EOPNOTSUPP)  # sockets, devices 
 _READS = (Access.USER_READ, Access.AGENT_READ)
 _WRITES = (Access.USER_WRITE, Access.AGENT_WRITE)
 _LINES = re.compile(r"[^\n]*\n|[^\n]+")  # "\n" only: editor, diff and agent line numbers must agree
+LINE_PATTERN = _LINES  # the same rule for agent tools (repo.read_file)
 
 
 class AnyVersion:

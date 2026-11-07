@@ -57,3 +57,16 @@ async def test_inputs_that_explode_are_refused(
                 {"query": "a", "glob": "*" * 20}, {"query": "a\nb"}):  # fmt: skip
         out = await find(sessions, scope, ws, **raw)
         assert out.startswith("error|"), (raw, out)
+
+
+async def test_hits_left_out_for_size_are_said(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, tmp_path: Path
+) -> None:
+    """Silent-failure M3: a match only in a file over the agent read limit is not "[no matches]"."""
+    from app.workspace.fs import AGENT_READ_LIMIT
+
+    ws = await task_worktree(tmp_path, {"src/a.py": "x\n"})
+    write(ws.root / "dist2" / "bundle.js", "needle\n" + "z" * AGENT_READ_LIMIT)
+    out = await find(sessions, scope, ws, query="needle")
+    assert "[no matches]" not in out, out
+    assert "[1 hits in files over the agent read limit were left out]" in out, out
