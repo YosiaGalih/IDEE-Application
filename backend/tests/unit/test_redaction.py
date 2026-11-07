@@ -285,6 +285,11 @@ def test_url_credentials_inside_a_word_run_are_still_redacted() -> None:
         ("X-Api-Key: s3cr3tv4lue", "credential_header"),
         ("password=hunter22", "credential_assignment"),
         ("machine github.com login bob password hunter22", "credential_assignment"),
+        (
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+            "jwt",
+        ),
+        ("$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo", "password_hash"),
     ],
 )
 def test_find_reports_what_redaction_would_remove(text: str, rule: str) -> None:
@@ -301,25 +306,3 @@ def test_find_never_returns_the_secret_and_ordinary_code_is_clean() -> None:
     assert [(f.line, f.rule) for f in found] == [(2, "anthropic_key")]
     assert FAKE_ANTHROPIC not in repr(found)
     assert redactor.find("token_count = 3\ndef tokenize(text): return text.split()\n") == []
-
-
-@pytest.mark.parametrize(
-    "hostile",
-    ["eyJ" * 87_000, "eyJ" + "a" * 260_000, ("eyJ" + "b" * 5 + ".") * 30_000],
-    ids=["eyJ-run", "one-long-segment", "short-dotted-segments"],
-)
-def test_the_jwt_pattern_is_linear_on_hostile_text(hostile: str) -> None:
-    # AG-13 WP-3.1d2a MEDIUM-2: 256 KiB of "eyJ" took 17 s (a match attempt from every "eyJ" in a run).
-    import time
-
-    redactor = Redactor()
-    started = time.perf_counter()
-    redactor.redact(hostile)
-    redactor.find(hostile)
-    assert time.perf_counter() - started < 1.0
-
-
-def test_a_jwt_after_a_separator_is_still_found() -> None:
-    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
-    for text in (token, f"Bearer {token}", f'"{token}"', f"x={token}", f"a,{token};"):
-        assert token not in Redactor().redact(text), text

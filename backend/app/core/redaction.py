@@ -35,8 +35,15 @@ _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
     # Starts only where a token starts: a match tried from every "eyJ" of a long run was quadratic (256 KiB of
-    # "eyJ" took 17 s; AG-13 WP-3.1d2a MEDIUM-2).
-    ("jwt", re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}")),
+    # "eyJ" took 17 s; AG-13 WP-3.1d2a MEDIUM-2). One "-" that itself follows no token character also counts
+    # as a start: git.diff prints a removed line as "-" + text (/code-review WP-3.1d2a spec HIGH).
+    (
+        "jwt",
+        re.compile(
+            r"(?:(?<![A-Za-z0-9_-])|(?<=^-)|(?<=[^A-Za-z0-9_-]-))"
+            r"eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
+        ),
+    ),
     ("password_hash", re.compile(r"\$argon2(?:id|i|d)\$[A-Za-z0-9+/=,$]+")),  # PHC string
     # PEM blocks, including a truncated block with no END marker.
     (
