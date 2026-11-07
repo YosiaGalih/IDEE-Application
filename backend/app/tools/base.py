@@ -140,6 +140,10 @@ class ToolSpec:
     write_paths: Callable[[Any], Iterable[str]] | None = None
 
 
+class R3InputNotCanonical(ValueError):
+    """The R3 input cannot be hashed canonically (floats, non-string keys): no approval can bind it."""
+
+
 @dataclass(frozen=True, slots=True)
 class R3Ticket:
     """``consumed``: an approval for exactly this action was approved and has just been used; otherwise
@@ -151,7 +155,8 @@ class R3Ticket:
 
 class R3Approvals(Protocol):
     """The approval side of an R3 tool call (ADR-022 port; implemented in ``app.services.tool_approvals``).
-    Runs in the gateway's transaction, never commits."""
+    Runs in the gateway's transaction, never commits. Raises ``R3InputNotCanonical`` for an input no approval
+    can bind; any other exception is a server fault."""
 
     async def authorize(
         self,

@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit import AuditWriter
 from app.models.approvals import Approval
 from app.services import approval_store
-from app.tools.base import R3Ticket
+from app.tools.base import R3InputNotCanonical, R3Ticket
 
 REQUESTER = "system:tool_gateway"
 RISK_LEVEL = 3
@@ -38,10 +38,13 @@ class ToolR3Approvals:
         payload: Mapping[str, object],
         summary: str,
     ) -> R3Ticket:
-        # First: a payload that cannot be hashed canonically (floats) raises before anything is written.
-        digest = approval_store.payload_hash(
-            approval_store.TOOL_R3, project_id=project_id, task_id=task_id, payload=payload
-        )
+        # First: a payload that cannot be hashed canonically (floats) is refused before anything is written.
+        try:
+            digest = approval_store.payload_hash(
+                approval_store.TOOL_R3, project_id=project_id, task_id=task_id, payload=payload
+            )
+        except ValueError as exc:
+            raise R3InputNotCanonical(str(exc)) from None
         current = await session.scalar(
             select(Approval)
             .where(

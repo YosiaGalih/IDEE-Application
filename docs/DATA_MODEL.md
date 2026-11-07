@@ -113,6 +113,8 @@ Index `(project_id, status)`, `(status, lease_expires_at)`.
 ### tool_calls
 | id | task_id fk cascade | agent_run_id fk null | tool_name varchar(80) | risk_level smallint | idempotency_key char(64) unique null | input_hash char(64) | sanitized_input jsonb | status check in (`ok`,`error`,`denied`,`timeout`,`approval_required`) | output_summary text (≤ 2 KB) | output_ref uuid null (artifact) | approval_id fk null | duration_ms int | created_at |
 
+> Realisasi WP-3.1d1 (migrasi 0008, spec `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md` Keputusan Lead 4 dan 5; konflik #72): status juga `running` (klaim yang di-commit sebelum handler tool side effect; baris yang masih `running` sesudah crash = hasil tidak diketahui, handler tidak dijalankan ulang) dan `cancelled`. Kolom tambahan: `agent_id varchar(40)`, `tool_use_id varchar(128) null`, `error_code varchar(40) null` (alasan penolakan atau kode galat), `updated_at`. `agent_run_id` ON DELETE CASCADE, `approval_id` ON DELETE SET NULL, `output_ref` tanpa FK sampai tabel `artifacts` ada. `idempotency_key` hanya diisi untuk tool side effect yang sampai ke handler (`sha256(agent_run_id|tool_use_id)`, tanpa run: `task:<task_id>|tool_use_id`). CHECK `input_hash`/`idempotency_key` hex, `output_summary` ≤ 2048 karakter, `risk_level` 0–4, `duration_ms` ≥ 0. Index `(task_id, created_at)`, `(agent_run_id, tool_name)`.
+
 ## Evidence (M12, M13)
 
 ### artifacts
@@ -132,6 +134,8 @@ Index `(project_id, status)`, `(status, lease_expires_at)`.
 ### approvals
 | id | project_id fk cascade | task_id fk cascade null | action_type check in (`apply_changes`,`budget_increase`,`tool_r3`,`project_delete`,`deploy_staging`,`deploy_production`,`git_push`,`waive_criterion`) | risk_level smallint | summary text | payload jsonb | payload_hash char(64) | requested_by varchar(80) | status check in (`pending`,`approved`,`rejected`,`expired`,`consumed`,`superseded`) | handler_status check in (`pending`,`succeeded`,`failed`,`not_required`) | handler_attempts int | handler_error text null (ADR-024) | decided_by fk users null | decided_at null | decision_note text null | expires_at null | consumed_at null | created_at |
 Index `(project_id, status)`.
+
+> Realisasi WP-3.1c1/3.1d1 (migrasi 0007, 0008): index unik parsial satu `project_delete` terbuka per project dan satu `tool_r3` terbuka per task (`status IN ('pending','approved')`). Trigger `approvals_status_guard`: baris baru wajib `pending`; `status` hanya berubah bila penanda transaksi `kk.approval_status_writer = 'approval_store'` di-set (hanya `app/services/approval_store.py`), dan hanya sepanjang siklus `pending → approved|rejected|expired|superseded`, `approved → consumed|expired|superseded`.
 
 ## Provider & usage (M17)
 

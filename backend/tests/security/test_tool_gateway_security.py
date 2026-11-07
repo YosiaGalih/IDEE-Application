@@ -19,7 +19,7 @@ from app.tools.catalog import ToolInfo
 from app.tools.gateway import ToolGateway
 from tests.integration import test_gateway_denials as denials
 from tests.integration.test_gateway_denials import Scope, calls
-from tests.tool_fakes import AUDIT, CATALOG, SECRET, ReadInput, Recorder, context, gateway, spec
+from tests.tool_fakes import AUDIT, CATALOG, SECRET, ReadInput, Recorder, context, gateway, make_run, spec
 
 sessions = denials.sessions
 scope = denials.scope
@@ -124,7 +124,10 @@ async def test_an_r3_call_cannot_approve_itself(
 ) -> None:
     """T7 / AC-13: whatever the model sends, an R3 call only ever creates a pending request."""
     built = gateway(sessions, spec("test.r3", Recorder()))
-    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.r3"])
+    async with sessions() as session:
+        run_id = await make_run(session, scope.task_id)
+        await session.commit()
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.r3"], agent_run_id=run_id)
     for raw in ({"target": "approved"}, {"target": "x", "count": 1}):
         result = await built.execute(ctx, "test.r3", raw, tool_use_id="toolu_1")
         assert result.status == "approval_required"

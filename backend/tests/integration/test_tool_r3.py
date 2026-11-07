@@ -5,6 +5,7 @@ gateway consumes the approval once when the tool runs."""
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import timedelta
 
 import httpx
@@ -35,19 +36,42 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     owner_id,
     workspace_root,
 )
-from tests.integration.test_task_schema import make_task
-from tests.tool_fakes import AUDIT, Recorder, context, gateway, spec
+from tests.integration.test_task_schema import make_project, make_task
+from tests.tool_fakes import AUDIT, SECRET, Recorder, context, gateway, make_run, spec
 
 clean = denials.clean
 sessions = denials.sessions
-scope = denials.scope
+
+
+@dataclass(frozen=True)
+class RunScope(Scope):
+    run_id: uuid.UUID
+
+
+@pytest.fixture
+async def scope(sessions: async_sessionmaker[AsyncSession]) -> RunScope:
+    """A project, a task and an agent run of B14 on it (an R3 approval names its run)."""
+    async with sessions() as session:
+        project = await make_project(session)
+        task = await make_task(session, project)
+        run_id = await make_run(session, task.id)
+        await session.commit()
+        return RunScope(project.id, task.id, run_id)
+
 
 S = TaskStatus
 RUNNING = (S.PLANNED, S.QUEUED, S.RUNNING)
 
 
 def r3_context(scope: Scope, **overrides: object) -> ToolContext:
-    return context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.r3"], **overrides)  # type: ignore[arg-type]
+    run_id = scope.run_id if isinstance(scope, RunScope) else None
+    return context(
+        task_id=scope.task_id,
+        project_id=scope.project_id,
+        tools=["test.r3"],
+        agent_run_id=run_id,
+        **overrides,  # type: ignore[arg-type]
+    )
 
 
 async def approvals_of(sessions: async_sessionmaker[AsyncSession], task_id: uuid.UUID) -> list[Approval]:
@@ -102,7 +126,7 @@ async def test_an_r3_call_asks_for_an_approval_bound_to_its_input(
     [approval] = await approvals_of(sessions, scope.task_id)
     payload = {
         "task_id": str(scope.task_id),
-        "agent_run_id": None,
+        "agent_run_id": str(scope.run_id),
         "tool": "test.r3",
         "input": {"target": "staging", "count": 1},
     }
@@ -328,8 +352,9 @@ async def test_a_person_decides_a_tool_r3_through_the_api(
         project = await session.get(Project, project_id)
         assert project is not None
         task = await make_task(session, project)
+        run_id = await make_run(session, task.id)
         await session.commit()
-    gated = Scope(project_id, task.id)
+    gated = RunScope(project_id, task.id, run_id)
     built = gateway(tool_sessions, spec("test.r3", Recorder()))
     await move(tool_sessions, task.id, *RUNNING)
     await built.execute(r3_context(gated), "test.r3", {"target": "a"}, tool_use_id="toolu_1")
@@ -343,3 +368,57 @@ async def test_a_person_decides_a_tool_r3_through_the_api(
     )
     assert answer.status_code == 200, answer.text
     assert await task_status(tool_sessions, task.id) == "queued"
+
+
+async def test_nul_in_an_r3_input_still_asks_for_an_approval(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope
+) -> None:
+    # M2: the approval payload is jsonb too; a NUL from the model must not make the request unrecordable.
+    built = gateway(sessions, spec("test.r3", Recorder()))
+    result = await built.execute(r3_context(scope), "test.r3", {"target": "a\x00b"}, tool_use_id="toolu_1")
+    assert result.status == "approval_required"
+    [approval] = await approvals_of(sessions, scope.task_id)
+    assert "\x00" not in approval.payload["input"]["target"]
+
+
+async def test_a_cancelled_run_consumes_no_approval(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope
+) -> None:
+    from app.core.cancel import CancelToken
+
+    handler = Recorder()
+    built = gateway(sessions, spec("test.r3", handler))
+    await built.execute(r3_context(scope), "test.r3", {"target": "a"}, tool_use_id="toolu_1")
+    [approval] = await approvals_of(sessions, scope.task_id)
+    await decide(sessions, approval.id, approve=True)
+    token = CancelToken()
+    token.cancel()
+    result = await built.execute(
+        r3_context(scope, cancel=token), "test.r3", {"target": "a"}, tool_use_id="toolu_2"
+    )
+    assert result.status == "cancelled" and handler.calls == []
+    [approval] = await approvals_of(sessions, scope.task_id)
+    assert approval.status == "approved"
+
+
+async def test_an_r3_call_outside_an_agent_run_is_refused(
+    sessions: async_sessionmaker[AsyncSession], scope: RunScope
+) -> None:
+    # AG-13: the payload names the run; without one, another agent of the task could use the approval.
+    built = gateway(sessions, spec("test.r3", Recorder()))
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.r3"])
+    result = await built.execute(ctx, "test.r3", {"target": "a"}, tool_use_id="toolu_1")
+    assert (result.status, result.content) == ("denied", DENIALS["r3_needs_agent_run"])
+    assert await approvals_of(sessions, scope.task_id) == []
+
+
+async def test_an_r3_input_carrying_a_secret_is_refused(
+    sessions: async_sessionmaker[AsyncSession], scope: RunScope
+) -> None:
+    # AG-13: an approval payload is stored and shown as is; it cannot be redacted without breaking its hash.
+    built = gateway(sessions, spec("test.r3", Recorder()))
+    result = await built.execute(
+        r3_context(scope), "test.r3", {"target": f"x {SECRET}"}, tool_use_id="toolu_1"
+    )
+    assert (result.status, result.content) == ("denied", DENIALS["secret_in_input"])
+    assert await approvals_of(sessions, scope.task_id) == []

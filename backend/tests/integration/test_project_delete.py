@@ -20,7 +20,7 @@ from app.models.audit import AuditEvent
 from app.models.identity import UserRole
 from app.models.projects import Project
 from app.models.tasks import Task
-from app.services import project_delete, projects
+from app.services import approval_store, project_delete, projects
 from tests.conftest import allow_approval_status_writes
 from tests.integration.test_dashboard_api import add_task
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
@@ -260,14 +260,27 @@ async def test_a_corrupt_previous_status_restores_to_archived(
     ``active``: it comes back archived, and the audit says so."""
     actor = owner_actor(owner_id)
     project_id = await blank(env, actor)
-    approval, _ = await project_delete.request_delete(env, actor, project_id)
-    async with engine.begin() as conn:
-        await allow_approval_status_writes(conn)
-        await conn.execute(
-            update(Approval)
-            .where(Approval.id == approval.id)
-            .values(status="rejected", payload={**approval.payload, "previous_status": "deleted"})
+    requested, _ = await project_delete.request_delete(env, actor, project_id)
+    # A payload cannot be edited after the request (approvals_status_guard), so the corrupt request is a new
+    # row replacing the real one, as a hand-made insert would be.
+    async with make_sessionmaker(engine)() as session:
+        original = await session.get(Approval, requested.id)
+        assert original is not None
+        await approval_store.supersede(session, env.audit, original, actor="system:test")
+        approval = await approval_store.create(
+            session,
+            env.audit,
+            project_id=project_id,
+            task_id=None,
+            action_type=project_delete.ACTION,
+            payload={**original.payload, "previous_status": "deleted"},
+            summary=original.summary,
+            risk_level=3,
+            requested_by=original.requested_by,
         )
+        await allow_approval_status_writes(session)
+        approval.status = "rejected"
+        await session.commit()
     await handler.rejected(approval.id, now=NOW)
     assert (await load(engine, Project, project_id)).status == "archived"
     async with make_sessionmaker(engine)() as session:

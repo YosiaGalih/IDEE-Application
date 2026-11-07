@@ -160,6 +160,27 @@ async def test_the_writer_still_follows_the_cycle(session: AsyncSession, start: 
         await session.execute(update(Approval).where(Approval.id == row.id).values(status=target))
 
 
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("payload_hash", "b" * 64),
+        ("payload", {"other": "action"}),
+        ("action_type", "tool_r3"),
+        ("requested_by", "system:someone_else"),
+        ("risk_level", 2),
+    ],
+)
+async def test_what_was_approved_never_changes(session: AsyncSession, column: str, value: object) -> None:
+    # AG-13 3.1d1: even the writer may not point an approved decision at another action.
+    project = await make_project(session)
+    await allow_approval_status_writes(session)
+    row = approval(project, status="approved")
+    session.add(row)
+    await session.flush()
+    with pytest.raises(DBAPIError, match="never changes after it is requested"):
+        await session.execute(update(Approval).where(Approval.id == row.id).values({column: value}))
+
+
 async def test_other_columns_stay_writable(session: AsyncSession) -> None:
     # The handler bookkeeping (ADR-024) is not a status change.
     project = await make_project(session)

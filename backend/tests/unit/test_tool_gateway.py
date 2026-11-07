@@ -100,3 +100,37 @@ def test_redaction_cost_is_bounded_by_the_window() -> None:
     built = ToolGateway(sessions=async_sessionmaker(), audit=AuditWriter(Measuring()), ports=None)  # type: ignore[arg-type]
     built._model_text("z" * (3 * REDACT_WINDOW_CHARS))  # pyright: ignore[reportPrivateUsage]
     assert seen and max(seen) <= REDACT_WINDOW_CHARS
+
+
+@pytest.mark.parametrize("name", ["test.write", "test.exec", "test.r3"])
+def test_risky_tools_must_be_side_effects(name: str) -> None:
+    # L3: an R1+ tool without side_effect would skip the idempotency key and could run twice.
+    with pytest.raises(ValueError, match="side_effect"):
+        bare().register(spec(name, Recorder(), side_effect=False))
+
+
+def test_a_secret_cut_at_the_window_edge_never_reaches_the_model() -> None:
+    # AG-13 LOW: heavy redaction can shrink the window below 64 KB, bringing its cut edge into the output.
+    from app.core.audit import AuditWriter
+    from app.core.redaction import Redactor
+    from app.tools.gateway import REDACT_WINDOW_CHARS
+
+    literal = "lit-" + "q7" * 98  # 200 characters, shrinks to [REDACTED]
+    built = ToolGateway(sessions=async_sessionmaker(), audit=AuditWriter(Redactor([literal])), ports=None)  # type: ignore[arg-type]
+    unit = literal + " "
+    content = unit * (REDACT_WINDOW_CHARS // len(unit) + 5)
+    text = built._model_text(content)  # pyright: ignore[reportPrivateUsage]
+    assert literal[:12] not in text
+    assert "truncated" in text
+
+
+def test_an_r3_input_model_cannot_exclude_fields() -> None:
+    from pydantic import ConfigDict, Field
+
+    class Hiding(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        target: str
+        hidden: str = Field(default="", exclude=True)
+
+    with pytest.raises(ValueError, match="exclude"):
+        bare().register(spec("test.r3", Recorder(), input_model=Hiding))

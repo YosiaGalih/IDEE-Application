@@ -261,3 +261,14 @@ async def test_a_failed_write_leaves_no_writer_marker_behind(session: AsyncSessi
     assert await _decide(session, approval, user_id=project.owner_id) is True
     marker = await session.scalar(select(func.current_setting("kk.approval_status_writer", True)))
     assert marker in ("", None)
+
+
+async def test_a_stray_status_change_is_not_flushed_under_the_marker(session: AsyncSession) -> None:
+    # kk-backend N1: the marker must cover only approval_store's own write, not whatever else is dirty.
+    from sqlalchemy.exc import DBAPIError
+
+    first = await new(session, await make_project(session, slug="a"))
+    second = await new(session, await make_project(session, slug="b"))
+    second.status = "approved"  # written by "someone else", not flushed yet
+    with pytest.raises(DBAPIError, match="only change through approval_store"):
+        await store.expire(session, AUDIT, first, actor="system:test", now=NOW)

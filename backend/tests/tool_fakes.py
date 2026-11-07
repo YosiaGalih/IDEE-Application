@@ -85,7 +85,7 @@ def spec(
             "side_effect": True,
             "write_paths": lambda v: [v.path],
         },
-        "test.exec": {"input_model": ReadInput, "risk": RiskLevel.R2},
+        "test.exec": {"input_model": ReadInput, "risk": RiskLevel.R2, "side_effect": True},
         "test.r3": {"input_model": R3Input, "risk": RiskLevel.R3, "side_effect": True},
     }
     values: dict[str, Any] = {"description": f"{name} for tests", **defaults.get(name, {}), **overrides}
@@ -141,3 +141,17 @@ def context(
 def gateway(sessions: async_sessionmaker[AsyncSession], *specs: ToolSpec) -> ToolGateway:
     # The test catalog adds test tools; everything else is the composition of production.
     return build_tool_gateway(sessions=sessions, audit=AUDIT, specs=specs, catalog=CATALOG)
+
+
+async def make_run(session: AsyncSession, task_id: uuid.UUID, agent_id: str = "B14") -> uuid.UUID:
+    """An agent run for ``task_id`` (R3 calls need one: the approval names the run)."""
+    from app.models.agents import AgentProfile, AgentRun
+    from tests.integration.test_agent_tables import profile
+
+    if await session.get(AgentProfile, agent_id) is None:
+        session.add(profile(agent_id))
+        await session.flush()
+    run = AgentRun(task_id=task_id, agent_id=agent_id, agent_version=1, step="test")
+    session.add(run)
+    await session.flush()
+    return run.id

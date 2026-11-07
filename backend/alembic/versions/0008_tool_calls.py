@@ -53,9 +53,7 @@ def upgrade() -> None:
             "idempotency_key IS NULL OR idempotency_key ~ '^[0-9a-f]{64}$'",
             name=op.f("ck_tool_calls_idempotency_key"),
         ),
-        sa.CheckConstraint(
-            "char_length(output_summary) <= 2048", name=op.f("ck_tool_calls_output_summary")
-        ),
+        sa.CheckConstraint("char_length(output_summary) <= 2048", name=op.f("ck_tool_calls_output_summary")),
         sa.CheckConstraint("duration_ms IS NULL OR duration_ms >= 0", name=op.f("ck_tool_calls_duration_ms")),
         sa.ForeignKeyConstraint(
             ["task_id"], ["tasks.id"], name=op.f("fk_tool_calls_task_id_tasks"), ondelete="CASCADE"
@@ -86,7 +84,9 @@ def upgrade() -> None:
     )
     # CLAUDE.md #5 backstop in the database (3.1c1 AG-13 C3): an approval starts pending, and its status only
     # changes through app.services.approval_store, which sets the transaction-local kk.approval_status_writer
-    # marker, and only along the approval cycle. The marker also lets a test insert a decided row.
+    # marker, and only along the approval cycle. What was approved (action, target, payload, hash, requester)
+    # never changes after the insert, whoever writes (AG-13 3.1d1). The marker also lets a test insert a
+    # decided row.
     op.execute(
         """
         CREATE FUNCTION approvals_status_guard() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -98,7 +98,17 @@ def upgrade() -> None:
                     RAISE EXCEPTION 'approvals start as pending'
                         USING ERRCODE = 'insufficient_privilege';
                 END IF;
-            ELSIF NEW.status IS DISTINCT FROM OLD.status THEN
+                RETURN NEW;
+            END IF;
+            IF (NEW.project_id, NEW.task_id, NEW.action_type, NEW.risk_level, NEW.payload, NEW.payload_hash,
+                NEW.requested_by, NEW.created_at)
+               IS DISTINCT FROM
+               (OLD.project_id, OLD.task_id, OLD.action_type, OLD.risk_level, OLD.payload, OLD.payload_hash,
+                OLD.requested_by, OLD.created_at) THEN
+                RAISE EXCEPTION 'what an approval is for never changes after it is requested'
+                    USING ERRCODE = 'check_violation';
+            END IF;
+            IF NEW.status IS DISTINCT FROM OLD.status THEN
                 IF writer <> 'approval_store' THEN
                     RAISE EXCEPTION 'approvals.status may only change through approval_store'
                         USING ERRCODE = 'insufficient_privilege';
@@ -118,7 +128,7 @@ def upgrade() -> None:
         """
     )
     op.execute(
-        "CREATE TRIGGER approvals_status_guard BEFORE INSERT OR UPDATE OF status ON approvals "
+        "CREATE TRIGGER approvals_status_guard BEFORE INSERT OR UPDATE ON approvals "
         "FOR EACH ROW EXECUTE FUNCTION approvals_status_guard()"
     )
     op.execute("ALTER TABLE approvals ENABLE ALWAYS TRIGGER approvals_status_guard")

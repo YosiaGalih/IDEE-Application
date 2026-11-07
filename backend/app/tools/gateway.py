@@ -5,9 +5,10 @@
 registered, not the terminal ``submit_result``) → permission preconditions → input schema → scope and write
 paths (task of this project, not finished; project active) → per-tool quota → risk and approval (R3 needs an
 approval for exactly this input, consumed once) → claim → handler (timeout, cancel) → redaction then
-truncation → record. Every call leaves a ``tool_calls`` row; every refusal is audited ``tool.denied``; every
-R1+ call that reaches its handler is audited ``tool.executed``; the task timeline gets ``tool.call_started``
-and ``tool.call_finished``.
+truncation → record. Every evaluated call leaves a ``tool_calls`` row (a replay of the same tool use answers
+with the original call's row); every refusal is audited ``tool.denied``; every R1+ call that reaches its
+handler is audited ``tool.executed``; the task timeline gets ``tool.call_started`` and
+``tool.call_finished``.
 
 The gateway uses its own sessions: the ``running`` claim is committed before the handler starts, so a crash
 leaves evidence, and a side-effect tool is never run twice for one ``tool_use_id`` (Keputusan Lead 2, 5).
@@ -18,14 +19,13 @@ The policy transaction locks the task row first (``FOR NO KEY UPDATE``), then an
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import json
 import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, get_args
 
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select, update
@@ -39,6 +39,7 @@ from app.llm.base import ToolDef, is_canonical_tool_name
 from app.models.tools import SUMMARY_MAX, ToolCall
 from app.tools.base import (
     AgentGrant,
+    R3InputNotCanonical,
     RiskLevel,
     ToolContext,
     ToolError,
@@ -46,6 +47,7 @@ from app.tools.base import (
     ToolPorts,
     ToolResult,
     ToolSpec,
+    ToolStatus,
 )
 from app.tools.catalog import TOOL_CATALOG, ToolInfo
 from app.tools.policy import is_r4, unmet_preconditions, write_allowed
@@ -58,6 +60,15 @@ MAX_RESULT_BYTES = 64 * 1024  # one tool_result to the model (TOOL_CATALOG, SECU
 # Only this much of a handler's output is redacted (then cut to MAX_RESULT_BYTES): the redaction cost stays
 # bounded whatever a handler returns, and a secret that reaches the final window lies wholly inside this one.
 REDACT_WINDOW_CHARS = 4 * MAX_RESULT_BYTES
+# When the window cut the output, this much of the redacted window's end is dropped too: a secret cut in two
+# at the window's edge is not recognised, and heavy redaction can bring that edge inside the final 64 KB.
+WINDOW_EDGE_CHARS = 4096
+# A model's input deeper than this is not recorded or validated (it is an invalid input): every recursive
+# step after it (redaction, hashing, validation) stays bounded.
+MAX_INPUT_DEPTH = 32
+# How long a cancelled or timed-out handler may take to stop before the gateway records and moves on (a
+# handler in a thread, or one that ignores cancellation, keeps running unobserved; its outcome is unknown).
+STOP_GRACE_S = 5.0
 INVALID_NAME = "<invalid>"
 # The finished task statuses (app.workflow.states.FINISHED; tools may not import workflow, a test keeps
 # the two equal).
@@ -88,7 +99,14 @@ DENIALS: Mapping[str, str] = {
     "quota_exceeded": "denied: the quota for this tool in this run is used up",
     "input_not_canonical": "denied: an R3 action input must be plain JSON without decimals",
     "tool_use_id_reused": "denied: this tool use id already belongs to another call",
+    "r3_needs_agent_run": "denied: an R3 action can only be requested from an agent run",
+    "secret_in_input": "denied: an R3 action input must not contain secrets",
 }
+UNKNOWN_OUTCOME = (
+    "error: this tool use was started before; it is still running or was interrupted, so its outcome is "
+    "unknown. It is not run again."
+)
+_STATUSES: frozenset[str] = frozenset(get_args(ToolStatus))
 
 
 class TaskMissing(LookupError):
@@ -106,15 +124,41 @@ def _canonical_name(tool_name: object) -> str | None:
     return tool_name if isinstance(tool_name, str) and is_canonical_tool_name(tool_name) else None
 
 
-def _input_hash(raw_input: object) -> str:
-    text = json.dumps(raw_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=repr)
+def _input_hash(value: object) -> str:
+    """Over the normalised input (plain JSON, clean text): stable, and it never fails to encode."""
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _no_nul(text: str) -> str:
-    """PostgreSQL refuses NUL in text and jsonb: one NUL from a model or a file must not make a call's outcome
-    unrecordable. U+FFFD marks where it was."""
-    return text.replace("\x00", "\ufffd")
+def _clean_text(text: str) -> str:
+    """Text PostgreSQL and the provider accept: NUL becomes U+FFFD and a lone surrogate becomes "?". One such
+    character from a model or a file must not make a call's input or outcome unrecordable."""
+    text = text.replace("\x00", "\ufffd")
+    try:
+        text.encode()
+    except UnicodeEncodeError:
+        text = text.encode("utf-8", "replace").decode()
+    return text
+
+
+class _TooDeep(Exception):
+    pass
+
+
+def _normalized(value: Any, depth: int = 0) -> Any:
+    """The model's input as plain JSON with clean text, at most ``MAX_INPUT_DEPTH`` levels deep."""
+    if depth > MAX_INPUT_DEPTH:
+        raise _TooDeep
+    if isinstance(value, str):
+        return _clean_text(value)
+    if isinstance(value, dict):
+        items = value.items()  # pyright: ignore[reportUnknownVariableType]
+        return {_clean_text(str(k)): _normalized(v, depth + 1) for k, v in items}  # pyright: ignore[reportUnknownArgumentType]
+    if isinstance(value, list | tuple):
+        return [_normalized(v, depth + 1) for v in value]  # pyright: ignore[reportUnknownVariableType]
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    return _clean_text(repr(value))
 
 
 def _bounded(value: Any, depth: int = 0) -> Any:
@@ -122,13 +166,13 @@ def _bounded(value: Any, depth: int = 0) -> Any:
     if depth >= _INPUT_DEPTH_MAX:
         return "<nested>"
     if isinstance(value, str):
-        value = _no_nul(value)
+        value = _clean_text(value)
         return (
             value if len(value) <= _INPUT_STRING_MAX else f"{value[:_INPUT_STRING_MAX]}…[{len(value)} chars]"
         )
     if isinstance(value, dict):
         items = list(value.items())[:_INPUT_ITEMS_MAX]  # pyright: ignore[reportUnknownArgumentType]
-        return {_no_nul(str(k)): _bounded(v, depth + 1) for k, v in items}  # pyright: ignore[reportUnknownVariableType]
+        return {_clean_text(str(k)): _bounded(v, depth + 1) for k, v in items}  # pyright: ignore[reportUnknownVariableType]
     if isinstance(value, list):
         return [_bounded(v, depth + 1) for v in value[:_INPUT_ITEMS_MAX]]  # pyright: ignore[reportUnknownVariableType]
     return value
@@ -212,6 +256,14 @@ class ToolGateway:
             problems.append('the input model must use extra="forbid"')
         if not spec.timeout_s > 0:
             problems.append("timeout_s must be positive")
+        if spec.risk is RiskLevel.R3 and any(f.exclude for f in spec.input_model.model_fields.values()):
+            # model_dump would leave the field out of the approval's hash: the person would approve less
+            # than what runs (AG-13 INFO).
+            problems.append("an R3 input model must not exclude fields")
+        if spec.risk >= RiskLevel.R1 and not spec.side_effect:
+            # Writes, sandbox runs and R3 actions change something: without side_effect they would skip the
+            # idempotency key and could run twice for one tool use (silent-failure L3).
+            problems.append("an R1+ tool must be a side_effect tool")
         if name in self._specs:
             problems.append("the tool is already registered")
         if problems:
@@ -244,6 +296,10 @@ class ToolGateway:
         info = self._catalog.get(name) if name is not None else None
         risk = spec.risk if spec else (RiskLevel.of(info.risk) if info and info.risk != "-" else RiskLevel.R4)
         use_id = tool_use_id if tool_use_id is not None and _TOOL_USE_ID.fullmatch(tool_use_id) else None
+        try:
+            clean, too_deep = _normalized(raw_input), False
+        except _TooDeep:
+            clean, too_deep = {"_unrecorded": f"input nested deeper than {MAX_INPUT_DEPTH} levels"}, True
         row = ToolCall(
             task_id=ctx.task_id,
             agent_run_id=ctx.agent_run_id,
@@ -251,16 +307,18 @@ class ToolGateway:
             tool_name=name or INVALID_NAME,
             tool_use_id=use_id,
             risk_level=int(risk),
-            input_hash=_input_hash(raw_input),
-            sanitized_input=json_safe(_bounded(self._audit.redactor.redact_obj(raw_input))),
+            input_hash=_input_hash(clean),
+            sanitized_input=json_safe(_bounded(self._audit.redactor.redact_obj(clean))),
         )
 
         refusal, detail = self._refusal(ctx, name, spec, info)
         validated: BaseModel | None = None
         invalid: str | None = None
-        if refusal is None and spec is not None:
+        if refusal is None and spec is not None and too_deep:
+            invalid = f"invalid input: nested deeper than {MAX_INPUT_DEPTH} levels"
+        elif refusal is None and spec is not None:
             try:
-                validated = spec.input_model.model_validate(raw_input)
+                validated = spec.input_model.model_validate(clean)
             except ValidationError as exc:
                 invalid = _invalid_input(exc)
         if refusal is None and validated is not None and spec is not None:
@@ -269,46 +327,76 @@ class ToolGateway:
             else:
                 refusal, invalid = self._path_refusal(ctx, spec, validated)
 
-        async with self._sessions() as session:
-            scope = await self._lock_task(session, ctx)
-            if refusal is None and invalid is None:
-                refusal = await self._scope_refusal(ctx, scope)
-            if refusal is None and invalid is None and spec is not None and spec.side_effect:
-                assert use_id is not None
-                # Before quota and approval: the same tool use again returns what happened, it is not a
-                # new action (an R3 replay must not ask for a new approval).
-                row.idempotency_key = self._idempotency_key(ctx, use_id)
-                previous = await session.scalar(
-                    select(ToolCall).where(ToolCall.idempotency_key == row.idempotency_key)
+        claimed = False
+        try:
+            async with self._sessions() as session:
+                result = await self._decide(
+                    session, ctx, row, spec, validated, refusal, detail, invalid, started
                 )
-                if previous is not None and (
-                    previous.tool_name != row.tool_name or previous.input_hash != row.input_hash
-                ):
-                    refusal = "tool_use_id_reused"  # never answer one call with another call's result
-                elif previous is not None:
-                    replay = self._replay(previous)  # read before the rollback expires the row
-                    await session.rollback()
-                    return replay
-            if refusal is None and invalid is None and spec is not None:
-                refusal = await self._quota_refusal(session, ctx, spec)
-            if refusal is not None:
-                return await self._deny(session, ctx, row, refusal, detail, started)
-            if invalid is not None or validated is None or spec is None:
-                outcome = _Outcome("error", invalid or "invalid input", "invalid_input")
-                return await self._finish_now(session, ctx, row, outcome, started)
-            if spec.risk is RiskLevel.R3:
-                result = await self._authorize_r3(session, ctx, row, spec, validated, started)
                 if result is not None:
                     return result
-            row.status = "running"
-            session.add(row)
-            await session.flush()
-            await self._event(session, ctx, row, "tool.call_started", None)
-            await self._commit(session)
+                assert spec is not None
+                row.status = "running"
+                session.add(row)
+                await session.flush()
+                await self._event(session, ctx, row, "tool.call_started", None)
+                await session.commit()
+                claimed = True
+                await self._publish(session)
+            outcome = await self._run(ctx, spec, validated)
+        except asyncio.CancelledError:
+            if claimed:
+                assert spec is not None
+                await self._settle_cancelled(ctx, row, spec)
+            raise
+        return await asyncio.shield(self._finish(ctx, row, spec, outcome, started))
 
-        outcome = await self._run(ctx, row, spec, validated)
-        async with self._sessions() as session:
-            return await self._record(session, ctx, row, spec, outcome, started)
+    async def _decide(
+        self,
+        session: AsyncSession,
+        ctx: ToolContext,
+        row: ToolCall,
+        spec: ToolSpec | None,
+        validated: BaseModel | None,
+        refusal: str | None,
+        detail: list[str],
+        invalid: str | None,
+        started: float,
+    ) -> ToolResult | None:
+        """The policy transaction, after the checks that need no database. A result: the call ends here
+        (refused, invalid, replayed, cancelled before it started, or waiting for an approval). ``None``: claim
+        the row and run the handler."""
+        scope = await self._lock_task(session, ctx)
+        if refusal is None and invalid is None:
+            refusal = await self._scope_refusal(ctx, scope)
+        if refusal is None and invalid is None and spec is not None and spec.side_effect:
+            assert row.tool_use_id is not None  # checked before: a side effect needs a tool use id
+            # Before quota and approval: the same tool use again returns what happened, it is not a new action
+            # (an R3 replay must not ask for a new approval).
+            row.idempotency_key = self._idempotency_key(ctx, row.tool_use_id)
+            previous = await session.scalar(
+                select(ToolCall).where(ToolCall.idempotency_key == row.idempotency_key)
+            )
+            if previous is not None and (
+                previous.tool_name != row.tool_name or previous.input_hash != row.input_hash
+            ):
+                refusal = "tool_use_id_reused"  # never answer one call with another call's result
+            elif previous is not None:
+                return await self._replay(session, ctx, previous)
+        if refusal is None and invalid is None and spec is not None:
+            refusal = await self._quota_refusal(session, ctx, spec)
+        if refusal is not None:
+            return await self._deny(session, ctx, row, refusal, detail, started)
+        if invalid is not None or validated is None or spec is None:
+            outcome = _Outcome("error", invalid or "invalid input", "invalid_input")
+            return await self._finish_now(session, ctx, row, outcome, started)
+        if ctx.cancel.cancelled:
+            # Before any approval is consumed and before the handler could start (S1/M5).
+            outcome = _Outcome("cancelled", "cancelled: the run was cancelled before the tool started")
+            return await self._finish_now(session, ctx, row, outcome, started)
+        if spec.risk is RiskLevel.R3:
+            return await self._authorize_r3(session, ctx, row, spec, validated, started)
+        return None
 
     def _refusal(
         self, ctx: ToolContext, name: str | None, spec: ToolSpec | None, info: ToolInfo | None
@@ -384,12 +472,19 @@ class ToolGateway:
         started: float,
     ) -> ToolResult | None:
         """``None``: an approval for exactly this input was consumed, run the tool. Otherwise the call ends
-        here as ``approval_required`` (or denied when the input cannot be hashed canonically)."""
+        here as ``approval_required``, or denied: an approval binds one agent run (the payload names the run,
+        so without one another agent of the task could use it), and its payload is stored and shown as is (it
+        cannot be redacted without breaking the hash), so an input carrying a secret is refused (AG-13)."""
+        if ctx.agent_run_id is None:
+            return await self._deny(session, ctx, row, "r3_needs_agent_run", [], started)
+        action_input = validated.model_dump(mode="json")
+        if self._audit.redactor.redact_obj(action_input) != action_input:
+            return await self._deny(session, ctx, row, "secret_in_input", [], started)
         payload = {
             "task_id": str(ctx.task_id),
-            "agent_run_id": str(ctx.agent_run_id) if ctx.agent_run_id is not None else None,
+            "agent_run_id": str(ctx.agent_run_id),
             "tool": spec.name,
-            "input": validated.model_dump(mode="json"),
+            "input": action_input,
         }
         try:
             ticket = await self._ports.approvals.authorize(
@@ -400,7 +495,7 @@ class ToolGateway:
                 payload=payload,
                 summary=f"Agent {ctx.grant.agent_id} asks to run {spec.name} (R3)",
             )
-        except ValueError:  # floats and other values a canonical hash refuses (approval_store.canonical_json)
+        except R3InputNotCanonical:  # floats and other values a canonical hash refuses
             return await self._deny(session, ctx, row, "input_not_canonical", [], started)
         row.approval_id = ticket.approval_id
         if ticket.consumed:
@@ -415,26 +510,42 @@ class ToolGateway:
         run = str(ctx.agent_run_id) if ctx.agent_run_id is not None else f"task:{ctx.task_id}"
         return hashlib.sha256(f"{run}|{use_id}".encode()).hexdigest()
 
-    def _replay(self, previous: ToolCall) -> ToolResult:
-        """The same tool use again (a resumed run): the handler is not run a second time."""
-        if previous.status == "running":
-            content = (
-                "error: this tool use was started before and its outcome is unknown (the process stopped "
-                "while it ran); it is not run again"
+    async def _replay(self, session: AsyncSession, ctx: ToolContext, previous: ToolCall) -> ToolResult:
+        """The same tool use again (a resumed run): the handler is not run a second time. A row still
+        ``running`` is closed as ``error``/``outcome_unknown`` (the run that owned it is gone: one worker
+        holds a task's lease)."""
+        call_id, status, summary = previous.id, previous.status, previous.output_summary or ""
+        if status == "running":
+            closed = await session.scalar(
+                update(ToolCall)
+                .where(ToolCall.id == call_id, ToolCall.status == "running")
+                .values(status="error", error_code="outcome_unknown", output_summary=UNKNOWN_OUTCOME)
+                .returning(ToolCall.id)
+                .execution_options(synchronize_session=False)
             )
-            return ToolResult(previous.id, "error", content, is_error=True)
+            if closed is not None:
+                await session.refresh(previous)
+                if previous.risk_level >= RiskLevel.R1:
+                    await self._audit_call(
+                        session, ctx, previous, "tool.executed", "error", {"status": "error", "replay": True}
+                    )
+                await self._event(session, ctx, previous, "tool.call_finished", UNKNOWN_OUTCOME)
+                await self._commit(session)
+            else:
+                await session.rollback()
+            return ToolResult(call_id, "error", UNKNOWN_OUTCOME, is_error=True)
+        await session.rollback()
+        cut = " (cut to its first 2048 characters)" if len(summary) >= SUMMARY_MAX else ""
         content = (
-            f"this tool use already ran (status {previous.status}); it is not run again. "
-            f"Recorded result: {previous.output_summary or ''}"
+            f"this tool use already ran (status {status}); it is not run again. "
+            f"Recorded result{cut}: {summary}"
         )
-        status = previous.status if previous.status in ("ok", "error", "timeout", "cancelled") else "error"
-        return ToolResult(previous.id, status, content, is_error=status != "ok")  # type: ignore[arg-type]
+        known = status if status in _STATUSES and status != "approval_required" else "error"
+        return ToolResult(call_id, known, content, is_error=known != "ok")  # pyright: ignore[reportArgumentType]
 
-    async def _run(
-        self, ctx: ToolContext, row: ToolCall, spec: ToolSpec, validated: BaseModel | None
-    ) -> _Outcome:
-        """The handler under its timeout and the cancel token. The caller being cancelled records the row as
-        ``cancelled`` (shielded) and re-raises."""
+    async def _run(self, ctx: ToolContext, spec: ToolSpec, validated: BaseModel | None) -> _Outcome:
+        """The handler under its timeout and the cancel token. If the caller is cancelled, the handler is
+        stopped and the cancellation propagates (``execute`` records it)."""
         handler = asyncio.ensure_future(spec.handler(ctx, validated))
         cancelled = asyncio.ensure_future(ctx.cancel.wait())
         unknown = " The outcome is unknown: the action may have been applied." if spec.side_effect else ""
@@ -443,22 +554,20 @@ class ToolGateway:
                 async with asyncio.timeout(spec.timeout_s):
                     await asyncio.wait({handler, cancelled}, return_when=asyncio.FIRST_COMPLETED)
             except TimeoutError:
-                await self._stop(handler)
+                await self._stop(ctx, spec, handler)
                 return _Outcome("timeout", f"error: the tool timed out after {spec.timeout_s:g} s.{unknown}")
-            if not handler.done():
-                await self._stop(handler)
-                return _Outcome("cancelled", f"cancelled: the run was cancelled.{unknown}")
-        except asyncio.CancelledError:
-            await self._stop(handler)
-            outcome = _Outcome("cancelled", f"cancelled: the run was cancelled.{unknown}")
-            try:
-                await asyncio.shield(self._record_detached(ctx, row, spec, outcome))
-            except Exception:
-                # The row stays "running" (a replay reports the outcome as unknown); the cancel still wins.
-                logger.error("tool_call_cancel_unrecorded", tool_call_id=str(row.id), exc_info=True)
-            raise
+            except asyncio.CancelledError:
+                await self._stop(ctx, spec, handler)
+                raise
         finally:
             cancelled.cancel()
+        if not handler.done():
+            await self._stop(ctx, spec, handler)
+            if ctx.cancel.cancelled:
+                return _Outcome("cancelled", f"cancelled: the run was cancelled.{unknown}")
+            # The token's waiter failed (e.g. used from another event loop): not a cancellation (L7).
+            logger.error("tool_cancel_token_failed", tool=spec.name, correlation_id=ctx.correlation_id)
+            return _Outcome("error", f"error: the run's cancel signal failed.{unknown}", "internal")
         try:
             output = handler.result()
         except asyncio.CancelledError:  # the handler cancelled itself; this task was not cancelled
@@ -469,7 +578,11 @@ class ToolGateway:
             return _Outcome("error", f"error: {exc.message}", exc.code[:40])
         except Exception as exc:
             logger.warning(
-                "tool_handler_failed", tool=spec.name, error_type=type(exc).__name__, exc_info=True
+                "tool_handler_failed",
+                tool=spec.name,
+                error_type=type(exc).__name__,
+                correlation_id=ctx.correlation_id,
+                exc_info=True,
             )
             return _Outcome("error", "error: the tool failed with an internal error", "internal")
         try:
@@ -479,10 +592,33 @@ class ToolGateway:
             return _Outcome("error", "error: the tool returned an unreadable result", "internal")
 
     @staticmethod
-    async def _stop(handler: asyncio.Future[ToolOutput]) -> None:
+    async def _stop(ctx: ToolContext, spec: ToolSpec, handler: asyncio.Future[ToolOutput]) -> None:
+        """Cancel the handler and give it ``STOP_GRACE_S`` to stop. ``asyncio.wait`` neither raises the
+        handler's error nor swallows a cancellation of the caller (S2/M4)."""
         handler.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await handler
+        await asyncio.wait({handler}, timeout=STOP_GRACE_S)
+        if handler.done():
+            if not handler.cancelled():
+                handler.exception()  # retrieved: a stopped handler's error is not reported again
+            return
+        logger.warning("tool_handler_did_not_stop", tool=spec.name, correlation_id=ctx.correlation_id)
+        handler.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+
+    async def _settle_cancelled(self, ctx: ToolContext, row: ToolCall, spec: ToolSpec) -> None:
+        """The caller was cancelled after the claim: record ``cancelled`` (shielded). If that fails the row
+        stays ``running`` (a replay closes it as unknown) and the cancellation still propagates."""
+        unknown = " The outcome is unknown: the action may have been applied." if spec.side_effect else ""
+        outcome = _Outcome("cancelled", f"cancelled: the run was cancelled.{unknown}")
+        try:
+            await asyncio.shield(self._record_detached(ctx, row, spec, outcome))
+        except Exception:
+            logger.error(
+                "tool_call_cancel_unrecorded",
+                tool_call_id=str(row.id),
+                task_id=str(ctx.task_id),
+                correlation_id=ctx.correlation_id,
+                exc_info=True,
+            )
 
     async def _record_detached(
         self, ctx: ToolContext, row: ToolCall, spec: ToolSpec, outcome: _Outcome
@@ -490,13 +626,53 @@ class ToolGateway:
         async with self._sessions() as session:
             await self._record(session, ctx, row, spec, outcome, self._clock())
 
+    async def _finish(
+        self, ctx: ToolContext, row: ToolCall, spec: ToolSpec, outcome: _Outcome, started: float
+    ) -> ToolResult:
+        """Record the outcome of a handler that ran. If that fails, the row is marked ``record_failed`` (not
+        left ``running``) and the failure propagates: no result without its record (M1)."""
+        try:
+            async with self._sessions() as session:
+                return await self._record(session, ctx, row, spec, outcome, started)
+        except Exception:
+            logger.error(
+                "tool_call_record_failed",
+                tool_call_id=str(row.id),
+                task_id=str(ctx.task_id),
+                correlation_id=ctx.correlation_id,
+                exc_info=True,
+            )
+            await self._mark_record_failed(ctx, row)
+            raise
+
+    async def _mark_record_failed(self, ctx: ToolContext, row: ToolCall) -> None:
+        try:
+            async with self._sessions() as session:
+                await session.execute(
+                    update(ToolCall)
+                    .where(ToolCall.id == row.id, ToolCall.status == "running")
+                    .values(
+                        status="error",
+                        error_code="record_failed",
+                        output_summary="error: the tool ran but its outcome could not be recorded",
+                        updated_at=func.now(),
+                    )
+                )
+                await session.commit()
+        except Exception:
+            logger.error(
+                "tool_call_unrecordable", tool_call_id=str(row.id), task_id=str(ctx.task_id), exc_info=True
+            )
+
     # --- recording ----------------------------------------------------------------------------------------
 
     def _model_text(self, content: str) -> str:
         """Redacted first, then cut: a cut must never split a secret so that its pattern no longer matches."""
-        window = content[:REDACT_WINDOW_CHARS]
-        total = len(content.encode()) if len(content) > REDACT_WINDOW_CHARS else None
-        return _truncate(self._audit.redactor.redact(_no_nul(window)), MAX_RESULT_BYTES, total)
+        if len(content) <= REDACT_WINDOW_CHARS:
+            return _truncate(self._audit.redactor.redact(_clean_text(content)), MAX_RESULT_BYTES)
+        total = len(_clean_text(content).encode())
+        redacted = self._audit.redactor.redact(_clean_text(content[:REDACT_WINDOW_CHARS]))
+        return _truncate(redacted[:-WINDOW_EDGE_CHARS], MAX_RESULT_BYTES, total)
 
     def _duration(self, started: float) -> int:
         return max(0, int((self._clock() - started) * 1000))
@@ -616,5 +792,8 @@ class ToolGateway:
 
     async def _commit(self, session: AsyncSession) -> None:
         await session.commit()
+        await self._publish(session)
+
+    async def _publish(self, session: AsyncSession) -> None:
         if self._bus is not None:
             await publish_pending(session, self._bus)

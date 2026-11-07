@@ -101,6 +101,8 @@ class ToolR3Handler:
             await session.commit()
 
     async def approved(self, approval_id: uuid.UUID, *, now: datetime | None) -> None:
+        # "consumed" too: the resumed run may already have used the approval before this handler ran (a sweep
+        # retry, or a crash between the gateway's consume and the handler's record).
         await self._move(approval_id, decision="approved", statuses=("approved", "consumed"))
 
     async def rejected(self, approval_id: uuid.UUID, *, now: datetime | None) -> None:
