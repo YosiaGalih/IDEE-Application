@@ -2271,7 +2271,7 @@ $ uv run pytest -q -p no:cacheprovider          # suite penuh, sendirian, DB kod
 
 Spec: `docs/superpowers/specs/2026-11-07-wp-3.1d-tool-gateway-design.md` (Goals 3.1d2b, Keputusan Lead 3.1d2b #1–#7, Review Focus 3.1d2b). Plan: `docs/superpowers/plans/2026-11-07-wp-3.1d2b-write-builtins.md`.
 
-**Syarat WP-3.1d2a yang dicatat di sini [Pasti]:** PR #25 CI 9/9 `success` di 547d489 (backend-lint, backend-types, backend-test, sandbox-test, sandbox-isolation, frontend, infra-config, clean-install, security-scan). Run pertama di 8f98fbd merah di `security-scan`: gitleaks `jwt` menandai token contoh publik jwt.io pada empat baris test. Ditutup dengan fingerprint di `.gitleaksignore` dan fixture yang dirakit dengan `+`. Pada saat bagian ini ditulis, PR #25 sudah siap merge dan menunggu PO.
+**Syarat WP-3.1d2a yang dicatat di sini [Pasti]:** PR #25 CI 9/9 `success` di 547d489 (backend-lint, backend-types, backend-test, sandbox-test, sandbox-isolation, frontend, infra-config, clean-install, security-scan). Run pertama di 8f98fbd merah di `security-scan`: gitleaks `jwt` menandai token contoh publik jwt.io pada empat baris test. Ditutup dengan fingerprint di `.gitleaksignore` dan fixture yang dirakit dengan `+`. PR #25 di-merge PO (merge commit 96fdf75, 7 Nov 2026 12:23 UTC); tree `main` sesudah merge identik dengan head PR yang diuji.
 
 **Keterbatasan nyata:** sama dengan 3.1d2a. Belum ada kode yang membuat worktree task, jadi builtin ini diuji dengan worktree fixture dan baru dipakai produk setelah runtime/engine (3.1f/3.2).
 
