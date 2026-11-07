@@ -65,7 +65,9 @@ def workspace_errors() -> Iterator[None]:
         raise ToolError("git_failed", f"git failed ({exc.reason})") from None
 
 
-SANDBOX_DIR = SANDBOX_OUTPUT_DIR  # sandbox output (SECURITY_MODEL §4): never listed for the model, never in git
+SANDBOX_DIR = (
+    SANDBOX_OUTPUT_DIR  # sandbox output (SECURITY_MODEL §4): never listed for the model, never in git
+)
 POLICY_BUDGET = 2_000_000  # [Menebak] .agentignore matching cells for one whole tool call (WP-2.1d hand-off)
 MAX_NAMES = 20_000  # [Menebak] names one tool call checks; the rest is reported as not checked
 
