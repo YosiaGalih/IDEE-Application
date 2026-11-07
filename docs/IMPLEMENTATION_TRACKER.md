@@ -2050,3 +2050,5 @@ Mutan putaran code-review (satu per run, dipulihkan): N1 riwayat menawarkan `pen
 
 **Status sign-off AG-13 WP-3.1c2:** SIGNED OFF WITH CONDITIONS (5d4f6c0, delta db0ebc7). C2, C3, C4, dan L3 ditutup. Satu-satunya syarat terbuka adalah **C1**, CI hijau di head PR (`test_approvals_api.py` dengan assertion `project_name`).
 
+**C1 terpenuhi (7 Nov 2026).** [Pasti] Check run PR #21 di head 68db3db (`get_check_runs`): 9 dari 9 `success` (backend-lint, backend-types, backend-test, frontend, security-scan, sandbox-test, sandbox-isolation, infra-config, clean-install; selesai 13:10–13:16 UTC 6 Nov). `backend-test` menjalankan suite penuh termasuk `tests/integration/test_approvals_api.py` dengan assertion `project_name`. PR #21 di-merge PO ke `main` (2137385) pada 6 Nov 14:20 UTC. **Status sign-off AG-13 WP-3.1c2: SIGNED OFF**, tanpa syarat terbuka.
+
