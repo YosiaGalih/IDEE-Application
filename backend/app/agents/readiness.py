@@ -11,12 +11,22 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Literal, Protocol
 
+from app.llm.readiness import ProviderState
 from app.tools.catalog import TOOL_CATALOG
 
 AgentStatus = Literal["planned", "disabled", "not_ready", "ready"]
 StatusReason = Literal[
-    "runtime_unavailable", "provider_readiness_unknown", "provider_not_ready", "tools_unavailable"
+    "runtime_unavailable",
+    "provider_readiness_unknown",
+    "provider_not_ready",
+    "provider_disabled",
+    "tools_unavailable",
 ]
+_PROVIDER_REASONS: Mapping[ProviderState, StatusReason] = {
+    "unknown": "provider_readiness_unknown",
+    "not_ready": "provider_not_ready",
+    "disabled": "provider_disabled",
+}
 
 
 class AgentLike(Protocol):
@@ -35,9 +45,10 @@ RUNTIMES_AVAILABLE: Mapping[str, bool] = {"agent_runtime": False, "workflow_engi
 
 
 def assess(
-    agent: AgentLike, *, enabled: bool, provider_ready: bool | None
+    agent: AgentLike, *, enabled: bool, provider: ProviderState
 ) -> tuple[AgentStatus, list[StatusReason], list[str]]:
-    """(status, reasons, unavailable tools). ``provider_ready`` is None while no readiness result exists."""
+    """(status, reasons, unavailable tools). ``provider`` is the provider verdict (WP-3.1e): ``unknown``
+    while no report of the current mode and models exists, ``disabled`` when an admin switched it off."""
     if agent.mvp_mode == "planned":
         return "planned", [], []
     if not enabled:
@@ -47,10 +58,8 @@ def assess(
     runtime = "agent_runtime" if calls_model else "workflow_engine"
     if not RUNTIMES_AVAILABLE[runtime]:
         reasons.append("runtime_unavailable")
-    if calls_model and provider_ready is None:
-        reasons.append("provider_readiness_unknown")
-    elif calls_model and not provider_ready:
-        reasons.append("provider_not_ready")
+    if calls_model and provider != "ready":
+        reasons.append(_PROVIDER_REASONS[provider])
     # A tool the catalog no longer knows (a stale row) is as unavailable as an unbuilt one.
     unavailable = [t for t in agent.tools if t != "submit_result" and not _built(t)]
     if unavailable:

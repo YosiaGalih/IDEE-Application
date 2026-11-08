@@ -20,7 +20,7 @@ from app.agents.registry import AGENT_ID_PATTERN, Group, Mode
 from app.api.deps import CurrentActor
 from app.api.routes.projects import EnvDep, _respond
 from app.core.errors import AppError
-from app.services import agents
+from app.services import agents, provider_readiness
 from app.services.agents import AgentDetail, AgentView, RunStats, RunSummary
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -144,11 +144,18 @@ async def list_agents(
 ) -> JSONResponse:
     del actor  # any signed-in user; the catalog holds no project data
     async with env.sessions() as session:
-        views, counts = await agents.list_agents(session, group=group, mode=mode, status=status, q=q)
+        verdict = await provider_readiness.current_verdict(session, request.app.state.settings)
+        views, counts = await agents.list_agents(
+            session, group=group, mode=mode, status=status, q=q, provider=verdict.state
+        )
     return _respond(
         request,
         [AgentOut.of(view).model_dump(mode="json") for view in views],
-        meta={"total": len(views), "counts": {"mode": counts.mode, "status": counts.status}},
+        meta={
+            "total": len(views),
+            "counts": {"mode": counts.mode, "status": counts.status},
+            "provider": _provider_meta(verdict),
+        },
     )
 
 
@@ -164,7 +171,18 @@ async def get_agent(
     ):  # malformed ids are just unknown ones: 404, never a 422 echo
         raise AppError("NOT_FOUND", "Not found", http_status=404)
     async with env.sessions() as session:
-        detail = await agents.get_agent(session, actor, agent_id)
+        verdict = await provider_readiness.current_verdict(session, request.app.state.settings)
+        detail = await agents.get_agent(session, actor, agent_id, provider=verdict.state)
     if detail is None:
         raise AppError("NOT_FOUND", "Not found", http_status=404)
-    return _respond(request, AgentDetailOut.of_detail(detail).model_dump(mode="json"))
+    return _respond(
+        request,
+        AgentDetailOut.of_detail(detail).model_dump(mode="json"),
+        meta={"provider": _provider_meta(verdict)},
+    )
+
+
+def _provider_meta(verdict: provider_readiness.ProviderVerdict) -> dict[str, str]:
+    """Why model-calling agents are (not) ready on the provider side; ``readiness_not_required`` says that
+    LLM_REQUIRE_READINESS=false skipped the gate (spec 3.1e Lead decision #8)."""
+    return {"state": verdict.state, "reason": verdict.reason}

@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import AuditWriter
 from app.core.config import Settings
-from app.llm.readiness import ReadinessReport
+from app.llm.readiness import ProviderState, ReadinessReport
 from app.models.projects import Project
 from app.models.providers import ProviderConfig
 
@@ -38,7 +38,6 @@ MAX_MODEL_ID = 100
 _HINT_MIN_KEY = 20  # a shorter key would be mostly revealed by prefix + last four
 KILL_SWITCH_KEY = "provider_calls_enabled"
 
-ProviderState = Literal["ready", "not_ready", "disabled", "unknown"]
 VerdictReason = Literal[
     "passed",
     "readiness_not_required",
@@ -213,6 +212,16 @@ def provider_ready(
     if row.readiness_status != "passed":
         return ProviderVerdict("not_ready", "report_failed")
     return ProviderVerdict("ready", "passed")
+
+
+async def current_verdict(
+    session: AsyncSession, settings: Settings, provider: str = PROVIDER
+) -> ProviderVerdict:
+    """``provider_ready`` for the stored row, read only (the api process: no key, no rotation check)."""
+    row = (
+        await session.scalars(select(ProviderConfig).where(ProviderConfig.provider == provider))
+    ).one_or_none()
+    return provider_ready(row, settings)
 
 
 def provider_calls_allowed(project: Project) -> bool:

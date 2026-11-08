@@ -697,6 +697,7 @@
       "runtime_unavailable": "runtime belum dibangun",
       "provider_readiness_unknown": "readiness provider belum diuji",
       "provider_not_ready": "provider belum lulus readiness",
+      "provider_disabled": "provider dinonaktifkan admin",
       "tools_unavailable_one": "{{count}} tool belum tersedia",
       "tools_unavailable_other": "{{count}} tool belum tersedia"
     },

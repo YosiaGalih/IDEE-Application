@@ -95,6 +95,9 @@ ECHO_TOOL = ToolDef(
 )
 
 CheckStatus = Literal["passed", "failed", "skipped"]
+# Whether model calls may go to the provider now (services.provider_readiness.provider_ready); the agent
+# catalog shows it (FR-045).
+ProviderState = Literal["ready", "not_ready", "disabled", "unknown"]
 _Outcome = tuple[CheckStatus, str]
 
 

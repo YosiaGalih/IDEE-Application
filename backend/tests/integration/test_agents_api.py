@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -198,3 +199,58 @@ async def test_requires_sign_in(app: FastAPI) -> None:  # noqa: F811
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as anonymous:
         assert (await anonymous.get(AGENTS)).status_code == 401
         assert (await anonymous.get(f"{AGENTS}/A02")).status_code == 401
+
+
+# --- WP-3.1e Goal 7: the provider verdict -----------------------------------------------------------------
+
+
+async def record_provider(engine: AsyncEngine, *, failed: str | None = None, enabled: bool = True) -> None:
+    from app.core.config import load_settings
+    from app.llm.readiness import CHECK_KEYS, Check, ReadinessReport
+    from app.services import provider_readiness
+    from tests.conftest import make_test_env
+
+    settings = load_settings(make_test_env())
+    checks = tuple(Check(key, "failed" if key == failed else "passed", "x") for key in CHECK_KEYS)
+    report = ReadinessReport("anthropic", settings.llm_provider, checks, datetime.now(UTC))
+    async with make_sessionmaker(engine)() as session:
+        row = await provider_readiness.record_report(
+            session, report, key=None, base_url=None, pricing_version=None,
+            models=provider_readiness.effective_models(settings, {}), audit=AuditWriter(Redactor()),
+            actor_id="worker",
+        )  # fmt: skip
+        row.enabled = enabled
+        await session.commit()
+
+
+@pytest.mark.parametrize(
+    ("failed", "enabled", "reason", "meta"),
+    [
+        (None, True, None, {"state": "ready", "reason": "passed"}),
+        ("streaming_ok", True, "provider_not_ready", {"state": "not_ready", "reason": "report_failed"}),
+        (None, False, "provider_disabled", {"state": "disabled", "reason": "disabled"}),
+    ],
+)
+async def test_agents_follow_the_provider_verdict(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+    failed: str | None,
+    enabled: bool,
+    reason: str | None,
+    meta: dict[str, str],
+) -> None:
+    """Mutant E12: a passed report of the current mode and models takes the provider reason away."""
+    await record_provider(engine, failed=failed, enabled=enabled)
+    body = (await owner.get(AGENTS)).json()
+    a02 = next(a for a in body["data"] if a["agent_id"] == "A02")
+    provider_reasons = [r for r in a02["status_reasons"] if r.startswith("provider_")]
+    assert provider_reasons == ([reason] if reason else []), a02["status_reasons"]
+    assert body["meta"]["provider"] == meta
+    detail = (await owner.get(f"{AGENTS}/A02")).json()
+    assert detail["meta"]["provider"] == meta
+    assert [r for r in detail["data"]["status_reasons"] if r.startswith("provider_")] == provider_reasons
+
+
+async def test_no_report_says_readiness_unknown(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    body = (await owner.get(AGENTS)).json()
+    assert body["meta"]["provider"] == {"state": "unknown", "reason": "no_report"}
