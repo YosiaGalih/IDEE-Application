@@ -76,7 +76,9 @@ async def test_a_recorded_report_carries_the_worker_view_of_the_key_but_never_th
     assert row.readiness_report["models"] == {"default": "claude-test-model", "fast": "claude-test-model",
                                               "complex": "claude-test-model"}  # fmt: skip
     events = await session.scalars(
-        select(AuditEvent).where(AuditEvent.action == "provider.readiness_recorded")
+        select(AuditEvent).where(
+            AuditEvent.action == "provider.readiness_recorded", AuditEvent.resource_id == str(row.id)
+        )
     )
     event = events.one()
     assert (event.actor_type, event.actor_id, event.result) == ("system", "cli", "success")

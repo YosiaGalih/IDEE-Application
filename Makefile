@@ -4,7 +4,7 @@ KK_ENV_FILE ?= .env
 export KK_ENV_FILE
 COMPOSE := docker compose -f infra/compose.yml --env-file $(KK_ENV_FILE)
 
-.PHONY: setup sandbox-images workspace config up down ps seed-agents logs healthcheck egress-off backup restore
+.PHONY: setup sandbox-images workspace config up down ps seed-agents smoke logs healthcheck egress-off backup restore
 
 setup: ## env file with fresh secrets, sandbox images, workspace folder
 	scripts/gen-secrets.sh
@@ -31,6 +31,9 @@ ps:
 
 seed-agents: ## validate agents/registry and sync it to agent_profiles (the API also syncs at start)
 	$(COMPOSE) exec api python -m app.cli seed-agents
+
+smoke: ## RUNBOOK §4: Claude readiness gate in the worker (the only holder of the key); exit 0 only when ready
+	$(COMPOSE) exec worker python -m app.cli claude-smoke
 
 logs: ## make logs SERVICE=api
 	$(COMPOSE) logs --tail 200 $(SERVICE)

@@ -7,6 +7,9 @@
   migration (``app.core.db_roles``).
 - ``seed-agents``: validate the agent registry (``AGENT_REGISTRY_PATH``) and sync it to ``agent_profiles``
   (FR-041; the API also syncs at start).
+- ``claude-smoke [--json]``: the Claude readiness gate (RUNBOOK §4, ``make smoke``), run in the ``worker``
+  container, the only one with ``ANTHROPIC_API_KEY``. Records the report in ``provider_configs`` and prints
+  it redacted; exit 0 only when ready, 1 when not, 2 on a configuration error, 3 while another smoke runs.
 """
 
 from __future__ import annotations
@@ -14,7 +17,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import sys
+import uuid
 from pathlib import Path
 
 from app.agents.registry import RegistryError, load_registry
@@ -69,6 +74,46 @@ async def _grant_runtime_role(role: str) -> int:
     return 0
 
 
+SMOKE_BUSY = 3
+
+
+async def _claude_smoke(as_json: bool) -> int:
+    from redis.asyncio import Redis
+    from redis.exceptions import RedisError
+
+    from app.services import provider_smoke
+    from app.services.provider_readiness import PROVIDER
+    from app.worker.celery_app import configure_worker_logging
+
+    settings = load_settings()
+    configure_worker_logging(settings)  # the worker's redaction, with the key as a literal
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(settings.redis_url, socket_timeout=5.0, socket_connect_timeout=5.0)
+    job_id = uuid.uuid4()
+    try:
+        try:
+            if not await provider_smoke.acquire(redis, PROVIDER, job_id):
+                print("a smoke test is already running for this provider; try again later", file=sys.stderr)
+                return SMOKE_BUSY
+        except RedisError as exc:
+            print(f"cannot take the smoke lock: Redis {type(exc).__name__}", file=sys.stderr)
+            return 2
+        env = provider_smoke.SmokeEnv(
+            settings=settings,
+            sessions=make_sessionmaker(engine),
+            audit=AuditWriter(Redactor(settings.secret_values())),
+        )
+        try:
+            report = await provider_smoke.run_smoke(env, actor_id="cli", job_id=job_id)
+        finally:
+            await provider_smoke.release(redis, PROVIDER, job_id)
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+    print(json.dumps(report.to_dict(), ensure_ascii=False) if as_json else provider_smoke.render(report))
+    return 0 if report.ready else 1
+
+
 async def _seed_agents() -> int:
     settings = load_settings()
     registry = load_registry(Path(settings.agent_registry_path))
@@ -99,7 +144,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     grant.add_argument("--role", required=True)
     commands.add_parser("seed-agents", help="validate the agent registry and sync it to the database")
+    smoke = commands.add_parser("claude-smoke", help="Claude readiness gate, in the worker (RUNBOOK §4)")
+    smoke.add_argument("--json", action="store_true", help="print the report as JSON (API §11 #8 shape)")
     args = parser.parse_args(argv)
+    if args.command == "claude-smoke":
+        try:
+            return asyncio.run(_claude_smoke(args.json))
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     if args.command == "seed-agents":
         try:
             return asyncio.run(_seed_agents())

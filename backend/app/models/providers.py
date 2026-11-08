@@ -1,9 +1,10 @@
 """Provider configuration and the Claude readiness gate (DATA_MODEL provider_configs, ADR-004, ADR-032; spec
 WP-3.1e Goal 1). One row per provider.
 
-The API key itself is never stored: ``secret_ref`` names where it lives (env/secret file, worker only), and the
-worker reports what it saw (``secret_status``, a masked ``secret_hint``, a one-way ``secret_fingerprint`` that
-detects a rotated key). ``readiness_report`` is the last gate run, already redacted.
+The API key itself is never stored: ``secret_ref`` names where it lives (env/secret file, worker only), and
+the worker reports what it saw (``secret_status``, a masked ``secret_hint``, a one-way
+``secret_fingerprint`` that detects a rotated key). ``readiness_report`` is the last gate run, already
+redacted.
 """
 
 from __future__ import annotations

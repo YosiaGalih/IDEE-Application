@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -142,16 +143,22 @@ async def record_report(
     models: Mapping[str, str],
     audit: AuditWriter,
     actor_id: str,
+    job_id: uuid.UUID | None = None,
 ) -> ProviderConfig:
     """Write a report the worker produced; the caller commits. ``models`` (what was tested) is stored with
-    it: a report counts only while the effective models are still those (``provider_ready``)."""
+    it: a report counts only while the effective models are still those (``provider_ready``). ``job_id`` names
+    the smoke run, so the API can tell when the report it asked for has landed."""
     row = await ensure_config(session, report.provider)
     await session.refresh(row, with_for_update=True)
     now = datetime.now(UTC)
     row.llm_provider_mode = report.mode
     row.readiness_status = "passed" if report.ready else "failed"
     row.readiness_checked_at = report.ran_at
-    row.readiness_report = {**report.to_dict(), "models": dict(models)}
+    row.readiness_report = {
+        **report.to_dict(),
+        "models": dict(models),
+        "job_id": str(job_id) if job_id else None,
+    }
     row.secret_status = "configured" if key else "missing"
     row.secret_hint = key_hint(key) if key else None
     row.secret_fingerprint = key_fingerprint(key) if key else None
@@ -174,6 +181,7 @@ async def record_report(
             "skipped": [check.key for check in report.checks if check.status == "skipped"],
             "secret_status": row.secret_status,
             "models": dict(models),
+            "job_id": str(job_id) if job_id else None,
         },
     )
     await session.flush()

@@ -117,5 +117,11 @@ type = "forbidden"
 source_modules = ["app.tools", "app.agents"]
 forbidden_modules = ["app.models.agents"]
 
+[[tool.importlinter.contracts]]
+name = "The api process never builds a provider or reads its key (spec 3.1e Lead decision #2, ADR-053)"
+type = "forbidden"
+source_modules = ["app.main", "app.api"]
+forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.services.provider_smoke", "app.worker"]
+
 [tool.ruff.lint.isort]
 known-third-party = ["alembic"]
