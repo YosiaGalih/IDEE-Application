@@ -363,6 +363,49 @@ async def test_patch_updates_metadata_but_never_the_slug(
     ]
 
 
+async def test_the_provider_kill_switch_is_a_project_setting(
+    owner: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """FR-158, ADR-011 (spec 3.1e Goal 8; mutant E9): absent means on; false stops provider calls; booleans
+    only; audited as project.update; other keys stay refused."""
+    from app.services.provider_readiness import provider_calls_allowed
+
+    created = (await create(owner, "Kill Switch")).json()["data"]
+    url = f"{PROJECTS}/{created['id']}"
+
+    async def allowed() -> bool:
+        async with make_sessionmaker(engine)() as session:
+            project = await session.get(Project, uuid.UUID(created["id"]))
+            assert project is not None
+            return provider_calls_allowed(project)
+
+    assert await allowed() is True
+    off = await owner.patch(url, json={"settings": {"provider_calls_enabled": False}}, headers=headers(owner))
+    assert off.status_code == 200, off.text
+    assert off.json()["data"]["settings"] == {"provider_calls_enabled": False}
+    assert await allowed() is False
+    for bad in (
+        {"provider_calls_enabled": "false"},
+        {"provider_calls_enabled": None},
+        {"provider_calls": False},
+    ):
+        refused = await owner.patch(url, json={"settings": bad}, headers=headers(owner))
+        assert refused.status_code == 422, bad
+    on = await owner.patch(url, json={"settings": {"provider_calls_enabled": True}}, headers=headers(owner))
+    assert on.json()["data"]["settings"] == {"provider_calls_enabled": True} and await allowed() is True
+    async with make_sessionmaker(engine)() as session:
+        updates = (
+            await session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.action == "project.update", AuditEvent.resource_id == created["id"])
+                .order_by(AuditEvent.id)
+            )
+        ).all()
+    assert [e.metadata_["settings"] for e in updates] == [
+        {"provider_calls_enabled": False}, {"provider_calls_enabled": True},
+    ]  # fmt: skip
+
+
 async def test_archive_and_unarchive(owner: httpx.AsyncClient) -> None:
     created = (await create(owner)).json()["data"]
     url = f"{PROJECTS}/{created['id']}"

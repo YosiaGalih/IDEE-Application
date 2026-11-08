@@ -72,7 +72,9 @@ _settling: set[asyncio.Task[bool]] = set()
 PAGE_SIZE_DEFAULT = 50
 PAGE_SIZE_MAX = 200
 _NAME_CHARACTER = re.compile(r"\w", re.UNICODE)
-SETTINGS_KEYS = frozenset({"plan_approval_required", "auto_remediation"})
+# provider_calls_enabled: the per-project kill switch for model calls (FR-158, ADR-011; absent means on,
+# enforced by the runtime in 3.1f through provider_readiness.provider_calls_allowed).
+SETTINGS_KEYS = frozenset({"plan_approval_required", "auto_remediation", "provider_calls_enabled"})
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 # Controls, format characters (bidi overrides, zero-width) and line/paragraph separators: a name holding
 # them can display as another project's name (SECURITY_MODEL §5: approvals show the name).

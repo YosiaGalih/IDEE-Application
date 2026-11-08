@@ -36,7 +36,7 @@ MODEL_ALIASES: tuple[str, ...] = ("default", "fast", "complex")
 MODEL_ID = re.compile(r"claude-[a-z0-9]+(?:[.-][a-z0-9]+)*")
 MAX_MODEL_ID = 100
 _HINT_MIN_KEY = 20  # a shorter key would be mostly revealed by prefix + last four
-KILL_SWITCH_KEY = "provider_calls_enabled"
+KILL_SWITCH_KEY = "provider_calls_enabled"  # in services.projects.SETTINGS_KEYS
 
 VerdictReason = Literal[
     "passed",

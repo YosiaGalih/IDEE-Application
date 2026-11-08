@@ -95,6 +95,7 @@ class SettingsIn(_Strict):
     model_config = ConfigDict(extra="forbid", strict=True)
     plan_approval_required: bool = False
     auto_remediation: bool = False
+    provider_calls_enabled: bool = True  # FR-158 kill switch; false stops model calls for the project
 
 
 class UpdateProjectIn(_Strict):
