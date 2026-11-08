@@ -73,6 +73,9 @@ class Settings(BaseModel):
     sandbox_max_output_bytes: int = Field(default=1_048_576, gt=0)
     sandbox_max_workspace_growth_mb: int = Field(default=512, gt=0)
     llm_require_readiness: bool = True
+    # How long POST /settings/providers/{id}/smoke-test waits for the worker's report before answering 202
+    # (spec 3.1e Lead decision #3); below the screen's 60 s client limit.
+    smoke_wait_s: float = Field(default=45.0, gt=0, le=55)
     sandbox_egress: Literal["off", "allowlist"] = "off"
     sandbox_egress_network: str = "kk-egress"
     sandbox_runtime: Literal["", "runsc"] = ""

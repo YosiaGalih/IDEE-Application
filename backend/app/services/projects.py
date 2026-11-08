@@ -30,7 +30,7 @@ import uuid
 from collections.abc import AsyncIterator, Coroutine
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -474,8 +474,15 @@ async def _enforce_create_rate(env: ProjectEnv, actor: Actor) -> None:
     )
 
 
+class Limited(Protocol):
+    """Anything that carries the per-user limiter (``ProjectEnv``, ``ProviderSettingsEnv``)."""
+
+    @property
+    def limiter(self) -> FixedWindowLimiter | None: ...
+
+
 async def enforce_rate(
-    env: ProjectEnv, actor: Actor, *, scope: str, limit: int, window_s: int, message: str
+    env: Limited, actor: Actor, *, scope: str, limit: int, window_s: int, message: str
 ) -> None:
     """Per-user fixed window in Redis; fails closed (503) when the limiter cannot answer."""
     if env.limiter is None:

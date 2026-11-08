@@ -4,9 +4,7 @@ Worker and CLI only. This module builds the provider and so reads ``ANTHROPIC_AP
 never imports it (lint-imports contract "the api process never holds the key", Lead decision 3.1e #2) and
 asks for a smoke through the job queue instead.
 
-One smoke per provider at a time across every process: a Redis key ``kk:smoke:<provider>`` holds the job id
-from the request (API) or the start (CLI) to the end of the run. Only the holder releases it; a worker that
-dies leaves it to expire (``LOCK_TTL_S``).
+One smoke per provider at a time across every process (``smoke_lock``); the caller holds the lock.
 """
 
 from __future__ import annotations
@@ -16,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
@@ -27,30 +24,8 @@ from app.llm.readiness import ReadinessReport, run_readiness, unconfigured_repor
 from app.services import provider_readiness
 
 # A run makes about seven small calls of at most CALL_TIMEOUT_S each; the job's time limit ends it before
-# its lock expires, so a lock never outlives its run.
+# its lock expires (smoke_lock.LOCK_TTL_S), so a lock never outlives its run.
 SMOKE_TIME_LIMIT_S = 180
-LOCK_TTL_S = 5 * 60
-
-_RELEASE = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
-
-
-def lock_key(provider: str) -> str:
-    return f"kk:smoke:{provider}"
-
-
-async def acquire(redis: Redis, provider: str, job_id: uuid.UUID) -> bool:
-    return bool(await redis.set(lock_key(provider), str(job_id), nx=True, ex=LOCK_TTL_S))
-
-
-async def holder(redis: Redis, provider: str) -> str | None:
-    value = await redis.get(lock_key(provider))
-    return value.decode() if isinstance(value, bytes) else value
-
-
-async def release(redis: Redis, provider: str, job_id: uuid.UUID) -> bool:
-    """Delete the lock only if ``job_id`` still holds it (a late run never frees a newer one's lock)."""
-    released = await redis.eval(_RELEASE, 1, lock_key(provider), str(job_id))  # type: ignore[misc]
-    return bool(released)
 
 
 @dataclass(frozen=True, slots=True)

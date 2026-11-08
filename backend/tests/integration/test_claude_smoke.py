@@ -22,13 +22,13 @@ from app.core.config import load_settings
 from app.core.redaction import Redactor
 from app.models.audit import AuditEvent
 from app.models.providers import ProviderConfig
-from app.services import provider_smoke
+from app.services import provider_smoke, smoke_lock
 from app.worker.platform_jobs import run_provider_smoke_job
 from tests.conftest import make_test_env, reset_data
 from tests.unit.test_llm_readiness import fake_api
 
 KEY = "sk-ant-" + "cli-smoke-" + "q" * 24 + "e5f6"  # built, not written: a test value
-LOCK = provider_smoke.lock_key("anthropic")
+LOCK = smoke_lock.lock_key("anthropic")
 PRICING = """
 version: "2026-11-08-test"
 currency: USD

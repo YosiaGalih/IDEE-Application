@@ -12,6 +12,7 @@ from app.api.routes import (
     project_imports,
     projects,
     repository,
+    settings,
     workspace,
 )
 
@@ -26,3 +27,4 @@ api_router.include_router(project_imports.router)
 api_router.include_router(workspace.router)
 api_router.include_router(git.router)
 api_router.include_router(repository.router)
+api_router.include_router(settings.router)

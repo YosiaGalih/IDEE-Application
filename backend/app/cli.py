@@ -81,7 +81,7 @@ async def _claude_smoke(as_json: bool) -> int:
     from redis.asyncio import Redis
     from redis.exceptions import RedisError
 
-    from app.services import provider_smoke
+    from app.services import provider_smoke, smoke_lock
     from app.services.provider_readiness import PROVIDER
     from app.worker.celery_app import configure_worker_logging
 
@@ -92,7 +92,7 @@ async def _claude_smoke(as_json: bool) -> int:
     job_id = uuid.uuid4()
     try:
         try:
-            if not await provider_smoke.acquire(redis, PROVIDER, job_id):
+            if not await smoke_lock.acquire(redis, PROVIDER, job_id):
                 print("a smoke test is already running for this provider; try again later", file=sys.stderr)
                 return SMOKE_BUSY
         except RedisError as exc:
@@ -106,7 +106,7 @@ async def _claude_smoke(as_json: bool) -> int:
         try:
             report = await provider_smoke.run_smoke(env, actor_id="cli", job_id=job_id)
         finally:
-            await provider_smoke.release(redis, PROVIDER, job_id)
+            await smoke_lock.release(redis, PROVIDER, job_id)
     finally:
         await redis.aclose()
         await engine.dispose()

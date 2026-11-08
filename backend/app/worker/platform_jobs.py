@@ -21,7 +21,7 @@ from app.core.logging import get_logger
 from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
 from app.models.enums import PROVIDERS
-from app.services import approval_handlers, project_delete, provider_smoke
+from app.services import approval_handlers, project_delete, provider_smoke, smoke_lock
 from app.services.approval_registry import default_handlers
 from app.services.job_queue import IMPORT_TASK, INDEX_TASK, PROVIDER_SMOKE_TASK, CeleryJobQueue
 from app.services.project_imports import ImportEnv, ImportRetry, run_import
@@ -190,7 +190,7 @@ async def run_provider_smoke_job(*, job_id: uuid.UUID, provider: str) -> str:
     engine = make_engine(settings.database_url)
     redis = Redis.from_url(settings.redis_url, socket_timeout=5.0, socket_connect_timeout=5.0)
     try:
-        if await provider_smoke.holder(redis, provider) != str(job_id):
+        if await smoke_lock.holder(redis, provider) != str(job_id):
             # The request's lock expired (a long queue wait) or another run holds it: that run reports.
             logger.warning("provider_smoke_skipped", job_id=str(job_id), provider=provider)
             return "skipped"
@@ -202,7 +202,7 @@ async def run_provider_smoke_job(*, job_id: uuid.UUID, provider: str) -> str:
         try:
             report = await provider_smoke.run_smoke(env, actor_id="worker", job_id=job_id, provider=provider)
         finally:
-            await provider_smoke.release(redis, provider, job_id)
+            await smoke_lock.release(redis, provider, job_id)
         return "ready" if report.ready else "not_ready"
     finally:
         await redis.aclose()
