@@ -21,7 +21,7 @@ from app.core.cancel import CancelToken
 from app.llm.anthropic_provider import AnthropicClaudeProvider
 from app.llm.base import LLMError, LLMRequest, LLMResponse, TextBlock, TextDeltaHandler, Usage
 from app.llm.pricing import PricingError, PricingTable
-from app.llm.readiness import CHECK_KEYS, ReadinessReport, run_readiness, unconfigured_report
+from app.llm.readiness import CHECK_KEYS, ReadinessReport, aborted_report, run_readiness
 from app.llm.scripted_provider import ScriptedProvider
 from tests.llm_fakes import (
     ChunkStream,
@@ -317,7 +317,7 @@ async def test_ready_needs_every_check_to_pass() -> None:
 
 
 def test_a_worker_without_a_key_gets_a_report_that_says_so() -> None:
-    report = unconfigured_report(
+    report = aborted_report(
         "ANTHROPIC_API_KEY is not set in the worker", models=MODELS, production=False, pricing=pricing(),
         ran_at=RAN_AT,
     )  # fmt: skip
@@ -368,3 +368,47 @@ async def test_the_anthropic_adapter_with_a_refused_key_leaks_it_nowhere(
     assert statuses(report)["secret_not_in_logs"] == "passed"
     captured = capsys.readouterr()
     assert KEY not in json.dumps(report.to_dict()) + captured.out + captured.err
+
+
+# --- review fixes (silent-failure 3.1e1 L7, L8) ---------------------------------------------------------
+
+
+async def test_a_provider_that_hangs_past_its_limit_fails_the_check_in_bounded_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.llm import readiness
+
+    monkeypatch.setattr(readiness, "CALL_GRACE_S", 0.05)
+
+    async def hang(*_: Any) -> Any:
+        await asyncio.sleep(30)
+
+    started = asyncio.get_running_loop().time()
+    report = await run(Patched(tool=hang), timeout_s=0.05)
+    assert asyncio.get_running_loop().time() - started < 5
+    only_failed(report, "tool_use_roundtrip")
+    assert "no answer within" in detail(report, "tool_use_roundtrip")
+
+
+async def test_the_cancel_probe_uses_the_runs_time_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[float] = []
+
+    async def cancel(req: LLMRequest, on_delta: TextDeltaHandler | None, token: CancelToken | None) -> Any:
+        seen.append(req.timeout_s)
+        assert on_delta is not None and token is not None
+        await on_delta("one ")
+        raise LLMError("cancelled")
+
+    await run(Patched(cancel=cancel), timeout_s=7.0)
+    assert seen == [7.0]
+
+
+async def test_log_output_that_cannot_be_observed_is_not_a_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero observed lines would make secret_not_in_logs pass vacuously (LOG_LEVEL above INFO, or no log
+    pipeline): the canary line must be seen."""
+    from app.llm import readiness
+
+    monkeypatch.setattr(readiness, "_log_canary", lambda marker: None)
+    report = await run(ScriptedProvider())
+    only_failed(report, "secret_not_in_logs")
+    assert "could not be observed" in detail(report, "secret_not_in_logs")

@@ -265,3 +265,48 @@ async def test_every_route_needs_settings_providers(
         await developer.aclose()
         await admin.aclose()
         await anonymous.aclose()
+
+
+# --- review fixes (silent-failure 3.1e1 M2, M6; backend review L4, L5, N7) -------------------------------
+
+
+async def test_readiness_says_whether_the_report_counts_now_and_which_job_runs(
+    owner: httpx.AsyncClient, app: FastAPI
+) -> None:
+    pid = await provider_id(owner)
+    smoke = await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))
+    readiness = (await owner.get(f"{PROVIDERS}/{pid}/readiness")).json()["data"]
+    assert readiness["job_id"] == smoke.json()["meta"]["job_id"] and readiness["running_job_id"] is None
+    assert (readiness["ready"], readiness["report_ready"]) == (True, True)
+    await owner.patch(f"{PROVIDERS}/{pid}", json={"model_policy": {"fast": "claude-test-fast"}},
+                      headers=headers(owner))  # fmt: skip
+    after = (await owner.get(f"{PROVIDERS}/{pid}/readiness")).json()["data"]
+    assert (after["ready"], after["report_ready"], after["readiness_status"]) == (False, True, "unknown")
+    app.state.dependencies.smoke_jobs = InlineSmoke(app, run=False)
+    queued = (await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))).json()["data"]
+    running = (await owner.get(f"{PROVIDERS}/{pid}/readiness")).json()["data"]
+    assert running["running_job_id"] == queued["job_id"] != running["job_id"]
+
+
+async def test_a_conflict_does_not_use_up_the_rate_limit(
+    owner: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(provider_settings, "SMOKE_RATE_LIMIT", 2)
+    app.state.dependencies.smoke_jobs = InlineSmoke(app, run=False)
+    pid = await provider_id(owner)
+    codes = [(await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))).status_code
+             for _ in range(4)]  # fmt: skip
+    assert codes == [202, 409, 409, 409]
+    await app.state.dependencies.redis.delete(smoke_lock.lock_key("anthropic"))
+    assert (await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))).status_code == 202
+    await app.state.dependencies.redis.delete(smoke_lock.lock_key("anthropic"))
+    limited = await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))
+    assert limited.status_code == 429
+    assert await smoke_lock.holder(app.state.dependencies.redis, "anthropic") is None  # 429 frees the lock
+
+
+@pytest.mark.parametrize("value", ["yes", 1, "true"])
+async def test_enabled_must_be_a_real_boolean(owner: httpx.AsyncClient, value: object) -> None:
+    pid = await provider_id(owner)
+    response = await owner.patch(f"{PROVIDERS}/{pid}", json={"enabled": value}, headers=headers(owner))
+    assert response.status_code == 422, response.text

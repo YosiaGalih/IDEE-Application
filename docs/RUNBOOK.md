@@ -132,7 +132,7 @@ Sembilan check bernama tetap (API §11 #8 + `pricing_verified`): `api_key_valid`
 |---|---|
 | 0 | siap (semua check `passed`; `pricing_verified` boleh `skipped` di luar production) |
 | 1 | tidak siap: baca baris `failed` |
-| 2 | konfigurasi salah atau Redis tidak terjangkau |
+| 2 | konfigurasi salah, atau smoke tidak dapat berjalan (DB/Redis tidak terjangkau; stderr menyebut jenis error) |
 | 3 | smoke lain sedang berjalan untuk provider ini (CLI dan API berbagi satu lock) |
 
 - Exit code ≠ 0 → **jangan** aktifkan agent. Periksa: key (401/403), model ID salah (404), kuota/rate limit (429), egress ke `api.anthropic.com:443` (worker ada di network `outbound`), CA/proxy (`SSL_CERT_FILE`, `HTTPS_PROXY`, CONFIGURATION).

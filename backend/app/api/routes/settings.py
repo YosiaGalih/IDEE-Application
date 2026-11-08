@@ -11,7 +11,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr, model_validator
 
 from app.api.deps import AuditDep, AuthContext, CurrentActor, LimiterDep, dependencies, require_permission
 from app.api.routes.projects import _respond
@@ -43,8 +43,8 @@ class ProviderPatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
-    model_policy: dict[str, str | None] | None = None
-    enabled: bool | None = None
+    model_policy: dict[str, StrictStr | None] | None = None
+    enabled: StrictBool | None = None  # "yes" or 1 is not a boolean (backend review 3.1e1 N7)
 
     @model_validator(mode="after")
     def _something_to_change(self) -> ProviderPatch:

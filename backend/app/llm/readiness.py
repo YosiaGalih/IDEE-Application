@@ -17,6 +17,7 @@ Lead decision 3.1e #2).
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import sys
 import time
@@ -79,7 +80,9 @@ _NEEDS_PROBE = (
 )
 _SECRET_RULES = frozenset({"configured_secret", "anthropic_key", "anthropic_admin_key"})
 
-CALL_TIMEOUT_S = 20.0
+# Seven calls at most: 7 x (15 + 5) s stays inside the smoke's own limit (provider_smoke.SMOKE_RUN_LIMIT_S).
+CALL_TIMEOUT_S = 15.0
+CALL_GRACE_S = 5.0  # an adapter that ignores its time limit is cut off this much later
 TIMEOUT_PROBE_S = 0.01  # far below any real answer: the provider must raise ``timeout``
 TIMEOUT_GRACE_S = 5.0  # ... and promptly
 SCENARIO = "readiness"  # ScriptedProvider scenario; metadata never reaches a real provider
@@ -161,14 +164,16 @@ async def run_readiness(
     look for it in the log output."""
     started = ran_at or datetime.now(UTC)
     outcomes: dict[str, _Outcome] = {}
+    marker = f"kk-log-{secrets.token_hex(6)}"
     with _captured_output() as output:
+        _log_canary(marker)
         await _provider_checks(provider, models, timeout_s, outcomes)
-    outcomes["secret_not_in_logs"] = _secret_check(output.getvalue(), key)
+    outcomes["secret_not_in_logs"] = _secret_check(output.getvalue(), key, marker)
     outcomes["pricing_verified"] = _pricing_check(pricing, models, production)
     return _report(provider_name, provider.name, outcomes, key, started)
 
 
-def unconfigured_report(
+def aborted_report(
     reason: str,
     *,
     models: Mapping[str, str],
@@ -177,12 +182,14 @@ def unconfigured_report(
     provider_name: str = "anthropic",
     mode: str = "anthropic",
     ran_at: datetime | None = None,
+    key: str | None = None,
 ) -> ReadinessReport:
-    """The provider cannot be built in this process (e.g. no key in the worker): nothing was called."""
+    """A run that could not happen or finish (no key in the worker, a provider that cannot be built, a run
+    past its time limit): ``reason`` is the failed ``api_key_valid``, what depends on it is skipped."""
     outcomes: dict[str, _Outcome] = {"api_key_valid": ("failed", reason)}
     outcomes["secret_not_in_logs"] = ("skipped", "skipped: no provider call was made")
     outcomes["pricing_verified"] = _pricing_check(pricing, models, production)
-    return _report(provider_name, mode, outcomes, None, ran_at or datetime.now(UTC))
+    return _report(provider_name, mode, outcomes, key, ran_at or datetime.now(UTC))
 
 
 def _report(
@@ -229,11 +236,15 @@ async def _call(
     on_text_delta: TextDeltaHandler | None = None,
     cancel: CancelToken | None = None,
 ) -> LLMResponse | LLMError | str:
-    """The answer, the normalised provider error, or a description of anything else that went wrong."""
+    """The answer, the normalised provider error, or a description of anything else that went wrong. An
+    adapter that ignores ``req.timeout_s`` is cut off ``CALL_GRACE_S`` later, so a run always ends."""
     try:
-        return await provider.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+        async with asyncio.timeout(req.timeout_s + CALL_GRACE_S):
+            return await provider.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
     except LLMError as exc:
         return exc
+    except TimeoutError:
+        return f"no answer within {req.timeout_s + CALL_GRACE_S:g} s (the provider ignored its time limit)"
     except Exception as exc:
         # The adapter normalises provider failures to LLMError, so this is a bug; the check records it as
         # failed. Its message is not kept or logged: it may echo a request (and the key) unredacted.
@@ -276,7 +287,7 @@ async def _provider_checks(
     outcomes["usage_reported"] = _usage_check(probe)
     outcomes["model_accessible"] = await _models_check(provider, models, timeout_s)
     outcomes["tool_use_roundtrip"] = await _tool_check(provider, default, timeout_s)
-    outcomes["timeout_cancel_handled"] = await _timeout_cancel_check(provider, default)
+    outcomes["timeout_cancel_handled"] = await _timeout_cancel_check(provider, default, timeout_s)
 
 
 def _messages_check(probe: LLMResponse) -> _Outcome:
@@ -349,7 +360,7 @@ async def _tool_check(provider: LLMProvider, model: str, timeout_s: float) -> _O
     return "passed", f"{ECHO_TOOL.name} was called, its result sent back, and the model finished"
 
 
-async def _timeout_cancel_check(provider: LLMProvider, model: str) -> _Outcome:
+async def _timeout_cancel_check(provider: LLMProvider, model: str, timeout_s: float) -> _Outcome:
     problems: list[str] = []
     count = "Count from 1 to 200, one number per line."
 
@@ -372,7 +383,7 @@ async def _timeout_cancel_check(provider: LLMProvider, model: str) -> _Outcome:
         token.cancel()
 
     cut = await _call(
-        provider, _request(model, "cancel", count, CALL_TIMEOUT_S, max_tokens=512),
+        provider, _request(model, "cancel", count, timeout_s, max_tokens=512),
         on_text_delta=cancel_on_first, cancel=token,
     )  # fmt: skip
     if isinstance(cut, LLMResponse):
@@ -422,11 +433,19 @@ def _captured_output() -> Iterator[StringIO]:
         sys.stdout, sys.stderr = stdout, stderr
 
 
-def _secret_check(output: str, key: str | None) -> _Outcome:
+def _log_canary(marker: str) -> None:
+    """One line through the logging pipeline, so the check knows it can see what the pipeline writes."""
+    logger.info("readiness_log_check", marker=marker)
+
+
+def _secret_check(output: str, key: str | None, marker: str) -> _Outcome:
     findings = [f for f in Redactor([key] if key else []).find(output) if f.rule in _SECRET_RULES]
     if findings:
         lines = sorted({finding.line for finding in findings})
         return "failed", f"a key appeared in the log output on {len(lines)} line(s) while the checks ran"
+    if marker not in output:
+        # Evidence over claims: no observed log output is not proof that the key stayed out of it.
+        return "failed", "the log output could not be observed (LOG_LEVEL above INFO, or no log pipeline)"
     return "passed", f"no key in the {len(output.splitlines())} log lines written while the checks ran"
 
 

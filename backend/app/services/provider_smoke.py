@@ -9,22 +9,30 @@ One smoke per provider at a time across every process (``smoke_lock``); the call
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
 from app.core.config import Settings
+from app.core.logging import get_logger
 from app.llm.factory import ProviderNotConfigured, build_provider
 from app.llm.pricing import PricingError, PricingTable, load_pricing
-from app.llm.readiness import ReadinessReport, run_readiness, unconfigured_report
-from app.services import provider_readiness
+from app.llm.readiness import ReadinessReport, aborted_report, run_readiness
+from app.services import provider_readiness, smoke_lock
 
-# A run makes about seven small calls of at most CALL_TIMEOUT_S each; the job's time limit ends it before
-# its lock expires (smoke_lock.LOCK_TTL_S), so a lock never outlives its run.
+logger = get_logger(__name__)
+
+# A run makes at most seven calls of CALL_TIMEOUT_S + CALL_GRACE_S each (140 s). Its own limit ends it with a
+# failed report before the job's hard limit kills it, and the job's limit ends before the lock it extended
+# at start (smoke_lock.LOCK_TTL_S) expires (silent-failure 3.1e1 M3, M5).
+SMOKE_RUN_LIMIT_S = 150.0
 SMOKE_TIME_LIMIT_S = 180
 
 
@@ -56,26 +64,45 @@ async def run_smoke(
     models = provider_readiness.effective_models(settings, policy)
     pricing = _pricing(settings)
     key = settings.anthropic_api_key
+
+    def aborted(reason: str) -> ReadinessReport:
+        return aborted_report(
+            reason, models=models, production=settings.is_production, pricing=pricing, provider_name=provider,
+            mode=settings.llm_provider, key=key,
+        )  # fmt: skip
+
     try:
-        llm = build_provider(settings, transport=env.transport)
+        async with asyncio.timeout(SMOKE_RUN_LIMIT_S):
+            llm = build_provider(settings, transport=env.transport)
+            report = await run_readiness(
+                llm, models=models, key=key, production=settings.is_production, pricing=pricing,
+                provider_name=provider,
+            )  # fmt: skip
     except ProviderNotConfigured as exc:
-        report = unconfigured_report(
-            str(exc), models=models, production=settings.is_production, pricing=pricing,
-            provider_name=provider, mode=settings.llm_provider,
-        )  # fmt: skip
-    else:
-        report = await run_readiness(
-            llm, models=models, key=key, production=settings.is_production, pricing=pricing,
-            provider_name=provider,
-        )  # fmt: skip
+        report = aborted(str(exc))
+    except TimeoutError:
+        report = aborted(f"the smoke did not finish within {SMOKE_RUN_LIMIT_S:g} s")
+    except Exception as exc:
+        # Recorded as a failed report, never as "still running"; the message may echo the key, so only the
+        # type is kept.
+        logger.error("provider_smoke_aborted", job_id=str(job_id), error_type=type(exc).__name__)
+        report = aborted(f"the smoke could not run: {type(exc).__name__}")
     async with env.sessions() as session:
         await provider_readiness.record_report(
             session, report, key=key, base_url=settings.anthropic_base_url,
             pricing_version=pricing.version if isinstance(pricing, PricingTable) else None, models=models,
-            audit=env.audit, actor_id=actor_id, job_id=job_id,
+            settings=settings, audit=env.audit, actor_id=actor_id, job_id=job_id,
         )  # fmt: skip
         await session.commit()
     return report
+
+
+async def release_quietly(redis: Redis, provider: str, job_id: uuid.UUID) -> None:
+    """Free the lock after a run; a Redis error here must not hide the report (it expires on its own)."""
+    try:
+        await smoke_lock.release(redis, provider, job_id)
+    except RedisError as exc:
+        logger.warning("provider_smoke_lock_not_released", job_id=str(job_id), error_type=type(exc).__name__)
 
 
 def render(report: ReadinessReport) -> str:

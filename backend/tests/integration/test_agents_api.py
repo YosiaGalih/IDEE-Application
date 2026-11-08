@@ -216,8 +216,8 @@ async def record_provider(engine: AsyncEngine, *, failed: str | None = None, ena
     async with make_sessionmaker(engine)() as session:
         row = await provider_readiness.record_report(
             session, report, key=None, base_url=None, pricing_version=None,
-            models=provider_readiness.effective_models(settings, {}), audit=AuditWriter(Redactor()),
-            actor_id="worker",
+            models=provider_readiness.effective_models(settings, {}), settings=settings,
+            audit=AuditWriter(Redactor()), actor_id="worker",
         )  # fmt: skip
         row.enabled = enabled
         await session.commit()

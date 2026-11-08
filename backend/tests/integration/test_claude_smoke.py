@@ -184,3 +184,93 @@ async def test_the_worker_job_runs_only_for_the_lock_it_was_given(
     finally:
         await redis.delete(LOCK)
         await redis.aclose()
+
+
+# --- review fixes (silent-failure 3.1e1 M2-M5) -------------------------------------------------------
+
+
+async def test_a_skipped_job_leaves_an_audit_event(engine: AsyncEngine, monkeypatch: Any) -> None:
+    from redis.asyncio import Redis
+
+    use_env(monkeypatch)
+    redis = Redis.from_url(make_test_env()["REDIS_URL"])
+    job_id = uuid.uuid4()
+    try:
+        assert (
+            await run_provider_smoke_job(job_id=job_id, provider="anthropic") == "skipped"
+        )  # no lock at all
+    finally:
+        await redis.delete(LOCK)
+        await redis.aclose()
+    async with async_sessionmaker(engine)() as session:
+        query = (
+            select(AuditEvent)
+            .where(AuditEvent.action == "provider.smoke_skipped")
+            .order_by(AuditEvent.id.desc())
+        )
+        event = (await session.scalars(query)).first()
+    assert event is not None and event.metadata_["job_id"] == str(job_id) and event.actor_id == "worker"
+
+
+async def test_the_job_extends_the_lock_it_was_given(monkeypatch: Any) -> None:
+    from redis.asyncio import Redis
+
+    redis = Redis.from_url(make_test_env()["REDIS_URL"])
+    job_id = uuid.uuid4()
+    try:
+        await redis.set(LOCK, str(job_id), ex=5)
+        assert await smoke_lock.claim(redis, "anthropic", job_id) is True
+        assert await redis.ttl(LOCK) > 5
+        assert await smoke_lock.claim(redis, "anthropic", uuid.uuid4()) is False
+    finally:
+        await redis.delete(LOCK)
+        await redis.aclose()
+
+
+async def _smoke(engine: AsyncEngine) -> tuple[Any, ProviderConfig]:
+    settings = load_settings(smoke_env())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    env = provider_smoke.SmokeEnv(settings=settings, sessions=sessions, audit=AuditWriter(Redactor()))
+    report = await provider_smoke.run_smoke(env, actor_id="worker", job_id=uuid.uuid4())
+    async with sessions() as session:
+        return report, (await session.scalars(select(ProviderConfig))).one()
+
+
+async def test_a_provider_that_cannot_be_built_records_a_failed_report(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_: Any, **__: Any) -> Any:
+        raise RuntimeError(f"bad base url with {KEY}")
+
+    monkeypatch.setattr(provider_smoke, "build_provider", broken)
+    report, row = await _smoke(engine)
+    assert report.ready is False and row.readiness_status == "failed"
+    api_key_valid = next(c for c in row.readiness_report["checks"] if c["key"] == "api_key_valid")
+    assert "RuntimeError" in api_key_valid["detail"] and KEY not in json.dumps(row.readiness_report)
+
+
+async def test_a_smoke_that_runs_too_long_records_a_failed_report(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def hang(*_: Any, **__: Any) -> Any:
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(provider_smoke, "SMOKE_RUN_LIMIT_S", 0.05)
+    monkeypatch.setattr(provider_smoke, "run_readiness", hang)
+    report, row = await _smoke(engine)
+    assert report.ready is False and row.readiness_status == "failed"
+    assert any("did not finish" in c["detail"] for c in row.readiness_report["checks"])
+
+
+def test_the_cli_says_when_it_could_not_run(
+    monkeypatch: pytest.MonkeyPatch, redis: SyncRedis, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Silent-failure 3.1e1 M4: exit 1 is "not ready", never "the tool broke"."""
+
+    async def down(*_: Any, **__: Any) -> Any:
+        raise ConnectionError("database unreachable")
+
+    use_env(monkeypatch)
+    monkeypatch.setattr(provider_smoke, "run_smoke", down)
+    assert cli_main(["claude-smoke"]) == 2
+    assert "could not run" in capsys.readouterr().err and redis.get(LOCK) is None

@@ -189,20 +189,24 @@ async def run_provider_smoke_job(*, job_id: uuid.UUID, provider: str) -> str:
     settings = load_settings()
     engine = make_engine(settings.database_url)
     redis = Redis.from_url(settings.redis_url, socket_timeout=5.0, socket_connect_timeout=5.0)
+    sessions = make_sessionmaker(engine)
+    audit = AuditWriter(Redactor(settings.secret_values()))
     try:
-        if await smoke_lock.holder(redis, provider) != str(job_id):
-            # The request's lock expired (a long queue wait) or another run holds it: that run reports.
+        if not await smoke_lock.claim(redis, provider, job_id):
+            # The request's lock expired (a long queue wait) or another run holds it. Said in the audit, and
+            # GET readiness shows this job neither running nor reported (silent-failure 3.1e1 M2).
             logger.warning("provider_smoke_skipped", job_id=str(job_id), provider=provider)
+            await audit.write_detached(
+                sessions, actor_type="system", actor_id="worker", action="provider.smoke_skipped",
+                result="error", resource_type="provider_config",
+                metadata={"provider": provider, "job_id": str(job_id), "reason": "lock_not_held"},
+            )  # fmt: skip
             return "skipped"
-        env = provider_smoke.SmokeEnv(
-            settings=settings,
-            sessions=make_sessionmaker(engine),
-            audit=AuditWriter(Redactor(settings.secret_values())),
-        )
+        env = provider_smoke.SmokeEnv(settings=settings, sessions=sessions, audit=audit)
         try:
             report = await provider_smoke.run_smoke(env, actor_id="worker", job_id=job_id, provider=provider)
         finally:
-            await smoke_lock.release(redis, provider, job_id)
+            await provider_smoke.release_quietly(redis, provider, job_id)
         return "ready" if report.ready else "not_ready"
     finally:
         await redis.aclose()

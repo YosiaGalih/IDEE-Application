@@ -89,10 +89,14 @@ async def _row(session: AsyncSession, provider_id: uuid.UUID, *, lock: bool = Fa
 
 async def list_providers(env: ProviderSettingsEnv, actor: Actor) -> list[ProviderView]:
     _authorize(actor)
+    query = select(ProviderConfig).order_by(ProviderConfig.provider)
     async with env.sessions() as session:
-        await provider_readiness.ensure_config(session)  # the configured vendor always has a row to show
-        await session.commit()
-        rows = (await session.scalars(select(ProviderConfig).order_by(ProviderConfig.provider))).all()
+        rows = (await session.scalars(query)).all()
+        if not any(row.provider == provider_readiness.PROVIDER for row in rows):
+            # The configured vendor always has a row to show: made on the first read only.
+            await provider_readiness.ensure_config(session)
+            await session.commit()
+            rows = (await session.scalars(query)).all()
         return [_view(row, env.settings) for row in rows]
 
 
@@ -154,8 +158,11 @@ async def update_provider(
         return _view(row, env.settings)
 
 
-def readiness_of(row: ProviderConfig, settings: Settings) -> dict[str, Any]:
-    """§11.3: the last report as recorded, the models it tested, and whether it counts now."""
+def readiness_of(row: ProviderConfig, settings: Settings, running_job_id: str | None) -> dict[str, Any]:
+    """§11.3: the last report as recorded, the models it tested, and whether it counts now. ``ready`` is
+    whether it counts now (never green for a report the models or mode moved away from; silent-failure
+    3.1e1 M6); ``report_ready`` is the report's own result. ``job_id`` names the run that wrote it and
+    ``running_job_id`` the run holding the lock: a 202 job id in neither has ended without a report."""
     report = dict(row.readiness_report or {})
     verdict = provider_readiness.provider_ready(row, settings)
     return {
@@ -163,9 +170,12 @@ def readiness_of(row: ProviderConfig, settings: Settings) -> dict[str, Any]:
         "readiness_status": row.readiness_status,
         "checked_at": row.readiness_checked_at.isoformat() if row.readiness_checked_at else None,
         "mode": report.get("mode"),
-        "ready": bool(report.get("ready", False)),
+        "ready": verdict.ready,
+        "report_ready": bool(report.get("ready", False)),
         "checks": list(report.get("checks", [])),
         "models": report.get("models"),
+        "job_id": report.get("job_id"),
+        "running_job_id": running_job_id,
         "effective": {"state": verdict.state, "reason": verdict.reason},
     }
 
@@ -173,7 +183,9 @@ def readiness_of(row: ProviderConfig, settings: Settings) -> dict[str, Any]:
 async def get_readiness(env: ProviderSettingsEnv, actor: Actor, provider_id: uuid.UUID) -> dict[str, Any]:
     _authorize(actor)
     async with env.sessions() as session:
-        return readiness_of(await _row(session, provider_id), env.settings)
+        row = await _row(session, provider_id)
+    running = await smoke_lock.holder(env.redis, row.provider) if env.redis is not None else None
+    return readiness_of(row, env.settings, running)
 
 
 async def request_smoke(
@@ -185,17 +197,22 @@ async def request_smoke(
     async with env.sessions() as session:
         row = await _row(session, provider_id)
         provider, row_id = row.provider, row.id
-    await enforce_rate(
-        env,
-        actor,
-        scope="provider-smoke",
-        limit=SMOKE_RATE_LIMIT,
-        window_s=SMOKE_RATE_WINDOW_S,
-        message="Too many smoke tests; try again later",
-    )
     job_id = uuid.uuid4()
     if not await smoke_lock.acquire(env.redis, provider, job_id):
         raise AppError("CONFLICT", "A smoke test is already running for this provider", http_status=409)
+    try:
+        # Counted only for a smoke that can start: a 409 uses up nothing (backend review 3.1e1 L5).
+        await enforce_rate(
+            env,
+            actor,
+            scope="provider-smoke",
+            limit=SMOKE_RATE_LIMIT,
+            window_s=SMOKE_RATE_WINDOW_S,
+            message="Too many smoke tests; try again later",
+        )
+    except AppError:
+        await smoke_lock.release(env.redis, provider, job_id)
+        raise
     audit = {
         "actor_type": "user",
         "actor_id": str(actor.user_id),

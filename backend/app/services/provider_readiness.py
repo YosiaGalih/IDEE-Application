@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -46,8 +47,20 @@ VerdictReason = Literal[
     "other_mode",
     "models_changed",
     "key_rotated",
+    "key_missing",
+    "endpoint_changed",
     "report_failed",
 ]
+MAX_BASE_URL = 300  # provider_configs.base_url
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerCredentials:
+    """What the worker holds now; 3.1f builds it from the worker's own settings before a model call. The
+    ``api`` process holds none and passes nothing, so its verdict is advisory (no rotation check)."""
+
+    key: str | None
+    base_url: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +86,18 @@ def key_hint(key: str) -> str:
     if len(key) < _HINT_MIN_KEY:
         return "…"
     return f"{key[:7]}…{key[-4:]}"
+
+
+def public_base_url(url: str | None) -> str | None:
+    """The endpoint as stored and shown: scheme, host, port and path. User info, query and fragment are
+    dropped (a gateway URL may carry a token there; backend review 3.1e1 M1); cut to the column's size."""
+    if not url:
+        return None
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    port = f":{parts.port}" if parts.port else ""
+    public = urlunsplit((parts.scheme.lower(), f"{host}{port}", parts.path, "", ""))
+    return public if len(public) <= MAX_BASE_URL else public[: MAX_BASE_URL - 1] + "…"
 
 
 # --- models -------------------------------------------------------------------------------------------------
@@ -140,6 +165,7 @@ async def record_report(
     base_url: str | None,
     pricing_version: str | None,
     models: Mapping[str, str],
+    settings: Settings,
     audit: AuditWriter,
     actor_id: str,
     job_id: uuid.UUID | None = None,
@@ -150,8 +176,10 @@ async def record_report(
     row = await ensure_config(session, report.provider)
     await session.refresh(row, with_for_update=True)
     now = datetime.now(UTC)
+    # A policy changed while the smoke ran: the report stays, but it is not about the models in effect.
+    stale = effective_models(settings, row.model_policy or {}) != dict(models)
     row.llm_provider_mode = report.mode
-    row.readiness_status = "passed" if report.ready else "failed"
+    row.readiness_status = "unknown" if stale else ("passed" if report.ready else "failed")
     row.readiness_checked_at = report.ran_at
     row.readiness_report = {
         **report.to_dict(),
@@ -162,7 +190,7 @@ async def record_report(
     row.secret_hint = key_hint(key) if key else None
     row.secret_fingerprint = key_fingerprint(key) if key else None
     row.secret_checked_at = now
-    row.base_url = base_url
+    row.base_url = public_base_url(base_url)
     row.pricing_version = pricing_version
     await audit.write(
         session,
@@ -180,6 +208,7 @@ async def record_report(
             "skipped": [check.key for check in report.checks if check.status == "skipped"],
             "secret_status": row.secret_status,
             "models": dict(models),
+            "stale": stale,
             "job_id": str(job_id) if job_id else None,
         },
     )
@@ -191,12 +220,13 @@ async def record_report(
 
 
 def provider_ready(
-    row: ProviderConfig | None, settings: Settings, *, key: str | None = None
+    row: ProviderConfig | None, settings: Settings, *, held: WorkerCredentials | None = None
 ) -> ProviderVerdict:
     """Ready only for a passed report of the current ``LLM_PROVIDER`` mode, made with the models in effect
-    now, on an enabled provider. ``key`` is the key this process holds (the worker): a different fingerprint
-    means the key was rotated since the report, so readiness is unknown again. The ``api`` process holds no
-    key and passes none. ``LLM_REQUIRE_READINESS=false`` (refused in production) skips the report."""
+    now, on an enabled provider. ``held`` is what the worker holds now: no key is not ready; another key
+    fingerprint (rotated) or another endpoint than the report used is unknown again. The ``api`` process
+    holds nothing and passes nothing: its verdict cannot see a rotation. ``LLM_REQUIRE_READINESS=false``
+    (refused in production) skips the report."""
     if row is not None and not row.enabled:
         return ProviderVerdict("disabled", "disabled")
     if not settings.llm_require_readiness:
@@ -207,8 +237,13 @@ def provider_ready(
         return ProviderVerdict("unknown", "other_mode")
     if row.readiness_report.get("models") != effective_models(settings, row.model_policy or {}):
         return ProviderVerdict("unknown", "models_changed")
-    if key is not None and row.secret_fingerprint != key_fingerprint(key):
-        return ProviderVerdict("unknown", "key_rotated")
+    if held is not None:
+        if row.llm_provider_mode == "anthropic" and not held.key:
+            return ProviderVerdict("not_ready", "key_missing")
+        if held.key and row.secret_fingerprint != key_fingerprint(held.key):
+            return ProviderVerdict("unknown", "key_rotated")
+        if row.base_url != public_base_url(held.base_url):
+            return ProviderVerdict("unknown", "endpoint_changed")
     if row.readiness_status != "passed":
         return ProviderVerdict("not_ready", "report_failed")
     return ProviderVerdict("ready", "passed")

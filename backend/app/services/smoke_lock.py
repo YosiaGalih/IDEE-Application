@@ -26,6 +26,18 @@ async def acquire(redis: Redis, provider: str, job_id: uuid.UUID) -> bool:
     return bool(await redis.set(lock_key(provider), str(job_id), nx=True, ex=LOCK_TTL_S))
 
 
+_CLAIM = (
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('EXPIRE', KEYS[1], ARGV[2]) end return 0"
+)
+
+
+async def claim(redis: Redis, provider: str, job_id: uuid.UUID) -> bool:
+    """The job starts: true only while ``job_id`` holds the lock, which then gets a full TTL again (a long
+    queue wait must not let it expire mid-run; silent-failure 3.1e1 M5)."""
+    claimed = await redis.eval(_CLAIM, 1, lock_key(provider), str(job_id), str(LOCK_TTL_S))  # type: ignore[misc]
+    return bool(claimed)
+
+
 async def holder(redis: Redis, provider: str) -> str | None:
     value = await redis.get(lock_key(provider))
     return value.decode() if isinstance(value, bytes) else value

@@ -46,8 +46,8 @@ async def record(session: AsyncSession, settings: Settings, rep: ReadinessReport
                  **extra: Any) -> ProviderConfig:  # fmt: skip
     models = service.effective_models(settings, {})
     row = await service.record_report(
-        session, rep, key=key, base_url=extra.get("base_url"), pricing_version="2026-11-08", models=models,
-        audit=AUDIT, actor_id="cli",
+        session, rep, key=key, base_url=extra.get("base_url"), pricing_version="2026-11-08",
+        models=extra.get("models", models), settings=settings, audit=AUDIT, actor_id="cli",
     )  # fmt: skip
     await session.commit()
     return row
@@ -106,7 +106,7 @@ async def test_ready_only_for_a_passed_report_of_the_current_mode_models_and_key
     anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
     assert service.provider_ready(None, anthropic).state == "unknown"
     row = await record(session, anthropic, report("anthropic"))
-    verdict = service.provider_ready(row, anthropic, key=KEY)
+    verdict = service.provider_ready(row, anthropic, held=service.WorkerCredentials(KEY, None))
     assert (verdict.state, verdict.reason, verdict.ready) == ("ready", "passed", True)
     assert service.provider_ready(row, anthropic).ready  # the api process holds no key and does not compare
 
@@ -143,7 +143,9 @@ async def test_changing_the_model_policy_resets_readiness(session: AsyncSession,
     row = await record(session, settings, report())
     assert service.set_model_policy(row, {"fast": "claude-test-fast"}) is True
     assert row.readiness_status == "unknown" and row.model_policy == {"fast": "claude-test-fast"}
-    row2 = await record(session, settings, report())
+    await session.commit()
+    tested = service.effective_models(settings, row.model_policy)  # a smoke of the new policy's models
+    row2 = await record(session, settings, report(), models=tested)
     assert service.set_model_policy(row2, dict(row2.model_policy)) is False  # unchanged: readiness kept
     assert row2.readiness_status == "passed"
 
@@ -152,7 +154,7 @@ async def test_a_rotated_key_is_not_ready_in_the_worker(session: AsyncSession) -
     """Mutant E5: the fingerprint of the key the worker holds now differs from the one that passed."""
     anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=OTHER_KEY)
     row = await record(session, anthropic, report("anthropic"), key=KEY)
-    verdict = service.provider_ready(row, anthropic, key=OTHER_KEY)
+    verdict = service.provider_ready(row, anthropic, held=service.WorkerCredentials(OTHER_KEY, None))
     assert (verdict.state, verdict.reason) == ("unknown", "key_rotated")
 
 
@@ -210,3 +212,72 @@ def test_model_policy_validation_keeps_ids_and_drops_empty_aliases() -> None:
     assert service.validate_model_policy({"fast": "claude-haiku-5-5-20261001"}) == {
         "fast": "claude-haiku-5-5-20261001"
     }
+
+
+# --- review fixes (silent-failure 3.1e1 H1, backend review M1, L3, N9) ----------------------------------
+
+
+async def test_a_worker_that_lost_its_key_is_not_ready(session: AsyncSession) -> None:
+    """The api passes no credentials; a worker without a key passes them as missing: never the same."""
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    verdict = service.provider_ready(row, anthropic, held=service.WorkerCredentials(None, None))
+    assert (verdict.state, verdict.reason) == ("not_ready", "key_missing")
+
+
+async def test_another_endpoint_than_the_report_used_is_not_ready_in_the_worker(
+    session: AsyncSession,
+) -> None:
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"), base_url="https://gateway.example/v1")
+    same = service.WorkerCredentials(KEY, "https://gateway.example/v1")
+    assert service.provider_ready(row, anthropic, held=same).state == "ready"
+    moved = service.WorkerCredentials(KEY, "https://other.example/v1")
+    verdict = service.provider_ready(row, anthropic, held=moved)
+    assert (verdict.state, verdict.reason) == ("unknown", "endpoint_changed")
+
+
+@pytest.mark.parametrize(
+    ("raw", "stored"),
+    [
+        ("https://user:tok3n@gateway.example:8443/v1?key=abc#frag", "https://gateway.example:8443/v1"),
+        ("https://GATEWAY.example", "https://gateway.example"),
+        (None, None),
+    ],
+)
+async def test_the_stored_base_url_carries_no_credentials(
+    session: AsyncSession, settings: Settings, raw: str | None, stored: str | None
+) -> None:
+    row = await record(session, settings, report(), base_url=raw)
+    assert row.base_url == stored
+    assert service.public_base_url(raw) == stored
+
+
+async def test_an_overlong_base_url_is_cut_not_a_lost_report(
+    session: AsyncSession, settings: Settings
+) -> None:
+    row = await record(session, settings, report(), base_url="https://gateway.example/" + "p" * 400)
+    assert row.base_url is not None and len(row.base_url) <= 300 and row.base_url.endswith("…")
+    assert row.readiness_status == "passed"
+
+
+async def test_a_policy_changed_while_the_smoke_ran_records_unknown(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """Backend review N9: the report is kept, but it tested other models than are in effect now."""
+    row = await service.ensure_config(session)
+    row.model_policy = {"fast": "claude-test-fast"}
+    await session.commit()
+    stale = await record(session, settings, report())  # tested the env models, not the new policy
+    assert stale.readiness_status == "unknown" and stale.readiness_report["ready"] is True
+    assert service.provider_ready(stale, settings).reason == "no_report"
+    event = (
+        await session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.action == "provider.readiness_recorded", AuditEvent.resource_id == str(stale.id)
+            )
+            .order_by(AuditEvent.id.desc())
+        )
+    ).first()
+    assert event is not None and event.metadata_["stale"] is True

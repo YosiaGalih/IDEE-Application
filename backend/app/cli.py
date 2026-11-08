@@ -106,7 +106,7 @@ async def _claude_smoke(as_json: bool) -> int:
         try:
             report = await provider_smoke.run_smoke(env, actor_id="cli", job_id=job_id)
         finally:
-            await smoke_lock.release(redis, PROVIDER, job_id)
+            await provider_smoke.release_quietly(redis, PROVIDER, job_id)
     finally:
         await redis.aclose()
         await engine.dispose()
@@ -152,6 +152,11 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_claude_smoke(args.json))
         except ConfigError as exc:
             print(str(exc), file=sys.stderr)
+            return 2
+        except Exception as exc:
+            # Exit 1 means "not ready"; a tool that could not run says so (silent-failure 3.1e1 M4). The
+            # message may carry a URL with a password: the type only.
+            print(f"claude-smoke could not run: {type(exc).__name__}", file=sys.stderr)
             return 2
     if args.command == "seed-agents":
         try:
