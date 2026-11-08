@@ -1,0 +1,213 @@
+"""Provider readiness (ADR-032, FR-045, FR-128, FR-130, FR-158; spec 3.1e Goals 1, 6).
+
+The ``provider_configs`` row holds the last readiness report and the key status *as the worker saw it*: the
+``api`` process never holds the key (Lead decision 3.1e #2, #4), so ``secret_status``, ``secret_hint`` and
+``secret_fingerprint`` come from the worker (CLI, smoke job, or the runtime in 3.1f). This module never
+reads ``Settings.anthropic_api_key``; a caller that holds the key passes it in.
+
+``provider_ready`` is the predicate 3.1f enforces before any model call; ``provider_calls_allowed`` is the
+per-project kill switch; ``resolve_model`` maps an alias to the model id (``model_policy`` over
+``CLAUDE_MODEL_*``, Lead decision 3.1e #5).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Literal
+
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.audit import AuditWriter
+from app.core.config import Settings
+from app.llm.readiness import ReadinessReport
+from app.models.projects import Project
+from app.models.providers import ProviderConfig
+
+PROVIDER = "anthropic"
+MODEL_ALIASES: tuple[str, ...] = ("default", "fast", "complex")
+# A Claude model id as the API names them (claude-sonnet-5-5, claude-haiku-5-5-20261001); no id is hard-coded.
+MODEL_ID = re.compile(r"claude-[a-z0-9]+(?:[.-][a-z0-9]+)*")
+MAX_MODEL_ID = 100
+_HINT_MIN_KEY = 20  # a shorter key would be mostly revealed by prefix + last four
+KILL_SWITCH_KEY = "provider_calls_enabled"
+
+ProviderState = Literal["ready", "not_ready", "disabled", "unknown"]
+VerdictReason = Literal[
+    "passed",
+    "readiness_not_required",
+    "disabled",
+    "no_report",
+    "other_mode",
+    "models_changed",
+    "key_rotated",
+    "report_failed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderVerdict:
+    state: ProviderState
+    reason: VerdictReason
+
+    @property
+    def ready(self) -> bool:
+        return self.state == "ready"
+
+
+# --- key status (the worker's view) -------------------------------------------------------------------------
+
+
+def key_fingerprint(key: str) -> str:
+    """The first 16 hex digits of SHA-256: detects a rotated key, cannot be turned back into it."""
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def key_hint(key: str) -> str:
+    """A masked identifier (FR-128): the vendor prefix and the last four characters, ``sk-ant-…a1b2``."""
+    if len(key) < _HINT_MIN_KEY:
+        return "…"
+    return f"{key[:7]}…{key[-4:]}"
+
+
+# --- models -------------------------------------------------------------------------------------------------
+
+
+def validate_model_policy(raw: Mapping[str, Any]) -> dict[str, str]:
+    """``{alias: model id}``; an empty or null value drops the alias (it then uses ``CLAUDE_MODEL_*``)."""
+    policy: dict[str, str] = {}
+    for alias, value in raw.items():
+        if alias not in MODEL_ALIASES:
+            raise ValueError(f"unknown model alias {alias!r}; expected one of {', '.join(MODEL_ALIASES)}")
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or len(value) > MAX_MODEL_ID or not MODEL_ID.fullmatch(value):
+            raise ValueError(f"model for {alias!r} must be a Claude model id such as claude-<name>")
+        policy[alias] = value
+    return policy
+
+
+def _env_models(settings: Settings) -> dict[str, str]:
+    # Settings fills fast/complex from default when unset.
+    return {
+        "default": settings.claude_model_default,
+        "fast": settings.claude_model_fast or settings.claude_model_default,
+        "complex": settings.claude_model_complex or settings.claude_model_default,
+    }
+
+
+def resolve_model(alias: str, settings: Settings, policy: Mapping[str, Any]) -> str:
+    if alias not in MODEL_ALIASES:
+        raise ValueError(f"unknown model alias {alias!r}")
+    chosen = policy.get(alias)
+    return chosen if isinstance(chosen, str) and chosen else _env_models(settings)[alias]
+
+
+def effective_models(settings: Settings, policy: Mapping[str, Any]) -> dict[str, str]:
+    return {alias: resolve_model(alias, settings, policy) for alias in MODEL_ALIASES}
+
+
+def set_model_policy(row: ProviderConfig, policy: dict[str, str]) -> bool:
+    """Store a validated policy; a change puts readiness back to ``unknown`` (ADR-032). True if changed."""
+    if dict(row.model_policy or {}) == policy:
+        return False
+    row.model_policy = policy
+    row.readiness_status = "unknown"
+    return True
+
+
+# --- the row ------------------------------------------------------------------------------------------------
+
+
+async def ensure_config(session: AsyncSession, provider: str = PROVIDER) -> ProviderConfig:
+    """The provider's row, created with its defaults when missing (idempotent, safe under concurrency)."""
+    await session.execute(
+        insert(ProviderConfig).values(provider=provider).on_conflict_do_nothing(index_elements=["provider"])
+    )
+    return (await session.scalars(select(ProviderConfig).where(ProviderConfig.provider == provider))).one()
+
+
+async def record_report(
+    session: AsyncSession,
+    report: ReadinessReport,
+    *,
+    key: str | None,
+    base_url: str | None,
+    pricing_version: str | None,
+    models: Mapping[str, str],
+    audit: AuditWriter,
+    actor_id: str,
+) -> ProviderConfig:
+    """Write a report the worker produced; the caller commits. ``models`` (what was tested) is stored with
+    it: a report counts only while the effective models are still those (``provider_ready``)."""
+    row = await ensure_config(session, report.provider)
+    await session.refresh(row, with_for_update=True)
+    now = datetime.now(UTC)
+    row.llm_provider_mode = report.mode
+    row.readiness_status = "passed" if report.ready else "failed"
+    row.readiness_checked_at = report.ran_at
+    row.readiness_report = {**report.to_dict(), "models": dict(models)}
+    row.secret_status = "configured" if key else "missing"
+    row.secret_hint = key_hint(key) if key else None
+    row.secret_fingerprint = key_fingerprint(key) if key else None
+    row.secret_checked_at = now
+    row.base_url = base_url
+    row.pricing_version = pricing_version
+    await audit.write(
+        session,
+        actor_type="system",
+        actor_id=actor_id,
+        action="provider.readiness_recorded",
+        result="success",
+        resource_type="provider_config",
+        resource_id=str(row.id),
+        metadata={
+            "provider": report.provider,
+            "mode": report.mode,
+            "ready": report.ready,
+            "failed": [check.key for check in report.checks if check.status == "failed"],
+            "skipped": [check.key for check in report.checks if check.status == "skipped"],
+            "secret_status": row.secret_status,
+            "models": dict(models),
+        },
+    )
+    await session.flush()
+    return row
+
+
+# --- predicates (enforced by 3.1f) --------------------------------------------------------------------------
+
+
+def provider_ready(
+    row: ProviderConfig | None, settings: Settings, *, key: str | None = None
+) -> ProviderVerdict:
+    """Ready only for a passed report of the current ``LLM_PROVIDER`` mode, made with the models in effect
+    now, on an enabled provider. ``key`` is the key this process holds (the worker): a different fingerprint
+    means the key was rotated since the report, so readiness is unknown again. The ``api`` process holds no
+    key and passes none. ``LLM_REQUIRE_READINESS=false`` (refused in production) skips the report."""
+    if row is not None and not row.enabled:
+        return ProviderVerdict("disabled", "disabled")
+    if not settings.llm_require_readiness:
+        return ProviderVerdict("ready", "readiness_not_required")
+    if row is None or row.readiness_status == "unknown" or not row.readiness_report:
+        return ProviderVerdict("unknown", "no_report")
+    if row.llm_provider_mode != settings.llm_provider:
+        return ProviderVerdict("unknown", "other_mode")
+    if row.readiness_report.get("models") != effective_models(settings, row.model_policy or {}):
+        return ProviderVerdict("unknown", "models_changed")
+    if key is not None and row.secret_fingerprint != key_fingerprint(key):
+        return ProviderVerdict("unknown", "key_rotated")
+    if row.readiness_status != "passed":
+        return ProviderVerdict("not_ready", "report_failed")
+    return ProviderVerdict("ready", "passed")
+
+
+def provider_calls_allowed(project: Project) -> bool:
+    """The per-project kill switch (FR-158, ADR-011): absent means on. Anything but ``true`` stops calls, so a
+    malformed value fails closed."""
+    return (project.settings or {}).get(KILL_SWITCH_KEY, True) is True
