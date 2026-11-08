@@ -13,7 +13,7 @@
 | Aset | Mengapa penting | Lokasi |
 |---|---|---|
 | Host VPS & Docker daemon | Kompromi = kompromi seluruh tenant/data (R-01) | host; Docker diakses hanya via `docker-socket-proxy` (ADR-009) |
-| `ANTHROPIC_API_KEY` | Biaya & akses akun Claude | env/secret file `worker` (+`api` untuk smoke) — ADR-004 |
+| `ANTHROPIC_API_KEY` | Biaya & akses akun Claude | env/secret file `worker` saja (smoke test juga berjalan di worker: CLI `claude-smoke` atau job) — ADR-004, ADR-073 |
 | `SECRET_KEY`, `SANDBOX_MANAGER_TOKEN`, password DB/Redis | Integritas sesi, kontrol sandbox, data | env/secret file service terkait |
 | Sesi & token (cookie `kk_session`, CSRF, reset token) | Pengambilalihan akun | DB (`sessions.token_hash`, `password_reset_tokens.token_hash` — sha256) |
 | Source code project pengguna | Kerahasiaan IP pengguna | `WORKSPACE_ROOT/<project>/…`; snippet minimum ke Claude API (§7) |
@@ -117,7 +117,7 @@ Tambahan *(turunan)*: approval memiliki `expires_at` (default 24 jam untuk `appl
 
 | Secret | Disimpan di | Siapa yang membaca | Tidak pernah boleh ada di |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | env/secret file (permission 0400) | `worker`, `api` (smoke test) | browser, DB, log, event, prompt, artefak, sandbox, image, repo |
+| `ANTHROPIC_API_KEY` | env/secret file (permission 0400) | `worker` saja (smoke test = CLI di container worker atau job worker; `api` meminta lewat antrean, ADR-073) | browser, DB, log, event, prompt, artefak, sandbox, image, repo, proses `api` |
 | `SECRET_KEY` | env/secret file | `api`, `worker` | idem |
 | `SANDBOX_MANAGER_TOKEN` | env/secret file | `api`, `worker`, `sandbox-manager` | idem |
 | Password PostgreSQL/Redis (dalam URL) | env/secret file | service terkait | log (URL di-mask), respons API |

@@ -141,7 +141,7 @@ Header: HSTS (`CADDY_HSTS_MAX_AGE`, 0 di dev), CSP `default-src 'self'; script-s
 
 - `.env` (dibuat `scripts/gen-secrets.sh`, mode 600, tidak di-commit) adalah satu-satunya sumber. Compose membacanya via `--env-file` dan memberikan ke tiap service **hanya** variabel yang dibutuhkan (anchor `x-backend-env`, daftar eksplisit untuk sandbox-manager/postgres/redis/caddy).
 - `DATABASE_URL`, `REDIS_URL`, `WORKSPACE_ROOT`, `SANDBOX_MANAGER_URL`, `DOCKER_HOST`, `SANDBOX_PROFILES_PATH`, `AGENT_REGISTRY_PATH` diturunkan compose (tidak bisa salah ketik).
-- `ANTHROPIC_API_KEY` nyata hanya untuk `worker` (+`api`, ADR-004). `migrate`/`scheduler` menerima placeholder non-rahasia karena validator Settings mewajibkan nilai tidak kosong di production.
+- `ANTHROPIC_API_KEY` nyata hanya untuk `worker` (ADR-004, ADR-073: smoke test juga di worker). `migrate`/`scheduler` menerima placeholder non-rahasia karena validator Settings mewajibkan nilai tidak kosong di production.
 - Build: image backend/web/sandbox-manager/egress-proxy/caddy/socket-proxy dibangun lokal (`pull_policy: never`: dibangun bila belum ada, `make up` selalu `--build`; tidak pernah di-pull dari registry publik). CA proxy korporat opsional via BuildKit secret `build_ca` (`KK_BUILD_CA_FILE`), tidak tersimpan di layer.
 
 ## 8. Scale-out (PRD §7.7, ARCHITECTURE §13)

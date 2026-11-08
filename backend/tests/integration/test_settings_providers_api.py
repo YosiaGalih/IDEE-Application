@@ -206,6 +206,7 @@ async def test_disabling_the_provider_is_said(owner: httpx.AsyncClient, engine: 
     "body",
     [
         {"base_url": "https://attacker.example"},
+        {"base_url": "https://attacker.example", "enabled": False},
         {"api_key": "sk-ant-" + "not-a-real-key-000000"},
         {"secret_ref": "OTHER"},
         {"model_policy": {"fast": "gpt-4o"}},

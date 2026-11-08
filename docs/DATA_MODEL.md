@@ -36,7 +36,7 @@ Kunci awal: `feature_flags`, `quotas` (max_projects_per_user, max_workspace_mb),
 ## Projects & repositories (M03, M04)
 
 ### projects
-| id | owner_id fk users restrict | name varchar(120) | slug varchar(140) | description text | stack jsonb (hasil detect: languages, frameworks, package_managers, test_profiles) | workspace_ref varchar(255) (`<project_id>`) | default_branch varchar(100) default `main` | status check in (`active`,`archived`,`deleting_pending_approval`,`deleted`) | settings jsonb (`plan_approval_required`, `auto_remediation`, budget default) | created_at, updated_at |
+| id | owner_id fk users restrict | name varchar(120) | slug varchar(140) | description text | stack jsonb (hasil detect: languages, frameworks, package_managers, test_profiles) | workspace_ref varchar(255) (`<project_id>`) | default_branch varchar(100) default `main` | status check in (`active`,`archived`,`deleting_pending_approval`,`deleted`) | settings jsonb (`plan_approval_required`, `auto_remediation`, `provider_calls_enabled` (kill switch FR-158; tidak ada = `true`, WP-3.1e1), budget default) | created_at, updated_at |
 Unique `(owner_id, slug)`.
 
 ### repositories
@@ -140,7 +140,9 @@ Index `(project_id, status)`.
 ## Provider & usage (M17)
 
 ### provider_configs
-| id | provider check in (`anthropic`) | base_url varchar(300) null | model_policy jsonb (`{default, fast, complex}` model ID) | secret_ref varchar(100) (nama env/secret file, mis. `ANTHROPIC_API_KEY`) | enabled bool | pricing_version varchar(40) | readiness_status check in (`unknown`,`passed`,`failed`) | readiness_checked_at null | readiness_report jsonb (ADR-032) | created_by uuid null | created_at, updated_at |
+| id | provider check in (`anthropic`) unik | base_url varchar(300) null (yang dilaporkan worker; tidak dapat diubah lewat API) | model_policy jsonb default `{}` (`{default?, fast?, complex?}` model ID `claude-…`) | secret_ref varchar(100) default `ANTHROPIC_API_KEY` (nama env/secret file) | enabled bool default true | pricing_version varchar(40) null | llm_provider_mode varchar(16) null check in (`anthropic`,`scripted`) | readiness_status varchar(16) default `unknown` check in (`unknown`,`passed`,`failed`) | readiness_checked_at timestamptz null | readiness_report jsonb default `{}` (ADR-032: bentuk API §11 #8 + `models` yang diuji + `job_id`; teredaksi) | secret_status varchar(16) default `unknown` check in (`unknown`,`configured`,`missing`) | secret_hint varchar(40) null (`sk-ant-…a1b2`) | secret_fingerprint char(16) null check `^[0-9a-f]{16}$` (16 hex pertama SHA-256 key; mendeteksi rotasi, tidak dapat dibalik) | secret_checked_at timestamptz null | created_by uuid fk users set null | created_at, updated_at |
+
+Migrasi 0009 (WP-3.1e1, ADR-073). Key tidak pernah disimpan: kolom `secret_*` adalah yang terakhir dilihat worker (CLI, job smoke, atau runtime 3.1f).
 
 ### usage_records
 | id | project_id | task_id fk null | agent_run_id fk null | provider | model | request_id varchar(120) null | input_tokens / output_tokens / cache_creation_tokens / cache_read_tokens int null | estimated_cost numeric(12,6) null | actual_cost numeric(12,6) null | currency char(3) default `USD` | cost_status check in (`estimated`,`partial`,`actual`,`unavailable`) — `actual` dicadangkan (ADR-025) | pricing_version varchar(40) null | retry_count int | duration_ms int | status varchar(20) | created_at |

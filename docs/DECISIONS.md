@@ -88,7 +88,7 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 **Keputusan:** Git lokal (init, branch, worktree, diff, commit lokal, merge lokal) = P0. Import `git_https` read-only (clone `--depth 1`) dari host allowlist (`github.com`, `gitlab.com`, `codeberg.org`, dapat diubah admin) = P1. Push/PR/merge remote = P2, R3 (approval), credential sebagai `credential_ref`. Force-push = R4 (ditolak).
 
 ## ADR-004 — Claude API key & model
-**Keputusan:** `ANTHROPIC_API_KEY` hanya di env/secret file `worker` (dan `api` untuk smoke test), tidak pernah dikirim ke browser/log/sandbox/DB. Tidak ada endpoint untuk menerima API key. Model ID dari `CLAUDE_MODEL_DEFAULT|FAST|COMPLEX` dan `provider_configs.model_policy`; harga dari `backend/config/pricing.yaml` (berversi, nilai awal ditandai *perlu verifikasi* terhadap halaman harga resmi saat deployment). Budget pilot per task: `TASK_MAX_COST_USD=2.00`, `TASK_MAX_TOKENS=400000`, `CLAUDE_MAX_TOOL_ITERATIONS=40` per agent run, `TASK_MAX_DEBUG_ATTEMPTS=5`.
+**Keputusan:** `ANTHROPIC_API_KEY` hanya di env/secret file `worker` (catatan WP-3.1e: "dan `api` untuk smoke test" dicabut; smoke juga berjalan di worker, ADR-073), tidak pernah dikirim ke browser/log/sandbox/DB. Tidak ada endpoint untuk menerima API key. Model ID dari `CLAUDE_MODEL_DEFAULT|FAST|COMPLEX` dan `provider_configs.model_policy`; harga dari `backend/config/pricing.yaml` (berversi, nilai awal ditandai *perlu verifikasi* terhadap halaman harga resmi saat deployment). Budget pilot per task: `TASK_MAX_COST_USD=2.00`, `TASK_MAX_TOKENS=400000`, `CLAUDE_MAX_TOOL_ITERATIONS=40` per agent run, `TASK_MAX_DEBUG_ATTEMPTS=5`.
 **Konsekuensi:** Readiness gate (`python -m app.cli claude-smoke`) wajib lulus sebelum coding agent diaktifkan (PRD §7.3.6).
 
 ## ADR-005 — Workspace storage
@@ -378,6 +378,18 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 4. `_landed` menerima commit yang mendarat walau git gagal hanya bila keempat bukti terpenuhi: parent, author, pesan, dan index sama dengan tree commit (WP-2.1c I-6). Bukti yang tidak terbaca berarti tidak terbukti.
 5. `ToolPorts.symbols: SymbolIndex` (ADR-022) dengan implementasi `RepoSymbolIndex` di `app.services.repo_index`. Builtin menerapkan policy task; hit tersembunyi tidak meninggalkan jejak.
 **Konsekuensi:** ARCHITECTURE §7 (denylist `.kk/` untuk agent) dan SECURITY_MODEL baris R1 serta §13 diselaraskan. Penolakan kebijakan di handler tetap berstatus `error` sampai gateway mengenal penolakan dari handler (3.1f).
+
+## ADR-073 — Readiness gate provider, key hanya di worker, kill switch per project (WP-3.1e1)
+**Status:** Proposed (Lead, 8 Nov 2026, di bawah mandat PO "jalan tanpa menunggu, catat keputusan Lead, laporkan konflik ke #72"; Keputusan Lead 3.1e #1–#9). Spec: `docs/superpowers/specs/2026-11-08-wp-3.1e-provider-readiness-design.md`.
+**Konteks:** ADR-032 meminta hasil readiness gate disimpan dan memblokir agent LLM; ADR-004 menyebut `api` ikut memegang key untuk smoke test, sedangkan ARCHITECTURE §2, SECURITY_MODEL §7, ADR-053 dan compose menaruh key hanya di worker. API §9 (`{job_id}`) dan §11 #8 (sinkron) memberi dua bentuk respons smoke.
+**Keputusan:**
+1. Key hanya di `worker`. Smoke berjalan di worker (CLI `claude-smoke` di container worker, atau job `provider_smoke`); `api` mengirim job dan membaca hasilnya dari `provider_configs`. Kontrak lint-imports melarang `app.main`/`app.api` mengimpor factory, adapter, `provider_smoke`, dan `app.worker`.
+2. Smoke dari API = job + tunggu terbatas `SMOKE_WAIT_S`: laporan dengan `job_id` yang sama dalam batas → bentuk §11 #8; lewat batas → `202 {job_id}`; smoke lain berjalan → `409`. Satu lock Redis per provider dipakai bersama CLI dan job.
+3. Runner sembilan check lewat port `LLMProvider` saja; detail diredaksi dengan key sebagai literal. `ready` = semua `passed`, kecuali `pricing_verified` boleh `skipped` di luar production (gagal di production bila `verify_before_production`).
+4. Status key dilaporkan worker: `secret_status`, `secret_hint` (`sk-ant-…` + 4 terakhir), `secret_fingerprint` (16 hex pertama SHA-256). Laporan menyimpan model yang diuji. `provider_ready` benar hanya untuk laporan `passed` dari mode `LLM_PROVIDER` yang sama, model efektif yang sama, provider `enabled`, dan (di worker) fingerprint key yang sama.
+5. `model_policy` per alias menimpa `CLAUDE_MODEL_*`; ID divalidasi pola `claude-…`; mengubahnya mengembalikan readiness ke `unknown`. `base_url` dan key tidak dapat diubah lewat API.
+6. Kill switch `projects.settings.provider_calls_enabled` (boolean, tidak ada = `true`; nilai lain = mati). Penegakan runtime (`PROVIDER_DISABLED`, draft bila belum siap) di 3.1f.
+**Konsekuensi:** ADR-004 dikoreksi (catatan di atas); SECURITY_MODEL §1/§6.1, CONFIGURATION, DEPLOYMENT, IMPLEMENTATION_DESIGN_V2 dan RUNBOOK diselaraskan; API §1 menambah `PROVIDER_DISABLED`; DATA_MODEL `provider_configs` menambah kolom status key dan `llm_provider_mode`. Konflik dilaporkan ke #72.
 
 ## Pengecualian keamanan (SECURITY_MODEL §11)
 
