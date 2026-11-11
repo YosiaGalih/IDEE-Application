@@ -82,6 +82,11 @@ describe("ProvidersPage: what the worker reported", () => {
     // F5: the data flow statement (SECURITY_MODEL §7) is on the screen.
     expect(screen.getByRole("heading", { name: id.providers.dataFlowTitle })).toBeInTheDocument();
     expect(screen.getByText(id.providers.dataFlow)).toBeInTheDocument();
+    // A report that counts now is not marked outdated, and nothing says the data is stale.
+    await screen.findByRole("region", { name: id.providers.readiness.title });
+    expect(screen.queryByText(id.providers.readiness.outdated)).toBeNull();
+    expect(screen.queryByText(id.providers.readiness.stale)).toBeNull();
+    expect(screen.queryByText(id.providers.listStale)).toBeNull();
   });
 
   it("colours readiness by whether the report counts now, not by the report's own result (F4)", async () => {
@@ -263,6 +268,68 @@ describe("ProvidersPage: changing models and the provider switch", () => {
     );
     expect(screen.getByText(id.providers.models.saved)).toBeInTheDocument(); // the list read did not wipe it
   });
+
+  it("drops the saved message once the models are edited again (silent-failure L1)", async () => {
+    backend();
+    server.use(http.patch(`${PROVIDERS}/${PROVIDER_ID}`, () => ok(provider())));
+    await open();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: id.providers.models.save }));
+    expect(await screen.findByText(id.providers.models.saved)).toBeInTheDocument();
+    await user.type(screen.getByLabelText(id.providers.models.alias.fast), "x");
+    expect(screen.queryByText(id.providers.models.saved)).toBeNull();
+  });
+
+  it("shows what the server applied even when the list cannot be read again, and says it may be stale (silent-failure H1)", async () => {
+    let listReads = 0;
+    server.use(
+      admin(),
+      http.get(PROVIDERS, () => {
+        listReads += 1;
+        return listReads === 1 ? ok([provider()]) : fail(500, "INTERNAL_ERROR");
+      }),
+      http.get(READINESS, () => ok(readiness())),
+      http.patch(`${PROVIDERS}/${PROVIDER_ID}`, () =>
+        ok(provider({ enabled: false, readiness_effective: { state: "disabled", reason: "disabled" } })),
+      ),
+    );
+    await open();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: id.providers.enabled.disable }));
+    await user.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: id.providers.enabled.confirm }),
+    );
+    expect(await screen.findByText(id.providers.enabled.off)).toBeInTheDocument();
+    expect(screen.queryByText(id.providers.enabled.on)).toBeNull();
+    expect(await screen.findByText(id.providers.listStale)).toBeInTheDocument();
+  });
+
+  it("says when the report on screen could not be read again (silent-failure M1)", async () => {
+    let reads = 0;
+    backend();
+    server.use(
+      http.get(READINESS, () => {
+        reads += 1;
+        return reads === 1 ? ok(readiness()) : fail(500, "INTERNAL_ERROR");
+      }),
+      http.patch(`${PROVIDERS}/${PROVIDER_ID}`, () => ok(provider())),
+    );
+    await open();
+    await screen.findByRole("region", { name: id.providers.readiness.title });
+    expect(screen.queryByText(id.providers.readiness.stale)).toBeNull();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: id.providers.models.save })); // re-reads readiness
+    expect(await screen.findByText(id.providers.readiness.stale)).toBeInTheDocument();
+  });
+
+  it("marks a report that no longer counts as outdated, and a current one not (silent-failure L4)", async () => {
+    backend(
+      [provider()],
+      readiness({ readiness_status: "unknown", effective: { state: "unknown", reason: "models_changed" } }),
+    );
+    await open();
+    expect(await screen.findByText(id.providers.readiness.outdated)).toBeInTheDocument();
+  });
 });
 
 describe("ProvidersPage: smoke test", () => {
@@ -301,6 +368,30 @@ describe("ProvidersPage: smoke test", () => {
     await click();
     expect(await screen.findByText(id.providers.smoke.finished)).toBeInTheDocument();
     await waitFor(() => expect(reads).toBeGreaterThan(1));
+  });
+
+  it("after a 200, claims finished only once readiness shows that job's report (silent-failure M1)", async () => {
+    let afterPost = false;
+    backend([provider()], readiness({ job_id: OTHER_JOB_ID }));
+    server.use(
+      http.get(READINESS, () =>
+        afterPost ? fail(500, "INTERNAL_ERROR") : ok(readiness({ job_id: OTHER_JOB_ID })),
+      ),
+      http.post(SMOKE, () => {
+        afterPost = true;
+        return HttpResponse.json({
+          request_id: "r-3",
+          status: "completed",
+          data: report(),
+          meta: { job_id: JOB_ID, effective: { state: "ready", reason: "passed" } },
+        });
+      }),
+    );
+    await open();
+    await click();
+    expect(await screen.findByText(id.providers.smoke.loading)).toBeInTheDocument();
+    expect(await screen.findByText(id.providers.smoke.readFailed)).toBeInTheDocument();
+    expect(screen.queryByText(id.providers.smoke.finished)).toBeNull();
   });
 
   it("on 202 says it is still running, then shows the result once the report of that job lands (F3)", async () => {
@@ -382,7 +473,7 @@ describe("ProvidersPage: smoke test", () => {
     await waitFor(() => expect(screen.getByText(id.providers.smoke.stillRunning)).toBeInTheDocument());
   });
 
-  it("with no answer, keeps reading until a report other than the one before lands (AG-13 L2)", async () => {
+  it("with no answer, keeps reading, and never claims a new report as its own (AG-13 L2, silent-failure H2)", async () => {
     await withFakeTimers(async () => {
       const state = { posted: false, landed: false };
       backend();
@@ -397,10 +488,40 @@ describe("ProvidersPage: smoke test", () => {
       await click(true);
       expect(await screen.findByText(id.providers.smoke.noAnswer)).toBeInTheDocument();
       expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
-      state.landed = true;
+      state.landed = true; // a report lands, but nothing says whose run made it
       await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS + 50));
-      expect(await screen.findByText(id.providers.smoke.finished)).toBeInTheDocument();
+      expect(await screen.findByText(id.providers.smoke.unconfirmed)).toBeInTheDocument();
+      expect(screen.queryByText(id.providers.smoke.finished)).toBeNull();
     });
+  });
+
+  it("with no answer, nothing running and no new report, says the request may not have arrived", async () => {
+    backend([provider()], readiness({ job_id: OTHER_JOB_ID }));
+    server.use(http.post(SMOKE, () => HttpResponse.error()));
+    await open();
+    await screen.findByRole("region", { name: id.providers.readiness.title });
+    await click();
+    expect(await screen.findByText(id.providers.smoke.noRun)).toBeInTheDocument();
+    expect(screen.queryByText(id.providers.smoke.endedWithout)).toBeNull();
+  });
+
+  it("treats a gateway error page as an unknown outcome and keeps reading (silent-failure M3)", async () => {
+    const state = { posted: false, landed: false };
+    backend();
+    server.use(
+      lockAfterPost(state),
+      http.post(SMOKE, () => {
+        state.posted = true;
+        return new HttpResponse("<html>504 Gateway Time-out</html>", {
+          status: 504,
+          headers: { "Content-Type": "text/html" },
+        });
+      }),
+    );
+    await open();
+    await click();
+    expect(await screen.findByText(id.providers.smoke.noAnswer)).toBeInTheDocument();
+    expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
   });
 
   it("stops waiting after the limit and says so (no endless polling)", async () => {
@@ -443,10 +564,16 @@ describe("ProvidersPage: smoke test", () => {
       await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS * 2));
       expect(await screen.findByText(id.providers.smoke.readFailed)).toBeInTheDocument();
       await act(() => vi.advanceTimersByTimeAsync(SMOKE_WAIT_LIMIT_MS + SMOKE_POLL_MS * 2));
-      expect(await screen.findByText(id.providers.smoke.stalled)).toBeInTheDocument();
+      // It cannot know whether a report came: it says the reads failed, not "no report" (silent-failure M2).
+      expect(await screen.findByText(id.providers.smoke.unreadable)).toBeInTheDocument();
+      expect(screen.queryByText(id.providers.smoke.stalled)).toBeNull();
       const settled = reads;
       await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS * 3));
       expect(reads).toBe(settled);
+      await userEvent
+        .setup({ advanceTimers: vi.advanceTimersByTime })
+        .click(screen.getByRole("button", { name: id.providers.smoke.recheck }));
+      await waitFor(() => expect(reads).toBe(settled + 1));
     });
   });
 

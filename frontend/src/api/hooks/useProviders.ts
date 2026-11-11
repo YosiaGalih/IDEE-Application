@@ -4,6 +4,7 @@ import {
   listProviders,
   patchProvider,
   runSmoke,
+  type Provider,
   type ProviderPatch,
   type Readiness,
 } from "../providers";
@@ -40,6 +41,13 @@ export function usePatchProvider(providerId: string) {
   const client = useQueryClient();
   return useMutation({
     mutationFn: (patch: ProviderPatch) => patchProvider(providerId, patch),
+    // The server's answer is what was applied: shown at once, even if the list read after it fails
+    // (silent-failure 3.1e2 H1).
+    onSuccess: (updated) => {
+      client.setQueryData<Provider[]>(providersKey, (rows) =>
+        rows?.map((row) => (row.id === updated.id ? updated : row)),
+      );
+    },
     // Not awaited: the caller's onSuccess runs before the list read remounts what it re-keys.
     onSettled: () => {
       void client.invalidateQueries({ queryKey: providersKey });

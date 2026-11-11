@@ -974,7 +974,10 @@
         "passed": "Passed",
         "failed": "Failed",
         "skipped": "Skipped"
-      }
+      },
+      "stale": "Readiness could not be read again. What is shown is the earlier read.",
+      "staleAt": "Read at {{when}}.",
+      "outdated": "This report no longer applies to the current settings. Run the smoke test again."
     },
     "checks": {
       "api_key_valid": "API key accepted",
@@ -996,9 +999,16 @@
       "endedWithout": "The smoke test ended without a report (skipped by the worker or failed before recording). Check the audit, then try again.",
       "busy": "Another smoke test is running for this provider.",
       "rateLimited": "Too many smoke tests. Try again later.",
-      "noAnswer": "No answer from the server. The smoke test may still be running; its result shows here once recorded.",
+      "noAnswer": "The outcome of the request is unknown (no readable answer from the server). The smoke test may still be running; its status is read from readiness.",
       "stalled": "No report after 5 minutes. Check the audit, then run it again if needed.",
-      "readFailed": "Readiness could not be read while waiting for the smoke test."
-    }
+      "readFailed": "Readiness could not be read while waiting for the smoke test.",
+      "loading": "The smoke test finished in the worker. Its result is being read.",
+      "unconfirmed": "A newer report exists than the one shown when you pressed the button, but it is not certain it came from your smoke test. Check the audit.",
+      "noRun": "No smoke test is running and there is no new report. The request may not have reached the server, or the run ended without a report. Check the audit, then try again.",
+      "unreadable": "Cannot check whether the smoke test finished: readiness keeps failing to load.",
+      "recheck": "Check again"
+    },
+    "listStale": "The provider list could not be read again. What is shown may be out of date.",
+    "reread": "Read again"
   }
 }

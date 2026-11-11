@@ -45,8 +45,9 @@ export function ModelPolicyForm({ provider, onSavedChange }: Props) {
         trimmed[alias] !== "" && (trimmed[alias].length > MAX_MODEL_ID || !MODEL_ID.test(trimmed[alias])),
     );
     setInvalidAliases(invalid);
-    if (invalid.length > 0 || patch.isPending) return;
+    if (patch.isPending) return;
     onSavedChange(false);
+    if (invalid.length > 0) return;
     const policy = Object.fromEntries(
       MODEL_ALIASES.map((alias) => [alias, trimmed[alias] === "" ? null : trimmed[alias]]),
     ) as Record<ModelAlias, string | null>;
@@ -68,7 +69,10 @@ export function ModelPolicyForm({ provider, onSavedChange }: Props) {
               spellCheck={false}
               maxLength={MAX_MODEL_ID}
               error={invalidAliases.includes(alias) ? t("providers.models.invalid") : undefined}
-              onChange={(event) => setValues((current) => ({ ...current, [alias]: event.target.value }))}
+              onChange={(event) => {
+                onSavedChange(false); // "saved" is about what was sent, not what is typed now
+                setValues((current) => ({ ...current, [alias]: event.target.value }));
+              }}
             />
             <p className="mt-1 break-all font-mono text-xs text-fg-muted">
               {t("providers.models.effective", { model: provider.effective_models[alias] })}

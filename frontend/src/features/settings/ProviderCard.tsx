@@ -105,7 +105,11 @@ export function ProviderCard({ provider }: Props) {
       {readiness.data === undefined ? (
         <QueryFallback query={readiness} />
       ) : (
-        <ReadinessPanel readiness={readiness.data} />
+        <ReadinessPanel
+          readiness={readiness.data}
+          staleSince={readiness.isError ? readiness.dataUpdatedAt : null}
+          onReread={() => void readiness.refetch()}
+        />
       )}
 
       <SmokeTest providerId={provider.id} />

@@ -974,7 +974,10 @@
         "passed": "Lulus",
         "failed": "Gagal",
         "skipped": "Dilewati"
-      }
+      },
+      "stale": "Readiness gagal dibaca ulang. Yang tampil adalah bacaan sebelumnya.",
+      "staleAt": "Dibaca pada {{when}}.",
+      "outdated": "Laporan ini tidak berlaku lagi untuk pengaturan sekarang. Jalankan smoke test lagi."
     },
     "checks": {
       "api_key_valid": "API key diterima",
@@ -996,9 +999,16 @@
       "endedWithout": "Smoke test berakhir tanpa laporan (dilewati worker atau gagal sebelum mencatat). Lihat audit, lalu coba lagi.",
       "busy": "Smoke test lain sedang berjalan untuk provider ini.",
       "rateLimited": "Terlalu banyak smoke test. Coba lagi nanti.",
-      "noAnswer": "Tidak ada jawaban dari server. Smoke test mungkin tetap berjalan; hasilnya tampil di sini begitu tercatat.",
+      "noAnswer": "Hasil permintaan tidak diketahui (tidak ada jawaban yang dapat dibaca dari server). Smoke test mungkin tetap berjalan; statusnya dibaca dari readiness.",
       "stalled": "Belum ada laporan setelah 5 menit. Lihat audit, lalu jalankan lagi bila perlu.",
-      "readFailed": "Readiness tidak dapat dibaca saat menunggu smoke test."
-    }
+      "readFailed": "Readiness tidak dapat dibaca saat menunggu smoke test.",
+      "loading": "Smoke test selesai di worker. Hasilnya sedang dibaca.",
+      "unconfirmed": "Ada laporan yang lebih baru daripada yang tampil saat Anda menekan tombol, tetapi belum pasti dari smoke test Anda. Lihat audit.",
+      "noRun": "Tidak ada smoke test yang berjalan dan tidak ada laporan baru. Permintaan mungkin tidak sampai ke server, atau run berakhir tanpa laporan. Lihat audit, lalu coba lagi.",
+      "unreadable": "Tidak dapat memeriksa apakah smoke test selesai: readiness terus gagal dibaca.",
+      "recheck": "Periksa lagi"
+    },
+    "listStale": "Daftar provider gagal dibaca ulang. Yang tampil mungkin sudah usang.",
+    "reread": "Baca ulang"
   }
 }

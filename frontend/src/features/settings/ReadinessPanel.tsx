@@ -2,6 +2,7 @@ import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { CHECK_KEYS, type Readiness, type Verdict } from "@/api/providers";
 import { Alert } from "@/components/ui/Alert";
+import { Button } from "@/components/ui/Button";
 import { CheckBadge, useDateTimeFormat, VerdictBadge } from "./providerStatus";
 
 const KNOWN_REASONS = [
@@ -50,10 +51,15 @@ export function VerdictLine({ verdict, hasAlert = false }: VerdictLineProps) {
   );
 }
 
-type Props = { readiness: Readiness };
+type Props = {
+  readiness: Readiness;
+  /** When the last read failed: the time the shown data was read (silent-failure 3.1e2 M1). */
+  staleSince?: number | null;
+  onReread?: () => void;
+};
 
 /** The last report (API §11.3) with every check by its own label; details are server text, shown as text. */
-export function ReadinessPanel({ readiness }: Props) {
+export function ReadinessPanel({ readiness, staleSince = null, onReread }: Props) {
   const { t } = useTranslation();
   const headingId = useId();
   const dateTime = useDateTimeFormat();
@@ -62,6 +68,19 @@ export function ReadinessPanel({ readiness }: Props) {
       <h3 id={headingId} className="text-lg font-semibold">
         {t("providers.readiness.title")}
       </h3>
+      {staleSince !== null ? (
+        <Alert tone="warning">
+          <p>{t("providers.readiness.stale")}</p>
+          <p className="mt-1">
+            {t("providers.readiness.staleAt", { when: dateTime.format(new Date(staleSince)) })}
+          </p>
+          {onReread ? (
+            <Button variant="secondary" size="sm" className="mt-2" onClick={onReread}>
+              {t("providers.reread")}
+            </Button>
+          ) : null}
+        </Alert>
+      ) : null}
       <VerdictLine verdict={readiness.effective} hasAlert />
       <p className="text-sm text-fg-muted">
         {readiness.checked_at
@@ -76,6 +95,10 @@ export function ReadinessPanel({ readiness }: Props) {
           <p className="text-sm">
             {t(`providers.readiness.reportResult.${readiness.report_ready ? "passed" : "failed"}`)}
           </p>
+          {readiness.effective.state === "unknown" ? (
+            // Mode, models, key or endpoint moved since this report: its result no longer counts (L4).
+            <p className="text-sm font-medium">{t("providers.readiness.outdated")}</p>
+          ) : null}
           <ul className="divide-y divide-line rounded-[var(--radius-control)] border border-line">
             {readiness.checks.map((check) => (
               <li

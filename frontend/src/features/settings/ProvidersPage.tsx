@@ -1,6 +1,8 @@
 import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { useProviders } from "@/api/hooks/useProviders";
+import { Alert } from "@/components/ui/Alert";
+import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { StateView } from "@/components/ui/StateView";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
@@ -26,6 +28,15 @@ export function ProvidersPage() {
   } else {
     body = (
       <div className="space-y-5">
+        {providers.isError ? (
+          // A later read failed: the rows stay, but they are said to be possibly out of date.
+          <Alert tone="warning">
+            <p>{t("providers.listStale")}</p>
+            <Button variant="secondary" size="sm" className="mt-2" onClick={() => void providers.refetch()}>
+              {t("providers.reread")}
+            </Button>
+          </Alert>
+        ) : null}
         {providers.data.map((provider) => (
           <ProviderCard key={provider.id} provider={provider} />
         ))}
