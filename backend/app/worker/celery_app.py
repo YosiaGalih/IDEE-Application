@@ -5,6 +5,8 @@
 - **JSON only.** Pickle is never accepted.
 - **At-least-once delivery.** ``acks_late`` with ``reject_on_worker_lost`` redelivers a task when its
   worker dies; the task lease (``workflow.lease``) makes a duplicate delivery harmless (NFR-05).
+- **Prices before work.** A worker loads ``PRICING_PATH`` while it is built and refuses to start without a
+  valid table (``app.worker.pricing``, WP-3.1f1).
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from app.worker.platform_jobs import (
     PROJECTS_PURGE_SECONDS,
     PROJECTS_PURGE_TASK,
 )
+from app.worker.pricing import PRICING_PATH_CONF, PricingStep
 
 RECOVERY_SWEEP_SECONDS = 30.0  # ARCHITECTURE §5.3
 
@@ -46,6 +49,7 @@ def create_celery(settings: Settings) -> Celery:
         worker_hijack_root_logger=False,  # logging goes through core.logging (redaction), see setup_logging
         broker_connection_retry_on_startup=True,
         timezone="UTC",
+        **{PRICING_PATH_CONF: settings.pricing_path},
         beat_schedule={
             "recovery-sweep": {
                 "task": "app.worker.jobs.recovery_sweep",
@@ -66,6 +70,9 @@ def create_celery(settings: Settings) -> Celery:
             },
         },
     )
+    if app.steps is None:  # typed optional; Celery always builds it, and a worker must never skip the step
+        raise RuntimeError("Celery app has no bootstep registry")
+    app.steps["worker"].add(PricingStep)  # worker processes only: beat and the api never load prices
     return app
 
 

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from app.core.config import load_settings
 from app.worker.celery_app import create_celery
 from tests.conftest import make_test_env
@@ -90,3 +94,75 @@ def test_approvals_sweep_and_purge_are_scheduled() -> None:
     purge = conf.beat_schedule["projects-purge"]
     assert (purge["task"], purge["schedule"]) == (platform_jobs.PROJECTS_PURGE_TASK, 3600.0)
     assert purge["options"]["expires"] < 3600.0
+
+
+# --- the pricing table is loaded when a worker is built (WP-3.1f1 Task 5; Keputusan Lead #10) ---
+
+BROKEN_PRICING = {
+    "missing": None,
+    "broken YAML": "version: [unclosed",
+    "a zero price": (Path(__file__).resolve().parents[2] / "config" / "pricing.yaml")
+    .read_text(encoding="utf-8")
+    .replace('input: "4"', 'input: "0"'),
+}
+REPO_PRICING = Path(__file__).resolve().parents[2] / "config" / "pricing.yaml"
+
+
+def test_pricing_step_is_part_of_the_worker() -> None:
+    from app.worker.pricing import PRICING_PATH_CONF, PricingStep
+
+    settings = load_settings(make_test_env(PRICING_PATH="/srv/pricing.yaml"))
+    app = create_celery(settings)
+    assert PricingStep in app.steps["worker"]
+    assert app.conf[PRICING_PATH_CONF] == settings.pricing_path == "/srv/pricing.yaml"
+
+
+def test_pricing_step_holds_the_table(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    from app.worker import pricing
+    from app.worker.pricing import PricingNotLoaded, PricingStep, worker_pricing
+
+    monkeypatch.setattr(pricing, "_held", None)
+    with pytest.raises(PricingNotLoaded):
+        worker_pricing()
+    app = create_celery(load_settings(make_test_env(PRICING_PATH=str(REPO_PRICING))))
+    PricingStep(SimpleNamespace(app=app))
+    assert worker_pricing().version == "2026-11-05"
+
+
+@pytest.mark.parametrize("case", list(BROKEN_PRICING))
+def test_building_a_worker_fails_on_a_broken_pricing_file(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+    case: str,
+) -> None:
+    from app.llm.pricing import PricingError
+    from app.worker import pricing
+
+    monkeypatch.setattr(pricing, "_held", None)
+    path = tmp_path / "pricing.yaml"
+    content = BROKEN_PRICING[case]
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    app = create_celery(load_settings(make_test_env(PRICING_PATH=str(path))))
+    # The steps' __init__ run before any include/create, so this never reaches the broker.
+    with pytest.raises(PricingError):
+        app.WorkController(app=app, pool_cls="solo")
+    assert pricing._held is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_signal_receivers_cannot_stop_the_worker() -> None:
+    """Why a bootstep and not a signal: Celery's Signal.send catches what a receiver raises, logs it and
+    returns it, so a worker_init receiver that fails to load prices would let the worker serve anyway."""
+    from celery import signals
+
+    def broken(**_: object) -> None:
+        raise RuntimeError("pricing failed")
+
+    signals.worker_init.connect(broken, weak=False)
+    try:
+        responses = signals.worker_init.send(sender=None)
+    finally:
+        signals.worker_init.disconnect(broken)
+    assert any(isinstance(result, RuntimeError) for _, result in responses)
