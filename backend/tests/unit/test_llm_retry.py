@@ -482,3 +482,52 @@ async def test_before_attempt_is_not_called_once_cancelled() -> None:
     assert raised.value.kind == "cancelled"
     assert log.events == []
     assert provider.calls == 0
+
+
+# --- a ledger failure while a cancel is reported (review L7) ----------------------------------------------
+
+
+async def test_a_ledger_failure_during_a_cancel_still_cancels_and_is_logged() -> None:
+    """The caller is going away, so the cancel wins; the lost ledger row is logged, never silent, and the
+    CancelledError carries the ledger error as its cause."""
+    from structlog.testing import capture_logs
+
+    entered = asyncio.Event()
+
+    class Hanging(FakeProvider):
+        async def create_message(self, req, *, on_text_delta=None, cancel=None):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class LedgerDown(Exception):
+        pass
+
+    async def on_attempt(record: AttemptRecord) -> None:
+        raise LedgerDown("usage_records is unavailable")
+
+    req = LLMRequest(
+        model="claude-test-model",
+        system="the secret system prompt",
+        messages=(Message("user", "the secret user text"),),
+        metadata={"call_id": "call-7"},
+    )
+    with capture_logs() as logs:
+        caller = asyncio.create_task(create_with_retry(Hanging([]), req, on_attempt=on_attempt))
+        await asyncio.wait_for(entered.wait(), 5)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await caller
+    assert caller.cancelled()
+    assert isinstance(raised.value.__cause__, LedgerDown)
+    assert [log for log in logs if log["event"] == "usage_attempt_unrecorded"] == [
+        {
+            "event": "usage_attempt_unrecorded",
+            "log_level": "error",
+            "call_id": "call-7",
+            "attempt": 1,
+            "error_type": "LedgerDown",
+        }
+    ]
+    assert "secret" not in repr(logs)  # no prompt or message text in the event

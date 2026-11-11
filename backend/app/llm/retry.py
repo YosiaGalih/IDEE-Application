@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from app.core.cancel import CancelToken
+from app.core.logging import get_logger
 from app.llm.base import ErrorKind, LLMError, LLMProvider, LLMRequest, LLMResponse, TextDeltaHandler, Usage
 
 
@@ -49,6 +50,8 @@ class AttemptRecord:
     status: Literal["ok", "error", "cancelled"]
     error_kind: ErrorKind | None  # None for an unexpected (non-LLMError) failure
 
+
+_log = get_logger(__name__)
 
 AttemptHandler = Callable[[AttemptRecord], Awaitable[None]]
 RestartHandler = Callable[[int], Awaitable[None]]
@@ -98,10 +101,20 @@ async def create_with_retry(
                 raise
             await _pause(delay, sleep, cancel)
             continue
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             # The caller was cancelled mid-attempt: the request still reached the provider. Its usage is not
             # known here, so the record says so (None, priced "unavailable"), never zero.
-            await _report(on_attempt, provider, req, attempt, started, cancelled=True)
+            try:
+                await _report(on_attempt, provider, req, attempt, started, cancelled=True)
+            except Exception as unrecorded:
+                # The cancel still wins (review L7), but a lost ledger row is never silent: ids only, no text.
+                _log.error(
+                    "usage_attempt_unrecorded",
+                    call_id=req.metadata.get("call_id"),
+                    attempt=attempt,
+                    error_type=type(unrecorded).__name__,
+                )
+                raise cancelled from unrecorded
             raise
         except Exception:
             await _report(on_attempt, provider, req, attempt, started, unexpected=True)
