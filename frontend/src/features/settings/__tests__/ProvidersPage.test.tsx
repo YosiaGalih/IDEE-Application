@@ -1,6 +1,6 @@
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { http, HttpResponse } from "msw";
+import { delay, http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { API, deferred, fail, ok, pendingApprovals, renderApp, signedInWith } from "@/__tests__/harness";
@@ -14,6 +14,7 @@ import {
   report,
 } from "@/__tests__/providerFixtures";
 import { SMOKE_POLL_MS, SMOKE_WAIT_LIMIT_MS } from "@/api/hooks/useProviders";
+import { SMOKE_TIMEOUT_MS } from "@/api/providers";
 import id from "@/i18n/locales/id.json";
 
 const server = setupServer(pendingApprovals());
@@ -392,6 +393,8 @@ describe("ProvidersPage: smoke test", () => {
     expect(await screen.findByText(id.providers.smoke.loading)).toBeInTheDocument();
     expect(await screen.findByText(id.providers.smoke.readFailed)).toBeInTheDocument();
     expect(screen.queryByText(id.providers.smoke.finished)).toBeNull();
+    // Its lock is released: another click now would start a second paid run.
+    expect(screen.getByRole("button", { name: id.providers.smoke.run })).toBeDisabled();
   });
 
   it("on 202 says it is still running, then shows the result once the report of that job lands (F3)", async () => {
@@ -496,13 +499,53 @@ describe("ProvidersPage: smoke test", () => {
   });
 
   it("with no answer, nothing running and no new report, says the request may not have arrived", async () => {
+    let posts = 0;
     backend([provider()], readiness({ job_id: OTHER_JOB_ID }));
-    server.use(http.post(SMOKE, () => HttpResponse.error()));
+    server.use(
+      http.post(SMOKE, () => {
+        posts += 1;
+        return HttpResponse.error();
+      }),
+    );
     await open();
     await screen.findByRole("region", { name: id.providers.readiness.title });
     await click();
     expect(await screen.findByText(id.providers.smoke.noRun)).toBeInTheDocument();
     expect(screen.queryByText(id.providers.smoke.endedWithout)).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 1_100)); // past any retry delay
+    expect(posts).toBe(1); // a lost answer is never sent again (AG-13 delta LOW-3)
+  });
+
+  it("treats the client's own 60 s limit as no answer, and sends nothing again (AG-13 delta LOW-3)", async () => {
+    const limit = new AbortController();
+    const original = AbortSignal.timeout.bind(AbortSignal);
+    const spy = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation((ms) => (ms === SMOKE_TIMEOUT_MS ? limit.signal : original(ms)));
+    try {
+      let posts = 0;
+      const state = { posted: false, landed: false };
+      backend();
+      server.use(
+        lockAfterPost(state),
+        http.post(SMOKE, async () => {
+          posts += 1;
+          state.posted = true;
+          await delay("infinite");
+          return HttpResponse.json({});
+        }),
+      );
+      await open();
+      await click();
+      await waitFor(() => expect(posts).toBe(1));
+      limit.abort(new DOMException("The operation timed out.", "TimeoutError"));
+      expect(await screen.findByText(id.providers.smoke.noAnswer)).toBeInTheDocument();
+      expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      expect(posts).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("treats a gateway error page as an unknown outcome and keeps reading (silent-failure M3)", async () => {
@@ -577,6 +620,44 @@ describe("ProvidersPage: smoke test", () => {
     });
   });
 
+  it("stops reading a run it did not start once reads keep failing past the limit (AG-13 delta LOW-1)", async () => {
+    await withFakeTimers(async () => {
+      let reads = 0;
+      backend();
+      server.use(
+        http.get(READINESS, () => {
+          reads += 1;
+          return reads === 1
+            ? ok(readiness({ job_id: OTHER_JOB_ID, running_job_id: JOB_ID }))
+            : fail(503, "DEPENDENCY_UNAVAILABLE");
+        }),
+      );
+      await open();
+      expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
+      // A run we did not start is read every few seconds while it holds the lock; failing reads end that.
+      await act(() => vi.advanceTimersByTimeAsync(SMOKE_WAIT_LIMIT_MS + SMOKE_POLL_MS * 3));
+      expect(await screen.findByText(id.providers.smoke.unreadable)).toBeInTheDocument();
+      const settled = reads;
+      await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS * 5));
+      expect(reads).toBe(settled);
+    });
+  });
+
+  it("keeps the button off until readiness has been read, so a new report can be told apart (AG-13 delta LOW-2)", async () => {
+    const held = deferred();
+    backend();
+    server.use(
+      http.get(READINESS, async () => {
+        await held.gate;
+        return ok(readiness());
+      }),
+    );
+    await open();
+    expect(await screen.findByRole("button", { name: id.providers.smoke.run })).toBeDisabled();
+    held.release();
+    await waitFor(() => expect(screen.getByRole("button", { name: id.providers.smoke.run })).toBeEnabled());
+  });
+
   it("shows a run already going (another admin, the CLI, or before navigating away) and keeps the button off", async () => {
     backend([provider()], readiness({ job_id: OTHER_JOB_ID, running_job_id: JOB_ID }));
     await open();
@@ -596,11 +677,15 @@ describe("ProvidersPage: smoke test", () => {
       }),
     );
     await open();
-    const user = userEvent.setup();
     const button = await screen.findByRole("button", { name: id.providers.smoke.run });
-    await user.click(button);
-    await user.click(button);
-    await user.click(button);
+    await waitFor(() => expect(button).toBeEnabled());
+    // In one act: no re-render between the clicks, so only the guard stops the second and third.
+    act(() => {
+      button.click();
+      button.click();
+      button.click();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
     held.release();
     await screen.findByText(id.states.provider_degraded.title);
     await new Promise((resolve) => setTimeout(resolve, 50));

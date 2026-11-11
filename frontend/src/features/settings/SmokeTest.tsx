@@ -29,7 +29,8 @@ type Read = { data?: Readiness | undefined; dataUpdatedAt: number; errorUpdatedA
  * Where the smoke stands, from the last readiness read (spec WP-3.1e2 Lead 4). Only reads made after the
  * request decide: the one cached from before would say nothing runs. "Finished" only when the report on
  * screen is this run's (silent-failure 3.1e2 H2, M1).
- * - Idle, but a run holds the lock (another admin, the CLI, or ours before navigating away): running.
+ * - Idle, but a run holds the lock (another admin, the CLI, or ours before navigating away): running, until
+ *   reads have failed for longer than the limit.
  * - Known job: its report on screen → finished; the lock held by it → running; neither → ended without a
  *   report (or, after a 200, replaced by a newer report: unconfirmed).
  * - No answer: a run holds the lock → running; a report newer than the one shown at the click →
@@ -38,7 +39,11 @@ type Read = { data?: Readiness | undefined; dataUpdatedAt: number; errorUpdatedA
  */
 function phaseOf(run: Run, read: Read): Phase {
   const { data } = read;
-  if (run.kind === "idle") return data?.running_job_id ? "running" : "idle";
+  if (run.kind === "idle") {
+    if (!data?.running_job_id) return "idle";
+    // A run we did not start is read while it holds the lock, but not forever once reads fail (AG-13 delta LOW-1).
+    return read.errorUpdatedAt - read.dataUpdatedAt > SMOKE_WAIT_LIMIT_MS ? "unreadable" : "running";
+  }
   const { jobId, before, since, isRecorded } = run.wait;
   const pending: Phase = isRecorded ? "loading" : "running";
   // Reads that keep failing still count against the limit: their attempts end the wait too (AG-13 L1).
@@ -120,7 +125,12 @@ export function SmokeTest({ providerId }: Props) {
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-3">
-        <Button onClick={handleStart} disabled={smoke.isPending || phase === "running"}>
+        {/* Off until readiness is read: the report shown at the click tells a new one apart (AG-13 delta
+            LOW-2); off while a run is read, its own lock already released after a 200 included. */}
+        <Button
+          onClick={handleStart}
+          disabled={smoke.isPending || POLLING.has(phase) || readiness.data === undefined}
+        >
           {smoke.isPending ? t("providers.smoke.running") : t("providers.smoke.run")}
         </Button>
         <p className="text-sm text-fg-muted">{t("providers.smoke.cost")}</p>

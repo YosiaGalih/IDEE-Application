@@ -903,7 +903,7 @@
   "providers": {
     "lead": "Status provider LLM seperti yang terakhir dilihat worker. Key tidak pernah diatur atau ditampilkan di sini.",
     "dataFlowTitle": "Data yang dikirim ke Claude Platform API",
-    "dataFlow": "Untuk menjalankan agent, KodeKantor mengirim potongan kode yang relevan, instruksi Anda, ringkasan hasil tool, dan cuplikan log ke Claude Platform API (Anthropic). File rahasia (.env, kunci, kredensial), folder dependensi/build, dan path di .agentignore tidak pernah dikirim; secret yang terdeteksi disamarkan. Admin dapat menonaktifkan provider di halaman ini. Pemanggilan provider juga dapat dihentikan per project lewat pengaturan project (saat ini lewat API; layarnya menyusul).",
+    "dataFlow": "Untuk menjalankan agent, KodeKantor mengirim potongan kode yang relevan, instruksi Anda, ringkasan hasil tool, dan cuplikan log ke Claude Platform API (Anthropic). File rahasia (.env, kunci, kredensial), folder dependensi/build, dan path di .agentignore tidak pernah dikirim; secret yang terdeteksi disamarkan. Admin dapat menonaktifkan provider di Pengaturan → Provider & model. Pemanggilan provider juga dapat dihentikan per project lewat pengaturan project (saat ini lewat API; layarnya menyusul).",
     "empty": "Belum ada provider.",
     "none": "—",
     "endpoint": "Endpoint",

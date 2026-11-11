@@ -903,7 +903,7 @@
   "providers": {
     "lead": "LLM provider status as the worker last saw it. The key is never set or shown here.",
     "dataFlowTitle": "Data sent to the Claude Platform API",
-    "dataFlow": "To run agents, KodeKantor sends relevant code snippets, your instructions, tool result summaries and log excerpts to the Claude Platform API (Anthropic). Secret files (.env, keys, credentials), dependency/build folders and paths in .agentignore are never sent; detected secrets are masked. Admins can disable the provider on this page. Provider calls can also be stopped per project through the project settings (through the API for now; the screen comes later).",
+    "dataFlow": "To run agents, KodeKantor sends relevant code snippets, your instructions, tool result summaries and log excerpts to the Claude Platform API (Anthropic). Secret files (.env, keys, credentials), dependency/build folders and paths in .agentignore are never sent; detected secrets are masked. Admins can disable the provider in Settings → Providers & models. Provider calls can also be stopped per project through the project settings (through the API for now; the screen comes later).",
     "empty": "No provider yet.",
     "none": "—",
     "endpoint": "Endpoint",
