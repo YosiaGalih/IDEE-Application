@@ -2313,3 +2313,71 @@ $ uv run pytest -q -p no:cacheprovider          # suite penuh, sendirian, DB kod
 - **3.1f/3.2:** membuat worktree task + `base_commit`; satu panggilan tool per task (commit dan sandbox tidak bersamaan); `test_prompt_injection.py` ujung-ke-ujung memakai `code.write_file` dengan path `/etc/passwd` (fixture SECURITY_MODEL T1).
 - **WP `tests.run` (R2):** laporan test di `.kk/` dibaca sebagai bukti hanya dari run sandbox itu sendiri (agent tidak dapat menulis `.kk/`, tetapi kode sandbox dapat).
 - **Review-first:** diff task, termasuk berkas di atas `AGENT_READ_LIMIT` yang ikut commit, ditinjau manusia sebelum apply (SECURITY_MODEL §13).
+
+
+### WP-3.1e1 (🔒 pengaturan provider, readiness gate, kill switch) — `provider_configs`, runner sembilan check, `claude-smoke` + job worker, `/settings/providers*`, `/agents` mengikuti verdict provider, `provider_calls_enabled` (FR-045 bagian, FR-128, FR-130, FR-135, FR-158; ADR-004, ADR-011, ADR-032, ADR-053)
+
+Spec: `docs/superpowers/specs/2026-11-08-wp-3.1e-provider-readiness-design.md` (Goals 3.1e1, Keputusan Lead 3.1e #1–#10, Review Focus 3.1e1). Plan: `docs/superpowers/plans/2026-11-08-wp-3.1e1-provider-readiness.md`. ADR-073 (Proposed).
+
+**Syarat WP-3.1d2b yang dicatat di sini [Pasti]:** PR #26 CI 9/9 `success` di b7742c5. Run pertama di 8473a5c merah di `security-scan`: gitleaks `generic-api-key` menandai `symbol_kind=` sesudah nama simbol fixture `add_key` (entropi 3,58; bukan secret). Ditutup dengan fingerprint di `.gitleaksignore` dan fixture `add_hidden`. PR #26 di-merge PO (merge commit ee6e032, 8 Nov 2026); tree `main` sesudah merge identik dengan head PR yang diuji.
+
+**Keterbatasan nyata:** belum ada yang memanggil predikat di runtime. `provider_ready(..., held=WorkerCredentials)` dan `provider_calls_allowed` ditegakkan oleh AgentRuntime di 3.1f. Sampai saat itu, verdict di `api` (layar, `/agents`) bersifat informatif dan tidak melihat rotasi key. Smoke dengan key sungguhan adalah gate WP-INT-07.
+
+**Bukti:**
+
+```text
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports   # @ 71438fb
+All checks passed! · 270 files already formatted · 0 errors · Contracts: 6 kept, 0 broken
+$ uv run pytest -q -p no:cacheprovider          # suite penuh, sendirian, DB kodekantor_test_wt
+2858 passed in 350.49s (0:05:50)        # @ 71438fb
+$ python3 -m unittest discover -s infra/tests
+Ran 112 tests · OK (skipped=1)
+```
+
+- Test per bagian:
+  - unit: `tests/unit/test_llm_readiness.py` (sembilan check dengan `ScriptedProvider`, provider palsu yang menggagalkan tiap check, adapter Anthropic di atas Messages API palsu termasuk timeout/cancel, provider yang mengabaikan batas waktunya, canary log, model default yang ditolak), `tests/unit/test_agent_readiness.py` (`provider_disabled`);
+  - integrasi:
+    - `test_provider_tables.py` (migrasi 0009, CHECK, default, round trip);
+    - `test_provider_readiness.py` (rekam laporan, verdict: mode lain, model berubah, key dirotasi, key hilang, endpoint lain, laporan basi);
+    - `test_claude_smoke.py` (exit code 0/1/2/3, lock bersama, job yang di-skip diaudit, run yang crash atau melewati 150 dtk tetap mencatat laporan gagal);
+    - `test_settings_api.py` (empat route, 200/202/409/503/429, PATCH menolak `base_url`/key, audit, `test_provider_key_masked` untuk AC-15);
+    - `test_agents_api.py` (verdict provider);
+    - `test_projects.py` (kunci `provider_calls_enabled`);
+  - keamanan:
+    - `tests/security/test_provider_secrets.py` (key tidak pernah ada di respons/laporan/audit; tidak ada modul yang diimpor `api` membaca `anthropic_api_key`);
+    - `tests/security/test_provider_controls.py` (regresi AG-13 M1, M2, L2, L3, N2).
+- Mutan E1–E30 satu per satu pada kode akhir: **30/30 merah** (E1–E30). E1–E12 dari plan; E13–E30 dari review (lihat tabel). Skrip dan keluarannya tersimpan.
+- **Penyimpangan proses:** test runner dan service hijau begitu modulnya ada, jadi "merah"-nya hanya karena modul belum ada. Kompensasinya mutan di atas. Perbaikan review memakai test merah dulu.
+- **Flake lokal:** `tests/security/test_search_inputs.py::test_a_large_search_output_never_blocks_the_loop` (batas jeda event loop 0,5 dtk) gagal dua kali di suite penuh lokal saat tiga sampai empat reviewer menjalankan pytest bersamaan di mesin yang sama, dan lulus saat dijalankan sendirian dan di CI. Bukan kode WP ini (pencarian WP-2.1d).
+
+**Review:**
+
+| Review | Hasil | Penutupan |
+|---|---|---|
+| `kk-backend-reviewer` @ d8a1924 | **APPROVE WITH NITS**, tanpa CRITICAL/HIGH | 19313cb:<br>- M1: `base_url` disimpan tanpa user info/query, dipotong 300.<br>- M2: job yang di-skip diaudit.<br>- L3: `WorkerCredentials`.<br>- L4: `ready` §11.3.<br>- L5: rate limit dihitung sesudah lock.<br>- L6: GET menulis hanya pada baca pertama.<br>- N7: `StrictBool`.<br>- N8: hard kill ditutup batas run.<br>- N9: test policy berubah saat smoke. |
+| `kk-silent-failure-hunter` @ d8a1924 | 1 HIGH, 5 MEDIUM, 4 LOW | 19313cb:<br>- run yang crash atau > 150 dtk mencatat laporan gagal;<br>- job meng-`claim` dan memperpanjang lock;<br>- `provider.smoke_skipped`;<br>- CLI exit 2;<br>- §11.3 `ready`/`report_ready`;<br>- batas waktu luar per panggilan;<br>- canary log;<br>- laporan basi `unknown`.<br>**Tidak dikerjakan (penilaian):** umur maksimum laporan. Perubahan dideteksi lewat mode, model, fingerprint, dan endpoint; error `auth` di runtime → `unknown` dibawa ke 3.1f. |
+| AG-13 @ d8a1924 | **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH.<br>- M1: kredensial gateway di `base_url`.<br>- M2: kill switch bisa dinyalakan kembali oleh `project:write` (UC-10 menyebut admin).<br>- L1: lock bisa kedaluwarsa.<br>- L2: hint `key[:7]`.<br>- L3: alias dipantulkan di 422.<br>- L4: suite merah (`test_config`; urutan test). | - 19313cb: M1, L1, L4a.<br>- 5abecc0: M2 (Keputusan Lead #10), L2, L3, L4b. |
+| AG-13 delta @ 5abecc0 | **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH. M1, M2, L1–L4 terpenuhi.<br>- N1 (LOW): handler 422 memantulkan kunci dict dan nama field asing di `loc`, untuk semua route.<br>- N2 (INFO): `;params`/token di path `base_url`; port tidak valid menghilangkan laporan. | - N2 ditutup: parameter path dibuang, URL diredaksi, port tidak valid → `[invalid base url]` dengan laporan tetap tercatat; test di `tests/security/test_provider_controls.py`.<br>- N1 dibawa (di bawah). |
+| `/code-review` (Standards + Spec) @ 5abecc0 | Standards:<br>- test regresi keamanan tidak di `tests/security/`;<br>- lokasi AC-15 (`test_settings_api.py::test_provider_key_masked`);<br>- route tanpa schema respons;<br>- tracker;<br>- konflik 202 + polling vs SSE, CONFIGURATION non-Settings;<br>- smell (`to_dict` berulang, `get_provider` tak terpakai, nama).<br>Spec:<br>- smoke 409/429 tidak diaudit;<br>- `ready` bermakna ganda;<br>- `true` saat sudah menyala ditolak;<br>- model default salah tercatat di `api_key_valid` saja;<br>- rotasi hanya di worker (diakui ADR). | Commit ini:<br>- test dipindah;<br>- file `test_settings_api.py` + `test_provider_key_masked`;<br>- schema `ProviderOut`/`ReadinessOut`/`ReportOut`;<br>- audit `denied`;<br>- §11.3 tanpa `ready` (pakai `report_ready` + `effective`, dan `meta.effective` di jawaban 200);<br>- `true` saat menyala = tanpa perubahan;<br>- `model_accessible` menyebut model default;<br>- `ProviderVerdict.to_dict`;<br>- `get_provider` dihapus;<br>- konflik dicatat di §8 butir 72.<br>Tidak dikerjakan (penilaian): setup CLI/job yang mirip, `WorkerCredentials` sebagai argumen `record_report`, `"settings:providers"` di dua modul. |
+
+**Status sign-off AG-13 WP-3.1e1: SIGNED OFF WITH CONDITIONS 🔒**
+- (1) suite penuh dan CI hijau di head PR, termasuk gate Trivy;
+- (2) butir 3.1e di konflik #72: dicatat di PR ini; ratifikasi PO atas ADR-073 #6 (pemegang kill switch) **menunggu PO**, sebelum 3.1f;
+- (3) N1, N2 dilacak: N2 ditutup di PR ini, N1 dibawa.
+
+**Gate image (bukan logika WP ini):**
+- `security-scan` merah karena advisory baru sesudah PR #26: `zlib1g` di empat image Debian (diperbaiki 85b7741, terbukti di CI), `libxslt` di `kodekantor/web` (diperbaiki di Dockerfile), `krb5-libs`/`libxslt` di `postgres:16.15-alpine`.
+- Digest upstream terbaru belum membawa perbaikan postgres, jadi masuk EX-03 sampai 2026-11-30, **menunggu persetujuan PO** seperti entri EX lain.
+
+**Syarat yang dibawa:**
+- **3.1f:**
+  - AgentRuntime memanggil `provider_ready(row, settings, held=WorkerCredentials(key, base_url))` sebelum setiap panggilan model dan `provider_calls_allowed(project)`.
+  - Kill switch mati → task `failed` `PROVIDER_DISABLED`; belum siap → `draft` dengan banner.
+  - Error `auth`/`not_found` pada panggilan nyata → readiness `unknown`.
+  - `pricing_version` yang berubah sejak laporan → `unknown`.
+- **3.1e2:**
+  - layar `/settings/providers` memakai `effective` (bukan `report_ready`) untuk warna;
+  - peringatan jelas bila `readiness_not_required`;
+  - batas klien 60 dtk; jawaban 202 → "masih berjalan" dan baca `running_job_id`/`job_id`.
+- **AG-13 N1:** handler 422 (`app/core/errors.py`) mengganti segmen `loc` dari kunci dict dan field asing dengan placeholder (semua route).
+- **PO:** ratifikasi ADR-073, khususnya #6 (pemegang kill switch) dan EX-03 postgres.
