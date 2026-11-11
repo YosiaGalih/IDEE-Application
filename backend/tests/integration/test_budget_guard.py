@@ -4,6 +4,7 @@ AG-13 3.1a M2; spec WP-3.1f Keputusan Lead #2, #6, #11; plan 3.1f1 Task 4)."""
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta, tzinfo
 from decimal import Decimal
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from app.llm.scripted_provider import ScriptedProvider
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.services.usage import UsageCallContext, UsageLedger
+from app.workflow import budget
 from app.workflow.budget import (
     BudgetConfigError,
     BudgetDefaults,
@@ -192,6 +194,30 @@ async def test_duration_runs_from_started_at_on_the_db_clock(
         await guard.check_before_attempt(task.id, NEXT)
     assert (raised.value.kind, raised.value.limit) == ("duration", 60)
     assert isinstance(raised.value.used, Decimal) and raised.value.used >= 61
+
+
+async def test_duration_ignores_the_application_clock(
+    session: AsyncSession, guard: BudgetGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keputusan plan #5: elapsed time is now() - started_at on the database clock. A worker whose own clock
+    runs ahead (or behind) must not stop a task early or keep it running late."""
+
+    class FarFuture(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> FarFuture:
+            return cls(2100, 1, 1, tzinfo=tz or UTC)
+
+    # The guard must not consult the application's clock at all, under any of the usual names.
+    monkeypatch.setattr(budget, "datetime", FarFuture, raising=False)
+    monkeypatch.setattr(budget, "time", None, raising=False)
+    task = await committed_task(session, budget_limit={"max_duration_minutes": 60})
+    await session.execute(
+        text("UPDATE tasks SET started_at = now() - interval '1 minute' WHERE id = :id"), {"id": task.id}
+    )
+    await session.commit()
+    snapshot = await guard.check_before_attempt(task.id, NEXT)
+    assert snapshot.usage.elapsed is not None
+    assert timedelta(minutes=1) <= snapshot.usage.elapsed < timedelta(minutes=10)
 
 
 @pytest.mark.parametrize(
