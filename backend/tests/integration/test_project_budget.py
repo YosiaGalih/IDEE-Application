@@ -267,6 +267,30 @@ async def test_budget_update_waits_for_the_project_row_lock(
     assert response.json()["data"]["max_tokens"] == 77
 
 
+async def test_budget_update_never_loses_a_concurrent_settings_change(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    """Why the row lock (U43): without it the PATCH reads the settings before another writer commits, then
+    writes them back over that writer's change. With it, the PATCH reads after the commit and keeps both."""
+    project_id = await new_project(owner)
+    async with engine.connect() as holder:
+        transaction = await holder.begin()
+        await holder.execute(
+            text("UPDATE projects SET settings = settings || CAST(:extra AS jsonb) WHERE id = :id"),
+            {"extra": '{"auto_remediation": true}', "id": project_id},
+        )
+        pending = asyncio.create_task(patch(owner, project_id, {"max_tokens": 77}))
+        done, _ = await asyncio.wait({pending}, timeout=0.3)
+        assert not done
+        await transaction.commit()
+    response = await asyncio.wait_for(pending, 10)
+    assert response.status_code == 200, response.text
+    settings = await stored_settings(engine, project_id)
+    assert settings["auto_remediation"] is True  # the other writer's change survived
+    assert settings["budget"]["max_tokens"] == 77
+
+
 async def test_guard_uses_the_patched_project_budget(
     owner: httpx.AsyncClient,  # noqa: F811
     owner_id: uuid.UUID,  # noqa: F811
