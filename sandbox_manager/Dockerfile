@@ -30,9 +30,10 @@ ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
     PYTHONPATH=/app
 # apt and libapt-pkg7.0 are upgraded to the archive's current revision: the base digest carries apt 3.0.3
 # (CVE-2026-109518, fixed in 3.0.4). Not pinned (DL3008), as for git: the archive serves only the latest.
+# zlib1g likewise: the base carries 1:1.3.dfsg+really1.3.1-1+b1 (CVE-2026-76844, CVE-2026-85091, fixed in +deb13u1).
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends apt libapt-pkg7.0 \
+    && apt-get install -y --no-install-recommends apt libapt-pkg7.0 zlib1g \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app \
