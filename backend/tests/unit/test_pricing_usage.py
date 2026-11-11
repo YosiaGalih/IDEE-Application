@@ -11,7 +11,7 @@ from app.llm.base import ERROR_KINDS, ErrorKind, Usage
 from app.llm.pricing import PricingError, PricingTable, load_pricing
 from app.llm.retry import AttemptRecord
 from app.models.enums import LLM_ERROR_KINDS, USAGE_ATTEMPT_STATUSES
-from app.services.usage import UsageCallContext, build_row
+from app.services.usage import EMPTY_TOTALS, UsageCallContext, UsageTotals, aggregate, build_row
 
 BACKEND = Path(__file__).resolve().parents[2]
 
@@ -275,3 +275,38 @@ def test_row_truncates_request_id(table: PricingTable) -> None:
 def test_context_refuses_bad_bounds_and_run_without_task(overrides: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         ctx(**overrides)
+
+
+# --- totals (WP-3.1f1 Task 6; spec WP-3.1f Keputusan Lead #5) ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ((0, 0, 0, None), UsageTotals(0, 0, Decimal(0), "estimated")),  # no rows: a counted zero
+        ((3, 0, 0, Decimal("0.3")), UsageTotals(30, 3, Decimal("0.3"), "estimated")),
+        ((3, 1, 0, Decimal("0.3")), UsageTotals(30, 3, Decimal("0.3"), "partial")),
+        (
+            (3, 0, 1, Decimal("0.2")),
+            UsageTotals(30, 3, Decimal("0.2"), "partial"),
+        ),  # known sum, a lower bound
+        ((3, 2, 1, Decimal("0.2")), UsageTotals(30, 3, Decimal("0.2"), "partial")),
+        ((3, 0, 3, None), UsageTotals(30, 3, None, "unavailable")),  # never "0"
+    ],
+)
+def test_aggregate_cost_status(counts: tuple[int, int, int, Decimal | None], expected: UsageTotals) -> None:
+    rows, partial, unavailable, known_cost = counts
+    tokens = (10 * rows, rows)
+    totals = aggregate(
+        rows=rows,
+        partial=partial,
+        unavailable=unavailable,
+        known_cost=known_cost,
+        input_tokens=tokens[0],
+        output_tokens=tokens[1],
+    )
+    assert totals == expected
+    assert (
+        aggregate(rows=0, partial=0, unavailable=0, known_cost=None, input_tokens=0, output_tokens=0)
+        == EMPTY_TOTALS
+    )
