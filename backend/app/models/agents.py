@@ -121,7 +121,9 @@ class AgentRun(UUIDPrimaryKey, Timestamps, Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_creation_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    # numeric(20,10) since 0010, like usage_records: a run total keeps what the ledger keeps (Keputusan Lead
+    # #12, spec WP-3.1f).
+    estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)
     cost_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(

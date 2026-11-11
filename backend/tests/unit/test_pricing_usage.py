@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
+from typing import get_args, get_type_hints
 
 import pytest
 
-from app.llm.base import Usage
+from app.llm.base import ERROR_KINDS, Usage
 from app.llm.pricing import PricingError, PricingTable, load_pricing
+from app.llm.retry import AttemptRecord
+from app.models.enums import LLM_ERROR_KINDS, USAGE_ATTEMPT_STATUSES
 
 BACKEND = Path(__file__).resolve().parents[2]
 
@@ -146,3 +149,10 @@ def test_repo_pricing_file_loads() -> None:
     assert table.verify_before_production is True
     assert table.currency == "USD"
     assert table.version
+
+
+def test_ledger_enums_match_the_llm_port() -> None:
+    """``app.models`` cannot import ``app.llm``: the ledger CHECKs copy the port's values, kept equal here."""
+    assert set(LLM_ERROR_KINDS) == ERROR_KINDS
+    assert len(LLM_ERROR_KINDS) == len(ERROR_KINDS)
+    assert USAGE_ATTEMPT_STATUSES == get_args(get_type_hints(AttemptRecord)["status"])
