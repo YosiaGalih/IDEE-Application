@@ -422,7 +422,7 @@
     },
     "costStatus": {
       "estimated": "estimasi",
-      "partial": "sebagian (belum semua dihargai)",
+      "partial": "estimasi sebagian",
       "actual": "aktual"
     }
   },

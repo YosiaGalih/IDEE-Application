@@ -5,6 +5,7 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { agentRun, dashboardData, dashboardMeta, project, task } from "@/__tests__/dashboardFixtures";
 import { API, deferred, fail, pendingApprovals, renderApp, signedIn, user } from "@/__tests__/harness";
+import en from "@/i18n/locales/en.json";
 import id from "@/i18n/locales/id.json";
 
 const server = setupServer(pendingApprovals());
@@ -143,6 +144,23 @@ describe("DashboardPage", () => {
     const cost = within(usage).getAllByRole("definition")[2];
     expect(cost).toHaveTextContent(`< US$0,01${id.dashboard.costStatus.estimated}`);
     expect(cost).not.toHaveTextContent("US$0,00");
+  });
+
+  it("names a partial total a partial estimate (API_CONTRACTS §11 #3)", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 160,
+      output_tokens: 25,
+      estimated_cost: "0.5",
+      cost_status: "partial",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const cost = within(usage).getAllByRole("definition")[2];
+    expect(cost).toHaveTextContent("US$0,50estimasi sebagian");
+    expect(en.dashboard.costStatus.partial).toBe("partial estimate");
   });
 
   it("shows a counted zero cost as zero", async () => {
