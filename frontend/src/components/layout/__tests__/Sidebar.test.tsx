@@ -2,7 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import { http } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { API, fail, okPage, pendingApprovals, renderApp, signedIn } from "@/__tests__/harness";
+import { API, fail, okPage, pendingApprovals, renderApp, signedIn, signedInWith } from "@/__tests__/harness";
 import { PENDING_POLL_MS } from "@/api/hooks/useApprovals";
 import id from "@/i18n/locales/id.json";
 import { IDLE_AFTER_MS } from "@/lib/userActivity";
@@ -84,5 +84,24 @@ describe("Sidebar pending approvals badge", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("Sidebar settings entry (spec WP-3.1e2 Goal 2)", () => {
+  const nav = () => screen.findByRole("navigation", { name: id.app.mainNav });
+
+  it("shows Settings, pointing at the landing page, to a holder of a settings permission", async () => {
+    server.use(signedInWith(["project:read", "settings:providers"]));
+    renderApp("/settings/usage"); // a placeholder: no other request
+    const link = await within(await nav()).findByRole("link", { name: id.nav.settings });
+    expect(link).toHaveAttribute("href", "/settings");
+  });
+
+  it("hides the whole settings section from everyone else", async () => {
+    server.use(signedIn()); // project:read only
+    renderApp("/settings/usage"); // a placeholder: no other request
+    await within(await nav()).findByRole("link", { name: id.nav.dashboard });
+    expect(within(await nav()).queryByRole("link", { name: id.nav.settings })).toBeNull();
+    expect(within(await nav()).queryAllByText(id.nav.sectionSettings)).toHaveLength(0); // nor its heading
   });
 });

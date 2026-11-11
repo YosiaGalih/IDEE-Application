@@ -36,6 +36,9 @@ export const fail = (status: number, code: string, message = "refused", headers?
   );
 
 export const signedIn = () => http.get(`${API}/auth/me`, () => ok(me));
+/** Signed in with these global permissions (`/auth/me` `permissions`), e.g. an admin's `settings:providers`. */
+export const signedInWith = (permissions: string[]) =>
+  http.get(`${API}/auth/me`, () => ok({ ...me, permissions }));
 /**
  * `GET /approvals` (any filter) with nothing pending: the navigation badge asks on every shell screen
  * (spec WP-3.1c2 Lead 8). Register it with `setupServer(pendingApprovals())` so it survives `resetHandlers`.

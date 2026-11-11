@@ -3,8 +3,10 @@ import type { ComponentType } from "react";
 import { useTranslation } from "react-i18next";
 import { NavLink } from "react-router";
 import { usePendingApprovalCount } from "@/api/hooks/useApprovals";
+import { useMe } from "@/api/hooks/useMe";
 import type id from "@/i18n/locales/id.json";
 import { cn } from "@/lib/cn";
+import { settingsSectionsFor } from "@/lib/settingsSections";
 
 type Item = {
   to: string;
@@ -43,7 +45,25 @@ const WORK: Item[] = [
   { to: "/agents", labelKey: "nav.agents", icon: Bot },
   { to: "/approvals", labelKey: "nav.approvals", icon: CheckSquare, Badge: PendingApprovalsBadge },
 ];
-const SETTINGS: Item[] = [{ to: "/settings/providers", labelKey: "nav.settings", icon: Settings }];
+const SETTINGS: Item[] = [{ to: "/settings", labelKey: "nav.settings", icon: Settings }];
+
+/**
+ * Settings only for a holder of a settings permission (spec WP-3.1e2 Goal 2). Display only: every settings
+ * route is refused by the server (403) without its permission.
+ */
+function SettingsNav() {
+  const { t } = useTranslation();
+  const me = useMe();
+  if (!me.isSuccess || settingsSectionsFor(me.data.permissions).length === 0) return null;
+  return (
+    <div>
+      <p className="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-sidebar-muted">
+        {t("nav.sectionSettings")}
+      </p>
+      <NavItems items={SETTINGS} />
+    </div>
+  );
+}
 
 function NavItems({ items }: { items: Item[] }) {
   const { t } = useTranslation();
@@ -86,12 +106,7 @@ export function Sidebar() {
           </p>
           <NavItems items={WORK} />
         </div>
-        <div>
-          <p className="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-sidebar-muted">
-            {t("nav.sectionSettings")}
-          </p>
-          <NavItems items={SETTINGS} />
-        </div>
+        <SettingsNav />
       </nav>
     </aside>
   );

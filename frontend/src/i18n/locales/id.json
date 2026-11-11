@@ -37,7 +37,8 @@
     "policies": "Kebijakan",
     "audit": "Audit",
     "notFound": "Halaman tidak ditemukan",
-    "importArchive": "Impor arsip"
+    "importArchive": "Impor arsip",
+    "settings": "Pengaturan"
   },
   "placeholder": {
     "body": "Layar ini sedang dibangun. Fondasi (klien API, stream event, i18n, komponen) sudah siap."
@@ -898,5 +899,125 @@
       "project_delete": "Hapus project {{name}}. Workspace disimpan 7 hari, lalu dihapus permanen."
     },
     "pendingRefreshFailed": "Daftar tertunda gagal dimuat ulang; yang tampil mungkin sudah berubah."
+  },
+  "settings": {
+    "lead": "Pengaturan platform yang boleh Anda buka.",
+    "sections": {
+      "providers": {
+        "title": "Provider & model",
+        "body": "Status key yang dilaporkan worker, model, readiness gate, dan smoke test."
+      },
+      "usage": {
+        "title": "Pemakaian & biaya",
+        "body": "Pemakaian token dan perkiraan biaya semua project."
+      },
+      "users": {
+        "title": "Pengguna",
+        "body": "Akun dan peran pengguna."
+      },
+      "policies": {
+        "title": "Kebijakan",
+        "body": "Kebijakan agent dan approval."
+      },
+      "audit": {
+        "title": "Audit",
+        "body": "Jejak audit platform."
+      }
+    }
+  },
+  "providers": {
+    "lead": "Status provider LLM seperti yang terakhir dilihat worker. Key tidak pernah diatur atau ditampilkan di sini.",
+    "dataFlowTitle": "Data yang dikirim ke Claude Platform API",
+    "dataFlow": "Untuk menjalankan agent, KodeKantor mengirim potongan kode yang relevan, instruksi Anda, ringkasan hasil tool, dan cuplikan log ke Claude Platform API (Anthropic). File rahasia (.env, kunci, kredensial), folder dependensi/build, dan path di .agentignore tidak pernah dikirim; secret yang terdeteksi disamarkan. Admin dapat menghentikan semua pemanggilan provider di halaman ini, dan per project lewat pengaturan project.",
+    "empty": "Belum ada provider.",
+    "none": "—",
+    "endpoint": "Endpoint",
+    "endpointDefault": "Bawaan SDK",
+    "mode": "Mode",
+    "pricing": "Versi tarif",
+    "key": {
+      "title": "API key",
+      "configured": "Terpasang di worker",
+      "missing": "Tidak ada di worker",
+      "unknown": "Belum dilaporkan worker",
+      "hint": "Petunjuk: {{hint}}",
+      "checkedAt": "Dilaporkan worker {{when}}",
+      "managedInEnv": "Key hanya diatur lewat env atau secret di worker, tidak pernah lewat layar ini."
+    },
+    "enabled": {
+      "on": "Aktif",
+      "off": "Nonaktif",
+      "disable": "Nonaktifkan provider",
+      "enable": "Aktifkan provider",
+      "help": "Menonaktifkan menghentikan semua panggilan ke provider ini, di semua project."
+    },
+    "models": {
+      "title": "Model",
+      "alias": {
+        "default": "Default",
+        "fast": "Cepat",
+        "complex": "Kompleks"
+      },
+      "effective": "Dipakai: {{model}}",
+      "placeholder": "Kosong = dari env",
+      "save": "Simpan model",
+      "saved": "Model disimpan. Readiness kembali belum diuji sampai smoke test berikutnya.",
+      "invalid": "Harus ID model Claude, mis. claude-sonnet-5-5."
+    },
+    "readiness": {
+      "title": "Readiness gate",
+      "state": {
+        "ready": "Siap",
+        "not_ready": "Belum siap",
+        "disabled": "Dinonaktifkan",
+        "unknown": "Belum diuji"
+      },
+      "reason": {
+        "passed": "Laporan terakhir lulus untuk mode dan model ini.",
+        "readiness_not_required": "Readiness gate dimatikan (LLM_REQUIRE_READINESS=false). Hanya untuk dev/test, ditolak di production.",
+        "disabled": "Provider dinonaktifkan admin.",
+        "no_report": "Belum ada laporan untuk konfigurasi ini.",
+        "other_mode": "Laporan terakhir dari mode provider lain.",
+        "models_changed": "Model berubah sejak laporan terakhir.",
+        "key_rotated": "Key berubah sejak laporan terakhir.",
+        "key_missing": "Worker tidak memegang key.",
+        "endpoint_changed": "Endpoint berubah sejak laporan terakhir.",
+        "report_failed": "Laporan terakhir gagal.",
+        "other": "Alasan: {{reason}}"
+      },
+      "checkedAt": "Diuji {{when}}, mode {{mode}}",
+      "never": "Belum pernah diuji.",
+      "reportResult": {
+        "passed": "Hasil laporan itu: lulus",
+        "failed": "Hasil laporan itu: gagal"
+      },
+      "status": {
+        "passed": "Lulus",
+        "failed": "Gagal",
+        "skipped": "Dilewati"
+      }
+    },
+    "checks": {
+      "api_key_valid": "API key diterima",
+      "model_accessible": "Model dapat diakses",
+      "messages_ok": "Messages API menjawab",
+      "streaming_ok": "Streaming mengirim jawaban",
+      "usage_reported": "Pemakaian token dilaporkan",
+      "tool_use_roundtrip": "Tool use bolak-balik",
+      "timeout_cancel_handled": "Timeout dan cancel ditangani",
+      "secret_not_in_logs": "Key tidak muncul di log",
+      "pricing_verified": "Tabel tarif terverifikasi"
+    },
+    "smoke": {
+      "run": "Jalankan smoke test",
+      "running": "Smoke test berjalan…",
+      "cost": "Menjalankan beberapa panggilan kecil berbayar ke provider, di worker.",
+      "finished": "Smoke test selesai.",
+      "stillRunning": "Smoke test masih berjalan di worker. Hasilnya tampil di sini begitu tercatat.",
+      "endedWithout": "Smoke test berakhir tanpa laporan (dilewati worker atau gagal sebelum mencatat). Lihat audit, lalu coba lagi.",
+      "busy": "Smoke test lain sedang berjalan untuk provider ini.",
+      "rateLimited": "Terlalu banyak smoke test. Coba lagi nanti.",
+      "timeout": "Tidak ada jawaban dalam 60 detik. Smoke test mungkin masih berjalan; hasilnya tampil di sini begitu tercatat."
+    }
   }
 }
