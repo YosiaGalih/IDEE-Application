@@ -9,6 +9,17 @@ describe("money", () => {
     expect(formatUsd("0.5", "id")).toBe("US$0,50");
   });
 
+  it("rounds up to the cent: a shown cost is never smaller than the recorded one", () => {
+    expect(formatUsd("1.001", "id")).toBe("US$1,01");
+    expect(formatUsd("0.0149", "id")).toBe("US$0,02");
+    expect(formatUsd("2.999", "id")).toBe("US$3,00");
+    expect(formatUsd("999.9951", "en")).toBe("$1,000.00");
+    // Exact cents, and zeros past them, stay as they are.
+    expect(formatUsd("0.01", "id")).toBe("US$0,01");
+    expect(formatUsd("1.0000000", "id")).toBe("US$1,00");
+    expect(formatUsd("0", "id")).toBe("US$0,00");
+  });
+
   it("tells a cost below a cent", () => {
     expect(isBelowCent("0.0000005")).toBe(true);
     expect(isBelowCent("0.0099999999")).toBe(true);

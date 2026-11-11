@@ -163,6 +163,22 @@ describe("DashboardPage", () => {
     expect(en.dashboard.costStatus.partial).toBe("partial estimate");
   });
 
+  it("rounds a cost up to the cent, never down", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 1,
+      output_tokens: 1,
+      estimated_cost: "1.001",
+      cost_status: "estimated",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const cost = within(usage).getAllByRole("definition")[2];
+    expect(cost).toHaveTextContent(`US$1,01${id.dashboard.costStatus.estimated}`);
+  });
+
   it("shows a counted zero cost as zero", async () => {
     const data = dashboardData();
     data.usage = {
