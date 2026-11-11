@@ -22,7 +22,16 @@ import { describeError, isOutcomeUnknown } from "@/lib/describeError";
 type Waiting = { jobId: string | null; before: string | null; since: number; isRecorded: boolean };
 type Run = { kind: "idle" } | { kind: "waiting"; wait: Waiting };
 type Phase =
-  "idle" | "running" | "loading" | "finished" | "unconfirmed" | "ended" | "noRun" | "stalled" | "unreadable";
+  | "idle"
+  | "running"
+  | "loading"
+  | "checking"
+  | "finished"
+  | "unconfirmed"
+  | "ended"
+  | "noRun"
+  | "stalled"
+  | "unreadable";
 type Read = { data?: Readiness | undefined; dataUpdatedAt: number; errorUpdatedAt: number };
 
 /**
@@ -33,7 +42,7 @@ type Read = { data?: Readiness | undefined; dataUpdatedAt: number; errorUpdatedA
  *   reads have failed for longer than the limit.
  * - Known job: its report on screen → finished; the lock held by it → running; neither → ended without a
  *   report (or, after a 200, replaced by a newer report: unconfirmed).
- * - No answer: a run holds the lock → running; a report newer than the one shown at the click →
+ * - No answer: before a read, checking (nothing says it runs); a run holds the lock → running; a report newer than the one shown at the click →
  *   unconfirmed (whose run is not known); neither → the request may not have arrived.
  * - Past the limit: stalled, or unreadable when the reads themselves fail (the client cannot tell).
  */
@@ -45,7 +54,8 @@ function phaseOf(run: Run, read: Read): Phase {
     return read.errorUpdatedAt - read.dataUpdatedAt > SMOKE_WAIT_LIMIT_MS ? "unreadable" : "running";
   }
   const { jobId, before, since, isRecorded } = run.wait;
-  const pending: Phase = isRecorded ? "loading" : "running";
+  // "Running" only once something says so: a 202, or a read that shows the lock held (AG-13 delta LOW-5).
+  const pending: Phase = isRecorded ? "loading" : jobId === null ? "checking" : "running";
   // Reads that keep failing still count against the limit: their attempts end the wait too (AG-13 L1).
   const hasWaitedTooLong = Math.max(read.dataUpdatedAt, read.errorUpdatedAt) - since > SMOKE_WAIT_LIMIT_MS;
   const giveUp: Phase = read.errorUpdatedAt > read.dataUpdatedAt ? "unreadable" : "stalled";
@@ -59,7 +69,7 @@ function phaseOf(run: Run, read: Read): Phase {
   return data.job_id !== before ? "unconfirmed" : "noRun";
 }
 
-const POLLING: ReadonlySet<Phase> = new Set(["running", "loading"]);
+const POLLING: ReadonlySet<Phase> = new Set(["running", "loading", "checking"]);
 const REPORT_LANDED: ReadonlySet<Phase> = new Set(["finished", "unconfirmed"]);
 
 /**
@@ -138,6 +148,7 @@ export function SmokeTest({ providerId }: Props) {
       {failure ? <ErrorSummary text={failure} focusKey={smoke.submittedAt} /> : null}
       {phase === "running" ? <Alert tone="info">{t("providers.smoke.stillRunning")}</Alert> : null}
       {phase === "loading" ? <Alert tone="info">{t("providers.smoke.loading")}</Alert> : null}
+      {phase === "checking" ? <Alert tone="info">{t("providers.smoke.checking")}</Alert> : null}
       {POLLING.has(phase) && readiness.isError ? (
         <Alert tone="warning">
           <p>{t("providers.smoke.readFailed")}</p>

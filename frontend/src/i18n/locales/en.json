@@ -1006,7 +1006,8 @@
       "unconfirmed": "A newer report exists than the one shown when you pressed the button, but it is not certain it came from your smoke test. Check the audit.",
       "noRun": "No smoke test is running and there is no new report. The request may not have reached the server, or the run ended without a report. Check the audit, then try again.",
       "unreadable": "Cannot check whether the smoke test finished: readiness keeps failing to load.",
-      "recheck": "Check again"
+      "recheck": "Check again",
+      "checking": "Checking readiness to see whether the smoke test is running…"
     },
     "listStale": "The provider list could not be read again. What is shown may be out of date.",
     "reread": "Read again"

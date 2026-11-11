@@ -25,6 +25,7 @@ beforeEach(() => {
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
+const NEWER_JOB_ID = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
 const PROVIDERS = `${API}/settings/providers`;
 const READINESS = `${PROVIDERS}/${PROVIDER_ID}/readiness`;
 const SMOKE = `${PROVIDERS}/${PROVIDER_ID}/smoke-test`;
@@ -397,6 +398,46 @@ describe("ProvidersPage: smoke test", () => {
     expect(screen.getByRole("button", { name: id.providers.smoke.run })).toBeDisabled();
   });
 
+  it("after a 200, a report of another job on screen is not called its result (AG-13 delta LOW-6)", async () => {
+    let afterPost = false;
+    backend([provider()], readiness({ job_id: OTHER_JOB_ID }));
+    server.use(
+      // The read after the 200 shows a report, but another job's (a newer run replaced ours).
+      http.get(READINESS, () => ok(readiness({ job_id: afterPost ? NEWER_JOB_ID : OTHER_JOB_ID }))),
+      http.post(SMOKE, () => {
+        afterPost = true;
+        return HttpResponse.json({
+          request_id: "r-3",
+          status: "completed",
+          data: report(),
+          meta: { job_id: JOB_ID, effective: { state: "ready", reason: "passed" } },
+        });
+      }),
+    );
+    await open();
+    await click();
+    expect(await screen.findByText(id.providers.smoke.unconfirmed)).toBeInTheDocument();
+    expect(screen.queryByText(id.providers.smoke.finished)).toBeNull();
+  });
+
+  it("with no answer, says it is checking, not running, until a read shows a run (AG-13 delta LOW-5)", async () => {
+    let afterPost = false;
+    backend();
+    server.use(
+      http.get(READINESS, () => (afterPost ? fail(503, "DEPENDENCY_UNAVAILABLE") : ok(readiness()))),
+      http.post(SMOKE, () => {
+        afterPost = true;
+        return HttpResponse.error();
+      }),
+    );
+    await open();
+    await click();
+    expect(await screen.findByText(id.providers.smoke.noAnswer)).toBeInTheDocument();
+    expect(await screen.findByText(id.providers.smoke.checking)).toBeInTheDocument();
+    expect(screen.queryByText(id.providers.smoke.stillRunning)).toBeNull();
+    expect(screen.getByRole("button", { name: id.providers.smoke.run })).toBeDisabled();
+  });
+
   it("on 202 says it is still running, then shows the result once the report of that job lands (F3)", async () => {
     await withFakeTimers(async () => {
       const state = { posted: false, landed: false };
@@ -593,6 +634,7 @@ describe("ProvidersPage: smoke test", () => {
   it("says when readiness cannot be read while waiting, and gives up after the limit (AG-13 L1)", async () => {
     await withFakeTimers(async () => {
       let reads = 0;
+      let posts = 0;
       const state = { posted: false, landed: false };
       backend();
       server.use(
@@ -600,7 +642,14 @@ describe("ProvidersPage: smoke test", () => {
           reads += 1;
           return state.posted ? fail(403, "FORBIDDEN") : ok(readiness({ job_id: OTHER_JOB_ID }));
         }),
-        accepted(state),
+        http.post(SMOKE, () => {
+          posts += 1;
+          state.posted = true;
+          return HttpResponse.json(
+            { request_id: "r-2", status: "accepted", data: { job_id: JOB_ID } },
+            { status: 202 },
+          );
+        }),
       );
       await open();
       await click(true);
@@ -617,6 +666,7 @@ describe("ProvidersPage: smoke test", () => {
         .setup({ advanceTimers: vi.advanceTimersByTime })
         .click(screen.getByRole("button", { name: id.providers.smoke.recheck }));
       await waitFor(() => expect(reads).toBe(settled + 1));
+      expect(posts).toBe(1); // "check again" reads; it never starts another paid run (AG-13 delta LOW-6)
     });
   });
 

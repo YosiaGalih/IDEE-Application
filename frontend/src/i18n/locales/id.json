@@ -1006,7 +1006,8 @@
       "unconfirmed": "Ada laporan yang lebih baru daripada yang tampil saat Anda menekan tombol, tetapi belum pasti dari smoke test Anda. Lihat audit.",
       "noRun": "Tidak ada smoke test yang berjalan dan tidak ada laporan baru. Permintaan mungkin tidak sampai ke server, atau run berakhir tanpa laporan. Lihat audit, lalu coba lagi.",
       "unreadable": "Tidak dapat memeriksa apakah smoke test selesai: readiness terus gagal dibaca.",
-      "recheck": "Periksa lagi"
+      "recheck": "Periksa lagi",
+      "checking": "Memeriksa readiness untuk melihat apakah smoke test berjalan…"
     },
     "listStale": "Daftar provider gagal dibaca ulang. Yang tampil mungkin sudah usang.",
     "reread": "Baca ulang"
