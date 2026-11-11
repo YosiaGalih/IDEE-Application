@@ -7,21 +7,15 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.core.db import make_sessionmaker
 from app.core.money import MONEY_PATTERN
-from app.llm.base import ErrorKind, Usage
-from app.llm.pricing import load_pricing
-from app.llm.retry import AttemptRecord
-from app.services.usage import UsageCallContext, UsageLedger
+from app.llm.base import Usage
 from tests.integration.test_dashboard_api import add_project, add_task
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     app,
@@ -30,43 +24,10 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     owner_id,
     workspace_root,
 )
+from tests.usage_fakes import HAIKU, record
 
 USAGE = "/api/v1/usage"
-HAIKU = "claude-haiku-5-5"
 SONNET = "claude-sonnet-5-5"
-PRICING = load_pricing(Path(__file__).resolve().parents[2] / "config" / "pricing.yaml")
-
-
-async def record(
-    engine: AsyncEngine,
-    project_id: uuid.UUID,
-    *,
-    task_id: uuid.UUID | None = None,
-    agent_id: str | None = None,
-    model: str = HAIKU,
-    status: str = "ok",
-    error_kind: ErrorKind | None = None,
-    usage: Usage | None = Usage(input_tokens=100, output_tokens=20),  # noqa: B008 - frozen
-    at: datetime | None = None,
-) -> uuid.UUID:
-    """One attempt through the real writer; ``at`` moves its created_at (the writer stamps now())."""
-    ledger = UsageLedger(make_sessionmaker(engine), PRICING)
-    context = UsageCallContext(
-        project_id=project_id,
-        call_id=uuid.uuid4(),
-        input_token_bound=1_000,
-        output_token_cap=8_192,
-        task_id=task_id,
-        agent_id=agent_id,
-    )
-    attempt = AttemptRecord("scripted", model, 1, "req_usage", usage, 7, status, error_kind)  # type: ignore[arg-type]
-    row_id = await ledger.record(context, attempt)
-    if at is not None:
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("UPDATE usage_records SET created_at = :at WHERE id = :id"), {"at": at, "id": row_id}
-            )
-    return row_id
 
 
 async def report(client: httpx.AsyncClient, **params: object) -> dict[str, Any]:

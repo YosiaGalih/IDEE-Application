@@ -14,12 +14,13 @@ from app.core.db import make_sessionmaker
 from app.models.projects import Project
 from tests.integration.test_dashboard_api import add_project, add_task
 from tests.integration.test_projects import OWNER
-from tests.integration.test_usage_api import USAGE, record
+from tests.integration.test_usage_api import USAGE
 from tests.security.test_cross_project import (  # noqa: F401 - fixtures shared with the cross-project matrix
     app,
     clean_state,
     world,
 )
+from tests.usage_fakes import record
 
 EMAILS = {"stranger": "eve@example.test", "admin": "adi@example.test"}  # the world fixture's users
 

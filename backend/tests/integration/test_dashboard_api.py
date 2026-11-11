@@ -1,10 +1,12 @@
 """``GET /dashboard`` (WP-2.1e; FR-007..011, API_CONTRACTS §3) on real PostgreSQL: counts and lists from
-stored projects and tasks; what the platform does not record yet is marked, never shown as 0."""
+stored projects and tasks, usage from the ledger (WP-3.1f1); what the platform does not record yet is marked,
+never shown as 0."""
 
 from __future__ import annotations
 
+import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -14,7 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.audit import AuditWriter
 from app.core.db import make_sessionmaker
+from app.core.money import MONEY_PATTERN
 from app.core.redaction import Redactor
+from app.llm.base import Usage
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.services.dashboard import current_period
@@ -26,6 +30,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     owner_id,
     workspace_root,
 )
+from tests.usage_fakes import record
 
 DASHBOARD = "/api/v1/dashboard"
 SYSTEM = Actor("system", "orchestrator")
@@ -42,12 +47,8 @@ PATHS: dict[str, tuple[TaskStatus, ...]] = {
     "interrupted": (S.PLANNED, S.QUEUED, S.RUNNING, S.INTERRUPTED),
     "needs_changes": (S.PLANNED, S.QUEUED, S.RUNNING, S.VALIDATING, S.NEEDS_CHANGES),
 }
-UNAVAILABLE_USAGE = {
-    "input_tokens": None,
-    "output_tokens": None,
-    "estimated_cost": None,
-    "cost_status": "unavailable",
-}
+# A task or a month without ledger rows: a counted zero (spec WP-3.1f Keputusan Lead #5).
+NO_USAGE = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": "0", "cost_status": "estimated"}
 
 
 async def add_project(
@@ -139,7 +140,7 @@ async def test_dashboard_counts_tasks_by_status(
     for item in data["recent_tasks"]:
         assert item["project_id"] == str(project_id)
         assert item["project_name"] == "Kalkulator"
-        assert item["usage"] == UNAVAILABLE_USAGE
+        assert item["usage"] == NO_USAGE
         assert item["has_pending_approval"] is (item["status"] == "waiting_approval")
     failed = queue["failed"]
     assert (failed["status_reason"], failed["workflow_type"], failed["priority"]) == (
@@ -180,14 +181,14 @@ async def test_dashboard_marks_what_is_not_recorded(
 ) -> None:
     data, meta, response = await board(owner)
     assert data["agent_activity"] == []
-    assert meta["unavailable"] == ["agent_activity", "usage"]
+    assert meta["unavailable"] == ["agent_activity"]  # usage now comes from the ledger (WP-3.1f1)
     start, end = current_period(datetime.now(UTC))
     assert data["usage"] == {
         "period": {
             "start": start.isoformat().replace("+00:00", "Z"),
             "end": end.isoformat().replace("+00:00", "Z"),
         },
-        **UNAVAILABLE_USAGE,
+        **NO_USAGE,
     }
     assert response.headers["Cache-Control"] == "no-store"
 
@@ -293,6 +294,7 @@ async def test_counts_and_lists_come_from_one_snapshot(
                 await conn.execute(
                     text("UPDATE projects SET status = 'archived' WHERE id = :id"), {"id": shelved}
                 )
+            await record(engine, kept, task_id=late[0])  # a ledger row lands too (WP-3.1f1)
         return await summaries(session, *args, **kwargs)
 
     monkeypatch.setattr(dashboard, "_summaries", meanwhile)
@@ -305,6 +307,7 @@ async def test_counts_and_lists_come_from_one_snapshot(
     assert [summary.title for summary in board.recent_tasks] == ["Lama"]
     assert board.metrics["active_projects"] == 2
     assert {view.project.id for view in board.recent_projects} == {kept, shelved}
+    assert (board.usage.input_tokens, dict(board.task_usage)) == (0, {})  # usage reads the same snapshot
 
 
 async def test_a_failed_read_leaves_the_pooled_connection_clean(
@@ -361,3 +364,69 @@ async def test_ties_in_updated_at_order_by_creation(
         )
     data, _, _ = await board(owner)
     assert [task["title"] for task in data["failed_queue"]] == ["Kedua", "Pertama"]
+
+
+# --- usage from the ledger (WP-3.1f1 Task 8a; spec WP-3.1f Goal 7, Keputusan Lead #5, #13) -----------------
+
+
+async def test_dashboard_usage_is_this_months_ledger(
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    project = await add_project(engine, owner_id, "Bulanan")
+    start, end = current_period(datetime.now(UTC))
+    await record(engine, project, at=start)  # in: the month starts here
+    await record(engine, project, model="claude-unpriced", usage=Usage(10, 5))  # in, unavailable
+    await record(
+        engine, project, usage=Usage(1_000, 1_000), at=start - timedelta(microseconds=1)
+    )  # last month
+    await record(engine, project, usage=Usage(2_000, 2_000), at=end)  # next month: [start, end)
+    data, meta, _ = await board(owner)
+    assert data["usage"] == {
+        "period": {
+            "start": start.isoformat().replace("+00:00", "Z"),
+            "end": end.isoformat().replace("+00:00", "Z"),
+        },
+        "input_tokens": 110,
+        "output_tokens": 25,
+        "estimated_cost": "0.00002",  # the known sum: 100 x 0.10 + 20 x 0.50 per million
+        "cost_status": "partial",  # priced rows mixed with an unavailable one
+    }
+    assert "usage" not in meta["unavailable"]
+
+
+async def test_task_summaries_carry_their_ledger_usage(
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    project = await add_project(engine, owner_id, "Per Task")
+    failed = await add_task(engine, project, owner_id, "failed", "Gagal", minutes_ago=1)
+    quiet = await add_task(engine, project, owner_id, "running", "Diam", minutes_ago=2)
+    await record(engine, project, task_id=failed)
+    await record(engine, project, task_id=failed, status="error", error_kind="rate_limited", usage=None)
+    data, _, _ = await board(owner)
+    recent = {item["id"]: item["usage"] for item in data["recent_tasks"]}
+    assert recent[str(failed)] == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "estimated_cost": "0.00002",
+        "cost_status": "partial",
+    }
+    assert recent[str(quiet)] == NO_USAGE
+    assert data["failed_queue"][0]["usage"] == recent[str(failed)]  # the queue carries the same numbers
+
+
+async def test_dashboard_money_is_a_decimal_string(
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    project = await add_project(engine, owner_id, "Uang")
+    task = await add_task(engine, project, owner_id, "failed", "Kecil")
+    await record(engine, project, task_id=task, usage=Usage(0, 1))  # 1 x 0.50 per million
+    data, _, _ = await board(owner)
+    costs = [data["usage"]["estimated_cost"], data["recent_tasks"][0]["usage"]["estimated_cost"]]
+    assert costs == ["0.0000005", "0.0000005"]  # never 5E-7, never a float, never rounded to 0
+    assert all(isinstance(cost, str) and re.fullmatch(MONEY_PATTERN, cost) for cost in costs)

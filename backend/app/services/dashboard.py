@@ -3,12 +3,15 @@ projects and tasks, in the user's scope (AC-01). Scope = ``visible_projects_filt
 ``GET /projects``.
 
 Read only: this module never writes ``tasks.status`` (CLAUDE.md #4; tests/unit/test_status_writer_guard.py).
-What the platform does not record yet (agent runs, usage) is reported as unavailable, never as 0 (AC-16).
+Usage comes from the ledger (WP-3.1f1): the month's totals over the visible projects and each listed task's
+totals, read in the same snapshot as the counts. What the platform does not record yet (agent runs) is
+reported as unavailable, never as 0 (AC-16).
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -18,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.projects import Project, Repository
 from app.models.tasks import Task
 from app.services.projects import Actor, ProjectEnv, ProjectView, project_views, visible_projects_filter
+from app.services.usage import UsageTotals, period_usage, task_usage
 
 RECENT_PROJECTS = 5
 RECENT_TASKS = 10
@@ -26,8 +30,8 @@ FAILED_QUEUE = 10
 RUNNING_STATUSES = ("running", "validating")
 # The attention queue of FR-010.
 ATTENTION_STATUSES = ("failed", "interrupted", "needs_changes", "waiting_approval")
-# No source yet: agent_runs and usage_records come with WP-3.1. The screen says "tidak tersedia".
-UNAVAILABLE = ("agent_activity", "usage")
+# No source yet: agent runs come with the runtime (WP-3.1f2). The screen says "tidak tersedia".
+UNAVAILABLE = ("agent_activity",)
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,8 @@ class Dashboard:
     failed_queue: list[TaskSummaryView]
     failed_queue_total: int
     period: tuple[datetime, datetime]
+    usage: UsageTotals  # the period's ledger over the visible projects
+    task_usage: Mapping[uuid.UUID, UsageTotals]  # per listed task; a task without rows is absent
 
 
 def current_period(now: datetime) -> tuple[datetime, datetime]:
@@ -102,6 +108,7 @@ async def _summaries(
 
 async def load_dashboard(env: ProjectEnv, actor: Actor, *, now: datetime | None = None) -> Dashboard:
     visible = visible_projects_filter(actor)
+    period = current_period(now or datetime.now(UTC))  # fixed before any query
     async with env.sessions() as session:
         # One read-only snapshot: the counts, the lists and the queue total agree with each other.
         await session.connection(
@@ -133,6 +140,9 @@ async def load_dashboard(env: ProjectEnv, actor: Actor, *, now: datetime | None 
                 .limit(RECENT_PROJECTS)
             )
         ).all()
+        usage = await period_usage(session, visible, *period)
+        listed = list(dict.fromkeys(summary.id for summary in (*recent_tasks, *failed_queue)))
+        usage_by_task = await task_usage(session, listed)
     # The look at the disk (missing repository, stalled import) needs no transaction.
     recent_projects = await project_views(
         env, actor, [(project, repository) for project, repository in project_rows]
@@ -150,5 +160,7 @@ async def load_dashboard(env: ProjectEnv, actor: Actor, *, now: datetime | None 
         recent_tasks=recent_tasks,
         failed_queue=failed_queue,
         failed_queue_total=sum(by_status.get(status, 0) for status in ATTENTION_STATUSES),
-        period=current_period(now or datetime.now(UTC)),
+        period=period,
+        usage=usage,
+        task_usage=usage_by_task,
     )
