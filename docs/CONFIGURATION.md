@@ -25,12 +25,12 @@ Satu daftar kanonik. `backend/app/core/config.py`, `sandbox_manager/…/config.p
 | `CLAUDE_MAX_OUTPUT_TOKENS` | `8192` | worker | |
 | `CLAUDE_REQUEST_TIMEOUT_SECONDS` | `120` | worker | |
 | `CLAUDE_MAX_TOOL_ITERATIONS` | `40` | worker | per agent run |
-| `PRICING_PATH` | `config/pricing.yaml` | worker, api | tarif berversi (ADR-004) |
-| `TASK_MAX_COST_USD` | `2.0` | worker | budget default per task |
-| `TASK_MAX_TOKENS` | `400000` | worker | |
+| `PRICING_PATH` | `config/pricing.yaml` | worker | tarif berversi (ADR-004). Dimuat worker saat start (bootstep, sebelum koneksi broker); file hilang atau rusak → worker menolak start. `celery beat` dan api tidak memuatnya di 3.1f1 (WP-3.1f1, Keputusan Lead 3.1f #10) |
+| `TASK_MAX_COST_USD` | `2.0` | worker, api | budget default per task. Desimal (`Decimal`, ≥ 0, ≤ 6 desimal), bukan float (WP-3.1f1, Keputusan Lead 3.1f #14). Bersama `TASK_MAX_TOKENS` dan `TASK_MAX_DURATION_MINUTES`: default env terakhir sesudah `tasks.budget_limit` dan `projects.settings.budget`; api memakainya untuk `effective` di `/projects/{id}/budget` |
+| `TASK_MAX_TOKENS` | `400000` | worker, api | hitungan token = input + output + cache_creation; `cache_read` di luar (Keputusan Lead 3.1f #6) |
 | `TASK_MAX_DEBUG_ATTEMPTS` | `5` | worker | PRD §5.6 |
 | `TASK_AUTO_REMEDIATION_MAX` | `1` | worker | siklus perbaikan otomatis setelah User Proxy gagal |
-| `TASK_MAX_DURATION_MINUTES` | `60` | worker | batas waktu total per task (FR-132, ADR-031) |
+| `TASK_MAX_DURATION_MINUTES` | `60` | worker, api | batas waktu total per task (FR-132, ADR-031); diukur dari `tasks.started_at` (Keputusan Lead 3.1f #11) |
 | `TASK_MAX_ITERATIONS` | `3` | worker, api | batas keras total iterasi per task (PRD §6.2 `max_iterations: 3`) |
 | `MAX_ACTIVE_TASKS` | `2` | worker | ADR-010 |
 | `WORKSPACE_ROOT` ★ | `/srv/kodekantor/workspaces` | api, worker, sandbox-manager | path identik host↔container |
