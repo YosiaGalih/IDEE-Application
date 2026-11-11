@@ -281,3 +281,25 @@ async def test_a_policy_changed_while_the_smoke_ran_records_unknown(
         )
     ).first()
     assert event is not None and event.metadata_["stale"] is True
+
+
+# --- AG-13 3.1e1 L2, L3 -----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "hint"),
+    [
+        ("sk-ant-" + "api03-" + "k" * 30 + "a1b2", "sk-ant-…a1b2"),
+        ("AbCdEfGhIjKlMnOpQrSt", "…QrSt"),  # not an Anthropic key: no prefix shown, only the last four
+        ("sk-ant-short1", "…"),
+    ],
+)
+def test_the_hint_shows_the_vendor_prefix_only_for_a_vendor_key(key: str, hint: str) -> None:
+    assert service.key_hint(key) == hint
+
+
+def test_an_unknown_alias_is_not_echoed_back() -> None:
+    pasted = "sk-ant-" + "pasted-into-the-alias-" + "x" * 10
+    with pytest.raises(ValueError) as raised:
+        service.validate_model_policy({pasted: "claude-x"})
+    assert pasted not in str(raised.value) and "unknown model alias" in str(raised.value)

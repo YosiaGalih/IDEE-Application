@@ -36,7 +36,7 @@ Kunci awal: `feature_flags`, `quotas` (max_projects_per_user, max_workspace_mb),
 ## Projects & repositories (M03, M04)
 
 ### projects
-| id | owner_id fk users restrict | name varchar(120) | slug varchar(140) | description text | stack jsonb (hasil detect: languages, frameworks, package_managers, test_profiles) | workspace_ref varchar(255) (`<project_id>`) | default_branch varchar(100) default `main` | status check in (`active`,`archived`,`deleting_pending_approval`,`deleted`) | settings jsonb (`plan_approval_required`, `auto_remediation`, `provider_calls_enabled` (kill switch FR-158; tidak ada = `true`, WP-3.1e1), budget default) | created_at, updated_at |
+| id | owner_id fk users restrict | name varchar(120) | slug varchar(140) | description text | stack jsonb (hasil detect: languages, frameworks, package_managers, test_profiles) | workspace_ref varchar(255) (`<project_id>`) | default_branch varchar(100) default `main` | status check in (`active`,`archived`,`deleting_pending_approval`,`deleted`) | settings jsonb (`plan_approval_required`, `auto_remediation`, `provider_calls_enabled` (kill switch FR-158; tidak ada = `true`; `false` oleh penulis project, `true` hanya oleh pemegang `settings:providers`; WP-3.1e1), budget default) | created_at, updated_at |
 Unique `(owner_id, slug)`.
 
 ### repositories

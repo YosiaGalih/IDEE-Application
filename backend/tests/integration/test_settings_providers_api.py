@@ -96,9 +96,15 @@ async def provider_id(client: httpx.AsyncClient) -> str:
     return response.json()["data"][0]["id"]
 
 
-async def events(engine: AsyncEngine, action: str) -> list[AuditEvent]:
+async def events(engine: AsyncEngine, action: str, resource_id: str) -> list[AuditEvent]:
+    """This test's events only: audit_events is append-only and kept across tests (AG-13 3.1e1 L4b); each
+    test makes its own provider row, so its id is a test's own."""
     async with make_sessionmaker(engine)() as session:
-        query = select(AuditEvent).where(AuditEvent.action == action).order_by(AuditEvent.id.desc()).limit(5)
+        query = (
+            select(AuditEvent)
+            .where(AuditEvent.action == action, AuditEvent.resource_id == resource_id)
+            .order_by(AuditEvent.id.desc())
+        )
         return list((await session.scalars(query)).all())
 
 
@@ -132,9 +138,9 @@ async def test_a_smoke_that_lands_in_time_answers_with_the_report(
     readiness = (await owner.get(f"{PROVIDERS}/{pid}/readiness")).json()["data"]
     assert readiness["readiness_status"] == "passed" and len(readiness["checks"]) == 9
     assert readiness["effective"] == {"state": "ready", "reason": "passed"}
-    [requested] = await events(engine, "provider.smoke_requested")
+    [requested] = await events(engine, "provider.smoke_requested", pid)
     assert requested.actor_type == "user" and requested.metadata_["job_id"] == body["meta"]["job_id"]
-    assert (await events(engine, "provider.readiness_recorded"))[0].actor_id == "worker"
+    assert (await events(engine, "provider.readiness_recorded", pid))[0].actor_id == "worker"
 
 
 async def test_a_slow_worker_gets_202_and_a_second_request_409(
@@ -159,7 +165,7 @@ async def test_a_queue_that_is_down_answers_503_and_frees_the_lock(
     response = await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))
     assert response.status_code == 503 and response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
     assert await smoke_lock.holder(app.state.dependencies.redis, "anthropic") is None
-    assert (await events(engine, "provider.smoke_requested"))[0].result == "error"
+    assert (await events(engine, "provider.smoke_requested", pid))[0].result == "error"
 
 
 async def test_smoke_requests_are_rate_limited(
@@ -185,7 +191,7 @@ async def test_changing_the_model_policy_resets_readiness_and_is_audited(
     assert row["model_policy"] == {"fast": "claude-test-fast"} and row["readiness_status"] == "unknown"
     assert row["effective_models"]["fast"] == "claude-test-fast"
     assert row["readiness_effective"]["state"] == "unknown"
-    [updated] = await events(engine, "provider.updated")
+    [updated] = await events(engine, "provider.updated", pid)
     assert updated.metadata_["changes"]["model_policy"] == [{}, {"fast": "claude-test-fast"}]
     assert updated.metadata_["readiness_reset"] is True
     # Merged per alias; an empty value drops one.
@@ -199,7 +205,9 @@ async def test_disabling_the_provider_is_said(owner: httpx.AsyncClient, engine: 
     response = await owner.patch(f"{PROVIDERS}/{pid}", json={"enabled": False}, headers=headers(owner))
     assert response.status_code == 200, response.text
     assert response.json()["data"]["readiness_effective"] == {"state": "disabled", "reason": "disabled"}
-    assert (await events(engine, "provider.updated"))[0].metadata_["changes"] == {"enabled": [True, False]}
+    assert (await events(engine, "provider.updated", pid))[0].metadata_["changes"] == {
+        "enabled": [True, False]
+    }
 
 
 @pytest.mark.parametrize(

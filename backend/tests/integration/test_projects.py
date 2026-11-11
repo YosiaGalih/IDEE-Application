@@ -406,6 +406,46 @@ async def test_the_provider_kill_switch_is_a_project_setting(
     ]  # fmt: skip
 
 
+async def test_turning_provider_calls_back_on_needs_a_provider_admin(
+    app: FastAPI, engine: AsyncEngine
+) -> None:
+    """AG-13 3.1e1 M2, Lead decision 3.1e #10: FR-158 is an admin control (UC-10). Whoever may write the
+    project may stop provider calls (the safe direction: the project's own data flow); turning them back on
+    needs settings:providers, so an admin's stop cannot be undone by a project writer. A global admin sees
+    the project only with a role on it (AC-01: a global role never widens visibility)."""
+    await make_user(engine, "dev@example.test", ("developer", "global"))
+    developer = await signed_in(app, "dev@example.test", "user-long-passphrase")
+    try:
+        created = (await create(developer, "Dev Project")).json()["data"]
+        url = f"{PROJECTS}/{created['id']}"
+        off = await developer.patch(url, json={"settings": {"provider_calls_enabled": False}},
+                                    headers=headers(developer))  # fmt: skip
+        assert off.status_code == 200, off.text
+        refused = await developer.patch(url, json={"settings": {"provider_calls_enabled": True}},
+                                        headers=headers(developer))  # fmt: skip
+        assert refused.status_code == 403, refused.text
+        mixed = await developer.patch(
+            url, json={"settings": {"auto_remediation": True, "provider_calls_enabled": True}},
+            headers=headers(developer),
+        )  # fmt: skip
+        assert mixed.status_code == 403  # nothing of a refused request is applied
+        admin_id = await make_user(engine, "admin@example.test", ("admin", "global"))
+        admin = await signed_in(app, "admin@example.test", "user-long-passphrase")
+        try:
+            assert (await admin.get(url)).status_code == 404  # not visible without a role on the project
+            await grant(engine, admin_id, "readonly", f"project:{created['id']}")
+            on = await admin.patch(
+                url, json={"settings": {"provider_calls_enabled": True}}, headers=headers(admin)
+            )
+            assert on.status_code == 200, on.text
+        finally:
+            await admin.aclose()
+        again = (await developer.get(url)).json()["data"]["settings"]
+        assert again == {"provider_calls_enabled": True}
+    finally:
+        await developer.aclose()
+
+
 async def test_archive_and_unarchive(owner: httpx.AsyncClient) -> None:
     created = (await create(owner)).json()["data"]
     url = f"{PROJECTS}/{created['id']}"

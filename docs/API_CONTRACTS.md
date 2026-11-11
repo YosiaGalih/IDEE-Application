@@ -75,7 +75,7 @@ Role berscope `project:<id>` hanya berlaku di project itu; role `global` berlaku
 | POST | `/projects/{id}/imports` | project:write | multipart `file` (.zip/.tar.gz ≤ 200 MB) | `{repository: Repository, job_id, upload: {filename, size, sha256}}` (202, §11 #14). Hanya untuk project `upload` yang belum berisi (FR-015 tanpa overwrite): 409 `CONFLICT` `details[0].reason` ∈ `repository_not_empty`, `not_an_upload_project`, `import_running`, `project_archived`, `import_expired`, `cleanup_failed`; 408 bila unggahan berhenti (§1) |
 | GET | `/projects/templates` | auth | – | `[{id, name, description, stack, icon}]` |
 | GET | `/projects/{id}` | project:read | – | `Project` (+ `repository`, `stats`) |
-| PATCH | `/projects/{id}` | project:write | `{name?, description?, settings?}` | `Project` |
+| PATCH | `/projects/{id}` | project:write | `{name?, description?, settings?}` | `Project`. `settings.provider_calls_enabled: true` (menyalakan kembali panggilan provider) juga butuh `settings:providers`, kalau tidak `403` dan tidak ada yang diterapkan; `false` cukup `project:write` (ADR-073) |
 | POST | `/projects/{id}/archive` | project:write | – | `Project` |
 | POST | `/projects/{id}/unarchive` | project:write | – | `Project` |
 | DELETE | `/projects/{id}` | project:delete | – | `{approval: Approval}` (202 — `project_delete` R3) |

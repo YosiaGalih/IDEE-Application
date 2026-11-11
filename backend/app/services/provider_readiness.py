@@ -30,6 +30,7 @@ from app.core.config import Settings
 from app.llm.readiness import ProviderState, ReadinessReport
 from app.models.projects import Project
 from app.models.providers import ProviderConfig
+from app.services.projects import KILL_SWITCH_KEY
 
 PROVIDER = "anthropic"
 MODEL_ALIASES: tuple[str, ...] = ("default", "fast", "complex")
@@ -37,7 +38,7 @@ MODEL_ALIASES: tuple[str, ...] = ("default", "fast", "complex")
 MODEL_ID = re.compile(r"claude-[a-z0-9]+(?:[.-][a-z0-9]+)*")
 MAX_MODEL_ID = 100
 _HINT_MIN_KEY = 20  # a shorter key would be mostly revealed by prefix + last four
-KILL_SWITCH_KEY = "provider_calls_enabled"  # in services.projects.SETTINGS_KEYS
+_VENDOR_PREFIX = "sk-ant-"
 
 VerdictReason = Literal[
     "passed",
@@ -82,10 +83,12 @@ def key_fingerprint(key: str) -> str:
 
 
 def key_hint(key: str) -> str:
-    """A masked identifier (FR-128): the vendor prefix and the last four characters, ``sk-ant-…a1b2``."""
+    """A masked identifier (FR-128): the vendor prefix and the last four characters, ``sk-ant-…a1b2``. The
+    prefix only for a key that has it (a mis-set value shows ``…`` and its last four; AG-13 3.1e1 L2)."""
     if len(key) < _HINT_MIN_KEY:
         return "…"
-    return f"{key[:7]}…{key[-4:]}"
+    prefix = _VENDOR_PREFIX if key.startswith(_VENDOR_PREFIX) else ""
+    return f"{prefix}…{key[-4:]}"
 
 
 def public_base_url(url: str | None) -> str | None:
@@ -108,7 +111,8 @@ def validate_model_policy(raw: Mapping[str, Any]) -> dict[str, str]:
     policy: dict[str, str] = {}
     for alias, value in raw.items():
         if alias not in MODEL_ALIASES:
-            raise ValueError(f"unknown model alias {alias!r}; expected one of {', '.join(MODEL_ALIASES)}")
+            # Not echoed: a key pasted into the wrong field must not come back in the 422 (AG-13 3.1e1 L3).
+            raise ValueError(f"unknown model alias; expected one of {', '.join(MODEL_ALIASES)}")
         if value is None or value == "":
             continue
         if not isinstance(value, str) or len(value) > MAX_MODEL_ID or not MODEL_ID.fullmatch(value):
