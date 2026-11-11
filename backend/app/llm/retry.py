@@ -6,6 +6,11 @@ failure of ``on_attempt`` itself propagates: losing a ledger entry is not silent
 retried; ``retry-after`` is honoured up to a ceiling, past which the error is passed on instead of holding a
 worker (and its task lease) asleep.
 
+``before_attempt(attempt)`` runs before every attempt, the first and each retry, ahead of any restart
+notice (ARCHITECTURE §5.4, "before every request"; WP-3.1f1). An exception from it stops the call as it is:
+no request is sent and nothing is reported through ``on_attempt``, since that attempt never reached the
+provider. The previous attempt's ``on_attempt`` has already completed, so a budget check sees it.
+
 Text already streamed to ``on_text_delta`` cannot be taken back. After such text, an attempt is retried only
 when ``on_restart(attempt)`` is given, so the consumer can discard the partial text first; without it the
 error is passed on rather than streaming the answer twice.
@@ -47,6 +52,7 @@ class AttemptRecord:
 
 AttemptHandler = Callable[[AttemptRecord], Awaitable[None]]
 RestartHandler = Callable[[int], Awaitable[None]]
+BeforeAttemptHandler = Callable[[int], Awaitable[None]]
 
 
 async def create_with_retry(
@@ -58,6 +64,7 @@ async def create_with_retry(
     on_restart: RestartHandler | None = None,
     cancel: CancelToken | None = None,
     on_attempt: AttemptHandler | None = None,
+    before_attempt: BeforeAttemptHandler | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: Callable[[], float] = random.random,
 ) -> LLMResponse:
@@ -67,6 +74,8 @@ async def create_with_retry(
         if cancel is not None and cancel.cancelled:
             raise LLMError("cancelled")
         attempt += 1
+        if before_attempt is not None:
+            await before_attempt(attempt)  # raises to refuse: nothing sent, nothing to record
         if streamed and on_restart is not None:
             await on_restart(attempt)
         streamed = False

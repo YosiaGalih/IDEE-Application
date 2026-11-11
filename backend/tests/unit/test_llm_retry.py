@@ -325,3 +325,160 @@ async def test_a_failing_sleep_is_not_mistaken_for_a_pause(with_cancel: bool) ->
             provider, REQ, sleep=broken_sleep, rng=lambda: 0.5, cancel=CancelToken() if with_cancel else None
         )
     assert provider.calls == 1
+
+
+# --- before_attempt (WP-3.1f1 Task 3; ARCHITECTURE §5.4 "before every request", spec WP-3.1f Goal 3) --------
+
+
+class Refused(Exception):
+    """What a budget check raises; any exception from the hook must stop the call as it is."""
+
+
+class EventLog:
+    """One timeline for the hook, the provider, the ledger and the backoff sleeps."""
+
+    def __init__(self, refuse_at: int | None = None) -> None:
+        self.events: list[str] = []
+        self.records: list[AttemptRecord] = []
+        self.sleeps: list[float] = []
+        self.refuse_at = refuse_at
+
+    async def before_attempt(self, attempt: int) -> None:
+        self.events.append(f"hook{attempt}")
+        if attempt == self.refuse_at:
+            raise Refused(attempt)
+
+    async def on_attempt(self, record: AttemptRecord) -> None:
+        self.events.append(f"record{record.attempt}")
+        self.records.append(record)
+
+    async def sleep(self, seconds: float) -> None:
+        self.events.append("sleep")
+        self.sleeps.append(seconds)
+
+
+class LoggedProvider(FakeProvider):
+    def __init__(self, outcomes: Sequence[LLMResponse | LLMError], log: EventLog) -> None:
+        super().__init__(outcomes)
+        self.log = log
+
+    async def create_message(self, req, *, on_text_delta=None, cancel=None):  # type: ignore[no-untyped-def]
+        self.log.events.append(f"call{self.calls + 1}")
+        return await super().create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+
+async def run_logged(provider: FakeProvider, log: EventLog, **kwargs: object) -> LLMResponse:
+    return await create_with_retry(
+        provider,
+        REQ,
+        on_attempt=log.on_attempt,
+        before_attempt=log.before_attempt,
+        sleep=log.sleep,
+        rng=lambda: 0.5,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+async def test_before_attempt_runs_before_every_attempt() -> None:
+    log = EventLog()
+    provider = LoggedProvider([LLMError("overloaded"), LLMError("transient"), ok()], log)
+    await run_logged(provider, log)
+    assert log.events == [
+        "hook1",
+        "call1",
+        "record1",
+        "sleep",
+        "hook2",
+        "call2",
+        "record2",
+        "sleep",
+        "hook3",
+        "call3",
+        "record3",
+    ]
+
+
+async def test_before_attempt_refusal_sends_nothing_and_records_nothing() -> None:
+    log = EventLog(refuse_at=1)
+    provider = LoggedProvider([ok()], log)
+    with pytest.raises(Refused):
+        await run_logged(provider, log)
+    assert provider.calls == 0
+    assert log.records == []
+    assert log.events == ["hook1"]
+
+
+async def test_before_attempt_refusal_on_a_retry_stops_the_call() -> None:
+    log = EventLog(refuse_at=2)
+    provider = LoggedProvider([LLMError("overloaded"), ok()], log)
+    with pytest.raises(Refused):  # the hook's own exception, not a retryable LLMError
+        await run_logged(provider, log)
+    assert provider.calls == 1
+    assert [(r.attempt, r.status, r.error_kind) for r in log.records] == [(1, "error", "overloaded")]
+    assert log.events == ["hook1", "call1", "record1", "sleep", "hook2"]  # no sleep after the refusal
+    assert log.sleeps == [0.5]
+
+
+async def test_before_attempt_comes_before_the_restart_notice() -> None:
+    log = EventLog()
+    provider = StreamingProvider([LLMError("overloaded"), ok()], deltas=[["Hel"], ["Hello"]])
+
+    async def on_delta(text: str) -> None:
+        log.events.append(text)
+
+    async def on_restart(attempt: int) -> None:
+        log.events.append(f"<restart {attempt}>")
+
+    async def hook(attempt: int) -> None:
+        log.events.append(f"<hook {attempt}>")
+
+    await create_with_retry(
+        provider,
+        REQ,
+        on_text_delta=on_delta,
+        on_restart=on_restart,
+        before_attempt=hook,
+        sleep=log.sleep,
+        rng=lambda: 0.5,
+    )
+    assert [e for e in log.events if e != "sleep"] == ["<hook 1>", "Hel", "<hook 2>", "<restart 2>", "Hello"]
+
+
+async def test_refused_retry_does_not_announce_a_restart() -> None:
+    provider = StreamingProvider([LLMError("overloaded"), ok()], deltas=[["Hel"], ["Hello"]])
+    restarts: list[int] = []
+
+    async def on_delta(_: str) -> None:
+        return None
+
+    async def on_restart(attempt: int) -> None:
+        restarts.append(attempt)
+
+    async def refuse_retry(attempt: int) -> None:
+        if attempt > 1:
+            raise Refused(attempt)
+
+    with pytest.raises(Refused):
+        await create_with_retry(
+            provider,
+            REQ,
+            on_text_delta=on_delta,
+            on_restart=on_restart,
+            before_attempt=refuse_retry,
+            sleep=Recorder().sleep,
+            rng=lambda: 0.5,
+        )
+    assert provider.calls == 1
+    assert restarts == []  # the consumer is not told to discard text for an attempt never sent
+
+
+async def test_before_attempt_is_not_called_once_cancelled() -> None:
+    log = EventLog()
+    provider = LoggedProvider([ok()], log)
+    token = CancelToken()
+    token.cancel()
+    with pytest.raises(LLMError) as raised:
+        await run_logged(provider, log, cancel=token)
+    assert raised.value.kind == "cancelled"
+    assert log.events == []
+    assert provider.calls == 0
