@@ -900,35 +900,10 @@
     },
     "pendingRefreshFailed": "Daftar tertunda gagal dimuat ulang; yang tampil mungkin sudah berubah."
   },
-  "settings": {
-    "lead": "Pengaturan platform yang boleh Anda buka.",
-    "sections": {
-      "providers": {
-        "title": "Provider & model",
-        "body": "Status key yang dilaporkan worker, model, readiness gate, dan smoke test."
-      },
-      "usage": {
-        "title": "Pemakaian & biaya",
-        "body": "Pemakaian token dan perkiraan biaya semua project."
-      },
-      "users": {
-        "title": "Pengguna",
-        "body": "Akun dan peran pengguna."
-      },
-      "policies": {
-        "title": "Kebijakan",
-        "body": "Kebijakan agent dan approval."
-      },
-      "audit": {
-        "title": "Audit",
-        "body": "Jejak audit platform."
-      }
-    }
-  },
   "providers": {
     "lead": "Status provider LLM seperti yang terakhir dilihat worker. Key tidak pernah diatur atau ditampilkan di sini.",
     "dataFlowTitle": "Data yang dikirim ke Claude Platform API",
-    "dataFlow": "Untuk menjalankan agent, KodeKantor mengirim potongan kode yang relevan, instruksi Anda, ringkasan hasil tool, dan cuplikan log ke Claude Platform API (Anthropic). File rahasia (.env, kunci, kredensial), folder dependensi/build, dan path di .agentignore tidak pernah dikirim; secret yang terdeteksi disamarkan. Admin dapat menghentikan semua pemanggilan provider di halaman ini, dan per project lewat pengaturan project.",
+    "dataFlow": "Untuk menjalankan agent, KodeKantor mengirim potongan kode yang relevan, instruksi Anda, ringkasan hasil tool, dan cuplikan log ke Claude Platform API (Anthropic). File rahasia (.env, kunci, kredensial), folder dependensi/build, dan path di .agentignore tidak pernah dikirim; secret yang terdeteksi disamarkan. Admin dapat menonaktifkan provider di halaman ini. Pemanggilan provider juga dapat dihentikan per project lewat pengaturan project (saat ini lewat API; layarnya menyusul).",
     "empty": "Belum ada provider.",
     "none": "—",
     "endpoint": "Endpoint",
@@ -949,7 +924,11 @@
       "off": "Nonaktif",
       "disable": "Nonaktifkan provider",
       "enable": "Aktifkan provider",
-      "help": "Menonaktifkan menghentikan semua panggilan ke provider ini, di semua project."
+      "help": "Selama nonaktif, agent tidak boleh memanggil provider ini di project mana pun. Smoke test tetap bisa dijalankan untuk memeriksa.",
+      "confirmTitle": "Nonaktifkan {{provider}}?",
+      "confirmBody": "Agent tidak boleh memanggil provider ini sampai diaktifkan lagi. Readiness tetap tercatat.",
+      "confirm": "Nonaktifkan",
+      "cancel": "Batal"
     },
     "models": {
       "title": "Model",
@@ -970,7 +949,7 @@
         "ready": "Siap",
         "not_ready": "Belum siap",
         "disabled": "Dinonaktifkan",
-        "unknown": "Belum diuji"
+        "unknown": "Perlu diuji"
       },
       "reason": {
         "passed": "Laporan terakhir lulus untuk mode dan model ini.",
@@ -1012,12 +991,14 @@
       "run": "Jalankan smoke test",
       "running": "Smoke test berjalan…",
       "cost": "Menjalankan beberapa panggilan kecil berbayar ke provider, di worker.",
-      "finished": "Smoke test selesai.",
+      "finished": "Smoke test selesai. Hasilnya di bawah.",
       "stillRunning": "Smoke test masih berjalan di worker. Hasilnya tampil di sini begitu tercatat.",
       "endedWithout": "Smoke test berakhir tanpa laporan (dilewati worker atau gagal sebelum mencatat). Lihat audit, lalu coba lagi.",
       "busy": "Smoke test lain sedang berjalan untuk provider ini.",
       "rateLimited": "Terlalu banyak smoke test. Coba lagi nanti.",
-      "timeout": "Tidak ada jawaban dalam 60 detik. Smoke test mungkin masih berjalan; hasilnya tampil di sini begitu tercatat."
+      "noAnswer": "Tidak ada jawaban dari server. Smoke test mungkin tetap berjalan; hasilnya tampil di sini begitu tercatat.",
+      "stalled": "Belum ada laporan setelah 5 menit. Lihat audit, lalu jalankan lagi bila perlu.",
+      "readFailed": "Readiness tidak dapat dibaca saat menunggu smoke test."
     }
   }
 }

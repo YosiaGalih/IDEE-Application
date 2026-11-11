@@ -4,17 +4,8 @@ export const PROVIDER_ID = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b";
 export const JOB_ID = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 export const OTHER_JOB_ID = "9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f";
 
-export const CHECK_KEYS = [
-  "api_key_valid",
-  "model_accessible",
-  "messages_ok",
-  "streaming_ok",
-  "usage_reported",
-  "tool_use_roundtrip",
-  "timeout_cancel_handled",
-  "secret_not_in_logs",
-  "pricing_verified",
-] as const;
+export { CHECK_KEYS } from "@/api/providers";
+import { CHECK_KEYS } from "@/api/providers";
 
 export function provider(overrides: Record<string, unknown> = {}) {
   return {

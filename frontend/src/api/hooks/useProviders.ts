@@ -11,6 +11,8 @@ import {
 export const providersKey = ["settings", "providers"] as const;
 /** How often readiness is read while a smoke that answered 202 runs (spec WP-3.1e2 Lead 4). */
 export const SMOKE_POLL_MS = 3_000;
+/** A run is waited for this long, then the screen says no report came (a stuck lock expires in 5 min). */
+export const SMOKE_WAIT_LIMIT_MS = 5 * 60_000;
 const readinessKey = (providerId: string) => [...providersKey, providerId, "readiness"] as const;
 
 export function useProviders() {
@@ -18,12 +20,14 @@ export function useProviders() {
 }
 
 /** What a polling decision may look at: the last read and when it was made. */
-export type ReadinessQuery = { state: { data?: Readiness | undefined; dataUpdatedAt: number } };
+export type ReadinessQuery = {
+  state: { data?: Readiness | undefined; dataUpdatedAt: number; errorUpdatedAt: number };
+};
 
 /** The last report; `refetchInterval` polls while a smoke that answered 202 is still running. */
 export function useReadiness(
   providerId: string,
-  refetchInterval: number | false | ((query: ReadinessQuery) => number | false) = false,
+  refetchInterval: false | ((query: ReadinessQuery) => number | false) = false,
 ) {
   return useQuery({
     queryKey: readinessKey(providerId),
@@ -36,7 +40,10 @@ export function usePatchProvider(providerId: string) {
   const client = useQueryClient();
   return useMutation({
     mutationFn: (patch: ProviderPatch) => patchProvider(providerId, patch),
-    onSettled: () => client.invalidateQueries({ queryKey: providersKey }),
+    // Not awaited: the caller's onSuccess runs before the list read remounts what it re-keys.
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: providersKey });
+    },
   });
 }
 

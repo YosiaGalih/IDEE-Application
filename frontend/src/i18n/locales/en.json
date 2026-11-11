@@ -900,35 +900,10 @@
     },
     "pendingRefreshFailed": "The pending list could not be reloaded; what you see may have changed."
   },
-  "settings": {
-    "lead": "Platform settings you may open.",
-    "sections": {
-      "providers": {
-        "title": "Providers & models",
-        "body": "Key status as the worker reported it, models, the readiness gate and the smoke test."
-      },
-      "usage": {
-        "title": "Usage & cost",
-        "body": "Token usage and estimated cost across projects."
-      },
-      "users": {
-        "title": "Users",
-        "body": "Accounts and roles."
-      },
-      "policies": {
-        "title": "Policies",
-        "body": "Agent and approval policies."
-      },
-      "audit": {
-        "title": "Audit",
-        "body": "The platform audit trail."
-      }
-    }
-  },
   "providers": {
     "lead": "LLM provider status as the worker last saw it. The key is never set or shown here.",
     "dataFlowTitle": "Data sent to the Claude Platform API",
-    "dataFlow": "To run agents, KodeKantor sends relevant code snippets, your instructions, tool result summaries and log excerpts to the Claude Platform API (Anthropic). Secret files (.env, keys, credentials), dependency/build folders and paths in .agentignore are never sent; detected secrets are masked. Admins can stop all provider calls on this page, and per project through the project settings.",
+    "dataFlow": "To run agents, KodeKantor sends relevant code snippets, your instructions, tool result summaries and log excerpts to the Claude Platform API (Anthropic). Secret files (.env, keys, credentials), dependency/build folders and paths in .agentignore are never sent; detected secrets are masked. Admins can disable the provider on this page. Provider calls can also be stopped per project through the project settings (through the API for now; the screen comes later).",
     "empty": "No provider yet.",
     "none": "—",
     "endpoint": "Endpoint",
@@ -949,7 +924,11 @@
       "off": "Disabled",
       "disable": "Disable provider",
       "enable": "Enable provider",
-      "help": "Disabling stops every call to this provider, in every project."
+      "help": "While disabled, agents may not call this provider in any project. Smoke tests can still run to check it.",
+      "confirmTitle": "Disable {{provider}}?",
+      "confirmBody": "Agents may not call this provider until it is enabled again. Readiness stays recorded.",
+      "confirm": "Disable",
+      "cancel": "Cancel"
     },
     "models": {
       "title": "Models",
@@ -970,7 +949,7 @@
         "ready": "Ready",
         "not_ready": "Not ready",
         "disabled": "Disabled",
-        "unknown": "Not tested"
+        "unknown": "Needs a test"
       },
       "reason": {
         "passed": "The last report passed for this mode and these models.",
@@ -1012,12 +991,14 @@
       "run": "Run smoke test",
       "running": "Smoke test running…",
       "cost": "Makes a few small paid calls to the provider, from the worker.",
-      "finished": "Smoke test finished.",
+      "finished": "Smoke test finished. The result is below.",
       "stillRunning": "The smoke test is still running in the worker. Its result shows here once recorded.",
       "endedWithout": "The smoke test ended without a report (skipped by the worker or failed before recording). Check the audit, then try again.",
       "busy": "Another smoke test is running for this provider.",
       "rateLimited": "Too many smoke tests. Try again later.",
-      "timeout": "No answer within 60 seconds. The smoke test may still be running; its result shows here once recorded."
+      "noAnswer": "No answer from the server. The smoke test may still be running; its result shows here once recorded.",
+      "stalled": "No report after 5 minutes. Check the audit, then run it again if needed.",
+      "readFailed": "Readiness could not be read while waiting for the smoke test."
     }
   }
 }

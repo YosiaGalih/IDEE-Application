@@ -1,27 +1,39 @@
+import { PowerOff } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import i18n from "@/i18n";
-import { ApiError } from "@/api/errors";
 import { usePatchProvider, useReadiness } from "@/api/hooks/useProviders";
 import type { Provider } from "@/api/providers";
-import { uxStateForError } from "@/api/uxState";
-import { Badge } from "@/components/ui/Badge";
+import { Alert } from "@/components/ui/Alert";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
+import { Dialog, DialogClose, DialogContent } from "@/components/ui/Dialog";
 import { ErrorSummary } from "@/components/ui/ErrorSummary";
-import { StateView } from "@/components/ui/StateView";
 import { describeError } from "@/lib/describeError";
 import { ModelPolicyForm } from "./ModelPolicyForm";
+import { EnabledBadge, KeyBadge, useDateTimeFormat } from "./providerStatus";
+import { QueryFallback } from "./QueryFallback";
 import { ReadinessPanel, VerdictLine } from "./ReadinessPanel";
 import { SmokeTest } from "./SmokeTest";
 
-const KEY_TONE = { configured: "success", missing: "danger", unknown: "warning" } as const;
+type Props = { provider: Provider };
 
 /** One provider row (API §9): what the worker reported about its key, the endpoint, models and readiness. */
-export function ProviderCard({ provider }: { provider: Provider }) {
+export function ProviderCard({ provider }: Props) {
   const { t } = useTranslation();
   const toggle = usePatchProvider(provider.id);
   const readiness = useReadiness(provider.id);
-  const when = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeStyle: "short" });
+  const dateTime = useDateTimeFormat();
+  const [isConfirming, setIsConfirming] = useState(false);
+  // Above the form, which is re-keyed by the saved policy: the message survives the list read.
+  const [isPolicySaved, setIsPolicySaved] = useState(false);
+
+  const handleToggle = () => {
+    if (provider.enabled) setIsConfirming(true);
+    else toggle.mutate({ enabled: true });
+  };
+  const handleDisable = () => {
+    toggle.mutate({ enabled: false }, { onSettled: () => setIsConfirming(false) });
+  };
 
   return (
     <Card className="space-y-6">
@@ -31,21 +43,19 @@ export function ProviderCard({ provider }: { provider: Provider }) {
           <VerdictLine verdict={provider.readiness_effective} />
         </div>
         <div className="flex flex-col items-end gap-2">
-          <Badge tone={provider.enabled ? "success" : "neutral"}>
-            {provider.enabled ? t("providers.enabled.on") : t("providers.enabled.off")}
-          </Badge>
+          <EnabledBadge isEnabled={provider.enabled} />
           <Button
             variant={provider.enabled ? "danger" : "secondary"}
             size="sm"
             disabled={toggle.isPending}
-            onClick={() => toggle.mutate({ enabled: !provider.enabled })}
+            onClick={handleToggle}
           >
             {provider.enabled ? t("providers.enabled.disable") : t("providers.enabled.enable")}
           </Button>
         </div>
       </div>
       <p className="text-sm text-fg-muted">{t("providers.enabled.help")}</p>
-      {toggle.isError ? (
+      {toggle.isError && !isConfirming ? (
         <ErrorSummary text={describeError(toggle.error, t)} focusKey={toggle.submittedAt} />
       ) : null}
 
@@ -53,15 +63,15 @@ export function ProviderCard({ provider }: { provider: Provider }) {
         <div>
           <dt className="font-medium">{t("providers.key.title")}</dt>
           <dd className="mt-1 space-y-1">
-            <Badge tone={KEY_TONE[provider.secret_status]}>
-              {t(`providers.key.${provider.secret_status}`)}
-            </Badge>
+            <KeyBadge status={provider.secret_status} />
             {provider.secret_hint ? (
               <p className="font-mono text-xs">{t("providers.key.hint", { hint: provider.secret_hint })}</p>
             ) : null}
             {provider.secret_checked_at ? (
               <p className="text-xs text-fg-muted">
-                {t("providers.key.checkedAt", { when: when.format(new Date(provider.secret_checked_at)) })}
+                {t("providers.key.checkedAt", {
+                  when: dateTime.format(new Date(provider.secret_checked_at)),
+                })}
               </p>
             ) : null}
             <p className="text-xs text-fg-muted">{t("providers.key.managedInEnv")}</p>
@@ -83,21 +93,54 @@ export function ProviderCard({ provider }: { provider: Provider }) {
         </div>
       </dl>
 
-      <ModelPolicyForm key={JSON.stringify(provider.model_policy)} provider={provider} />
-
-      {readiness.isPending ? (
-        <StateView state="loading" />
-      ) : readiness.data === undefined ? (
-        <StateView
-          state={uxStateForError(readiness.error)}
-          requestId={readiness.error instanceof ApiError ? readiness.error.requestId : null}
-          onAction={() => void readiness.refetch()}
+      <div className="space-y-3">
+        <ModelPolicyForm
+          key={JSON.stringify(provider.model_policy)}
+          provider={provider}
+          onSavedChange={setIsPolicySaved}
         />
+        {isPolicySaved ? <Alert tone="success">{t("providers.models.saved")}</Alert> : null}
+      </div>
+
+      {readiness.data === undefined ? (
+        <QueryFallback query={readiness} />
       ) : (
         <ReadinessPanel readiness={readiness.data} />
       )}
 
       <SmokeTest providerId={provider.id} />
+
+      {isConfirming ? (
+        // Not while the request is in flight: closing would drop its answer.
+        <Dialog open onOpenChange={(open) => (open || toggle.isPending ? undefined : setIsConfirming(false))}>
+          <DialogContent
+            title={t("providers.enabled.confirmTitle", { provider: provider.provider })}
+            description={t("providers.enabled.confirmBody")}
+          >
+            {toggle.isError ? (
+              <div className="mb-4">
+                <ErrorSummary text={describeError(toggle.error, t)} focusKey={toggle.submittedAt} />
+              </div>
+            ) : null}
+            <div className="flex justify-end gap-2">
+              <DialogClose asChild>
+                <Button variant="secondary" disabled={toggle.isPending}>
+                  {t("providers.enabled.cancel")}
+                </Button>
+              </DialogClose>
+              <Button
+                variant="danger"
+                disabled={toggle.isPending}
+                aria-busy={toggle.isPending}
+                onClick={handleDisable}
+              >
+                <PowerOff aria-hidden="true" className="size-4" />
+                {t("providers.enabled.confirm")}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      ) : null}
     </Card>
   );
 }

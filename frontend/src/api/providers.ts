@@ -34,6 +34,7 @@ const datetime = z.iso.datetime({ offset: true });
 
 // A reason this screen does not know yet is shown generically, not refused; the state colours the screen.
 export const VerdictSchema = z.object({ state: z.enum(EFFECTIVE_STATES), reason: z.string() });
+const ReadinessStatusSchema = z.enum(["unknown", "passed", "failed"]);
 export type Verdict = z.infer<typeof VerdictSchema>;
 
 export const ProviderSchema = z.object({
@@ -48,7 +49,7 @@ export const ProviderSchema = z.object({
   enabled: z.boolean(),
   pricing_version: z.string().nullable(),
   llm_provider_mode: z.string().nullable(),
-  readiness_status: z.enum(["unknown", "passed", "failed"]),
+  readiness_status: ReadinessStatusSchema,
   readiness_checked_at: datetime.nullable(),
   readiness_effective: VerdictSchema,
 });
@@ -65,7 +66,7 @@ export type Check = z.infer<typeof CheckSchema>;
 /** §11.3: `report_ready` is the gate's own result; `effective` whether it counts now. */
 export const ReadinessSchema = z.object({
   provider: z.string(),
-  readiness_status: z.enum(["unknown", "passed", "failed"]),
+  readiness_status: ReadinessStatusSchema,
   checked_at: datetime.nullable(),
   mode: z.string().nullable(),
   report_ready: z.boolean(),

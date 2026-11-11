@@ -54,7 +54,8 @@ const SETTINGS: Item[] = [{ to: "/settings", labelKey: "nav.settings", icon: Set
 function SettingsNav() {
   const { t } = useTranslation();
   const me = useMe();
-  if (!me.isSuccess || settingsSectionsFor(me.data.permissions).length === 0) return null;
+  // The data, not isSuccess: a failed background refresh keeps the user it already had.
+  if (!me.data || settingsSectionsFor(me.data.permissions).length === 0) return null;
   return (
     <div>
       <p className="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-sidebar-muted">

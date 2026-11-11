@@ -13,7 +13,7 @@ import {
   readiness,
   report,
 } from "@/__tests__/providerFixtures";
-import { SMOKE_POLL_MS } from "@/api/hooks/useProviders";
+import { SMOKE_POLL_MS, SMOKE_WAIT_LIMIT_MS } from "@/api/hooks/useProviders";
 import id from "@/i18n/locales/id.json";
 
 const server = setupServer(pendingApprovals());
@@ -29,15 +29,38 @@ const READINESS = `${PROVIDERS}/${PROVIDER_ID}/readiness`;
 const SMOKE = `${PROVIDERS}/${PROVIDER_ID}/smoke-test`;
 const admin = () => signedInWith(["project:read", "settings:providers"]);
 
+let providerReads = 0;
 function backend(rows = [provider()], last = readiness()) {
   server.use(
     admin(),
-    http.get(PROVIDERS, () =>
-      HttpResponse.json({ request_id: "r-1", status: "completed", data: rows, meta: { total: rows.length } }),
-    ),
+    http.get(PROVIDERS, () => {
+      providerReads += 1;
+      return HttpResponse.json({
+        request_id: "r-1",
+        status: "completed",
+        data: rows,
+        meta: { total: rows.length },
+      });
+    }),
     http.get(READINESS, () => ok(last)),
   );
 }
+
+/** Before the smoke request nothing holds the lock; after it, this job does (until `landed`). */
+function lockAfterPost(state: { posted: boolean; landed: boolean }) {
+  return http.get(READINESS, () => {
+    if (state.landed) return ok(readiness({ job_id: JOB_ID }));
+    return ok(readiness({ job_id: OTHER_JOB_ID, running_job_id: state.posted ? JOB_ID : null }));
+  });
+}
+const accepted = (state: { posted: boolean }) =>
+  http.post(SMOKE, () => {
+    state.posted = true;
+    return HttpResponse.json(
+      { request_id: "r-2", status: "accepted", data: { job_id: JOB_ID } },
+      { status: 202 },
+    );
+  });
 
 async function open() {
   renderApp("/settings/providers");
@@ -53,6 +76,9 @@ describe("ProvidersPage: what the worker reported", () => {
     expect(screen.getByText(id.providers.key.managedInEnv)).toBeInTheDocument();
     expect(screen.queryByLabelText(/key/i, { selector: "input" })).toBeNull(); // no way to type a key
     expect(screen.getByText(id.providers.endpointDefault)).toBeInTheDocument();
+    // Status as text + icon, never colour alone (frontend.md).
+    const keyBadge = screen.getByText(id.providers.key.configured);
+    expect(keyBadge.querySelector("[data-testid='status-icon']")).not.toBeNull();
     // F5: the data flow statement (SECURITY_MODEL §7) is on the screen.
     expect(screen.getByRole("heading", { name: id.providers.dataFlowTitle })).toBeInTheDocument();
     expect(screen.getByText(id.providers.dataFlow)).toBeInTheDocument();
@@ -107,6 +133,42 @@ describe("ProvidersPage: what the worker reported", () => {
     expect(within(panel).getAllByText(id.providers.readiness.status.passed)).toHaveLength(8);
   });
 
+  it("shows loading, then the empty state when no provider exists", async () => {
+    const held = deferred();
+    server.use(
+      admin(),
+      http.get(PROVIDERS, async () => {
+        await held.gate;
+        return ok([]);
+      }),
+    );
+    renderApp("/settings/providers");
+    expect(await screen.findByText(id.states.loading.title)).toBeInTheDocument();
+    held.release();
+    expect(await screen.findByText(id.providers.empty)).toBeInTheDocument();
+  });
+
+  it("shows the error state with a retry when the list cannot be read", async () => {
+    server.use(
+      admin(),
+      http.get(PROVIDERS, () => fail(500, "INTERNAL_ERROR")),
+    );
+    renderApp("/settings/providers");
+    expect(await screen.findByText(id.states.error.title)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: id.states.error.action })).toBeInTheDocument();
+  });
+
+  it("keeps the provider on screen when only its readiness cannot be read", async () => {
+    server.use(
+      admin(),
+      http.get(PROVIDERS, () => ok([provider()])),
+      http.get(READINESS, () => fail(500, "INTERNAL_ERROR")),
+    );
+    await open();
+    expect(await screen.findByText(id.providers.key.configured)).toBeInTheDocument();
+    expect(await screen.findByText(id.states.error.title)).toBeInTheDocument();
+  });
+
   it("says permission denied to someone the server refuses", async () => {
     server.use(
       admin(),
@@ -154,11 +216,13 @@ describe("ProvidersPage: changing models and the provider switch", () => {
     expect(sent).not.toHaveBeenCalled();
   });
 
-  it("disables the provider with enabled=false only", async () => {
+  it("asks before disabling, then sends enabled=false only; cancelling sends nothing", async () => {
     backend();
     let body: unknown = null;
+    let calls = 0;
     server.use(
       http.patch(`${PROVIDERS}/${PROVIDER_ID}`, async ({ request }) => {
+        calls += 1;
         body = await request.json();
         return ok(
           provider({ enabled: false, readiness_effective: { state: "disabled", reason: "disabled" } }),
@@ -166,12 +230,56 @@ describe("ProvidersPage: changing models and the provider switch", () => {
       }),
     );
     await open();
-    await userEvent.setup().click(await screen.findByRole("button", { name: id.providers.enabled.disable }));
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: id.providers.enabled.disable }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: id.providers.enabled.cancel }));
+    expect(calls).toBe(0);
+    await user.click(screen.getByRole("button", { name: id.providers.enabled.disable }));
+    await user.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: id.providers.enabled.confirm }),
+    );
     await waitFor(() => expect(body).toEqual({ enabled: false }));
+  });
+
+  it("keeps saying the models were saved after the list comes back with them", async () => {
+    let policy: Record<string, string> = {};
+    server.use(
+      admin(),
+      http.get(PROVIDERS, () => ok([provider({ model_policy: policy })])),
+      http.get(READINESS, () => ok(readiness())),
+      http.patch(`${PROVIDERS}/${PROVIDER_ID}`, () => {
+        policy = { fast: "claude-haiku-5-5" };
+        return ok(provider({ model_policy: policy, readiness_status: "unknown" }));
+      }),
+    );
+    await open();
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText(id.providers.models.alias.fast), "claude-haiku-5-5");
+    await user.click(screen.getByRole("button", { name: id.providers.models.save }));
+    expect(await screen.findByText(id.providers.models.saved)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByLabelText(id.providers.models.alias.fast)).toHaveValue("claude-haiku-5-5"),
+    );
+    expect(screen.getByText(id.providers.models.saved)).toBeInTheDocument(); // the list read did not wipe it
   });
 });
 
 describe("ProvidersPage: smoke test", () => {
+  const click = async (withTimers = false) =>
+    (withTimers ? userEvent.setup({ advanceTimers: vi.advanceTimersByTime }) : userEvent.setup()).click(
+      await screen.findByRole("button", { name: id.providers.smoke.run }),
+    );
+
+  async function withFakeTimers(body: () => Promise<void>) {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await body();
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
   it("shows the result when the worker answered in time, and reads readiness again", async () => {
     backend([provider()], readiness({ job_id: OTHER_JOB_ID }));
     let reads = 0;
@@ -190,75 +298,61 @@ describe("ProvidersPage: smoke test", () => {
       ),
     );
     await open();
-    await userEvent.setup().click(await screen.findByRole("button", { name: id.providers.smoke.run }));
+    await click();
     expect(await screen.findByText(id.providers.smoke.finished)).toBeInTheDocument();
     await waitFor(() => expect(reads).toBeGreaterThan(1));
   });
 
   it("on 202 says it is still running, then shows the result once the report of that job lands (F3)", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      let landed = false;
+    await withFakeTimers(async () => {
+      const state = { posted: false, landed: false };
       backend();
-      server.use(
-        http.get(READINESS, () =>
-          ok(
-            landed
-              ? readiness({ job_id: JOB_ID })
-              : readiness({ job_id: OTHER_JOB_ID, running_job_id: JOB_ID }),
-          ),
-        ),
-        http.post(SMOKE, () =>
-          HttpResponse.json(
-            { request_id: "r-2", status: "accepted", data: { job_id: JOB_ID } },
-            { status: 202 },
-          ),
-        ),
-      );
+      server.use(lockAfterPost(state), accepted(state));
       await open();
-      await userEvent
-        .setup({ advanceTimers: vi.advanceTimersByTime })
-        .click(await screen.findByRole("button", { name: id.providers.smoke.run }));
+      await click(true);
       expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
       expect(screen.queryByText(id.providers.smoke.finished)).toBeNull();
-      landed = true;
+      const listReads = providerReads;
+      state.landed = true;
       await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS + 50));
       expect(await screen.findByText(id.providers.smoke.finished)).toBeInTheDocument();
-    } finally {
-      vi.useRealTimers();
-    }
+      // The card's own verdict comes from the list: read again once the report landed.
+      await waitFor(() => expect(providerReads).toBeGreaterThan(listReads));
+    });
   });
 
   it("stops waiting when the job neither runs nor reported: it ended without a report (F7)", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
+    await withFakeTimers(async () => {
       let reads = 0;
+      let afterPost = 0;
       backend();
       server.use(
         http.get(READINESS, () => {
           reads += 1;
-          return ok(readiness({ job_id: OTHER_JOB_ID, running_job_id: reads > 2 ? null : JOB_ID }));
+          if (afterPost > 0) afterPost += 1;
+          return ok(
+            readiness({
+              job_id: OTHER_JOB_ID,
+              running_job_id: afterPost > 0 && afterPost < 3 ? JOB_ID : null,
+            }),
+          );
         }),
-        http.post(SMOKE, () =>
-          HttpResponse.json(
+        http.post(SMOKE, () => {
+          afterPost = 1;
+          return HttpResponse.json(
             { request_id: "r-2", status: "accepted", data: { job_id: JOB_ID } },
             { status: 202 },
-          ),
-        ),
+          );
+        }),
       );
       await open();
-      await userEvent
-        .setup({ advanceTimers: vi.advanceTimersByTime })
-        .click(await screen.findByRole("button", { name: id.providers.smoke.run }));
-      await screen.findByText(id.providers.smoke.stillRunning);
+      await click(true);
       await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS * 3));
       expect(await screen.findByText(id.providers.smoke.endedWithout)).toBeInTheDocument();
       const settled = reads;
       await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS * 3));
       expect(reads).toBe(settled); // no more polling
-    } finally {
-      vi.useRealTimers();
-    }
+    });
   });
 
   it("lets only reads made after the 202 decide: the cached one says nothing runs (F9)", async () => {
@@ -281,11 +375,109 @@ describe("ProvidersPage: smoke test", () => {
     );
     await open();
     await screen.findByRole("region", { name: id.providers.readiness.title }); // cached: nothing running
-    await userEvent.setup().click(await screen.findByRole("button", { name: id.providers.smoke.run }));
+    await click();
     expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
     expect(screen.queryByText(id.providers.smoke.endedWithout)).toBeNull();
     held.release();
     await waitFor(() => expect(screen.getByText(id.providers.smoke.stillRunning)).toBeInTheDocument());
+  });
+
+  it("with no answer, keeps reading until a report other than the one before lands (AG-13 L2)", async () => {
+    await withFakeTimers(async () => {
+      const state = { posted: false, landed: false };
+      backend();
+      server.use(
+        lockAfterPost(state),
+        http.post(SMOKE, () => {
+          state.posted = true;
+          return HttpResponse.error(); // no answer: whether the run started is unknown
+        }),
+      );
+      await open();
+      await click(true);
+      expect(await screen.findByText(id.providers.smoke.noAnswer)).toBeInTheDocument();
+      expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
+      state.landed = true;
+      await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS + 50));
+      expect(await screen.findByText(id.providers.smoke.finished)).toBeInTheDocument();
+    });
+  });
+
+  it("stops waiting after the limit and says so (no endless polling)", async () => {
+    await withFakeTimers(async () => {
+      let reads = 0;
+      const state = { posted: false, landed: false };
+      backend();
+      server.use(
+        http.get(READINESS, () => {
+          reads += 1;
+          return ok(readiness({ job_id: OTHER_JOB_ID, running_job_id: state.posted ? JOB_ID : null })); // a stuck lock
+        }),
+        accepted(state),
+      );
+      await open();
+      await click(true);
+      await screen.findByText(id.providers.smoke.stillRunning);
+      await act(() => vi.advanceTimersByTimeAsync(SMOKE_WAIT_LIMIT_MS + SMOKE_POLL_MS * 2));
+      expect(await screen.findByText(id.providers.smoke.stalled)).toBeInTheDocument();
+      const settled = reads;
+      await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS * 3));
+      expect(reads).toBe(settled);
+    });
+  });
+
+  it("says when readiness cannot be read while waiting, and gives up after the limit (AG-13 L1)", async () => {
+    await withFakeTimers(async () => {
+      let reads = 0;
+      const state = { posted: false, landed: false };
+      backend();
+      server.use(
+        http.get(READINESS, () => {
+          reads += 1;
+          return state.posted ? fail(403, "FORBIDDEN") : ok(readiness({ job_id: OTHER_JOB_ID }));
+        }),
+        accepted(state),
+      );
+      await open();
+      await click(true);
+      await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS * 2));
+      expect(await screen.findByText(id.providers.smoke.readFailed)).toBeInTheDocument();
+      await act(() => vi.advanceTimersByTimeAsync(SMOKE_WAIT_LIMIT_MS + SMOKE_POLL_MS * 2));
+      expect(await screen.findByText(id.providers.smoke.stalled)).toBeInTheDocument();
+      const settled = reads;
+      await act(() => vi.advanceTimersByTimeAsync(SMOKE_POLL_MS * 3));
+      expect(reads).toBe(settled);
+    });
+  });
+
+  it("shows a run already going (another admin, the CLI, or before navigating away) and keeps the button off", async () => {
+    backend([provider()], readiness({ job_id: OTHER_JOB_ID, running_job_id: JOB_ID }));
+    await open();
+    expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: id.providers.smoke.run })).toBeDisabled();
+  });
+
+  it("sends one request however fast the clicks come, and never retries a failed one (AG-13 L3)", async () => {
+    const held = deferred();
+    let posts = 0;
+    backend();
+    server.use(
+      http.post(SMOKE, async () => {
+        posts += 1;
+        await held.gate;
+        return fail(503, "DEPENDENCY_UNAVAILABLE");
+      }),
+    );
+    await open();
+    const user = userEvent.setup();
+    const button = await screen.findByRole("button", { name: id.providers.smoke.run });
+    await user.click(button);
+    await user.click(button);
+    await user.click(button);
+    held.release();
+    await screen.findByText(id.states.provider_degraded.title);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(posts).toBe(1);
   });
 
   it.each([
@@ -295,7 +487,7 @@ describe("ProvidersPage: smoke test", () => {
     backend();
     server.use(http.post(SMOKE, () => fail(status, code)));
     await open();
-    await userEvent.setup().click(await screen.findByRole("button", { name: id.providers.smoke.run }));
+    await click();
     expect(await screen.findByText(text)).toBeInTheDocument();
   });
 });

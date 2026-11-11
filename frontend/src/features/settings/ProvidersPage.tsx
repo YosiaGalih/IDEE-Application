@@ -1,12 +1,11 @@
 import { useId } from "react";
 import { useTranslation } from "react-i18next";
-import { ApiError } from "@/api/errors";
 import { useProviders } from "@/api/hooks/useProviders";
-import { uxStateForError } from "@/api/uxState";
 import { Card } from "@/components/ui/Card";
 import { StateView } from "@/components/ui/StateView";
 import { useDocumentTitle } from "@/lib/useDocumentTitle";
 import { ProviderCard } from "./ProviderCard";
+import { QueryFallback } from "./QueryFallback";
 
 /**
  * `/settings/providers` (spec WP-3.1e Goals 3.1e2): provider status as the worker reported it, models, the
@@ -20,16 +19,8 @@ export function ProvidersPage() {
   const providers = useProviders();
 
   let body: React.ReactNode;
-  if (providers.isPending) {
-    body = <StateView state="loading" />;
-  } else if (providers.data === undefined) {
-    body = (
-      <StateView
-        state={uxStateForError(providers.error)}
-        requestId={providers.error instanceof ApiError ? providers.error.requestId : null}
-        onAction={() => void providers.refetch()}
-      />
-    );
+  if (providers.data === undefined) {
+    body = <QueryFallback query={providers} />;
   } else if (providers.data.length === 0) {
     body = <StateView state="empty" title={t("providers.empty")} />;
   } else {
