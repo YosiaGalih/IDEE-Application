@@ -33,9 +33,10 @@ def hold_pricing(path: Path) -> PricingTable:
     global _held
     table = load_pricing(path)
     _held = table
-    get_logger(__name__).info(
-        "pricing_loaded", version=table.version, verify_before_production=table.verify_before_production
-    )
+    logger = get_logger(__name__)
+    # Prices not yet checked against the official page must stand out in the start log (review L1).
+    log = logger.warning if table.verify_before_production else logger.info
+    log("pricing_loaded", version=table.version, verify_before_production=table.verify_before_production)
     return table
 
 

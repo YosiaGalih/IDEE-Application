@@ -136,6 +136,7 @@ def test_partial_usage_is_marked_partial(table: PricingTable) -> None:
         (TABLE.replace('    cache_read: "0.30"\n', ""), "missing price"),
         (TABLE.replace("above_tokens: 100000", "above_tokens: 0"), "tier threshold not positive"),
         (TABLE.replace('input: "3"', 'input: "0"'), "zero price (a typo that would look like a real price)"),
+        (TABLE.split("models:")[0] + "models: {}\n", "no models (every call would be unpriced; review L1)"),
     ],
 )
 def test_load_rejects(tmp_path: Path, content: str | None, reason: str) -> None:

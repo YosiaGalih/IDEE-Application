@@ -166,3 +166,30 @@ def test_signal_receivers_cannot_stop_the_worker() -> None:
     finally:
         signals.worker_init.disconnect(broken)
     assert any(isinstance(result, RuntimeError) for _, result in responses)
+
+
+@pytest.mark.parametrize(("verify", "level"), [(True, "warning"), (False, "info")])
+def test_unverified_prices_are_logged_as_a_warning(
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+    monkeypatch,  # type: ignore[no-untyped-def]
+    verify: bool,
+    level: str,
+) -> None:
+    """Review L1: a table still marked verify_before_production must stand out in the worker's start log."""
+    import json
+
+    from app.worker import pricing
+    from app.worker.celery_app import configure_worker_logging
+
+    monkeypatch.setattr(pricing, "_held", None)
+    path = tmp_path / "pricing.yaml"
+    content = REPO_PRICING.read_text(encoding="utf-8")
+    path.write_text(
+        content.replace("verify_before_production: true", f"verify_before_production: {str(verify).lower()}"),
+        encoding="utf-8",
+    )
+    configure_worker_logging(load_settings(make_test_env()))
+    pricing.hold_pricing(path)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if "pricing_loaded" in line]
+    assert [(event["level"], event["verify_before_production"]) for event in events] == [(level, verify)]

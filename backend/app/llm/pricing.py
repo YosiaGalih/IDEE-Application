@@ -88,7 +88,8 @@ class PricingTable(BaseModel):
     currency: Literal["USD"]
     source: str = Field(min_length=1)
     verify_before_production: bool
-    models: Mapping[str, ModelPrice]
+    # At least one model: an empty table would price every call "unavailable" and bound no budget (review L1).
+    models: Mapping[str, ModelPrice] = Field(min_length=1)
 
     def estimate(self, model: str, usage: Usage | None, *, partial: bool) -> CostEstimate:
         """``partial`` must be stated: True for an attempt that failed or was cancelled after it started.

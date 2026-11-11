@@ -70,7 +70,6 @@ models:
     cache_write: "2.50"
     cache_read: "0.30"
 """
-EMPTY_TABLE = TABLE.split("models:")[0] + "models: {}\n"
 MILLION = Decimal(1_000_000)
 DEFAULTS = BudgetDefaults(max_cost_usd=Decimal("2"), max_tokens=400_000, max_duration_minutes=60)
 
@@ -87,8 +86,12 @@ def table(tmp_path: Path) -> PricingTable:
 
 
 @pytest.fixture
-def empty_table(tmp_path: Path) -> PricingTable:
-    return _load(tmp_path, EMPTY_TABLE)
+def empty_table() -> PricingTable:
+    # load_pricing refuses a table without models (review L1); the guard still fails closed on one that got
+    # past it, so build it without validation.
+    return PricingTable.model_construct(
+        version="2026-11-05", currency="USD", source="test", verify_before_production=True, models={}
+    )
 
 
 def row(**overrides: object) -> LedgerRow:
