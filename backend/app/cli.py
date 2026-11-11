@@ -74,6 +74,8 @@ async def _grant_runtime_role(role: str) -> int:
     return 0
 
 
+SMOKE_NOT_READY = 1
+SMOKE_CANNOT_RUN = 2
 SMOKE_BUSY = 3
 
 
@@ -97,7 +99,7 @@ async def _claude_smoke(as_json: bool) -> int:
                 return SMOKE_BUSY
         except RedisError as exc:
             print(f"cannot take the smoke lock: Redis {type(exc).__name__}", file=sys.stderr)
-            return 2
+            return SMOKE_CANNOT_RUN
         env = provider_smoke.SmokeEnv(
             settings=settings,
             sessions=make_sessionmaker(engine),
@@ -111,7 +113,7 @@ async def _claude_smoke(as_json: bool) -> int:
         await redis.aclose()
         await engine.dispose()
     print(json.dumps(report.to_dict(), ensure_ascii=False) if as_json else provider_smoke.render(report))
-    return 0 if report.ready else 1
+    return 0 if report.ready else SMOKE_NOT_READY
 
 
 async def _seed_agents() -> int:
@@ -157,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
             # Exit 1 means "not ready"; a tool that could not run says so (silent-failure 3.1e1 M4). The
             # message may carry a URL with a password: the type only.
             print(f"claude-smoke could not run: {type(exc).__name__}", file=sys.stderr)
-            return 2
+            return SMOKE_CANNOT_RUN
     if args.command == "seed-agents":
         try:
             return asyncio.run(_seed_agents())

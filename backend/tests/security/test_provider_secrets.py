@@ -34,7 +34,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     signed_in,
     workspace_root,
 )
-from tests.integration.test_settings_providers_api import PRICING, PROVIDERS, InlineSmoke
+from tests.integration.test_settings_api import PRICING, PROVIDERS, InlineSmoke
 
 KEY = "sk-ant-" + "api-misconfig-" + "w" * 24 + "g7h8"  # built, not written: a test value
 

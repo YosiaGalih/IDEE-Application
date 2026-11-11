@@ -962,9 +962,11 @@ async def update_project(
             bad = set(incoming) - SETTINGS_KEYS
             if bad or not all(isinstance(value, bool) for value in incoming.values()):
                 raise _invalid("settings", "unknown setting or not a boolean")
-            if incoming.get(KILL_SWITCH_KEY) is True and not has_permission(
-                actor.grants, KILL_SWITCH_PERMISSION, user_id=actor.user_id
-            ):
+            turns_on = (
+                incoming.get(KILL_SWITCH_KEY) is True
+                and project.settings.get(KILL_SWITCH_KEY, True) is not True
+            )
+            if turns_on and not has_permission(actor.grants, KILL_SWITCH_PERMISSION, user_id=actor.user_id):
                 # FR-158 is an admin control (UC-10). Stopping provider calls is the safe direction and stays
                 # with whoever may write the project; turning them back on needs settings:providers, so an
                 # admin's stop cannot be undone by a project writer (AG-13 3.1e1 M2, Lead decision 3.1e #10).

@@ -185,4 +185,4 @@ async def get_agent(
 def _provider_meta(verdict: provider_readiness.ProviderVerdict) -> dict[str, str]:
     """Why model-calling agents are (not) ready on the provider side; ``readiness_not_required`` says that
     LLM_REQUIRE_READINESS=false skipped the gate (spec 3.1e Lead decision #8)."""
-    return {"state": verdict.state, "reason": verdict.reason}
+    return verdict.to_dict()

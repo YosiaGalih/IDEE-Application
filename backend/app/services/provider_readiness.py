@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import AuditWriter
 from app.core.config import Settings
+from app.core.redaction import Redactor
 from app.llm.readiness import ProviderState, ReadinessReport
 from app.models.projects import Project
 from app.models.providers import ProviderConfig
@@ -53,6 +54,7 @@ VerdictReason = Literal[
     "report_failed",
 ]
 MAX_BASE_URL = 300  # provider_configs.base_url
+INVALID_BASE_URL = "[invalid base url]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +75,9 @@ class ProviderVerdict:
     def ready(self) -> bool:
         return self.state == "ready"
 
+    def to_dict(self) -> dict[str, str]:
+        return {"state": self.state, "reason": self.reason}
+
 
 # --- key status (the worker's view) -------------------------------------------------------------------------
 
@@ -92,14 +97,20 @@ def key_hint(key: str) -> str:
 
 
 def public_base_url(url: str | None) -> str | None:
-    """The endpoint as stored and shown: scheme, host, port and path. User info, query and fragment are
-    dropped (a gateway URL may carry a token there; backend review 3.1e1 M1); cut to the column's size."""
+    """The endpoint as stored and shown: scheme, host, port and path. User info, query, fragment and path
+    parameters are dropped and the rest goes through the redactor (a gateway URL may carry a token; backend
+    review 3.1e1 M1, AG-13 N2); cut to the column's size. A URL that cannot be read is said, not raised:
+    the report it belongs to must still be recorded."""
     if not url:
         return None
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return INVALID_BASE_URL
     host = (parts.hostname or "").lower()
-    port = f":{parts.port}" if parts.port else ""
-    public = urlunsplit((parts.scheme.lower(), f"{host}{port}", parts.path, "", ""))
+    path = parts.path.split(";", 1)[0]
+    public = Redactor().redact(urlunsplit((parts.scheme.lower(), f"{host}{port}", path, "", "")))
     return public if len(public) <= MAX_BASE_URL else public[: MAX_BASE_URL - 1] + "…"
 
 

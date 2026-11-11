@@ -412,3 +412,13 @@ async def test_log_output_that_cannot_be_observed_is_not_a_pass(monkeypatch: pyt
     report = await run(ScriptedProvider())
     only_failed(report, "secret_not_in_logs")
     assert "could not be observed" in detail(report, "secret_not_in_logs")
+
+
+async def test_a_default_model_the_provider_refuses_is_named_in_model_accessible() -> None:
+    """Code review 3.1e1 spec c4: a wrong default model id is a model problem, not only an unconfirmed key."""
+    missing = LLMError("bad_request", status_code=404, vendor_type="not_found_error")
+    report = await run(Patched(probe=raise_(missing)))
+    got = statuses(report)
+    assert got["api_key_valid"] == "failed" and got["model_accessible"] == "failed"
+    assert "default=claude-test-default" in detail(report, "model_accessible")
+    assert all(got[key] == "skipped" for key in DEPENDENT if key != "model_accessible"), got

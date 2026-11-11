@@ -63,6 +63,7 @@ class ProviderView:
 class SmokeOutcome:
     job_id: uuid.UUID
     report: dict[str, Any] | None  # None: still running when the wait ended
+    effective: provider_readiness.ProviderVerdict | None  # whether that report counts now
 
 
 def _authorize(actor: Actor) -> None:
@@ -98,12 +99,6 @@ async def list_providers(env: ProviderSettingsEnv, actor: Actor) -> list[Provide
             await session.commit()
             rows = (await session.scalars(query)).all()
         return [_view(row, env.settings) for row in rows]
-
-
-async def get_provider(env: ProviderSettingsEnv, actor: Actor, provider_id: uuid.UUID) -> ProviderView:
-    _authorize(actor)
-    async with env.sessions() as session:
-        return _view(await _row(session, provider_id), env.settings)
 
 
 _UNSET: Any = object()
@@ -159,10 +154,11 @@ async def update_provider(
 
 
 def readiness_of(row: ProviderConfig, settings: Settings, running_job_id: str | None) -> dict[str, Any]:
-    """§11.3: the last report as recorded, the models it tested, and whether it counts now. ``ready`` is
-    whether it counts now (never green for a report the models or mode moved away from; silent-failure
-    3.1e1 M6); ``report_ready`` is the report's own result. ``job_id`` names the run that wrote it and
-    ``running_job_id`` the run holding the lock: a 202 job id in neither has ended without a report."""
+    """§11.3: the last report as recorded, the models it tested, and whether it counts now. One meaning per
+    key: ``report_ready`` is the gate's own result (``ready`` in §11 #8), ``effective`` whether it counts now
+    (never green for a report the models or mode moved away from; silent-failure 3.1e1 M6). ``job_id`` names
+    the run that wrote it and ``running_job_id`` the run holding the lock: a 202 job id in neither has ended
+    without a report."""
     report = dict(row.readiness_report or {})
     verdict = provider_readiness.provider_ready(row, settings)
     return {
@@ -170,13 +166,12 @@ def readiness_of(row: ProviderConfig, settings: Settings, running_job_id: str | 
         "readiness_status": row.readiness_status,
         "checked_at": row.readiness_checked_at.isoformat() if row.readiness_checked_at else None,
         "mode": report.get("mode"),
-        "ready": verdict.ready,
         "report_ready": bool(report.get("ready", False)),
         "checks": list(report.get("checks", [])),
         "models": report.get("models"),
         "job_id": report.get("job_id"),
         "running_job_id": running_job_id,
-        "effective": {"state": verdict.state, "reason": verdict.reason},
+        "effective": verdict.to_dict(),
     }
 
 
@@ -191,6 +186,8 @@ async def get_readiness(env: ProviderSettingsEnv, actor: Actor, provider_id: uui
 async def request_smoke(
     env: ProviderSettingsEnv, actor: Actor, provider_id: uuid.UUID, *, wait_s: float | None = None
 ) -> SmokeOutcome:
+    """Every request is audited as ``provider.smoke_requested``: ``success`` once queued, ``denied`` when
+    another smoke runs or the rate limit refuses it, ``error`` when the queue is down."""
     _authorize(actor)
     if env.redis is None or env.smoke_jobs is None:
         raise AppError("DEPENDENCY_UNAVAILABLE", "A required dependency is unavailable", http_status=503)
@@ -198,7 +195,21 @@ async def request_smoke(
         row = await _row(session, provider_id)
         provider, row_id = row.provider, row.id
     job_id = uuid.uuid4()
+    audit = {
+        "actor_type": "user",
+        "actor_id": str(actor.user_id),
+        "action": "provider.smoke_requested",
+        "resource_type": "provider_config",
+        "resource_id": str(row_id),
+        "ip": actor.ip,
+    }
+
+    async def refused(result: str, reason: str) -> None:
+        metadata = {"provider": provider, "job_id": str(job_id), "reason": reason}
+        await env.audit.write_detached(env.sessions, result=result, metadata=metadata, **audit)
+
     if not await smoke_lock.acquire(env.redis, provider, job_id):
+        await refused("denied", "smoke_running")
         raise AppError("CONFLICT", "A smoke test is already running for this provider", http_status=409)
     try:
         # Counted only for a smoke that can start: a 409 uses up nothing (backend review 3.1e1 L5).
@@ -210,26 +221,19 @@ async def request_smoke(
             window_s=SMOKE_RATE_WINDOW_S,
             message="Too many smoke tests; try again later",
         )
-    except AppError:
+    except AppError as exc:
         await smoke_lock.release(env.redis, provider, job_id)
+        limited = exc.code == "RATE_LIMITED"
+        await refused(
+            "denied" if limited else "error", "rate_limited" if limited else "rate_limiter_unavailable"
+        )
         raise
-    audit = {
-        "actor_type": "user",
-        "actor_id": str(actor.user_id),
-        "action": "provider.smoke_requested",
-        "resource_type": "provider_config",
-        "resource_id": str(row_id),
-        "ip": actor.ip,
-    }
     try:
         await env.smoke_jobs.enqueue_provider_smoke(job_id=job_id, provider=provider)
     except Exception as exc:
         logger.error("provider_smoke_enqueue_failed", job_id=str(job_id), error_type=type(exc).__name__)
         await smoke_lock.release(env.redis, provider, job_id)
-        await env.audit.write_detached(
-            env.sessions, result="error", metadata={"provider": provider, "job_id": str(job_id),
-                                                    "error": "queue_unavailable"}, **audit,
-        )  # fmt: skip
+        await refused("error", "queue_unavailable")
         raise AppError(
             "DEPENDENCY_UNAVAILABLE", "A required dependency is unavailable", http_status=503
         ) from None
@@ -241,7 +245,12 @@ async def request_smoke(
     report = await _wait_for_report(
         env, row_id, job_id, env.settings.smoke_wait_s if wait_s is None else wait_s
     )
-    return SmokeOutcome(job_id, report)
+    if report is None:
+        return SmokeOutcome(job_id, None, None)
+    async with env.sessions() as session:
+        landed = await session.get(ProviderConfig, row_id)
+        verdict = provider_readiness.provider_ready(landed, env.settings)
+    return SmokeOutcome(job_id, report, verdict)
 
 
 async def _wait_for_report(

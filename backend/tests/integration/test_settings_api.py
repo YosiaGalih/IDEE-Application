@@ -285,11 +285,17 @@ async def test_readiness_says_whether_the_report_counts_now_and_which_job_runs(
     smoke = await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))
     readiness = (await owner.get(f"{PROVIDERS}/{pid}/readiness")).json()["data"]
     assert readiness["job_id"] == smoke.json()["meta"]["job_id"] and readiness["running_job_id"] is None
-    assert (readiness["ready"], readiness["report_ready"]) == (True, True)
+    # One meaning per key (code review 3.1e1 spec c1): "ready" is the gate's own result, as in §11 #8 and in
+    # the smoke answer; whether it counts now is "effective" only, so no field reads green for a stale report.
+    assert "ready" not in readiness and readiness["report_ready"] is True
+    assert readiness["effective"] == {"state": "ready", "reason": "passed"}
+    assert smoke.json()["meta"]["effective"] == readiness["effective"]
     await owner.patch(f"{PROVIDERS}/{pid}", json={"model_policy": {"fast": "claude-test-fast"}},
                       headers=headers(owner))  # fmt: skip
     after = (await owner.get(f"{PROVIDERS}/{pid}/readiness")).json()["data"]
-    assert (after["ready"], after["report_ready"], after["readiness_status"]) == (False, True, "unknown")
+    assert (after["report_ready"], after["readiness_status"], after["effective"]["state"]) == (
+        True, "unknown", "unknown",
+    )  # fmt: skip
     app.state.dependencies.smoke_jobs = InlineSmoke(app, run=False)
     queued = (await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))).json()["data"]
     running = (await owner.get(f"{PROVIDERS}/{pid}/readiness")).json()["data"]
@@ -318,3 +324,41 @@ async def test_enabled_must_be_a_real_boolean(owner: httpx.AsyncClient, value: o
     pid = await provider_id(owner)
     response = await owner.patch(f"{PROVIDERS}/{pid}", json={"enabled": value}, headers=headers(owner))
     assert response.status_code == 422, response.text
+
+
+async def test_provider_key_masked(app: FastAPI, owner: httpx.AsyncClient) -> None:
+    """TEST_STRATEGY AC-15: the list shows the worker-reported status and a masked hint, never the key."""
+    from app.core.config import load_settings
+    from app.services import provider_readiness
+    from tests.integration.test_provider_readiness import report
+
+    key = "sk-ant-" + "masked-" + "m" * 24 + "z9y8"  # built, not written: a test value
+    worker = load_settings(make_test_env(ANTHROPIC_API_KEY=key))
+    async with app.state.dependencies.sessions() as session:
+        await provider_readiness.record_report(
+            session, report(), key=key, base_url=None, pricing_version=None,
+            models=provider_readiness.effective_models(worker, {}), settings=worker,
+            audit=AuditWriter(Redactor()), actor_id="worker",
+        )  # fmt: skip
+        await session.commit()
+    response = await owner.get(PROVIDERS)
+    row = response.json()["data"][0]
+    assert (row["secret_status"], row["secret_hint"]) == ("configured", "sk-ant-…z9y8")
+    assert key not in response.text and key[7:-4] not in response.text
+
+
+async def test_a_refused_smoke_request_is_audited_too(
+    owner: httpx.AsyncClient, app: FastAPI, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 3.1e Goal 5: every smoke request is audited, also the ones refused (code review 3.1e1 spec a3)."""
+    monkeypatch.setattr(provider_settings, "SMOKE_RATE_LIMIT", 1)
+    app.state.dependencies.smoke_jobs = InlineSmoke(app, run=False)
+    pid = await provider_id(owner)
+    assert (await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))).status_code == 202
+    assert (await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))).status_code == 409
+    await app.state.dependencies.redis.delete(smoke_lock.lock_key("anthropic"))
+    assert (await owner.post(f"{PROVIDERS}/{pid}/smoke-test", headers=headers(owner))).status_code == 429
+    found = [
+        (e.result, e.metadata_.get("reason")) for e in await events(engine, "provider.smoke_requested", pid)
+    ]
+    assert found == [("denied", "rate_limited"), ("denied", "smoke_running"), ("success", None)]

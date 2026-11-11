@@ -380,7 +380,7 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 **Konsekuensi:** ARCHITECTURE §7 (denylist `.kk/` untuk agent) dan SECURITY_MODEL baris R1 serta §13 diselaraskan. Penolakan kebijakan di handler tetap berstatus `error` sampai gateway mengenal penolakan dari handler (3.1f).
 
 ## ADR-073 — Readiness gate provider, key hanya di worker, kill switch per project (WP-3.1e1)
-**Status:** Proposed (Lead, 8 Nov 2026, di bawah mandat PO "jalan tanpa menunggu, catat keputusan Lead, laporkan konflik ke #72"; Keputusan Lead 3.1e #1–#9). Spec: `docs/superpowers/specs/2026-11-08-wp-3.1e-provider-readiness-design.md`.
+**Status:** Proposed (Lead, 8 Nov 2026, di bawah mandat PO "jalan tanpa menunggu, catat keputusan Lead, laporkan konflik ke #72"; Keputusan Lead 3.1e #1–#10). Spec: `docs/superpowers/specs/2026-11-08-wp-3.1e-provider-readiness-design.md`.
 **Konteks:** ADR-032 meminta hasil readiness gate disimpan dan memblokir agent LLM; ADR-004 menyebut `api` ikut memegang key untuk smoke test, sedangkan ARCHITECTURE §2, SECURITY_MODEL §7, ADR-053 dan compose menaruh key hanya di worker. API §9 (`{job_id}`) dan §11 #8 (sinkron) memberi dua bentuk respons smoke.
 **Keputusan:**
 1. Key hanya di `worker`. Smoke berjalan di worker (CLI `claude-smoke` di container worker, atau job `provider_smoke`); `api` mengirim job dan membaca hasilnya dari `provider_configs`. Kontrak lint-imports melarang `app.main`/`app.api` mengimpor factory, adapter, `provider_smoke`, dan `app.worker`.

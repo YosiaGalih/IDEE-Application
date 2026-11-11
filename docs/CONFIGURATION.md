@@ -17,7 +17,7 @@ Satu daftar kanonik. `backend/app/core/config.py`, `sandbox_manager/…/config.p
 | `REDIS_URL` ★ | – | api, worker | `redis://:pass@redis:6379/0` |
 | `LLM_PROVIDER` | `anthropic` | worker, api | `anthropic` \| `scripted` (dilarang di production, ADR-015) |
 | `ANTHROPIC_API_KEY` | – | worker | wajib bila `LLM_PROVIDER=anthropic`; tidak pernah dicatat. Hanya worker: smoke test juga berjalan di worker (ADR-073); `api` tidak membacanya (kontrak lint-imports + `tests/security/test_provider_secrets.py`) |
-| `ANTHROPIC_BASE_URL` | – | worker | opsional; https di production. Tidak dapat diubah lewat API (ADR-073); `base_url` di `GET /settings/providers` adalah yang dilaporkan worker |
+| `ANTHROPIC_BASE_URL` | – | worker | opsional; https di production. Tidak dapat diubah lewat API (ADR-073); `base_url` di `GET /settings/providers` adalah yang dilaporkan worker, tanpa user info, query, fragment, dan parameter path, lalu diredaksi. Jangan menaruh kredensial gateway di URL; pakai header/secret proxy |
 | `SMOKE_WAIT_S` | `45` | api | batas tunggu `POST /settings/providers/{id}/smoke-test` sebelum menjawab `202 {job_id}` (0 < x ≤ 55; di bawah batas klien 60 dtk) |
 | `CLAUDE_MODEL_DEFAULT` ★ | – | worker | model ID dari katalog resmi, divalidasi saat deployment |
 | `CLAUDE_MODEL_FAST` | = default | worker | opsional |

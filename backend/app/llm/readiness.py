@@ -277,6 +277,10 @@ async def _provider_checks(
             "failed",
             f"a request with the default model ({default}) failed: {probe}",
         )
+        if not (isinstance(probe, LLMError) and probe.kind == "auth"):
+            # Not a refused key: the default model itself may be the cause (a wrong id is a 404), so it is
+            # named where a reader looks for model problems (code review 3.1e1 spec c4).
+            outcomes["model_accessible"] = ("failed", f"default={default}: {probe}")
         return
     outcomes["api_key_valid"] = (
         "passed",
@@ -362,10 +366,12 @@ async def _tool_check(provider: LLMProvider, model: str, timeout_s: float) -> _O
 
 async def _timeout_cancel_check(provider: LLMProvider, model: str, timeout_s: float) -> _Outcome:
     problems: list[str] = []
-    count = "Count from 1 to 200, one number per line."
+    counting_prompt = "Count from 1 to 200, one number per line."
 
     started = time.monotonic()
-    timed = await _call(provider, _request(model, "timeout", count, TIMEOUT_PROBE_S, max_tokens=512))
+    timed = await _call(
+        provider, _request(model, "timeout", counting_prompt, TIMEOUT_PROBE_S, max_tokens=512)
+    )
     elapsed = time.monotonic() - started
     if isinstance(timed, LLMResponse):
         problems.append(f"a request with a {TIMEOUT_PROBE_S} s limit was answered instead of a timeout")
@@ -383,7 +389,7 @@ async def _timeout_cancel_check(provider: LLMProvider, model: str, timeout_s: fl
         token.cancel()
 
     cut = await _call(
-        provider, _request(model, "cancel", count, timeout_s, max_tokens=512),
+        provider, _request(model, "cancel", counting_prompt, timeout_s, max_tokens=512),
         on_text_delta=cancel_on_first, cancel=token,
     )  # fmt: skip
     if isinstance(cut, LLMResponse):
