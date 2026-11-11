@@ -2381,3 +2381,97 @@ Ran 112 tests · OK (skipped=1)
   - batas klien 60 dtk; jawaban 202 → "masih berjalan" dan baca `running_job_id`/`job_id`.
 - **AG-13 N1:** handler 422 (`app/core/errors.py`) mengganti segmen `loc` dari kunci dict dan field asing dengan placeholder (semua route).
 - **PO:** ratifikasi ADR-073, khususnya #6 (pemegang kill switch) dan EX-03 postgres.
+
+
+### WP-3.1e2 (🔒 layar pengaturan provider) — `/settings/providers`, `/settings` → sub-halaman pertama yang diizinkan, item sidebar "Pengaturan" menurut izin, pernyataan data flow (FR-128 layar, FR-130 layar, FR-158 pernyataan; ADR-032, ADR-073)
+
+Spec: `docs/superpowers/specs/2026-11-08-wp-3.1e-provider-readiness-design.md` (Goals 3.1e2). Plan: `docs/superpowers/plans/2026-11-11-wp-3.1e2-provider-settings-screen.md` (Keputusan Lead 3.1e2 #1–#6). Branch dari `main` 4fcc31f. Hanya frontend dan dokumen; tidak ada perubahan backend.
+
+**Syarat WP-3.1e1 yang dicatat di sini [Pasti]:** PR #27 CI 9/9 `success` di dd099af (`get_check_runs`: backend-lint, backend-types, backend-test, frontend, security-scan, sandbox-test, sandbox-isolation, infra-config, clean-install; selesai 08:21–08:28 UTC 11 Nov), termasuk gate Trivy sesudah perbaikan zlib/libxslt dan EX-03 postgres. PR #27 di-merge PO (merge commit 4fcc31f, 11 Nov 2026); tree `main` sesudah merge identik dengan dd099af (`git diff --quiet`). Syarat AG-13 3.1e1 (1) terpenuhi; (2) ratifikasi ADR-073 #6 dan (3) N1 tetap terbuka (di bawah).
+
+**Syarat 3.1e1 untuk layar ini, terpenuhi:**
+- warna dan teks readiness dari `effective`, bukan `report_ready` (mutan F4);
+- `readiness_not_required` tampil sebagai `role="alert"`, sekali per kartu;
+- batas klien smoke 60 dtk (`SMOKE_TIMEOUT_MS`, mutan F2);
+- jawaban 202 → "masih berjalan", lalu readiness dibaca ulang tiap 3 dtk sampai `job_id` = job ini (selesai) atau `running_job_id` bukan job ini lagi (berakhir tanpa laporan) (F3, F7, F9).
+
+**Keterbatasan nyata:**
+- Sakelar `enabled` tersimpan dan diaudit, tetapi baru ditegakkan AgentRuntime di 3.1f. Teks layar memakai bentuk normatif ("agent tidak boleh memanggil") dan menyebut smoke test tetap bisa dijalankan.
+- Penghentian per project (`provider_calls_enabled`) saat ini hanya lewat API `PATCH /projects/{id}`; layar pengaturan project menyusul (non-goal 3.1e).
+- Izin di klien hanya untuk tampilan (Keputusan Lead 3.1e2 #1); server tetap penegak (403 → state `permission_denied`, diuji).
+- Lebar 390 px: shell aplikasi (sidebar `w-60` tetap) menggulung horizontal, sama seperti `/approvals` (HANDOFF, di luar cakupan).
+- Bila POST smoke tidak mendapat jawaban yang dapat dibaca, layar tidak dapat membuktikan run mana yang menulis laporan berikutnya; laporan baru itu disebut "belum pasti dari smoke test Anda", bukan "selesai" (silent-failure H2). Kepastian penuh butuh id korelasi dari klien di kontrak smoke (perubahan API; tidak di WP ini).
+
+**Bukti:**
+
+```text
+$ npm run format:check && npm run lint && npm run lint:guards && npm run typecheck   # @ 9907843
+All matched files use Prettier code style! · eslint 0 warnings · lint guards: every contract rule rejects its violation · tsc 0 errors
+$ npm test
+Test Files  44 passed (44) · Tests  584 passed (584)        # @ 9907843; main 4fcc31f: 40 file, 535 test
+$ npx vite build && npm audit --omit=dev --audit-level=high
+✓ built in 3.03s · found 0 vulnerabilities
+```
+
+- Test baru (49): `src/api/__tests__/providers.test.ts` (8: schema §9/§11 #8/§11.3, 200 vs 202 lewat `status === "accepted"`, PATCH hanya `model_policy`/`enabled`), `providers.timeout.test.ts` (1: `timeoutMs` 60 000), `Sidebar.test.tsx` (+2: item "Pengaturan" tampil/tersembunyi menurut izin), `SettingsPage.test.tsx` (3: redirect ke `providers` atau `audit`, `permission_denied`), `ProvidersPage.test.tsx` (35):
+  - status key + hint + ikon, pernyataan data flow, warna dari `effective`, alert `readiness_not_required`, `detail` sebagai teks (`<img onerror>` tidak menjadi elemen);
+  - state loading, empty, error, 403, readiness gagal yang tetap menampilkan kartu, daftar atau readiness yang gagal dibaca ulang disebut usang, laporan yang tidak berlaku lagi ditandai;
+  - alias kosong dikirim `null`, model id tidak valid ditolak di klien, pesan "tersimpan" bertahan saat form di-remount dan hilang saat diedit lagi;
+  - nonaktifkan dengan konfirmasi (setuju/batal); jawaban PATCH tampil walau daftar gagal dibaca ulang;
+  - smoke: 200 baru "selesai" sesudah bacaan yang memuat laporannya, 202 lalu selesai, 202 lalu berakhir tanpa laporan, bacaan lama sebelum POST tidak memutuskan, tanpa jawaban (timeout/network/halaman gateway) lalu polling, tanpa jawaban disebut "memeriksa" sampai bacaan menunjukkan run, laporan baru tanpa jawaban (atau laporan job lain sesudah 200) disebut belum pasti milik kita, tanpa jawaban dan tanpa run disebut mungkin tidak sampai, "Periksa lagi" tidak pernah mengirim POST, batas 5 menit, bacaan yang terus gagal berhenti di batas dengan teks "tidak dapat memeriksa" dan "Periksa lagi" (juga untuk run yang tidak kita mulai), run yang sudah berjalan saat halaman dibuka, tombol nonaktif sampai readiness terbaca dan selama laporan 200 dibaca, satu POST tanpa retry untuk 503/network/timeout klien 60 dtk, tiga klik dalam satu `act` = satu POST, 409 dan 429.
+- Mutan F1–F34 satu per satu pada kode akhir (9907843): **34/34 merah**. F1–F8 dari plan; F9–F34 dari review:
+  - F9: bacaan sebelum POST memutuskan;
+  - F10: bacaan gagal tidak dihitung ke batas;
+  - F11: nonaktifkan tanpa konfirmasi;
+  - F12: mutasi smoke di-retry;
+  - F13: run yang sudah berjalan diabaikan;
+  - F14: `/settings` tidak redirect;
+  - F15: daftar provider tidak dimuat ulang saat laporan tiba;
+  - F16: jawaban PATCH tidak ditulis ke daftar;
+  - F17: daftar usang tidak disebut;
+  - F18: tanpa jawaban, laporan baru diklaim "selesai";
+  - F19: 200 diklaim "selesai" sebelum bacaan;
+  - F20: readiness usang tidak disebut;
+  - F21: bacaan gagal disebut "tidak ada laporan";
+  - F22: halaman gateway dianggap kegagalan biasa;
+  - F23: "tersimpan" tetap tampil saat diedit;
+  - F24: laporan yang tidak berlaku tidak ditandai;
+  - F25: tanpa jawaban dan tanpa run disebut "berakhir tanpa laporan";
+  - F26: penjaga klik dihapus;
+  - F27: timeout klien dianggap kegagalan biasa;
+  - F28: tombol aktif saat laporan 200 dibaca;
+  - F29: run yang tidak kita mulai dibaca selamanya;
+  - F30: tombol aktif sebelum readiness terbaca;
+  - F31: smoke di-retry sesudah jawaban hilang;
+  - F32: "Periksa lagi" menjalankan smoke berbayar;
+  - F33: sesudah 200, laporan job lain disebut "selesai";
+  - F34: tanpa jawaban disebut "masih berjalan" sebelum ada bacaan.
+  Skrip dan keluarannya tersimpan di scratchpad sesi.
+- **Penyimpangan proses:** commit pertama (1ba9efc) memuat layar dan test bersama; "merah"-nya tidak terekam terpisah. Kompensasinya mutan di atas. Perbaikan review memakai test merah dulu (mis. F9 awalnya `SURVIVED`; test diperkuat dengan jawaban yang ditahan, lalu ketahuan bug nyata: invalidasi yang di-`await` menunda "masih berjalan").
+- **Live check @ bba12a1, diulang @ c868e08:** build produksi lewat `vite preview` + Playwright, API di-mock di level jaringan browser (`/auth/me` dengan `settings:providers`, daftar, readiness dengan laporan yang tidak berlaku lagi). Hasilnya:
+  - 0 error konsol, 13 ikon status;
+  - dialog "Nonaktifkan anthropic?" dengan Batal/Nonaktifkan;
+  - `/settings` mendarat di `/settings/providers`;
+  - penanda "Laporan ini tidak berlaku lagi" tampil.
+  Di 1280 px tanpa scroll horizontal; di 390 px ada scroll horizontal dari shell (lihat keterbatasan).
+
+**Review:**
+
+| Review | Hasil | Penutupan |
+|---|---|---|
+| `kk-frontend-reviewer` @ 9bdf33d | **APPROVE WITH NITS**, 0 HIGH, 5 MEDIUM, 5 LOW, 3 NIT | 42d8c18:<br>- M1 "tersimpan" hilang saat remount: state diangkat ke `ProviderCard` di atas form ber-`key`; invalidasi tidak di-`await`; test dengan PATCH yang mengubah policy.<br>- M2 teks timeout menjanjikan hasil: tanpa jawaban → menunggu dengan `jobId: null` dan polling (`noAnswer`).<br>- M3 polling tanpa batas dan tanpa galat: batas 5 menit (`stalled`), alert `readFailed` saat menunggu.<br>- M4 landing `permission_denied` saat `/auth/me` memuat/gagal: state loading/error.<br>- M5 pernyataan data flow: lihat AG-13 M1.<br>- L6 nonaktifkan tanpa konfirmasi: `Dialog` konfirmasi (F11).<br>- L7 nada hijau pada smoke gagal: alert `info` netral.<br>- L8 level heading: readiness `h3`. Data flow sudah `<section>` berlabel (`Card` merender `section`), jadi bagian itu tidak diubah.<br>- L9 `role="alert"` ganda: `VerdictLine` dengan `hasAlert` sekali.<br>- L10 run hilang saat pindah halaman: idle + `running_job_id` → running (F13).<br>- NIT: `trim` sekali; regex model id merujuk `provider_readiness.MODEL_ID`. **Diterima:** enum `state` ketat (nilai baru dari backend → `bad_response`, sengaja). |
+| AG-13 @ 9bdf33d | **SIGNED OFF WITH CONDITIONS 🔒**, 0 CRITICAL/HIGH.<br>- M1: pernyataan data flow dan bantuan sakelar melebih-lebihkan kill switch (penegakan baru 3.1f; smoke tetap jalan saat nonaktif; layar project belum ada; pemegang per project adalah `project:write`, bukan admin).<br>- L1: polling tanpa batas bila bacaan gagal.<br>- L2: teks timeout.<br>- L3: tidak ada test regresi kontrol biaya. | 42d8c18:<br>- M1: teks layar `id`/`en` menyebut yang ada (sakelar di halaman ini; per project lewat API, layar menyusul; bantuan sakelar normatif dan menyebut smoke tetap bisa dijalankan); SECURITY_MODEL §7 diperbarui; konflik #72 butir 3.1e2.<br>- L1: batas memakai `max(dataUpdatedAt, errorUpdatedAt)` (F10).<br>- L2: lihat frontend M2.<br>- L3: test satu POST tanpa retry untuk 503/network/klik ganda (F12). |
+| `/code-review` Standards @ 9bdf33d | - Keras: status hanya teks + warna (frontend.md "teks + ikon"); nama handler/boolean (`submit`, `start`, `saved`, `busy`); state loading/empty/error dan readiness gagal belum diuji; tracker belum ada.<br>- Lunak: props inline.<br>- Smell: `CHECK_KEYS` disalin di fixture; UUID literal; formatter tanggal ganda; rangkaian loading/error ganda; enum status ganda; alias ditulis manual; empat peta nada; `refetchInterval` bertipe `number` tak terpakai; nama `settle`/`wrong`/`when`; `import i18n` langsung.<br>- Di luar sumbu: `me.isSuccess` vs `me.data`. | 42d8c18:<br>- Peta `LOOK` {ikon, nada} per jenis status di `providerStatus.tsx` (`data-testid="status-icon"`, diuji).<br>- `handleSubmit`, `handleStart`, `isPolicySaved`, `isStarting`; `type Props`.<br>- Test state ditambah; tracker ini.<br>- `CHECK_KEYS`/`MODEL_ALIASES` dari `api/providers.ts`; fixture ID diimpor; `useDateTimeFormat`; `QueryFallback`; satu enum; `phaseOf`, `invalidAliases`; `useTranslation`.<br>- Sidebar dan landing membaca `me.data`. |
+| `/code-review` Spec @ 9bdf33d | - (a1) Task 6 plan (tracker, HANDOFF, #72) belum.<br>- (a2) header kartu tidak dimuat ulang saat laporan tiba.<br>- (c3) landing bertentangan dengan API §11 #18 (redirect) dan tafsiran `settings:*` tidak dilaporkan.<br>- (c4) pernyataan data flow (lihat AG-13 M1).<br>- (c5) alert "selesai" hijau.<br>- (c6) teks timeout.<br>- (c7) `unknown` = "Belum diuji" menyesatkan untuk laporan basi.<br>- (c8) `me.isSuccess`. | 42d8c18:<br>- (a1) tracker, HANDOFF, #72 di PR ini.<br>- (a2) daftar di-invalidate saat fase `finished` (F15).<br>- (c3) `/settings` → `<Navigate replace>` ke sub-halaman pertama yang diizinkan (F14); tafsiran dan redirect dicatat di #72.<br>- (c5) nada netral.<br>- (c6) lihat frontend M2.<br>- (c7) "Perlu diuji" / "Needs a test".<br>- (c8) `me.data`. |
+| `kk-silent-failure-hunter` @ 42d8c18 | 0 CRITICAL, **2 HIGH**, 4 MEDIUM, 4 LOW.<br>- H1: PATCH yang berhasil tampil "belum diterapkan" bila daftar gagal dibaca ulang (PoC).<br>- H2: tanpa jawaban, laporan run lain diklaim "selesai".<br>- M1: readiness yang gagal dibaca ulang tetap tampil sebagai data sekarang; jalur 200 "selesai" sebelum bacaan.<br>- M2: "tidak ada laporan sesudah 5 menit" padahal bacaannya yang gagal.<br>- M3/M4: halaman gateway/2xx tanpa envelope dianggap gagal biasa.<br>- L1: "tersimpan" tetap tampil saat diedit.<br>- L2: jawaban PATCH tidak dibandingkan dengan yang dikirim.<br>- L3: Settings tersembunyi saat `/auth/me` gagal.<br>- L4: laporan basi tampil sebagai hasil. | bba12a1 (test merah dulu, mutan F16–F25):<br>- H1: jawaban PATCH ditulis ke cache daftar; peringatan daftar usang + "Baca ulang".<br>- H2: fase `unconfirmed` ("belum pasti dari smoke test Anda") dan `noRun`.<br>- M1: 200 menunggu bacaan dengan `job_id`-nya (teks "sedang dibaca"); panel menyebut bacaan usang dengan waktunya.<br>- M2: fase `unreadable` + "Periksa lagi".<br>- M3/M4: `isOutcomeUnknown`, kecuali envelope HTTP API (409/429/503 tetap jawaban).<br>- L1: dihapus saat diedit atau saat submit tidak valid.<br>- L4: penanda "tidak berlaku lagi" bila `effective.state = unknown`.<br>**Diterima, tidak diubah:** L2 (server menyimpan nilai yang lolos validasi apa adanya atau 422; kartu kini dirender dari jawaban PATCH); L3 (`RequireSession` tidak merender shell tanpa `me.data`, jadi sidebar tidak tampil sama sekali). |
+| AG-13 delta @ 42d8c18 | **SIGNED OFF WITH CONDITIONS 🔒**, 0 CRITICAL/HIGH/MEDIUM. M1 dan L2 terpenuhi; L1 terpenuhi di jalur menunggu; L3 sebagian.<br>- LOW-1: jalur idle (run yang tidak kita mulai) dibaca tiap 3 dtk selamanya bila bacaan terus gagal (PoC H: 221 GET dalam 11 menit; hanya GET).<br>- LOW-2: tanpa jawaban, laporan lain bisa disebut "selesai" (`before` null bila klik sebelum readiness terbaca).<br>- LOW-3: penjaga klik dan no-retry network/timeout tanpa test regresi (mutan N1, N3, N9 lolos).<br>- LOW-4: kalimat kanonik menyebut "di halaman ini", padahal juga untuk dialog task pertama.<br>Syarat 5: perubahan sesudah 42d8c18 di-review delta sebelum merge. | c868e08 (test merah dulu kecuali test regresi LOW-3, yang dibuktikan dengan mutan F26, F27, F31):<br>- LOW-1: jalur idle berhenti bila bacaan gagal lebih lama dari batas → `unreadable` (F29).<br>- LOW-2: fase `unconfirmed` (bba12a1) + tombol nonaktif sampai readiness terbaca (F30).<br>- LOW-3: tiga klik dalam satu `act`; hitung POST sesudah 1,1 dtk; timeout klien lewat spy `AbortSignal.timeout`.<br>- LOW-4: "di Pengaturan → Provider & model"; SECURITY_MODEL §7 identik byte per byte dengan `id.json`.<br>- Ditemukan sendiri saat menutup LOW-2: di bba12a1 tombol aktif selama fase `loading` (lock server sudah lepas, klik kedua = run berbayar baru); kini nonaktif (F28). |
+| AG-13 delta @ c868e08 | **SIGNED OFF WITH CONDITIONS 🔒**, 0 CRITICAL/HIGH. Syarat 5 putaran sebelumnya terpenuhi; LOW-1–LOW-4 ditutup (mutan N1, N3, N9, N11–N14 merah terhadap test repo).<br>- Teks baru didukung data klien; tidak ada jalur baru yang memicu smoke berbayar tanpa klik atau dua kali (PoC G, K, N, Q, J); `setQueryData` hanya menulis jawaban PATCH yang lolos schema (PoC M).<br>- LOW-5: tanpa jawaban, "masih berjalan di worker" tampil sebelum ada bacaan (PoC S).<br>- LOW-6: mutan N15 (200 lalu laporan job lain → "selesai") dan N23 ("Periksa lagi" → `handleStart`) lolos test repo.<br>Syarat: (1) tracker di PR yang sama; (2) LOW-5/6 diperbaiki atau dilacak; (3) 3.1f menegakkan `enabled`/`provider_calls_enabled`; (4) CI hijau; (5) perubahan `SmokeTest.tsx`/`useProviders.ts` sesudahnya di-review delta. | 9907843:<br>- LOW-5: fase `checking` ("Memeriksa readiness…") sampai bacaan menunjukkan lock dipegang (F34).<br>- LOW-6: test "Periksa lagi" menghitung POST = 1 (F32); test 200 lalu laporan job lain → `unconfirmed` (F33). |
+| AG-13 delta @ 9907843 | Berjalan saat commit ini dibuat; hasilnya dicatat di commit berikutnya pada PR ini. | – |
+
+**Status sign-off AG-13 WP-3.1e2:** SIGNED OFF WITH CONDITIONS di c868e08 (delta kedua). Delta ketiga (9907843) berjalan. Syarat terbuka: CI hijau di head PR; 3.1f menegakkan `enabled` dan `provider_calls_enabled` sebelum jalur LLM runtime mana pun.
+
+**Syarat yang dibawa:**
+- **3.1f:** AgentRuntime menegakkan `enabled` (provider) dan `provider_calls_enabled` (project) sebelum jalur LLM runtime mana pun dirilis (AG-13 3.1e2 syarat 3); sampai itu teks layar bersifat normatif. Syarat 3.1e1 untuk 3.1f tetap berlaku.
+- **AG-13 3.1e1 N1:** handler 422 mengganti segmen `loc` dari kunci dict dan field asing (semua route).
+- **PO:** ratifikasi ADR-073 (#6 pemegang kill switch) dan EX-03 postgres (sampai 2026-11-30).
+- **Shell 390 px:** sidebar tetap menggulung horizontal di layar ponsel (sudah tercatat sejak WP-3.1c2).
