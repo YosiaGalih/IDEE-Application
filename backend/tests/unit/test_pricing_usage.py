@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import uuid
 from decimal import Decimal
 from pathlib import Path
-from typing import get_args, get_type_hints
+from typing import Literal, get_args, get_type_hints
 
 import pytest
 
-from app.llm.base import ERROR_KINDS, Usage
+from app.llm.base import ERROR_KINDS, ErrorKind, Usage
 from app.llm.pricing import PricingError, PricingTable, load_pricing
 from app.llm.retry import AttemptRecord
 from app.models.enums import LLM_ERROR_KINDS, USAGE_ATTEMPT_STATUSES
+from app.services.usage import UsageCallContext, build_row
 
 BACKEND = Path(__file__).resolve().parents[2]
 
@@ -156,3 +158,120 @@ def test_ledger_enums_match_the_llm_port() -> None:
     assert set(LLM_ERROR_KINDS) == ERROR_KINDS
     assert len(LLM_ERROR_KINDS) == len(ERROR_KINDS)
     assert USAGE_ATTEMPT_STATUSES == get_args(get_type_hints(AttemptRecord)["status"])
+
+
+# --- ledger rows (WP-3.1f1 Task 2; spec WP-3.1f Keputusan Lead #3, #4) --------------------------------------
+
+PROJECT = uuid.UUID(int=1)
+CALL = uuid.UUID(int=2)
+
+
+def ctx(**overrides: object) -> UsageCallContext:
+    values: dict[str, object] = {
+        "project_id": PROJECT,
+        "call_id": CALL,
+        "input_token_bound": 1_000,
+        "output_token_cap": 8_192,
+    }
+    values.update(overrides)
+    return UsageCallContext(**values)  # type: ignore[arg-type]
+
+
+def attempt_record(
+    *,
+    status: Literal["ok", "error", "cancelled"] = "ok",
+    error_kind: ErrorKind | None = None,
+    usage: Usage | None = Usage(input_tokens=1_000, output_tokens=100),  # noqa: B008 - frozen
+    model: str = "claude-test-model",
+    attempt: int = 1,
+    request_id: str | None = "req_1",
+) -> AttemptRecord:
+    return AttemptRecord("scripted", model, attempt, request_id, usage, 42, status, error_kind)
+
+
+def test_row_from_ok_attempt_is_estimated(table: PricingTable) -> None:
+    row = build_row(ctx(), attempt_record(), table)
+    assert row["status"] == "ok" and row["error_kind"] is None
+    assert row["cost_status"] == "estimated"
+    assert row["estimated_cost"] == Decimal("0.0045")  # 1000 x 3 + 100 x 15 per million
+    assert row["pricing_version"] == "2026-11-05"
+    assert (row["input_tokens"], row["output_tokens"]) == (1_000, 100)
+    assert (row["cache_creation_tokens"], row["cache_read_tokens"]) == (0, 0)
+    assert (row["provider"], row["model"], row["duration_ms"]) == ("scripted", "claude-test-model", 42)
+    assert (row["project_id"], row["call_id"]) == (PROJECT, CALL)
+
+
+@pytest.mark.parametrize(("status", "kind"), [("error", "transient"), ("cancelled", "cancelled")])
+def test_row_from_failed_attempt_with_usage_is_partial(
+    table: PricingTable, status: Literal["error", "cancelled"], kind: ErrorKind
+) -> None:
+    usage = Usage(input_tokens=50, output_tokens=0)
+    row = build_row(ctx(), attempt_record(status=status, error_kind=kind, usage=usage), table)
+    assert (row["status"], row["error_kind"]) == (status, kind)
+    assert row["cost_status"] == "partial"  # a lower bound, never a plain estimate (AG-13 3.1a M2)
+    assert row["estimated_cost"] == Decimal("0.00015")
+    assert (row["input_tokens"], row["output_tokens"]) == (50, 0)
+
+
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [("error", "transient"), ("cancelled", "cancelled"), ("ok", None), ("error", None)],
+)
+def test_row_without_usage_is_unavailable(
+    table: PricingTable, status: Literal["ok", "error", "cancelled"], kind: ErrorKind | None
+) -> None:
+    row = build_row(ctx(), attempt_record(status=status, error_kind=kind, usage=None), table)
+    assert (row["cost_status"], row["estimated_cost"]) == ("unavailable", None)
+    tokens = ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
+    assert [row[name] for name in tokens] == [None, None, None, None]
+    assert row["pricing_version"] == "2026-11-05"
+
+
+def test_row_of_unknown_model_keeps_tokens_and_is_unavailable(table: PricingTable) -> None:
+    usage = Usage(input_tokens=10, output_tokens=5, cache_creation_tokens=2, cache_read_tokens=3)
+    row = build_row(ctx(), attempt_record(model="claude-unpriced", usage=usage), table)
+    assert (row["cost_status"], row["estimated_cost"]) == ("unavailable", None)
+    assert (row["input_tokens"], row["output_tokens"]) == (10, 5)
+    assert (row["cache_creation_tokens"], row["cache_read_tokens"]) == (2, 3)
+
+
+def test_row_cost_rounds_up_at_ten_places(tmp_path: Path) -> None:
+    path = tmp_path / "pricing.yaml"
+    path.write_text(TABLE.replace('input: "3"', 'input: "0.00001"'), encoding="utf-8")
+    cheap = load_pricing(path)
+    row = build_row(ctx(), attempt_record(usage=Usage(input_tokens=1, output_tokens=0)), cheap)
+    # 1 token x 0.00001 / 1e6 = 1E-11: stored rounded up, never down to a zero that reads as a price.
+    assert row["estimated_cost"] == Decimal("1E-10")
+    assert row["cost_status"] == "estimated"
+
+
+def test_row_keeps_attempt_retry_count_and_bounds(table: PricingTable) -> None:
+    task_id, run_id = uuid.uuid4(), uuid.uuid4()
+    context = ctx(
+        task_id=task_id, agent_run_id=run_id, agent_id="B14", input_token_bound=77, output_token_cap=9
+    )
+    row = build_row(context, attempt_record(attempt=4, status="error", error_kind="overloaded"), table)
+    assert (row["attempt"], row["retry_count"]) == (4, 3)
+    assert (row["input_token_bound"], row["output_token_cap"]) == (77, 9)
+    assert (row["task_id"], row["agent_run_id"], row["agent_id"]) == (task_id, run_id, "B14")
+
+
+def test_row_truncates_request_id(table: PricingTable) -> None:
+    row = build_row(ctx(), attempt_record(request_id="r" * 500), table)
+    assert row["request_id"] == "r" * 120
+    assert build_row(ctx(), attempt_record(request_id=None), table)["request_id"] is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"input_token_bound": -1},
+        {"output_token_cap": 0},
+        {"output_token_cap": -5},
+        {"agent_run_id": uuid.UUID(int=3), "agent_id": "B14"},  # a run without its task
+        {"agent_run_id": uuid.UUID(int=3), "task_id": uuid.UUID(int=4)},  # a run without its agent
+    ],
+)
+def test_context_refuses_bad_bounds_and_run_without_task(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        ctx(**overrides)
