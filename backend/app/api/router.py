@@ -6,6 +6,7 @@ from app.api.routes import (
     agents,
     approvals,
     auth,
+    budget,
     dashboard,
     git,
     health,
@@ -28,5 +29,6 @@ api_router.include_router(project_imports.router)
 api_router.include_router(workspace.router)
 api_router.include_router(git.router)
 api_router.include_router(repository.router)
+api_router.include_router(budget.router)
 api_router.include_router(settings.router)
 api_router.include_router(usage.router)
