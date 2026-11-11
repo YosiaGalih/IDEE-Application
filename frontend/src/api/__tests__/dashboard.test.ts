@@ -82,6 +82,29 @@ describe("getDashboard", () => {
     await expect(getDashboard()).rejects.toMatchObject({ kind: "bad_response" });
   });
 
+  it.each([
+    ["an unavailable cost that carries an amount", "0", "unavailable"],
+    ["an estimated cost without an amount", null, "estimated"],
+    ["a partial cost without an amount", null, "partial"],
+  ])("refuses %s: the cost must match its status (WP-3.1f1)", async (_, cost, status) => {
+    const data = dashboardData();
+    const usage = {
+      ...data.usage,
+      input_tokens: 1,
+      output_tokens: 1,
+      estimated_cost: cost,
+      cost_status: status,
+    };
+    answer({ ...data, usage }, dashboardMeta({ unavailable: [] }));
+    await expect(getDashboard()).rejects.toMatchObject({ kind: "bad_response" });
+    const recent = {
+      ...data.recent_tasks[0],
+      usage: { ...usage, estimated_cost: cost, cost_status: status },
+    };
+    answer({ ...data, recent_tasks: [recent] });
+    await expect(getDashboard()).rejects.toMatchObject({ kind: "bad_response" });
+  });
+
   it("refuses a task cost sent as a number", async () => {
     const data = dashboardData();
     const recent = {

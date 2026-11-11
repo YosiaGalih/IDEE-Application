@@ -111,13 +111,13 @@ describe("DashboardPage", () => {
     expect(cost).toHaveTextContent(id.dashboard.costStatus.estimated);
   });
 
-  it("never prints a cost whose status says it is unknown", async () => {
+  it("shows an unknown cost as not available, next to the counted tokens", async () => {
     const data = dashboardData();
     data.usage = {
       ...data.usage,
       input_tokens: 0,
       output_tokens: 12,
-      estimated_cost: "0",
+      estimated_cost: null,
       cost_status: "unavailable",
     };
     backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
