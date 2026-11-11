@@ -126,9 +126,19 @@ make smoke      # = docker compose exec worker python -m app.cli claude-smoke
 
 Dijalankan di container **worker** (satu-satunya pemegang `ANTHROPIC_API_KEY` yang dimaksud, ARCHITECTURE §2). Smoke test membuktikan (PRD §7.3.6): API key valid, model ID dapat diakses, Messages API berhasil, streaming + usage diproses, round-trip tool-use bekerja, timeout/cancel/error ditangani, dan secret tidak muncul di log. Memakai fixture sintetis, bukan repo pengguna.
 
-- Exit code ≠ 0 → **jangan** aktifkan agent. Periksa: key (401/403), model ID salah (404), kuota/rate limit (429), egress ke `api.anthropic.com:443` (worker ada di network `outbound`).
+Sembilan check bernama tetap (API §11 #8 + `pricing_verified`): `api_key_valid`, `model_accessible` (setiap model `default`/`fast`/`complex` yang efektif), `messages_ok`, `streaming_ok`, `usage_reported`, `tool_use_roundtrip`, `timeout_cancel_handled`, `secret_not_in_logs` (stdout/stderr proses selama check), `pricing_verified` (gagal di production bila `verify_before_production: true`). Laporan (teredaksi) dicatat di `provider_configs` dan tampil di `GET /settings/providers/{id}/readiness`; `--json` mencetak bentuk API.
+
+| Exit | Arti |
+|---|---|
+| 0 | siap (semua check `passed`; `pricing_verified` boleh `skipped` di luar production) |
+| 1 | tidak siap: baca baris `failed` |
+| 2 | konfigurasi salah, atau smoke tidak dapat berjalan (DB/Redis tidak terjangkau; stderr menyebut jenis error) |
+| 3 | smoke lain sedang berjalan untuk provider ini (CLI dan API berbagi satu lock) |
+
+- Exit code ≠ 0 → **jangan** aktifkan agent. Periksa: key (401/403), model ID salah (404), kuota/rate limit (429), egress ke `api.anthropic.com:443` (worker ada di network `outbound`), CA/proxy (`SSL_CERT_FILE`, `HTTPS_PROXY`, CONFIGURATION).
+- Owner/admin juga dapat menjalankannya dari layar `/settings/providers` (job worker yang sama; jawaban `202` berarti masih berjalan).
 - Catat output smoke (tanpa secret) di catatan perubahan deployment.
-- Ulangi `make smoke` setiap ganti key, model, atau versi rilis.
+- Ulangi `make smoke` setiap ganti key, model, atau versi rilis. Mengubah `model_policy` atau `CLAUDE_MODEL_*` dan merotasi key mengembalikan readiness ke `unknown` sampai smoke berikutnya.
 
 ---
 
@@ -347,7 +357,7 @@ Saat: korupsi data, migrasi buruk, penghapusan tak sengaja.
 **ANTHROPIC_API_KEY bocor** (terlihat di log, commit, tiket, layar):
 
 1. **Segera** revoke key di Claude Console; buat key baru.
-2. Ganti `ANTHROPIC_API_KEY` di `.env`, lalu `docker compose -f infra/compose.yml --env-file .env up -d worker api` (recreate = env baru).
+2. Ganti `ANTHROPIC_API_KEY` di `.env`, lalu `docker compose -f infra/compose.yml --env-file .env up -d worker` (recreate = env baru; `api` tidak memegang key, ADR-073). Sampai `make smoke` lulus dengan key baru, worker menganggap readiness `unknown` (fingerprint key berbeda dari laporan terakhir).
 3. `make smoke` harus lulus.
 4. Tinjau usage/billing di Console untuk penggunaan tak sah sejak waktu bocor; catat di audit insiden.
 5. Cari sumber: `git log -p -S 'sk-ant-'`, log container, tiket. Bila masuk git: hapus dari history + rotasi tetap wajib (anggap sudah bocor). Pastikan gitleaks CI hijau.
@@ -411,7 +421,7 @@ Host & jaringan
 Secret & konfigurasi
 - [ ] `.env` mode 600 milik root, dibuat oleh `scripts/gen-secrets.sh`, tidak ada nilai `change-me`
 - [ ] `APP_ENV=production`, `COOKIE_SECURE=true`, `LLM_PROVIDER=anthropic`, `CORS_ORIGINS` kosong
-- [ ] `ANTHROPIC_API_KEY` hanya di worker (+api, ADR-004); migrate/scheduler menerima placeholder
+- [ ] `ANTHROPIC_API_KEY` hanya di worker (ADR-004, ADR-073); migrate/scheduler menerima placeholder
 - [ ] `make smoke` lulus dan dicatat
 
 Container (diverifikasi oleh `infra/compose.yml`)

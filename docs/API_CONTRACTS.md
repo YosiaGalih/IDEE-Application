@@ -31,6 +31,7 @@ Error:
 | 429 | `RATE_LIMITED`, `QUOTA_EXCEEDED` |
 | 500 | `INTERNAL_ERROR` (tanpa stack trace / path absolut) |
 | 503 | `DEPENDENCY_UNAVAILABLE` |
+| – | `PROVIDER_DISABLED`: kode `error` task/agent run, bukan respons HTTP: kill switch project `provider_calls_enabled=false` menghentikan panggilan provider (FR-158, SECURITY_MODEL §7; ADR-073, ditegakkan WP-3.1f) |
 
 Header: response selalu `X-Request-ID`. Client boleh kirim `X-Request-ID` (divalidasi `^[A-Za-z0-9_-]{8,64}$`). Mutating endpoint menerima `Idempotency-Key` (disimpan 24 jam di Redis; replay mengembalikan respons pertama).
 
@@ -74,7 +75,7 @@ Role berscope `project:<id>` hanya berlaku di project itu; role `global` berlaku
 | POST | `/projects/{id}/imports` | project:write | multipart `file` (.zip/.tar.gz ≤ 200 MB) | `{repository: Repository, job_id, upload: {filename, size, sha256}}` (202, §11 #14). Hanya untuk project `upload` yang belum berisi (FR-015 tanpa overwrite): 409 `CONFLICT` `details[0].reason` ∈ `repository_not_empty`, `not_an_upload_project`, `import_running`, `project_archived`, `import_expired`, `cleanup_failed`; 408 bila unggahan berhenti (§1) |
 | GET | `/projects/templates` | auth | – | `[{id, name, description, stack, icon}]` |
 | GET | `/projects/{id}` | project:read | – | `Project` (+ `repository`, `stats`) |
-| PATCH | `/projects/{id}` | project:write | `{name?, description?, settings?}` | `Project` |
+| PATCH | `/projects/{id}` | project:write | `{name?, description?, settings?}` | `Project`. `settings.provider_calls_enabled: true` (menyalakan kembali panggilan provider) juga butuh `settings:providers`, kalau tidak `403` dan tidak ada yang diterapkan; `false` cukup `project:write` (ADR-073) |
 | POST | `/projects/{id}/archive` | project:write | – | `Project` |
 | POST | `/projects/{id}/unarchive` | project:write | – | `Project` |
 | DELETE | `/projects/{id}` | project:delete | – | `{approval: Approval}` (202 — `project_delete` R3) |
@@ -170,6 +171,8 @@ data: {"task_id": "...", "seq": 12, "type": "tool.call_finished", "ts": "...", "
 
 `AgentProfile = {agent_id, slug, name, group, version, enabled, mvp_mode, priority, description, capabilities:[..], tools:[..], permission_profile:{filesystem, sandbox, git, network, deployment, approval_grant}, model_tier, limits, runtime_agent, status:"ready"|"disabled"|"planned"}`
 
+WP-3.1e1 (ADR-073): `status_reasons` dapat memuat `provider_readiness_unknown`, `provider_not_ready`, atau `provider_disabled` untuk agent `llm`/`profile`, menurut verdict provider; `meta.provider = {state, reason}` di list dan detail (`reason` `readiness_not_required` bila `LLM_REQUIRE_READINESS=false`).
+
 ## 7. Testing & terminal (M11, M12)
 
 | GET | `/projects/{id}/test-profiles` | workspace:read | – | `[{profile_id, suite, label, image, timeout_s, network}]` (sesuai stack) |
@@ -205,9 +208,9 @@ Terminal UI (M11) = viewer read-only untuk output run sandbox; input hanya berup
 
 ## 9. Settings, usage, knowledge, deployments, admin
 
-| GET | `/settings/providers` | settings:providers | – | `[{id, provider, base_url, model_policy, secret_status:"configured"\|"missing", secret_hint:"sk-ant-…a1b2", enabled, pricing_version}]` |
-| PATCH | `/settings/providers/{id}` | settings:providers | `{model_policy?, enabled?, base_url?}` | idem (API key TIDAK pernah diterima/dikirim lewat API; dikelola di env/secret file — ADR-004) |
-| POST | `/settings/providers/{id}/smoke-test` | settings:providers | – | `{job_id}` → hasil readiness gate (PRD §7.3.6) |
+| GET | `/settings/providers` | settings:providers | – | `[{id, provider, base_url, model_policy, effective_models:{default,fast,complex}, secret_status:"configured"\|"missing"\|"unknown", secret_hint:"sk-ant-…a1b2", secret_checked_at, enabled, pricing_version, llm_provider_mode, readiness_status, readiness_checked_at, readiness_effective:{state:"ready"\|"not_ready"\|"disabled"\|"unknown", reason}}]`; baris provider yang dikonfigurasi dibuat saat dibaca pertama kali. Status key = yang terakhir dilaporkan worker (ADR-073) |
+| PATCH | `/settings/providers/{id}` | settings:providers | `{model_policy?, enabled?}` | idem. `model_policy` digabung per alias (nilai kosong/null menghapus alias), ID harus `claude-…`; perubahan mengembalikan readiness ke `unknown` (ADR-032). `base_url`, key, dan kolom lain ditolak `422` (ADR-073; API key TIDAK pernah diterima/dikirim lewat API — ADR-004). Audit `provider.updated` |
+| POST | `/settings/providers/{id}/smoke-test` | settings:providers | – | job worker + tunggu ≤ `SMOKE_WAIT_S`: `200` bentuk §11 #8 (`meta.job_id`, `meta.effective` = apakah laporan itu berlaku sekarang); `202 {job_id}` bila belum selesai (laporan menyusul di §11.3); `409 CONFLICT` bila smoke lain berjalan (tidak dihitung rate limit); `503` bila antrean tidak terjangkau; `429` di atas 20/jam per user. Run yang macet atau crash di worker tetap mencatat laporan gagal (batas run 150 dtk). Setiap permintaan diaudit `provider.smoke_requested` (`success`; `denied` untuk 409/429; `error` bila antrean/limiter tidak terjangkau); worker mencatat `provider.readiness_recorded` (ADR-073) |
 | GET | `/usage?project_id=&task_id=&from=&to=&group_by=day\|model\|agent` | usage:read / project:read | – | `{totals:{input_tokens, output_tokens, estimated_cost, actual_cost:null, cost_status}, series:[..], records:[UsageRecord]}` |
 | GET | `/projects/{id}/budget` · PATCH | project:read / project:write | `{max_cost_usd, max_tokens, max_tool_iterations}` | default budget project |
 | GET | `/projects/{id}/knowledge` | project:read | `?type=` | `[ProjectMemory]` |
@@ -253,7 +256,7 @@ Daftar ini menutup ketidakcocokan yang ditemukan agent frontend dan backend pada
 | 5 | `criteria_results[]` | Tambah `downgraded: bool`, `downgrade_reason: string\|null`, `subjective: bool`. |
 | 6 | Payload approval | `apply_changes`: `{task_id, branch, base_commit, head_commit, target_branch, diff_sha256, files_changed, unverified_criteria:[key]}`; `budget_increase`: `{task_id, current_limit:{max_cost_usd,max_tokens}, used:{cost_usd,tokens,cost_status}, proposed_limit:{…}}`; `tool_r3`: `{task_id, agent_run_id, tool, input}`; `project_delete`: `{project_id, name, previous_status}`; `deploy_staging`: `{deployment_id, project_id, commit}`. |
 | 7 | `/test-runs/{id}/stream` | Frame SSE sama dengan TaskEvent (`event: test.output` / `test.run_finished`, `data: {test_run_id, seq?, type, ts, payload}`), channel `kk:test:{id}`. |
-| 8 | Smoke test | `POST /settings/providers/{id}/smoke-test` sinkron (≤ 60 dtk) → `{provider, mode:"anthropic"\|"scripted", ready, checks:[{key, label, status:"passed"\|"failed"\|"skipped", detail}], ran_at}`; key: `api_key_valid, model_accessible, messages_ok, streaming_ok, usage_reported, tool_use_roundtrip, timeout_cancel_handled, secret_not_in_logs`. Tidak ada endpoint polling. `ProviderConfig` menambah `llm_provider_mode`. |
+| 8 | Smoke test | `POST /settings/providers/{id}/smoke-test` sinkron (≤ 60 dtk) → `{provider, mode:"anthropic"\|"scripted", ready, checks:[{key, label, status:"passed"\|"failed"\|"skipped", detail}], ran_at}`; key: `api_key_valid, model_accessible, messages_ok, streaming_ok, usage_reported, tool_use_roundtrip, timeout_cancel_handled, secret_not_in_logs`. Tidak ada endpoint polling. `ProviderConfig` menambah `llm_provider_mode`. **WP-3.1e1 (ADR-073):** check kesembilan `pricing_verified` (aditif); smoke berjalan di worker, jadi lewat `SMOKE_WAIT_S` jawabannya `202 {job_id}` dan laporan dibaca lewat §11.3. |
 | 9 | Usage | `series: [{key, input_tokens, output_tokens, estimated_cost, cost_status}]`; list `records` dipaginasi (`page`, `page_size`, `meta.total`). |
 | 10 | Audit | Query `result=success\|denied\|error` didukung server; `action` = prefix match. |
 | 11 | Admin users | `GET /admin/users` menyertakan `roles:[{role, scope}]`; `PATCH` menerima `{display_name?, status?, roles?}`; `GET /admin/users/{uid}`, `GET /admin/policies/{key}` resmi. |
@@ -300,7 +303,7 @@ Catatan: `waive_criterion` **bukan** approval — waiver adalah aksi langsung us
 | Method | Path | Perm | Keterangan |
 |---|---|---|---|
 | POST | `/tasks/{tid}/pause` | task:control | ADR-031: berhenti di batas langkah berikutnya → `interrupted` (`status_reason=paused_by_user`); lanjut lewat `/resume` |
-| GET | `/settings/providers/{id}/readiness` | settings:providers | ADR-032: hasil readiness gate terakhir (`readiness_status`, `checked_at`, `checks`) |
+| GET | `/settings/providers/{id}/readiness` | settings:providers | ADR-032: hasil readiness gate terakhir `{provider, readiness_status, checked_at, mode, report_ready, checks, models, job_id, running_job_id, effective:{state, reason}}`. Satu arti per kunci: `report_ready` = hasil gate itu sendiri (`ready` di §11 #8); `effective` = apakah laporan itu berlaku sekarang (mode, model, `enabled`), tidak pernah hijau untuk laporan basi; `job_id` = run yang menulisnya; `running_job_id` = run yang memegang lock. `job_id` dari `202` yang tidak ada di keduanya berarti run berakhir tanpa laporan (lihat audit `provider.smoke_skipped`) |
 | — | `budget` task/project | – | `budget_limit` menambah `max_duration_minutes` (default `TASK_MAX_DURATION_MINUTES`) |
 | — | `SandboxRunRequest` / `POST /v1/runs` | – | menambah `read_only: bool`; `target:"main"` selalu `read_only=true` (ADR-033) |
 

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from app.llm.scenarios import faults, generic
+from app.llm.scenarios import faults, generic, readiness
 from app.llm.scenarios.model import Scenario
 
 SCENARIOS: Mapping[str, Scenario] = {
-    scenario.name: scenario for scenario in (generic.SCENARIO, faults.SCENARIO)
+    scenario.name: scenario for scenario in (generic.SCENARIO, faults.SCENARIO, readiness.SCENARIO)
 }

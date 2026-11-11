@@ -27,6 +27,7 @@ export const STATUS_REASONS = [
   "runtime_unavailable",
   "provider_readiness_unknown",
   "provider_not_ready",
+  "provider_disabled",
   "tools_unavailable",
 ] as const;
 export type StatusReason = (typeof STATUS_REASONS)[number];

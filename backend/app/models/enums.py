@@ -77,3 +77,8 @@ HANDLER_STATUSES = ("pending", "succeeded", "failed", "not_required")
 # DATA_MODEL tool_calls + running (the claim before a side-effect handler) and cancelled (spec WP-3.1d,
 # Keputusan Lead 4).
 TOOL_CALL_STATUSES = ("running", "ok", "error", "denied", "timeout", "approval_required", "cancelled")
+# DATA_MODEL provider_configs (ADR-004, ADR-032; spec WP-3.1e Goal 1).
+PROVIDERS = ("anthropic",)
+READINESS_STATUSES = ("unknown", "passed", "failed")
+SECRET_STATUSES = ("unknown", "configured", "missing")  # as last seen by the worker (spec 3.1e Keputusan #4)
+LLM_PROVIDER_MODES = ("anthropic", "scripted")

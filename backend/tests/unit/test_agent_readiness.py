@@ -35,7 +35,7 @@ def registry_agent(agent_id: str):  # type: ignore[no-untyped-def]
 
 def test_enabled_llm_agent_is_not_ready_with_all_reasons() -> None:
     a02 = registry_agent("A02")
-    status, reasons, unavailable = readiness.assess(a02, enabled=True, provider_ready=None)
+    status, reasons, unavailable = readiness.assess(a02, enabled=True, provider="unknown")
     assert status == "not_ready"
     assert reasons == ["runtime_unavailable", "provider_readiness_unknown", "tools_unavailable"]
     # WP-3.1d2a builtins are built; the rest of A02's allowlist is not yet (submit_result: the runtime's).
@@ -46,7 +46,7 @@ def test_enabled_llm_agent_is_not_ready_with_all_reasons() -> None:
 def test_tool_agent_waits_for_the_engine_and_its_tools() -> None:
     # Tool-mode agents are invoked by the orchestrator (AGENT_CATALOG §4.3), not by themselves.
     a04 = registry_agent("A04")
-    status, reasons, _ = readiness.assess(a04, enabled=True, provider_ready=None)
+    status, reasons, _ = readiness.assess(a04, enabled=True, provider="unknown")
     assert (status, reasons) == ("not_ready", ["runtime_unavailable", "tools_unavailable"])
 
 
@@ -54,7 +54,7 @@ def test_no_agent_is_ready_while_no_runtime_exists(monkeypatch: pytest.MonkeyPat
     # Every tool built and the provider ready: the runtimes alone still decide (AG-13 L1, silent M2).
     monkeypatch.setattr(readiness, "_built", lambda tool: True)
     statuses = {
-        a.agent_id: readiness.assess(a, enabled=a.enabled, provider_ready=True)[0]
+        a.agent_id: readiness.assess(a, enabled=a.enabled, provider="ready")[0]
         for a in load_registry(REGISTRY).agents
     }
     assert "ready" not in statuses.values()
@@ -66,12 +66,12 @@ def test_a_tool_agent_without_tools_still_waits_for_the_engine(raw: Raw) -> None
     agent(data, "A04")["tools"] = []
     a04 = parse_registry(data).by_id("A04")
     assert a04 is not None
-    assert readiness.assess(a04, enabled=True, provider_ready=True)[0] == "not_ready"
+    assert readiness.assess(a04, enabled=True, provider="ready")[0] == "not_ready"
 
 
 def test_orch_waits_for_the_engine() -> None:
     orch = registry_agent("ORCH")
-    assert readiness.assess(orch, enabled=True, provider_ready=True) == (
+    assert readiness.assess(orch, enabled=True, provider="ready") == (
         "not_ready",
         ["runtime_unavailable"],
         [],
@@ -80,14 +80,22 @@ def test_orch_waits_for_the_engine() -> None:
 
 def test_planned_and_disabled() -> None:
     planned = next(a for a in load_registry(REGISTRY).agents if a.mvp_mode == "planned")
-    assert readiness.assess(planned, enabled=False, provider_ready=True) == ("planned", [], [])
-    assert readiness.assess(registry_agent("A02"), enabled=False, provider_ready=True) == ("disabled", [], [])
+    assert readiness.assess(planned, enabled=False, provider="ready") == ("planned", [], [])
+    assert readiness.assess(registry_agent("A02"), enabled=False, provider="ready") == ("disabled", [], [])
 
 
 def test_provider_not_ready_is_its_own_reason() -> None:
-    _, reasons, _ = readiness.assess(registry_agent("A02"), enabled=True, provider_ready=False)
+    _, reasons, _ = readiness.assess(registry_agent("A02"), enabled=True, provider="not_ready")
     assert "provider_not_ready" in reasons
     assert "provider_readiness_unknown" not in reasons
+
+
+def test_a_disabled_provider_is_its_own_reason() -> None:
+    """WP-3.1e Goal 7: an admin switched the provider off; not the same as an untested one."""
+    _, reasons, _ = readiness.assess(registry_agent("A02"), enabled=True, provider="disabled")
+    assert "provider_disabled" in reasons and "provider_readiness_unknown" not in reasons
+    tool_agent = readiness.assess(registry_agent("A04"), enabled=True, provider="disabled")[1]
+    assert not any(reason.startswith("provider_") for reason in tool_agent)  # it never calls the model
 
 
 def test_ready_only_without_reasons(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,4 +105,4 @@ def test_ready_only_without_reasons(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     monkeypatch.setattr(readiness, "TOOL_CATALOG", built)
     monkeypatch.setattr(readiness, "RUNTIMES_AVAILABLE", {"agent_runtime": True, "workflow_engine": True})
-    assert readiness.assess(registry_agent("A02"), enabled=True, provider_ready=True) == ("ready", [], [])
+    assert readiness.assess(registry_agent("A02"), enabled=True, provider="ready") == ("ready", [], [])

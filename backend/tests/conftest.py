@@ -95,5 +95,6 @@ async def reset_data(engine: AsyncEngine) -> None:
     """Delete test-owned rows in FK order (projects restrict their owner). audit_events stays: append-only."""
     async with engine.begin() as conn:
         await conn.execute(text("DELETE FROM projects"))  # cascades to tasks, agent_runs and approvals
+        await conn.execute(text("DELETE FROM provider_configs"))
         await conn.execute(text("DELETE FROM agent_profiles"))
         await conn.execute(text("DELETE FROM users"))

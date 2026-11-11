@@ -15,6 +15,7 @@ from app.agents.readiness import AgentStatus, StatusReason, assess
 from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.audit import AuditWriter
 from app.core.logging import get_logger
+from app.llm.readiness import ProviderState
 from app.models.agents import AgentProfile, AgentRun
 from app.models.enums import AGENT_GROUPS, AGENT_MODES
 from app.models.projects import Project
@@ -199,9 +200,9 @@ class _Facts:
     tools: tuple[str, ...]
 
 
-def _view(profile: AgentProfile, provider_ready: bool | None) -> AgentView:
+def _view(profile: AgentProfile, provider: ProviderState) -> AgentView:
     facts = _Facts(profile.mvp_mode, profile.group, tuple(profile.tools))
-    status, reasons, unavailable = assess(facts, enabled=profile.enabled, provider_ready=provider_ready)
+    status, reasons, unavailable = assess(facts, enabled=profile.enabled, provider=provider)
     return AgentView(profile, status, reasons, unavailable)
 
 
@@ -219,13 +220,13 @@ async def list_agents(
     mode: str | None = None,
     status: AgentStatus | None = None,
     q: str | None = None,
-    provider_ready: bool | None = None,
+    provider: ProviderState = "unknown",
 ) -> tuple[list[AgentView], Counts]:
     """The agents of the current registry, in catalog order (group, then id). ``Counts`` cover the whole
     registry, so the filter chips keep their numbers while a filter is applied."""
     rows = (await session.scalars(select(AgentProfile).where(AgentProfile.in_registry))).all()
     views = sorted(
-        (_view(row, provider_ready) for row in rows),
+        (_view(row, provider) for row in rows),
         key=lambda v: (AGENT_GROUPS.index(v.profile.group), v.profile.agent_id),
     )
     counts = Counts(
@@ -244,7 +245,7 @@ async def list_agents(
 
 
 async def get_agent(
-    session: AsyncSession, actor: Actor, agent_id: str, *, provider_ready: bool | None = None
+    session: AsyncSession, actor: Actor, agent_id: str, *, provider: ProviderState = "unknown"
 ) -> AgentDetail | None:
     """One agent with its recent runs and run statistics, counting only runs of tasks in projects the actor
     can see (AC-01): the catalog is shared, the runs are not."""
@@ -279,7 +280,7 @@ async def get_agent(
         )
     ).all()
     return AgentDetail(
-        agent=_view(profile, provider_ready),
+        agent=_view(profile, provider),
         recent_runs=[
             RunSummary(
                 id=run.id,

@@ -17,14 +17,18 @@ from redis.asyncio import Redis
 from app.core.audit import AuditWriter
 from app.core.config import load_settings
 from app.core.db import make_engine, make_sessionmaker
+from app.core.logging import get_logger
 from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
-from app.services import approval_handlers, project_delete
+from app.models.enums import PROVIDERS
+from app.services import approval_handlers, project_delete, provider_smoke, smoke_lock
 from app.services.approval_registry import default_handlers
-from app.services.job_queue import IMPORT_TASK, INDEX_TASK, CeleryJobQueue
+from app.services.job_queue import IMPORT_TASK, INDEX_TASK, PROVIDER_SMOKE_TASK, CeleryJobQueue
 from app.services.project_imports import ImportEnv, ImportRetry, run_import
 from app.services.projects import ProjectEnv
 from app.services.repo_index import IndexEnv, Trigger, index_soon, run_index
+
+logger = get_logger(__name__)
 
 # A job runs well inside its lock (import_lock.LOCK_TTL_S, 45 min): its archive and lock never outlive it.
 IMPORT_TIME_LIMIT_S = 40 * 60
@@ -167,3 +171,43 @@ async def run_projects_purge(*, now: datetime | None = None) -> dict[str, list[s
     finally:
         await engine.dispose()
     return {"purged": [str(i) for i in result.purged], "failed": [str(i) for i in result.failed]}
+
+
+# --- provider smoke test (WP-3.1e) -----------------------------------------------------------------------
+
+
+@shared_task(name=PROVIDER_SMOKE_TASK, time_limit=provider_smoke.SMOKE_TIME_LIMIT_S)
+def provider_smoke_job(job_id: str, provider: str) -> str:
+    """``ready`` / ``not_ready`` / ``skipped``. The report is in ``provider_configs`` (the API reads it
+    there); no retry: the user asks again. The key never leaves this process (Lead decision 3.1e #2)."""
+    return asyncio.run(run_provider_smoke_job(job_id=uuid.UUID(job_id), provider=provider))
+
+
+async def run_provider_smoke_job(*, job_id: uuid.UUID, provider: str) -> str:
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown provider {provider!r}")
+    settings = load_settings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(settings.redis_url, socket_timeout=5.0, socket_connect_timeout=5.0)
+    sessions = make_sessionmaker(engine)
+    audit = AuditWriter(Redactor(settings.secret_values()))
+    try:
+        if not await smoke_lock.claim(redis, provider, job_id):
+            # The request's lock expired (a long queue wait) or another run holds it. Said in the audit, and
+            # GET readiness shows this job neither running nor reported (silent-failure 3.1e1 M2).
+            logger.warning("provider_smoke_skipped", job_id=str(job_id), provider=provider)
+            await audit.write_detached(
+                sessions, actor_type="system", actor_id="worker", action="provider.smoke_skipped",
+                result="error", resource_type="provider_config",
+                metadata={"provider": provider, "job_id": str(job_id), "reason": "lock_not_held"},
+            )  # fmt: skip
+            return "skipped"
+        env = provider_smoke.SmokeEnv(settings=settings, sessions=sessions, audit=audit)
+        try:
+            report = await provider_smoke.run_smoke(env, actor_id="worker", job_id=job_id, provider=provider)
+        finally:
+            await provider_smoke.release_quietly(redis, provider, job_id)
+        return "ready" if report.ready else "not_ready"
+    finally:
+        await redis.aclose()
+        await engine.dispose()

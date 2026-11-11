@@ -30,7 +30,7 @@ import uuid
 from collections.abc import AsyncIterator, Coroutine
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -42,7 +42,7 @@ from app.core.audit import AuditWriter
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.core.ratelimit import FixedWindowLimiter, RateLimiterUnavailable
-from app.core.rbac import RoleGrant, effective_permissions
+from app.core.rbac import RoleGrant, effective_permissions, has_permission
 from app.gitops.adapter import Author, GitAdapter, GitTarget
 from app.gitops.errors import GitError
 from app.models.projects import Project, Repository
@@ -72,7 +72,11 @@ _settling: set[asyncio.Task[bool]] = set()
 PAGE_SIZE_DEFAULT = 50
 PAGE_SIZE_MAX = 200
 _NAME_CHARACTER = re.compile(r"\w", re.UNICODE)
-SETTINGS_KEYS = frozenset({"plan_approval_required", "auto_remediation"})
+# provider_calls_enabled: the per-project kill switch for model calls (FR-158, ADR-011; absent means on,
+# enforced by the runtime in 3.1f through provider_readiness.provider_calls_allowed).
+SETTINGS_KEYS = frozenset({"plan_approval_required", "auto_remediation", "provider_calls_enabled"})
+KILL_SWITCH_KEY = "provider_calls_enabled"
+KILL_SWITCH_PERMISSION = "settings:providers"  # to turn provider calls back on: owners and admins only
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 # Controls, format characters (bidi overrides, zero-width) and line/paragraph separators: a name holding
 # them can display as another project's name (SECURITY_MODEL §5: approvals show the name).
@@ -474,8 +478,15 @@ async def _enforce_create_rate(env: ProjectEnv, actor: Actor) -> None:
     )
 
 
+class Limited(Protocol):
+    """Anything that carries the per-user limiter (``ProjectEnv``, ``ProviderSettingsEnv``)."""
+
+    @property
+    def limiter(self) -> FixedWindowLimiter | None: ...
+
+
 async def enforce_rate(
-    env: ProjectEnv, actor: Actor, *, scope: str, limit: int, window_s: int, message: str
+    env: Limited, actor: Actor, *, scope: str, limit: int, window_s: int, message: str
 ) -> None:
     """Per-user fixed window in Redis; fails closed (503) when the limiter cannot answer."""
     if env.limiter is None:
@@ -951,6 +962,15 @@ async def update_project(
             bad = set(incoming) - SETTINGS_KEYS
             if bad or not all(isinstance(value, bool) for value in incoming.values()):
                 raise _invalid("settings", "unknown setting or not a boolean")
+            turns_on = (
+                incoming.get(KILL_SWITCH_KEY) is True
+                and project.settings.get(KILL_SWITCH_KEY, True) is not True
+            )
+            if turns_on and not has_permission(actor.grants, KILL_SWITCH_PERMISSION, user_id=actor.user_id):
+                # FR-158 is an admin control (UC-10). Stopping provider calls is the safe direction and stays
+                # with whoever may write the project; turning them back on needs settings:providers, so an
+                # admin's stop cannot be undone by a project writer (AG-13 3.1e1 M2, Lead decision 3.1e #10).
+                raise AppError("FORBIDDEN", "Not allowed", http_status=403)
             changed_settings = {
                 key: value for key, value in incoming.items() if project.settings.get(key) != value
             }

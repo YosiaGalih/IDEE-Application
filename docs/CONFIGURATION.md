@@ -16,8 +16,9 @@ Satu daftar kanonik. `backend/app/core/config.py`, `sandbox_manager/…/config.p
 | `DATABASE_URL` ★ | – | api, worker | `postgresql+asyncpg://user:pass@postgres:5432/kodekantor` |
 | `REDIS_URL` ★ | – | api, worker | `redis://:pass@redis:6379/0` |
 | `LLM_PROVIDER` | `anthropic` | worker, api | `anthropic` \| `scripted` (dilarang di production, ADR-015) |
-| `ANTHROPIC_API_KEY` | – | worker (+api smoke) | wajib bila `LLM_PROVIDER=anthropic`; tidak pernah dicatat |
-| `ANTHROPIC_BASE_URL` | – | worker | opsional |
+| `ANTHROPIC_API_KEY` | – | worker | wajib bila `LLM_PROVIDER=anthropic`; tidak pernah dicatat. Hanya worker: smoke test juga berjalan di worker (ADR-073); `api` tidak membacanya (kontrak lint-imports + `tests/security/test_provider_secrets.py`) |
+| `ANTHROPIC_BASE_URL` | – | worker | opsional; https di production. Tidak dapat diubah lewat API (ADR-073); `base_url` di `GET /settings/providers` adalah yang dilaporkan worker, tanpa user info, query, fragment, dan parameter path, lalu diredaksi. Jangan menaruh kredensial gateway di URL; pakai header/secret proxy |
+| `SMOKE_WAIT_S` | `45` | api | batas tunggu `POST /settings/providers/{id}/smoke-test` sebelum menjawab `202 {job_id}` (0 < x ≤ 55; di bawah batas klien 60 dtk) |
 | `CLAUDE_MODEL_DEFAULT` ★ | – | worker | model ID dari katalog resmi, divalidasi saat deployment |
 | `CLAUDE_MODEL_FAST` | = default | worker | opsional |
 | `CLAUDE_MODEL_COMPLEX` | = default | worker | opsional |
@@ -58,6 +59,16 @@ Satu daftar kanonik. `backend/app/core/config.py`, `sandbox_manager/…/config.p
 | `CELERY_TASK_ALWAYS_EAGER` | `false` | api, worker | `true` hanya untuk test/dev single-process |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `` | semua | opsional |
 | `VITE_API_BASE` | `/api/v1` | frontend build | |
+
+## Variabel yang dibaca library di worker (bukan Settings; syarat AG-13 3.1a, WP-3.1e1)
+
+Client HTTP SDK Anthropic (httpx2, `trust_env=True`) dan SDK itu sendiri membaca variabel ini langsung dari environment proses worker; KodeKantor tidak memvalidasinya.
+
+| Variabel | Default | Dipakai | Catatan |
+|---|---|---|---|
+| `SSL_CERT_FILE` / `SSL_CERT_DIR` | – (bundle `certifi`) | worker | dibaca client HTTP SDK Anthropic (httpx2, `trust_env`) untuk CA tambahan, mis. proxy TLS korporat. Tanpa nilai: bundle `certifi` (syarat AG-13 3.1a) |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` | – | worker | proxy keluar yang dibaca httpx2 lewat `urllib.request.getproxies()`; host di `NO_PROXY` dilewati. Proxy melihat host tujuan, bukan isi TLS |
+| `ANTHROPIC_LOG` | – | worker | dibaca SDK saat diimpor; level di bawah WARNING tetap dibuang (`QUIET_LOGGERS`, WP-3.1a) |
 
 ## Variabel infra tambahan (compose/CI)
 
