@@ -272,11 +272,24 @@ def _require_time_zones(query: UsageQuery) -> None:
             raise _invalid(field, "must carry a time zone")
 
 
+def _in_utc(field: str, value: datetime) -> datetime:
+    try:
+        return value.astimezone(UTC)
+    except OverflowError:  # e.g. 0001-01-01T00:30+01:00 or 9999-12-31T23:59-01:00 (AG-13 L2)
+        raise _invalid(field, "is outside the supported dates") from None
+
+
 def _window(query: UsageQuery, now: datetime) -> tuple[datetime, datetime]:
     """``[from, to)`` in UTC: ``to`` defaults to ``now`` (the database clock), ``from`` to 30 days before; at
-    most 366 days."""
-    end = (query.end or now).astimezone(UTC)
-    start = (query.start or end - RANGE_DEFAULT).astimezone(UTC)
+    most 366 days. A date that cannot be represented is a 422 naming its field, never a 500."""
+    end = _in_utc("to", query.end) if query.end is not None else now.astimezone(UTC)
+    if query.start is not None:
+        start = _in_utc("from", query.start)
+    else:
+        try:
+            start = end - RANGE_DEFAULT
+        except OverflowError:  # a `to` within 30 days of year 1
+            raise _invalid("to", "is too early for the default 30-day range") from None
     if start >= end:
         raise _invalid("from", "must be before to")
     if end - start > RANGE_MAX:
