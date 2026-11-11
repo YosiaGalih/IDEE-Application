@@ -6,16 +6,18 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.money import MONEY_PATTERN
 from app.llm.base import Usage
+from app.services import usage as usage_service
 from tests.integration.test_dashboard_api import add_project, add_task
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     app,
@@ -149,6 +151,30 @@ async def test_usage_range_is_half_open_and_defaults_to_30_days(
     assert default["data"]["totals"]["input_tokens"] == 8
     window = datetime.fromisoformat(default["meta"]["to"]) - datetime.fromisoformat(default["meta"]["from"])
     assert window == timedelta(days=30)
+
+
+async def test_usage_default_window_ends_on_the_database_clock(
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review L5: the default `to` is now() of the read snapshot. An api clock running ahead must neither hide
+    today's rows nor move the window."""
+
+    class FarFuture(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> FarFuture:
+            return cls(2100, 1, 1, tzinfo=tz or UTC)
+
+    monkeypatch.setattr(usage_service, "datetime", FarFuture)
+    project = await add_project(engine, owner_id, "Jam DB")
+    await record(engine, project)
+    body = await report(owner, project_id=project)
+    assert body["data"]["totals"]["input_tokens"] == 100
+    async with engine.connect() as conn:
+        db_now = (await conn.execute(text("SELECT now()"))).scalar_one()
+    assert abs(datetime.fromisoformat(body["meta"]["to"]) - db_now) < timedelta(minutes=1)
 
 
 @pytest.mark.parametrize(

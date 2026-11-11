@@ -266,11 +266,15 @@ def _invalid(field: str, message: str) -> AppError:
     )
 
 
-def _window(query: UsageQuery, now: datetime) -> tuple[datetime, datetime]:
-    """``[from, to)`` in UTC: ``to`` defaults to now, ``from`` to 30 days before; at most 366 days."""
+def _require_time_zones(query: UsageQuery) -> None:
     for field, value in (("from", query.start), ("to", query.end)):
         if value is not None and value.utcoffset() is None:
             raise _invalid(field, "must carry a time zone")
+
+
+def _window(query: UsageQuery, now: datetime) -> tuple[datetime, datetime]:
+    """``[from, to)`` in UTC: ``to`` defaults to ``now`` (the database clock), ``from`` to 30 days before; at
+    most 366 days."""
     end = (query.end or now).astimezone(UTC)
     start = (query.start or end - RANGE_DEFAULT).astimezone(UTC)
     if start >= end:
@@ -297,29 +301,33 @@ async def _scope(session: AsyncSession, actor: Actor, query: UsageQuery) -> list
     return where
 
 
-async def usage_report(
-    env: ProjectEnv, actor: Actor, query: UsageQuery, *, now: datetime | None = None
-) -> UsageReport:
-    """``GET /usage``: totals, a series by ``group_by`` and a page of records (API §9, §11 #9)."""
-    start, end = _window(query, now or datetime.now(UTC))  # before the scope: a 422 tells nothing
+async def usage_report(env: ProjectEnv, actor: Actor, query: UsageQuery) -> UsageReport:
+    """``GET /usage``: totals, a series by ``group_by`` and a page of records (API §9, §11 #9).
+
+    One read-only snapshot holds everything: its clock (``now()``) ends the default window (review L5), the
+    scope is decided in it, and totals, series, the count and the page agree with each other. Every 422
+    comes before the scope, so it tells nothing about what exists."""
+    _require_time_zones(query)
     if query.page < 1 or not 1 <= query.page_size <= PAGE_SIZE_MAX:
         raise _invalid("page_size", f"page >= 1 and page_size 1-{PAGE_SIZE_MAX}")
     async with env.sessions() as session:
-        where = await _scope(session, actor, query)
-    # Every query also joins the visible projects: the same rule as the list, and a project deleted
-    # since the check is gone here too.
-    where += [visible_projects_filter(actor), UsageRecord.created_at >= start, UsageRecord.created_at < end]
-    key = {
-        "day": func.to_char(func.timezone("UTC", UsageRecord.created_at), "YYYY-MM-DD"),
-        "model": UsageRecord.model,
-        "agent": UsageRecord.agent_id,
-    }[query.group_by]
-    rows = select(UsageRecord).join(Project, Project.id == UsageRecord.project_id).where(*where)
-    async with env.sessions() as session:
-        # One read-only snapshot: totals, series, the count and the page agree with each other.
         await session.connection(
             execution_options={"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
         )
+        start, end = _window(query, (await session.execute(select(func.now()))).scalar_one())
+        where = await _scope(session, actor, query)
+        # Every query also joins the visible projects: the same rule as the project list.
+        where += [
+            visible_projects_filter(actor),
+            UsageRecord.created_at >= start,
+            UsageRecord.created_at < end,
+        ]
+        key = {
+            "day": func.to_char(func.timezone("UTC", UsageRecord.created_at), "YYYY-MM-DD"),
+            "model": UsageRecord.model,
+            "agent": UsageRecord.agent_id,
+        }[query.group_by]
+        rows = select(UsageRecord).join(Project, Project.id == UsageRecord.project_id).where(*where)
         joined = (
             select(*_AGGREGATE).select_from(UsageRecord).join(Project, Project.id == UsageRecord.project_id)
         )
