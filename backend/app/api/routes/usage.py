@@ -28,8 +28,8 @@ CostStatus = Literal["estimated", "partial", "actual", "unavailable"]
 
 
 class UsageTotalsOut(BaseModel):
-    input_tokens: int
-    output_tokens: int
+    input_tokens: int | None  # null: rows exist but none reported tokens (unknown, never 0)
+    output_tokens: int | None
     estimated_cost: Money | None
     actual_cost: None = None  # reserved for provider-reported costs (ADR-025)
     cost_status: CostStatus
@@ -46,8 +46,8 @@ class UsageTotalsOut(BaseModel):
 
 class UsagePointOut(BaseModel):
     key: str | None  # YYYY-MM-DD (UTC), a model id, or an agent id (null: rows without an agent)
-    input_tokens: int
-    output_tokens: int
+    input_tokens: int | None
+    output_tokens: int | None
     estimated_cost: Money | None
     cost_status: CostStatus
 

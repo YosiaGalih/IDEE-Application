@@ -27,8 +27,8 @@ CostStatus = Literal["estimated", "partial", "actual", "unavailable"]
 
 
 class UsageOut(BaseModel):
-    input_tokens: int
-    output_tokens: int
+    input_tokens: int | None  # null: rows exist but none reported tokens (unknown, never 0)
+    output_tokens: int | None
     estimated_cost: Money | None  # null only when no row could be priced (AC-16)
     cost_status: CostStatus
 

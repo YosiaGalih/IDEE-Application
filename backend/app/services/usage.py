@@ -167,8 +167,10 @@ PAGE_SIZE_MAX: Final = 200
 
 @dataclass(frozen=True, slots=True)
 class UsageTotals:
-    input_tokens: int  # the known sum: a lower bound when a row has no usage
-    output_tokens: int
+    # The known sum, a lower bound when some row has no usage; None when rows exist but none reported tokens
+    # (silent-failure M1: unknown is never a counted 0).
+    input_tokens: int | None
+    output_tokens: int | None
     estimated_cost: Decimal | None  # None only when no row could be priced
     cost_status: CostStatus
 
@@ -181,20 +183,23 @@ def aggregate(
     rows: int,
     partial: int,
     unavailable: int,
+    counted: int,
     known_cost: Decimal | None,
     input_tokens: int,
     output_tokens: int,
 ) -> UsageTotals:
     """Keputusan Lead #5: no rows -> estimated "0"; all estimated -> estimated; any partial, or priced rows
     mixed with unavailable -> partial with the known sum; all unavailable -> unavailable, cost None.
-    Tokens are the known sum."""
+    Tokens are the sum over the ``counted`` rows that reported them; None when rows exist and none did."""
     if rows == 0:
         return UsageTotals(input_tokens, output_tokens, Decimal(0), "estimated")
+    known_input = input_tokens if counted else None
+    known_output = output_tokens if counted else None
     if unavailable == rows:
-        return UsageTotals(input_tokens, output_tokens, None, "unavailable")
+        return UsageTotals(known_input, known_output, None, "unavailable")
     cost = known_cost if known_cost is not None else Decimal(0)
     status: CostStatus = "partial" if partial or unavailable else "estimated"
-    return UsageTotals(input_tokens, output_tokens, cost, status)
+    return UsageTotals(known_input, known_output, cost, status)
 
 
 # One aggregate for totals, series, the dashboard and task summaries.
@@ -202,6 +207,7 @@ _AGGREGATE = (
     func.count(),
     func.count().filter(UsageRecord.cost_status == "partial"),
     func.count().filter(UsageRecord.cost_status == "unavailable"),
+    func.count(UsageRecord.input_tokens),  # rows that reported tokens (all four are null together)
     func.coalesce(func.sum(UsageRecord.input_tokens), 0),
     func.coalesce(func.sum(UsageRecord.output_tokens), 0),
     func.sum(UsageRecord.estimated_cost),
@@ -209,11 +215,12 @@ _AGGREGATE = (
 
 
 def _totals(values: Sequence[Any]) -> UsageTotals:
-    rows, partial, unavailable, input_tokens, output_tokens, known_cost = values
+    rows, partial, unavailable, counted, input_tokens, output_tokens, known_cost = values
     return aggregate(
         rows=rows,
         partial=partial,
         unavailable=unavailable,
+        counted=counted,
         known_cost=known_cost,
         input_tokens=input_tokens,
         output_tokens=output_tokens,

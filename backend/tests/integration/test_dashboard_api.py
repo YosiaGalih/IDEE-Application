@@ -418,6 +418,27 @@ async def test_task_summaries_carry_their_ledger_usage(
     assert data["failed_queue"][0]["usage"] == recent[str(failed)]  # the queue carries the same numbers
 
 
+async def test_usage_without_reported_tokens_is_unknown_not_zero(
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    """Silent-failure M1: the month's usage and a task's usage are unknown when no row reported tokens."""
+    project = await add_project(engine, owner_id, "Tanpa Token")
+    task = await add_task(engine, project, owner_id, "failed", "Dibatasi")
+    await record(engine, project, task_id=task, status="error", error_kind="rate_limited", usage=None)
+    data, _, _ = await board(owner)
+    unknown = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "estimated_cost": None,
+        "cost_status": "unavailable",
+    }
+    assert {key: data["usage"][key] for key in unknown} == unknown
+    assert data["recent_tasks"][0]["usage"] == unknown
+    assert data["failed_queue"][0]["usage"] == unknown
+
+
 async def test_dashboard_money_is_a_decimal_string(
     owner: httpx.AsyncClient,  # noqa: F811
     owner_id: uuid.UUID,  # noqa: F811

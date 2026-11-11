@@ -249,6 +249,26 @@ async def test_usage_all_unavailable_has_null_cost(
     assert totals["input_tokens"] == 100  # the tokens that are known
 
 
+async def test_usage_tokens_are_unknown_when_no_row_reported_them(
+    owner: httpx.AsyncClient,  # noqa: F811
+    owner_id: uuid.UUID,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    """Silent-failure M1: attempts that never reported usage are not zero tokens; the sum is unknown."""
+    project = await add_project(engine, owner_id, "Tanpa Token")
+    await record(engine, project, status="error", error_kind="rate_limited", usage=None)
+    await record(engine, project, status="cancelled", error_kind="cancelled", usage=None)
+    body = await report(owner, project_id=project, group_by="model")
+    unknown = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "estimated_cost": None,
+        "cost_status": "unavailable",
+    }
+    assert body["data"]["totals"] == {**unknown, "actual_cost": None}
+    assert body["data"]["series"] == [{"key": HAIKU, **unknown}]
+
+
 async def test_usage_without_a_filter_adds_up_the_visible_projects(
     owner: httpx.AsyncClient,  # noqa: F811
     owner_id: uuid.UUID,  # noqa: F811

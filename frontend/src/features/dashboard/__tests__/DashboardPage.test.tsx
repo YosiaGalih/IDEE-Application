@@ -179,6 +179,24 @@ describe("DashboardPage", () => {
     expect(cost).toHaveTextContent(`US$1,01${id.dashboard.costStatus.estimated}`);
   });
 
+  it("shows tokens no attempt reported as not available, never as 0", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: null,
+      output_tokens: null,
+      estimated_cost: null,
+      cost_status: "unavailable",
+    };
+    // Recorded usage (not listed as unavailable) whose attempts never reported tokens (silent-failure M1).
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const values = within(usage).getAllByRole("definition");
+    expect(values.map((value) => value.textContent)).toEqual(Array(3).fill(id.dashboard.unavailable));
+    expect(within(usage).queryByText(id.dashboard.usage.body)).not.toBeInTheDocument();
+  });
+
   it("shows a counted zero cost as zero", async () => {
     const data = dashboardData();
     data.usage = {
