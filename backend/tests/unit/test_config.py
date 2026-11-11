@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -183,3 +184,18 @@ def test_blank_base_url_means_the_default(blank: str) -> None:
     # compose passes ${ANTHROPIC_BASE_URL:-}; "" must not reach the SDK as a base URL (AG-13 L8).
     assert load_settings(base_env(ANTHROPIC_BASE_URL=blank)).anthropic_base_url is None
     assert load_settings(production_env(ANTHROPIC_BASE_URL=blank)).anthropic_base_url is None
+
+
+def test_task_max_cost_is_decimal() -> None:
+    """Money is never a float (spec WP-3.1f Keputusan Lead #4; plan 3.1f1 Keputusan plan #9)."""
+    settings = load_settings(base_env(TASK_MAX_COST_USD="0.1"))
+    assert isinstance(settings.task_max_cost_usd, Decimal)
+    assert settings.task_max_cost_usd == Decimal("0.1")
+    assert load_settings(base_env()).task_max_cost_usd == Decimal("2.0")
+
+
+@pytest.mark.parametrize("value", ["NaN", "nan", "Infinity", "-0.01", "0.0000001", "abc"])
+def test_task_max_cost_rejects_nan_and_negative(value: str) -> None:
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base_env(TASK_MAX_COST_USD=value))
+    assert any(problem.startswith("TASK_MAX_COST_USD:") for problem in exc.value.problems)

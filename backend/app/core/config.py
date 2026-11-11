@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from decimal import Decimal
 from functools import cached_property
 from typing import Literal
 from urllib.parse import urlsplit
@@ -51,7 +52,8 @@ class Settings(BaseModel):
     claude_request_timeout_seconds: int = Field(default=120, gt=0)
     claude_max_tool_iterations: int = Field(default=40, gt=0)
     pricing_path: str = "config/pricing.yaml"
-    task_max_cost_usd: float = Field(default=2.0, ge=0)
+    # Money is never a float (spec WP-3.1f Keputusan Lead #4): "0.1" stays exactly 0.1.
+    task_max_cost_usd: Decimal = Field(default=Decimal("2.0"), ge=0, decimal_places=6, allow_inf_nan=False)
     task_max_tokens: int = Field(default=400_000, gt=0)
     task_max_debug_attempts: int = Field(default=5, ge=0)
     task_auto_remediation_max: int = Field(default=1, ge=0)
