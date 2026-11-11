@@ -25,6 +25,21 @@ vulns = [
 ]
 pkgs = ["brace-expansion", "ip-address", "pacote", "picomatch", "sigstore"]
 
+# postgres:16.15-alpine: krb5-libs 1.22.2-r1 and libxslt 1.1.43-r3 (Trivy, 11 Nov 2026), fixed in Alpine but not in
+# the newest upstream digest (16.15-alpine on Alpine 3.24.4, checked 11 Nov 2026). Kerberos/GSSAPI is not
+# configured (password auth on the private app network) and xml2 is not installed. Bump the digest once upstream
+# carries krb5-libs >= 1.22.3-r0 and libxslt >= 1.1.43-r4.
+[[exception]]
+id = "EX-03"
+until = 2026-11-30
+image = "postgres:16.15-alpine"
+vulns = [
+  "CVE-2026-107364", "CVE-2026-112315", "CVE-2026-112316", "CVE-2026-112317", "CVE-2026-112318", "CVE-2026-112319",
+  "CVE-2026-112320", "CVE-2026-112321", "CVE-2026-112322", "CVE-2026-112323", "CVE-2026-118380", "CVE-2026-119079",
+  "CVE-2026-40355", "CVE-2026-40356", "CVE-2026-71199", "CVE-2026-71200", "CVE-2026-87636", "CVE-2026-9947",
+]
+pkgs = ["krb5-libs", "libxslt"]
+
 # gosu is only called by docker-entrypoint.sh when the container starts as root; compose runs postgres as 70:70
 # (EX-04, kept true by infra/tests/test_scan_gate.py).
 [[exception]]
