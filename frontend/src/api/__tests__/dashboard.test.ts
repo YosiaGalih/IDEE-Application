@@ -31,11 +31,18 @@ describe("getDashboard", () => {
 
   it("accepts recorded usage and agent runs once the server no longer lists them as unavailable", async () => {
     const data = dashboardData();
-    data.usage = { ...data.usage, cost_status: "estimated", input_tokens: 10, estimated_cost: 0.5 };
+    data.usage = {
+      ...data.usage,
+      cost_status: "estimated",
+      input_tokens: 10,
+      output_tokens: 2,
+      estimated_cost: "0.5",
+    };
     data.agent_activity = [agentRun()];
     answer(data, dashboardMeta({ unavailable: [] }));
     const result = await getDashboard();
     expect(result.data.usage.cost_status).toBe("estimated");
+    expect(result.data.usage.estimated_cost).toBe("0.5");
     expect(result.data.agent_activity[0]?.agent_name).toBe("General Code Implementation Agent");
     expect(result.unavailable.size).toBe(0);
   });
@@ -61,6 +68,27 @@ describe("getDashboard", () => {
     ],
   ])("refuses an answer that contradicts itself: %s", async (_, make) => {
     answer(make());
+    await expect(getDashboard()).rejects.toMatchObject({ kind: "bad_response" });
+  });
+
+  it.each([
+    ["a cost sent as a number", 0.5],
+    ["a cost in exponent form", "5E-7"],
+    ["a negative cost", "-1"],
+  ])("refuses %s: money is a plain decimal string (WP-3.1f1)", async (_, cost) => {
+    const data = dashboardData();
+    data.usage = { ...data.usage, cost_status: "estimated", input_tokens: 1, output_tokens: 1 };
+    answer({ ...data, usage: { ...data.usage, estimated_cost: cost } }, dashboardMeta({ unavailable: [] }));
+    await expect(getDashboard()).rejects.toMatchObject({ kind: "bad_response" });
+  });
+
+  it("refuses a task cost sent as a number", async () => {
+    const data = dashboardData();
+    const recent = {
+      ...data.recent_tasks[0],
+      usage: { ...data.usage, cost_status: "estimated", estimated_cost: 0.5 },
+    };
+    answer({ ...data, recent_tasks: [recent] });
     await expect(getDashboard()).rejects.toMatchObject({ kind: "bad_response" });
   });
 

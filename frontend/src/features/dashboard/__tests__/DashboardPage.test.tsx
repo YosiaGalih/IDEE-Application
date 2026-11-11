@@ -97,7 +97,7 @@ describe("DashboardPage", () => {
       ...data.usage,
       input_tokens: 275306,
       output_tokens: 4143,
-      estimated_cost: 0.5,
+      estimated_cost: "0.5",
       cost_status: "estimated",
     };
     backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
@@ -116,7 +116,7 @@ describe("DashboardPage", () => {
       ...data.usage,
       input_tokens: 0,
       output_tokens: 12,
-      estimated_cost: 0,
+      estimated_cost: "0",
       cost_status: "unavailable",
     };
     backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
@@ -126,6 +126,40 @@ describe("DashboardPage", () => {
     expect(input).toHaveTextContent(/^0$/); // a counted 0 is a real 0
     expect(output).toHaveTextContent(/^12$/);
     expect(cost).toHaveTextContent(id.dashboard.unavailable);
+  });
+
+  it("shows a tiny cost as less than a cent, never as zero", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 0,
+      output_tokens: 1,
+      estimated_cost: "0.0000005",
+      cost_status: "estimated",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const cost = within(usage).getAllByRole("definition")[2];
+    expect(cost).toHaveTextContent(`< US$0,01${id.dashboard.costStatus.estimated}`);
+    expect(cost).not.toHaveTextContent("US$0,00");
+  });
+
+  it("shows a counted zero cost as zero", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 0,
+      output_tokens: 0,
+      estimated_cost: "0",
+      cost_status: "estimated",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const cost = within(usage).getAllByRole("definition")[2];
+    expect(cost).toHaveTextContent(`US$0,00${id.dashboard.costStatus.estimated}`);
+    expect(cost).not.toHaveTextContent("<");
   });
 
   it("lists agent runs once they are recorded, and says when there are none", async () => {

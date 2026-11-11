@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DECIMAL_STRING } from "@/lib/money";
 import { apiRequest } from "./client";
 import { ApiError } from "./errors";
 import { ProjectSchema } from "./projects";
@@ -6,10 +7,12 @@ import { TASK_STATUSES } from "./taskStatus";
 
 /** `cost_status` (DATA_MODEL usage_records): `unavailable` is unknown, never 0 (AC-16). */
 export const COST_STATUSES = ["estimated", "partial", "actual", "unavailable"] as const;
+// Tokens stay nullable for a server that still lists usage in `meta.unavailable`. The cost is a plain decimal
+// string (WP-3.1f1): a number would already have lost digits, and "5E-7" is not a price anyone can read.
 const UsageSchema = z.object({
   input_tokens: z.number().int().nullable(),
   output_tokens: z.number().int().nullable(),
-  estimated_cost: z.number().nullable(),
+  estimated_cost: z.string().regex(DECIMAL_STRING).nullable(),
   cost_status: z.enum(COST_STATUSES),
 });
 

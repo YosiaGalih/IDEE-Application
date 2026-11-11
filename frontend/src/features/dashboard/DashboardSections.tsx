@@ -20,6 +20,7 @@ import { Button } from "@/components/ui/Button";
 import { Card, CardTitle } from "@/components/ui/Card";
 import { StatusPill } from "@/components/ui/StatusPill";
 import { cn } from "@/lib/cn";
+import { formatUsd, isBelowCent } from "@/lib/money";
 import { PROJECTS_PATH, taskPath, workspacePath } from "@/lib/paths";
 
 type Metric = keyof Dashboard["metrics"];
@@ -230,7 +231,11 @@ export function UsageSummary({ usage, isUnavailable }: UsageProps) {
   const { t, i18n } = useTranslation();
   const format = new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeZone: "UTC" });
   const integer = new Intl.NumberFormat(i18n.language);
-  const money = new Intl.NumberFormat(i18n.language, { style: "currency", currency: "USD" });
+  // A cost above 0 but below a cent would format as US$0,00 and read as nothing spent.
+  const money = (cost: string) =>
+    isBelowCent(cost)
+      ? t("dashboard.usage.belowCent", { amount: formatUsd("0.01", i18n.language) })
+      : formatUsd(cost, i18n.language);
   // The period is [start, end): its last day is the one before `end`.
   const lastDay = new Date(new Date(usage.period.end).getTime() - 1);
   const hasCost = !isUnavailable && usage.cost_status !== "unavailable";
@@ -240,7 +245,7 @@ export function UsageSummary({ usage, isUnavailable }: UsageProps) {
     // A cost is shown only with a status that says what it is (estimate, partial, actual).
     {
       key: "cost",
-      text: hasCost && usage.estimated_cost !== null ? money.format(usage.estimated_cost) : null,
+      text: hasCost && usage.estimated_cost !== null ? money(usage.estimated_cost) : null,
     },
   ] as const;
   return (
