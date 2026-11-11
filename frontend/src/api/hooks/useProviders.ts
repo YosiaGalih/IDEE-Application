@@ -44,6 +44,9 @@ export function useSmokeTest(providerId: string) {
   const client = useQueryClient();
   return useMutation({
     mutationFn: () => runSmoke(providerId),
-    onSettled: () => client.invalidateQueries({ queryKey: providersKey }),
+    // Not awaited: the screen says "still running" as soon as the 202 arrives, not after the next read.
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: providersKey });
+    },
   });
 }

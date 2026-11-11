@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { API, fail, ok, pendingApprovals, renderApp, signedInWith } from "@/__tests__/harness";
+import { API, deferred, fail, ok, pendingApprovals, renderApp, signedInWith } from "@/__tests__/harness";
 import {
   JOB_ID,
   OTHER_JOB_ID,
@@ -259,6 +259,33 @@ describe("ProvidersPage: smoke test", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("lets only reads made after the 202 decide: the cached one says nothing runs (F9)", async () => {
+    let after202 = false;
+    const held = deferred(); // the first read after the 202 waits: the cached read is all there is
+    backend();
+    server.use(
+      http.get(READINESS, async () => {
+        if (!after202) return ok(readiness({ job_id: OTHER_JOB_ID }));
+        await held.gate;
+        return ok(readiness({ job_id: OTHER_JOB_ID, running_job_id: JOB_ID }));
+      }),
+      http.post(SMOKE, () => {
+        after202 = true;
+        return HttpResponse.json(
+          { request_id: "r-2", status: "accepted", data: { job_id: JOB_ID } },
+          { status: 202 },
+        );
+      }),
+    );
+    await open();
+    await screen.findByRole("region", { name: id.providers.readiness.title }); // cached: nothing running
+    await userEvent.setup().click(await screen.findByRole("button", { name: id.providers.smoke.run }));
+    expect(await screen.findByText(id.providers.smoke.stillRunning)).toBeInTheDocument();
+    expect(screen.queryByText(id.providers.smoke.endedWithout)).toBeNull();
+    held.release();
+    await waitFor(() => expect(screen.getByText(id.providers.smoke.stillRunning)).toBeInTheDocument());
   });
 
   it.each([
