@@ -22,18 +22,19 @@ belong to the caller (3.1f2/3.2). Every check reads afresh in a short session of
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from decimal import ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal
 from typing import Final, Literal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
-from app.core.money import decimal_str
+from app.core.money import MONEY_PATTERN, decimal_str
 from app.llm.base import ErrorKind
 from app.llm.pricing import PricingTable
 from app.models.projects import Project
@@ -49,8 +50,15 @@ REJECTED_BEFORE_PROCESSING: Final[frozenset[ErrorKind]] = frozenset(
 )
 # Keputusan Lead #6: iterations are tool calls that reached a handler.
 UNCOUNTED_TOOL_STATUSES: Final = ("denied", "approval_required")
+# The bounds of a stored budget: PATCH /projects/{id}/budget validates input against them and parse_budget
+# reads stored values against them (review L2). One set of numbers, so the two never disagree.
+BUDGET_MAX_COST_USD: Final = Decimal("1000")
+BUDGET_MAX_TOKENS: Final = 100_000_000
+BUDGET_MAX_TOOL_ITERATIONS: Final = 10_000
+BUDGET_MAX_DURATION_MINUTES: Final = 1440
 
 _MILLION: Final = Decimal(1_000_000)
+_MONEY: Final = re.compile(MONEY_PATTERN)
 _MINUTES_QUANTUM: Final = Decimal("0.001")
 
 
@@ -117,30 +125,34 @@ class BudgetFields:
 def _cost_value(value: object) -> Decimal | None:
     if value is None:
         return None
-    # JSONB gives a number back as a float, which cannot hold money exactly: costs are stored as strings.
-    if isinstance(value, bool) or not isinstance(value, str | int):
-        raise BudgetConfigError("max_cost_usd must be a decimal string or an integer")
-    try:
+    # JSONB gives a number back as a float, which cannot hold money exactly: costs are stored as strings, in
+    # the API's plain form. Decimal()'s own grammar (underscores, spaces, exponents, signs) is refused (L2).
+    if isinstance(value, str):
+        if not _MONEY.fullmatch(value):
+            raise BudgetConfigError("max_cost_usd must be a plain decimal string")
         cost = Decimal(value)
-    except InvalidOperation:
-        raise BudgetConfigError("max_cost_usd is not a decimal number") from None
-    if not cost.is_finite() or cost < 0:
-        raise BudgetConfigError("max_cost_usd must be finite and not negative")
+    elif isinstance(value, int) and not isinstance(value, bool):
+        cost = Decimal(value)
+    else:
+        raise BudgetConfigError("max_cost_usd must be a decimal string or an integer")
+    if not 0 <= cost <= BUDGET_MAX_COST_USD:
+        raise BudgetConfigError(f"max_cost_usd must be between 0 and {BUDGET_MAX_COST_USD}")
     return cost
 
 
-def _count_value(name: str, value: object) -> int | None:
+def _count_value(name: str, value: object, upper: int) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise BudgetConfigError(f"{name} must be a non-negative integer")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= upper:
+        raise BudgetConfigError(f"{name} must be an integer between 0 and {upper}")
     return value
 
 
 def parse_budget(raw: object) -> BudgetFields:
     """``None``/``{}``: every field inherits. Otherwise a mapping with only ``BUDGET_KEYS``: ``max_cost_usd``
-    a decimal string or an integer, the others integers, all finite and not negative. Anything else (a float,
-    a bool, an unknown key, a non-mapping) raises ``BudgetConfigError``."""
+    a plain decimal string (``MONEY_PATTERN``) or an integer, the others integers, all from 0 up to the
+    ``BUDGET_MAX_*`` bounds. Anything else (a float, a bool, an unknown key, a non-mapping, another number
+    syntax, a value past a bound) raises ``BudgetConfigError``."""
     if raw is None:
         return BudgetFields()
     if not isinstance(raw, Mapping):
@@ -151,9 +163,13 @@ def parse_budget(raw: object) -> BudgetFields:
         raise BudgetConfigError(f"unknown budget keys: {', '.join(sorted(unknown))}")
     return BudgetFields(
         max_cost_usd=_cost_value(fields.get("max_cost_usd")),
-        max_tokens=_count_value("max_tokens", fields.get("max_tokens")),
-        max_tool_iterations=_count_value("max_tool_iterations", fields.get("max_tool_iterations")),
-        max_duration_minutes=_count_value("max_duration_minutes", fields.get("max_duration_minutes")),
+        max_tokens=_count_value("max_tokens", fields.get("max_tokens"), BUDGET_MAX_TOKENS),
+        max_tool_iterations=_count_value(
+            "max_tool_iterations", fields.get("max_tool_iterations"), BUDGET_MAX_TOOL_ITERATIONS
+        ),
+        max_duration_minutes=_count_value(
+            "max_duration_minutes", fields.get("max_duration_minutes"), BUDGET_MAX_DURATION_MINUTES
+        ),
     )
 
 

@@ -12,7 +12,6 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Any, Final
 
 from app.core.errors import AppError
@@ -30,10 +29,6 @@ from app.workflow.budget import (
 
 BUDGET_SETTINGS_KEY: Final = "budget"
 AUDIT_ACTION: Final = "project.budget_updated"
-API_MAX_COST_USD: Final = Decimal("1000")
-API_MAX_TOKENS: Final = 100_000_000
-API_MAX_TOOL_ITERATIONS: Final = 10_000
-API_MAX_DURATION_MINUTES: Final = 1440
 
 
 @dataclass(frozen=True, slots=True)

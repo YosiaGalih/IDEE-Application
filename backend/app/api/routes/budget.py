@@ -19,20 +19,20 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from app.api.routes.projects import EnvDep, ProjectReader, ProjectWriter, _respond
 from app.core.money import Money
 from app.services import project_budget
-from app.services.project_budget import (
-    API_MAX_COST_USD,
-    API_MAX_DURATION_MINUTES,
-    API_MAX_TOKENS,
-    API_MAX_TOOL_ITERATIONS,
-    BudgetChanges,
-    ProjectBudgetView,
+from app.services.project_budget import BudgetChanges, ProjectBudgetView
+from app.workflow.budget import (
+    BUDGET_MAX_COST_USD,
+    BUDGET_MAX_DURATION_MINUTES,
+    BUDGET_MAX_TOKENS,
+    BUDGET_MAX_TOOL_ITERATIONS,
+    BudgetDefaults,
+    BudgetFields,
 )
-from app.workflow.budget import BudgetDefaults, BudgetFields
 
 router = APIRouter(prefix="/projects", tags=["budget"])
 
 Cost = Annotated[
-    Decimal, Field(ge=0, le=API_MAX_COST_USD, max_digits=10, decimal_places=6, allow_inf_nan=False)
+    Decimal, Field(ge=0, le=BUDGET_MAX_COST_USD, max_digits=10, decimal_places=6, allow_inf_nan=False)
 ]
 
 
@@ -42,9 +42,9 @@ class BudgetPatchIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_cost_usd: Cost | None = None
-    max_tokens: Annotated[StrictInt, Field(ge=1, le=API_MAX_TOKENS)] | None = None
-    max_tool_iterations: Annotated[StrictInt, Field(ge=0, le=API_MAX_TOOL_ITERATIONS)] | None = None
-    max_duration_minutes: Annotated[StrictInt, Field(ge=1, le=API_MAX_DURATION_MINUTES)] | None = None
+    max_tokens: Annotated[StrictInt, Field(ge=1, le=BUDGET_MAX_TOKENS)] | None = None
+    max_tool_iterations: Annotated[StrictInt, Field(ge=0, le=BUDGET_MAX_TOOL_ITERATIONS)] | None = None
+    max_duration_minutes: Annotated[StrictInt, Field(ge=1, le=BUDGET_MAX_DURATION_MINUTES)] | None = None
 
 
 class EffectiveBudgetOut(BaseModel):

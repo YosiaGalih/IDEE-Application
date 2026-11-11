@@ -18,6 +18,10 @@ from app.llm.pricing import PricingTable, load_pricing
 from app.models.enums import TOOL_CALL_STATUSES
 from app.workflow.budget import (
     BUDGET_KEYS,
+    BUDGET_MAX_COST_USD,
+    BUDGET_MAX_DURATION_MINUTES,
+    BUDGET_MAX_TOKENS,
+    BUDGET_MAX_TOOL_ITERATIONS,
     REJECTED_BEFORE_PROCESSING,
     UNCOUNTED_TOOL_STATUSES,
     BudgetConfigError,
@@ -189,6 +193,41 @@ def test_env_cost_default_is_exact() -> None:
 def test_malformed_budget_fails_closed(raw: object) -> None:
     with pytest.raises(BudgetConfigError):
         parse_budget(raw)
+
+
+@pytest.mark.parametrize("cost", ["1_0", " 5 ", "1e400", "-0", "NaN", "Infinity", "+1", "0x10", "\u0661"])
+def test_stored_cost_must_be_a_plain_decimal_string(cost: str) -> None:
+    """Review L2: a stored cost is read with the API's strict money pattern, never Decimal()'s looser
+    grammar (underscores, spaces, exponents, signs)."""
+    with pytest.raises(BudgetConfigError):
+        parse_budget({"max_cost_usd": cost})
+
+
+@pytest.mark.parametrize(
+    ("field", "too_big"),
+    [
+        ("max_cost_usd", "1000.000001"),
+        ("max_cost_usd", 1001),
+        ("max_tokens", 100_000_001),
+        ("max_tool_iterations", 10_001),
+        ("max_duration_minutes", 1441),
+    ],
+)
+def test_stored_budget_above_the_api_bounds_fails_closed(field: str, too_big: object) -> None:
+    """Review L2: the bounds PATCH /projects/{id}/budget enforces hold for any stored budget too."""
+    with pytest.raises(BudgetConfigError):
+        parse_budget({field: too_big})
+
+
+def test_stored_budget_at_the_api_bounds_is_read() -> None:
+    at_bounds = {
+        "max_cost_usd": str(BUDGET_MAX_COST_USD),
+        "max_tokens": BUDGET_MAX_TOKENS,
+        "max_tool_iterations": BUDGET_MAX_TOOL_ITERATIONS,
+        "max_duration_minutes": BUDGET_MAX_DURATION_MINUTES,
+    }
+    assert parse_budget(at_bounds) == BudgetFields(Decimal("1000"), 100_000_000, 10_000, 1440)
+    assert parse_budget({"max_cost_usd": "0", "max_tokens": 0}) == BudgetFields(Decimal(0), 0)
 
 
 def test_dump_then_parse_round_trips() -> None:
