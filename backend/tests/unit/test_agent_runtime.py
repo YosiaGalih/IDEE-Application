@@ -1549,3 +1549,20 @@ async def test_a_failing_close_starts_the_write_and_one_retry_only() -> None:
         await make_runtime(fakes, runtime_config=config(close_timeout_s=0.2)).run(run_request("B14"))
     await asyncio.sleep(0.1)  # a write started after the last attempt would run now
     assert runs.writes == 2 and runs.failed_runs == runs.ids
+
+
+async def test_the_input_limit_is_measured_on_what_is_sent() -> None:
+    """Code review of 073e68d (ADR-011): the limit applies to the ``<agent_input>`` content, the input JSON
+    redacted and escaped. An input one byte under it whose escaped form is over is refused, with no run
+    row."""
+
+    def make(pad: int) -> contracts.IntakeInput:
+        prompt = "<" * 1_000 + "日" * 19_000  # 58 000 bytes; each "<" is sent as the 6 bytes of \\u003c
+        return contracts.IntakeInput(task_id=uuid.UUID(UUID_A), prompt=prompt, stack_summary="y" * pad)
+
+    value = make(CONTEXT_MAX_BYTES - 1 - len(make(1).model_dump_json().encode("utf-8")) + 1)
+    assert len(value.model_dump_json().encode("utf-8")) == CONTEXT_MAX_BYTES - 1
+    fakes = Fakes(scripted(submit_turn(OUTPUTS["IntakeOutput"])))
+    with pytest.raises(AgentInputTooLarge):
+        await make_runtime(fakes).run(run_request("A02", task_id=uuid.UUID(UUID_A), agent_input=value))
+    assert fakes.runs.starts == [] and fakes.log == []

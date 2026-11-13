@@ -248,10 +248,15 @@ class ScenarioNotAllowed(ValueError):
 _INPUT_BRACKETS: Final = str.maketrans({"<": "\\u003c", "\uff1c": "\\uff1c", "\ufe64": "\\ufe64"})
 
 
-def input_block(input_json: str) -> str:
-    """The run's first message: the (redacted) input JSON inside ``<agent_input>``, with no bracket that
-    could open a tag."""
-    return f"<agent_input>\n{input_json.translate(_INPUT_BRACKETS)}\n</agent_input>"
+def input_content(input_json: str, redact: Callable[[str], str]) -> str:
+    """What ``<agent_input>`` carries: the input JSON redacted, then with no bracket that could open a tag.
+    ADR-011's limit is measured on it, since it is what the model is sent (code review of 073e68d)."""
+    return redact(input_json).translate(_INPUT_BRACKETS)
+
+
+def input_block(content: str) -> str:
+    """The run's first message (``content`` from ``input_content``)."""
+    return f"<agent_input>\n{content}\n</agent_input>"
 
 
 def run_cap(registry_max_iterations: int, global_max: int) -> int:
@@ -692,7 +697,7 @@ class _Run:
     prompt: Prompt
     runtime_id: str
     output_contract: type[Contract]
-    input_json: str
+    input_content: str  # the <agent_input> content: redacted, escaped, within CONTEXT_MAX_BYTES
     deadline: float
     stop: _RunStop = field(default_factory=_RunStop)
     tally: _Tally = field(default_factory=_Tally)
@@ -817,9 +822,9 @@ class AgentRuntime:
             raise AgentInputInvalid(f"{spec.agent_id} takes a {input_contract.__name__}")
         if getattr(request.agent_input, "task_id", None) != request.task_id:
             raise AgentInputInvalid("the input names another task than the run")
-        input_json = request.agent_input.model_dump_json()
-        if len(input_json.encode("utf-8")) > CONTEXT_MAX_BYTES:
-            raise AgentInputTooLarge(f"the input is over {CONTEXT_MAX_BYTES} bytes (ADR-011)")
+        content = input_content(request.agent_input.model_dump_json(), self._redactor.redact)
+        if len(content.encode("utf-8")) > CONTEXT_MAX_BYTES:
+            raise AgentInputTooLarge(f"the input sent is over {CONTEXT_MAX_BYTES} bytes (ADR-011)")
         if request.scenario is not None and not self._config.scripted:
             raise ScenarioNotAllowed("a scenario is only for the scripted provider (ADR-015)")
         return _Run(
@@ -829,7 +834,7 @@ class AgentRuntime:
             prompt=prompt,
             runtime_id=runtime_id,
             output_contract=output_contract,
-            input_json=input_json,
+            input_content=content,
             deadline=self._clock() + spec.limits.timeout_seconds,
         )
 
@@ -964,7 +969,7 @@ class AgentRuntime:
             cancel=run.stop.token,
             workspace=request.workspace,
         )
-        messages = [Message("user", input_block(self._redactor.redact(run.input_json)))]
+        messages = [Message("user", input_block(run.input_content))]
         cap = run_cap(run.spec.limits.max_iterations, self._config.max_tool_iterations)
         nudged = False
         while run.iterations < cap:
