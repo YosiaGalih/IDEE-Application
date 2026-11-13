@@ -1321,3 +1321,31 @@ async def test_a_hanging_ledger_write_is_usage_unrecorded_within_its_bound() -> 
     assert finished, "the run hung on the ledger write"
     assert (result.status, result.error_code) == ("failed", "usage_unrecorded")
     assert fakes.ledger.records == []
+
+
+@pytest.mark.parametrize("port", ["gate", "budget", "tool"])
+async def test_a_timeout_raised_inside_a_port_is_not_the_run_deadline(port: str) -> None:
+    """Review N2: a ``TimeoutError`` a port raises itself (a database connect timeout, say) is that port's
+    error, not the run's deadline: ``internal_error``, logged by type, while the run still had its time."""
+    from structlog.testing import capture_logs
+
+    fakes = Fakes(
+        scripted(in_order(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+    )
+    if port == "gate":
+        fakes.gate.refuse[1] = TimeoutError("db connect timed out")
+    elif port == "budget":
+        fakes.budget.attempts.refuse[1] = TimeoutError("db connect timed out")
+    else:
+
+        async def times_out(ctx: Any, raw: object) -> Any:
+            raise TimeoutError("db connect timed out")
+
+        fakes.tools.handlers["repo.read_file"] = times_out
+    with capture_logs() as logs:
+        with pytest.raises(TimeoutError):
+            await make_runtime(fakes).run(run_request("B14"))
+    assert (ended(fakes).status, ended(fakes).error_code) == ("failed", "internal_error")
+    assert ended(fakes).error == "TimeoutError: an internal error ended the run"
+    failed = [log for log in logs if log["event"] == "agent_run_internal_error"]
+    assert [log["error_type"] for log in failed] == ["TimeoutError"]

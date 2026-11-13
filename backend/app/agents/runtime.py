@@ -833,17 +833,22 @@ class AgentRuntime:
     # --- bounded ports (reviews of 42bcb2e: a held lock never stalls a run) ---------------------------------
 
     async def _port[T](self, run: _Run, awaitable: Awaitable[T], *, grace: float = 0.0) -> T:
-        """``awaitable`` bounded by the run's remaining time (plus ``grace``): then, ``_DeadlineReached``."""
+        """``awaitable`` bounded by the run's remaining time (plus ``grace``): then, ``_DeadlineReached``. A
+        ``TimeoutError`` the port raises itself (a database connect timeout, say) is the port's error and
+        propagates as it is (review N2 of 073e68d)."""
         limit = run.deadline - self._clock() + grace
         if limit <= 0:
             if asyncio.iscoroutine(awaitable):
                 awaitable.close()
             raise _DeadlineReached
+        bound = asyncio.timeout(limit)
         try:
-            async with asyncio.timeout(limit):
+            async with bound:
                 return await awaitable
         except TimeoutError:
-            raise _DeadlineReached from None
+            if bound.expired():
+                raise _DeadlineReached from None
+            raise
 
     def _beat_timeout(self) -> float:
         configured = self._config.beat_timeout_s
