@@ -2557,8 +2557,8 @@ Spec: `docs/superpowers/specs/2026-11-11-wp-3.1f-runtime-budget-usage-design.md`
 ```text
 $ f1-pytest.sh -q          # @ 073e68d, suite backend penuh, sendirian, DB kodekantor_test_f1
 3712 passed in 527.38s
-$ f1-pytest.sh -q          # @ 082f104 (laporan implementer; dijalankan ulang oleh Lead, lihat di bawah)
-3834 passed in 483s
+$ f1-pytest.sh -q          # @ 082f104, dijalankan Lead (implementer: 3834 passed in 483s; AG-13: 3834 passed in 575.88s)
+3834 passed in 548.00s
 $ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports   # @ 082f104
 All checks passed! · 327 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
 $ uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml   # exit 0
@@ -2580,9 +2580,9 @@ $ uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml   # e
 | AG-13 delta @ 073e68d | **SIGNED OFF WITH CONDITIONS 🔒**; LOW-1 dan LOW-2 **tertutup**, C10 (`aclose` di protocol) OK, suite penuh 3712 passed; baru: **MEDIUM D-M1** (pencarian kandidat delta kuadratik/kubik di event loop: 32 KiB → 14,5 dtk), LOW D-L1 (ejaan umum password berkutip panjang bocor 768 karakter), D-I1..D-I7 | 082f104 (D-M1 cek ekor linear + langkah rilis tumbuh, test performa 64 KiB < 1 dtk; D-L1 kandidat di teks mentah, kunci dari redaktor, ejaan diparametrisasi), 62d5f7d (D-I1), 45c1de8 (D-I4), aa7d66b (D-I5), D-I2/D-I3 di ARCHITECTURE §5.3/§6.1 dan SECURITY_MODEL T4, D-I6 → 3.1f2b, D-I7 diterima (himpunan sama dengan `app/tools/untrusted.py`) |
 | `/code-review` Standards @ 0dbc6a3 | Keras: §4.2 tertinggal, baris log tanpa id, tracker belum ada. Smell: teks `lease_lost` salah (Repeated Switches), kunci secret ganda, `Literal` vs `str`, komentar import-linter keliru, dll. | 45c1de8 (satu kalimat per kode, id di log close, tipe, komentar), dokumen §4.2/§6.1 dan tracker ini. Tidak dikerjakan (penilaian, spec "Tidak dikerjakan"): data clump `BudgetBreach`, nama `_port`, jam injectable, `STEPS`, duplikasi `HANDLER_DENIALS`, helper payload |
 | `/code-review` Spec @ 0dbc6a3 | Tracker/HANDOFF dan butir #72 basi; `hidden_paths_affected` dan langkah rilis tanpa keputusan; tulis ledger tanpa tenggat; cakupan `reset` ≠ API §5.1; pola `EvidenceRef` A07 mengulang #36 untuk V2; teks lease; ADR-011 diukur sebelum escape | #42, #43 (keputusan), 512aa3e, 082f104 (#44), f5f7dd4 (#45), 45c1de8, 83ad404 (#46), butir #72 dan tracker ini |
-| AG-13 delta @ 082f104 | ⏳ berjalan | |
+| AG-13 delta @ 082f104 | **SIGNED OFF WITH CONDITIONS 🔒**, 0 CRITICAL/HIGH di range; D-M1 dan D-L1 **tertutup** (48 KiB → 0,2 dtk; fuzz 2000 run, 0 secret di payload reset/restart; 14 ejaan 0 karakter mentah), D-I1/D-I4 tertutup, LOW-1/LOW-2/C10 tetap; N1 terbatas di jalur normal dan cancel; N6 sekali per run; `bound_transaction` dan rename netral; #45 tanpa konsumen. Baru: LOW D2-L1 (reset run-wide kuadratik: 147 MiB/30 dtk CPU pada run maksimum), LOW D2-L2 (jendela kunci 128 karakter), D2-I1..I6; celah `Redactor` yang sudah ada R-1..R-3 MEDIUM, R-4..R-6 LOW | Keputusan Lead #49: **WP-3.1f2c** (pengerasan redaksi) untuk R-1..R-6, D2-L1, D2-L2, D2-I1, D2-I2, sebelum pemanggil produksi pertama; semuanya dicatat di SECURITY_MODEL §13 dengan pemilik dan tenggat. D2-I3 → syarat 3.2. D2-I4 → kelas LOW-3 (3.1f2b). D2-I5 diabaikan. D2-I6 dan D-I2/D-I3 di dokumen (63df358 dan commit ini) |
 
-**Status sign-off AG-13 WP-3.1f2a:** ⏳ menunggu delta @ 082f104.
+**Status sign-off AG-13 WP-3.1f2a: SIGNED OFF WITH CONDITIONS 🔒** (42bcb2e; delta 073e68d; delta 082f104). Syarat merge PR #31: CI 9/9 hijau termasuk `security-scan` (saat ini merah oleh temuan gitleaks PEM sintetis b35c3c7, menunggu keputusan PO), perubahan sesudah 082f104 hanya dokumen/tracker; perubahan kode lain butuh delta AG-13. Syarat ke depan di bawah.
 
 **Syarat yang dibawa:**
 - **3.1f2b (recovery, blocking sebelum pemanggil produksi `build_agent_runtime`):**
@@ -2590,6 +2590,7 @@ $ uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml   # e
   - AG-13 LOW-3: catat atau tandai percobaan yang mungkin hilang saat worker mati (marker sebelum percobaan → baris `unavailable`), atau keputusan Lead tertulis yang menerimanya;
   - silent N5 / AG-13 D-I6: baris `running` yatim saat `start` ter-commit tetapi ack-nya hilang;
   - worker memperlakukan `AgentRunUnfinished` sebagai "hasil akhir tidak diketahui; baris DB adalah kebenaran" (#48).
-- **3.2:** `services/acceptance.verify_report` V1–V10 + test UPA-02 sebelum status A07 dikonsumsi (#36, #45); AG-13 INFO-5 (`worker_id` unik per proses, `TaskWorkspace` dari baris task yang sama, penulis `AgentRunResult.output`/`pending_tool` meredaksi, transkrip resume diredaksi); transisi task dari hasil run, task `running` dengan provider belum siap → `interrupted/provider_not_ready` (#15); resume `tool_r3`; `GET /tasks/{id}/agent-runs`; penulis `tasks.title` meredaksi.
+- **WP-3.1f2c (pengerasan redaksi, sebelum pemanggil produksi pertama `build_agent_runtime`; Keputusan Lead #49):** `Redactor` R-1 (kunci camelCase), R-2 (nilai berkutip sesudah header), R-3 (PGP private key), R-4..R-6 (paling lambat sebelum WP-3.2 di-merge); delta D2-L1 (paling banyak satu reset per panggilan atau batas payload), D2-L2 (jendela dari karakter non-spasi terakhir), D2-I1 (kandidat `scheme://`, `hold ≥` literal terpanjang), D2-I2 (redaksi kandidat terbuka saat `flush`). Review AG-13 utuh atas `app/core/redaction.py`.
+- **3.2:** `services/acceptance.verify_report` V1–V10 + test UPA-02 sebelum status A07 dikonsumsi (#36, #45), audit `malformed_ref` menyimpan ref dalam bentuk ter-escape atau tipe ref A07 menolak Cc/Cf (AG-13 D2-I3); AG-13 INFO-5 (`worker_id` unik per proses, `TaskWorkspace` dari baris task yang sama, penulis `AgentRunResult.output`/`pending_tool` meredaksi, transkrip resume diredaksi); transisi task dari hasil run, task `running` dengan provider belum siap → `interrupted/provider_not_ready` (#15); resume `tool_r3`; `GET /tasks/{id}/agent-runs`; penulis `tasks.title` meredaksi.
 - **WP yang me-render `agent.delta` (frontend):** wajib menghormati `reset` (API §5.1).
 - **PO:** keputusan temuan gitleaks (di atas); ratifikasi ADR-073 #6, ADR-074, ADR-075; butir 3.1f2 di #72.
