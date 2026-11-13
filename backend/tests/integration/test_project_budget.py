@@ -291,6 +291,81 @@ async def test_budget_update_never_loses_a_concurrent_settings_change(
     assert settings["budget"]["max_tokens"] == 77
 
 
+# --- a malformed stored budget (AG-13 L3: only a direct DB edit can make one) -----------------------------
+
+BIG_JUNK = '{"max_cost_usd": "' + "x" * 5_000 + '"}'
+ALL_FOUR = {
+    "max_cost_usd": "1.25",
+    "max_tokens": 9_000,
+    "max_tool_iterations": None,
+    "max_duration_minutes": 30,
+}
+
+
+async def corrupt(engine: AsyncEngine, project_id: str, raw: str) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE projects SET settings = settings "
+                "|| jsonb_build_object('budget', CAST(:raw AS jsonb)) WHERE id = :id"
+            ),
+            {"raw": raw, "id": project_id},
+        )
+
+
+def assert_budget_invalid(response: httpx.Response) -> None:
+    assert response.status_code == 409, response.text
+    error = response.json()["error"]
+    assert error["code"] == "CONFLICT"
+    assert error["details"][0]["reason"] == "budget_invalid"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ['{"max_cost_usd": 2.5}', '{"max_tokens": -1}', '"not a mapping"', BIG_JUNK],
+    ids=["float cost", "negative tokens", "not a mapping", "5000 characters of junk"],
+)
+async def test_a_malformed_stored_budget_is_a_conflict(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+    raw: str,
+) -> None:
+    project_id = await new_project(owner)
+    await corrupt(engine, project_id, raw)
+    response = await owner.get(budget_url(project_id))
+    assert_budget_invalid(response)
+    assert "xxxx" not in response.text
+
+
+@pytest.mark.parametrize("repair", [ALL_FOUR, dict.fromkeys(ALL_FOUR)], ids=["values", "all inherit"])
+async def test_a_patch_with_all_four_keys_repairs_a_malformed_budget(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+    repair: dict[str, Any],
+) -> None:
+    project_id = await new_project(owner)
+    await corrupt(engine, project_id, BIG_JUNK)
+    response = await patch(owner, project_id, repair)
+    assert response.status_code == 200, response.text
+    assert (await stored_settings(engine, project_id))["budget"] == repair
+    assert (await owner.get(budget_url(project_id))).status_code == 200
+    audits = await budget_audits(engine, project_id)
+    assert audits == [{"fields": list(ALL_FOUR), "budget": repair, "previous": "<invalid>"}]
+    assert "xxxx" not in str(audits)  # the malformed value is never echoed into the audit trail
+
+
+async def test_a_partial_patch_of_a_malformed_budget_is_a_conflict(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    project_id = await new_project(owner)
+    await corrupt(engine, project_id, '{"max_cost_usd": 2.5}')
+    response = await patch(owner, project_id, {"max_tokens": 5})
+    assert_budget_invalid(response)
+    assert (await stored_settings(engine, project_id))["budget"] == {"max_cost_usd": 2.5}  # untouched
+    assert await budget_audits(engine, project_id) == []
+
+
 async def test_guard_uses_the_patched_project_budget(
     owner: httpx.AsyncClient,  # noqa: F811
     owner_id: uuid.UUID,  # noqa: F811

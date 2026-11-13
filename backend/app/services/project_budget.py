@@ -19,6 +19,7 @@ from app.services import projects
 from app.services.projects import Actor, ProjectEnv
 from app.workflow.budget import (
     BUDGET_KEYS,
+    BudgetConfigError,
     BudgetDefaults,
     BudgetFields,
     EffectiveBudget,
@@ -29,6 +30,7 @@ from app.workflow.budget import (
 
 BUDGET_SETTINGS_KEY: Final = "budget"
 AUDIT_ACTION: Final = "project.budget_updated"
+INVALID_PREVIOUS: Final = "<invalid>"  # what the audit records for a malformed budget that was replaced
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +46,26 @@ class BudgetChanges:
     values: BudgetFields
 
 
+def _budget_invalid() -> AppError:
+    return AppError(
+        "CONFLICT",
+        "The stored budget cannot be read; send all four fields to replace it",
+        http_status=409,
+        details=[{"reason": "budget_invalid"}],
+    )
+
+
+def _stored(settings: dict[str, Any]) -> BudgetFields:
+    """The stored budget; a malformed one (only a direct DB edit makes one) is a 409, never a 500 (AG-13 L3).
+    BudgetGuard still refuses to run a task under it: it fails closed on the same parse."""
+    try:
+        return parse_budget(settings.get(BUDGET_SETTINGS_KEY))
+    except BudgetConfigError:
+        raise _budget_invalid() from None
+
+
 def _view(project_id: uuid.UUID, settings: dict[str, Any], defaults: BudgetDefaults) -> ProjectBudgetView:
-    stored = parse_budget(settings.get(BUDGET_SETTINGS_KEY))
+    stored = _stored(settings)
     return ProjectBudgetView(project_id, stored, effective_budget(BudgetFields(), stored, defaults))
 
 
@@ -71,25 +91,35 @@ async def update_budget(
         )
     async with env.sessions() as session:
         project, _ = await projects.authorize(session, actor, project_id, "project:write", lock=True)
-        current = parse_budget(project.settings.get(BUDGET_SETTINGS_KEY))
-        updated = dataclasses.replace(
-            current, **{name: getattr(changes.values, name) for name in changes.fields}
-        )
-        changed = [name for name in BUDGET_KEYS if getattr(updated, name) != getattr(current, name)]
+        try:
+            current: BudgetFields | None = parse_budget(project.settings.get(BUDGET_SETTINGS_KEY))
+        except BudgetConfigError:
+            # A stored budget nobody can read is replaced only as a whole: there is nothing to merge into.
+            if changes.fields != frozenset(BUDGET_KEYS):
+                raise _budget_invalid() from None
+            current = None
+        if current is None:
+            updated, changed = changes.values, list(BUDGET_KEYS)
+        else:
+            updated = dataclasses.replace(
+                current, **{name: getattr(changes.values, name) for name in changes.fields}
+            )
+            changed = [name for name in BUDGET_KEYS if getattr(updated, name) != getattr(current, name)]
         if changed:
-            before, after = dump_budget(current), dump_budget(updated)
+            after = dump_budget(updated)
             project.settings = {**project.settings, BUDGET_SETTINGS_KEY: after}
+            # The old value is never echoed when it was malformed: it could be anything, of any size.
+            previous: dict[str, str | int | None] | str = INVALID_PREVIOUS
+            if current is not None:
+                before = dump_budget(current)
+                previous = {name: before[name] for name in changed}
             await projects.audit_project(
                 env,
                 session,
                 actor,
                 project,
                 AUDIT_ACTION,
-                {
-                    "fields": changed,
-                    "budget": {name: after[name] for name in changed},
-                    "previous": {name: before[name] for name in changed},
-                },
+                {"fields": changed, "budget": {name: after[name] for name in changed}, "previous": previous},
             )
         settings = dict(project.settings)
         await session.commit()
