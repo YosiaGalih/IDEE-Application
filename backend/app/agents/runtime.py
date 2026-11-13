@@ -1183,7 +1183,7 @@ class AgentRuntime:
                 _log.error(
                     "agent_run_unfinished", **_ctx(run), attempt=attempt, error_type=type(error).__name__
                 )
-                if write.done():
+                if attempt == 1 and write.done():  # one retry; nothing is started after the last attempt
                     write = self._write(run, end)
         if run.agent_run_id is not None:
             mark = asyncio.ensure_future(self._ports.runs.fail(run.agent_run_id))

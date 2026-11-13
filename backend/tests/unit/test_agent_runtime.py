@@ -1525,3 +1525,27 @@ def test_the_ports_share_the_literal_types_of_their_owners() -> None:
 
     assert set(get_args(CostStatus)) == set(get_args(EstimateStatus))
     assert set(get_args(BudgetKind)) == set(get_args(budget.BudgetKind))
+
+
+class DownRuns(FakeRuns):
+    """Every finish fails; each write started is counted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes = 0
+
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+        self.writes += 1
+        raise RuntimeError("database down")
+
+
+async def test_a_failing_close_starts_the_write_and_one_retry_only() -> None:
+    """AG-13 D-I1 (delta review of 073e68d): one retry between the first and the second attempt, no third
+    write after the last attempt that nobody awaits (it could close the row after AgentRunUnfinished)."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    runs = DownRuns()
+    fakes.runs = runs
+    with pytest.raises(AgentRunUnfinished):
+        await make_runtime(fakes, runtime_config=config(close_timeout_s=0.2)).run(run_request("B14"))
+    await asyncio.sleep(0.1)  # a write started after the last attempt would run now
+    assert runs.writes == 2 and runs.failed_runs == runs.ids
