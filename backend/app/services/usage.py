@@ -393,6 +393,7 @@ class RunTotals:
     totals: UsageTotals
     cache_read_tokens: int | None
     cache_creation_tokens: int | None
+    rows: int = 0
 
 
 async def run_usage(session: AsyncSession, agent_run_id: uuid.UUID) -> RunTotals:
@@ -411,7 +412,24 @@ async def run_usage(session: AsyncSession, agent_run_id: uuid.UUID) -> RunTotals
     rows, counted = int(values[0]), int(values[3])
     known = rows == 0 or counted > 0
     cache_read, cache_creation = int(values[7]), int(values[8])
-    return RunTotals(_totals(values[:7]), cache_read if known else None, cache_creation if known else None)
+    return RunTotals(
+        _totals(values[:7]), cache_read if known else None, cache_creation if known else None, rows=rows
+    )
+
+
+def incomplete_run_totals(found: RunTotals) -> RunTotals:
+    """A run whose ledger is known to miss attempts (review H1): never a complete zero. No rows -> tokens and
+    cost unknown (``unavailable``); rows -> their known sum, ``partial`` (``unavailable`` stays)."""
+    if found.rows == 0:
+        return RunTotals(UsageTotals(None, None, None, "unavailable"), None, None, rows=0)
+    totals = found.totals
+    status: EstimateStatus = "unavailable" if totals.cost_status == "unavailable" else "partial"
+    return RunTotals(
+        UsageTotals(totals.input_tokens, totals.output_tokens, totals.estimated_cost, status),
+        found.cache_read_tokens,
+        found.cache_creation_tokens,
+        rows=found.rows,
+    )
 
 
 async def task_usage(session: AsyncSession, task_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, UsageTotals]:

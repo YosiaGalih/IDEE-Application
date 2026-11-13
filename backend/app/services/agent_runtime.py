@@ -55,7 +55,14 @@ from app.services.provider_readiness import (
     provider_ready,
 )
 from app.services.tool_gateway import build_tool_gateway
-from app.services.usage import EMPTY_TOTALS, UsageCallContext, UsageLedger, run_usage, task_usage
+from app.services.usage import (
+    EMPTY_TOTALS,
+    UsageCallContext,
+    UsageLedger,
+    incomplete_run_totals,
+    run_usage,
+    task_usage,
+)
 from app.workflow.budget import BudgetDefaults, BudgetExceeded, BudgetGuard, CallBound
 from app.workflow.lease import LeaseLost, renew_lease
 
@@ -282,6 +289,8 @@ class AgentRunWriter:
         redactor = self._audit.redactor
         async with self._sessions() as session:
             run_totals = await run_usage(session, agent_run_id)
+            if not end.usage_complete or end.error_code == "usage_unrecorded":
+                run_totals = incomplete_run_totals(run_totals)
             totals = run_totals.totals
             cost = stored_cost(totals.estimated_cost) if totals.estimated_cost is not None else None
             finished = (

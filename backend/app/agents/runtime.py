@@ -23,7 +23,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
@@ -419,6 +419,9 @@ class RunEnd:
     error: str | None = None  # short text; the store redacts and cuts it
     output: Mapping[str, Any] | None = None  # succeeded: the output; approval_required: the pending tool
     budget: BudgetBreach | None = None
+    # False when an attempt reached the provider without its ledger row being written by the close (review
+    # H1): the store then reports the known sum as partial, or unknown, never a complete zero.
+    usage_complete: bool = True
 
     def __post_init__(self) -> None:
         if (self.status == "failed") != (self.error_code is not None):
@@ -520,6 +523,14 @@ class RuntimeConfig:
 # --- the runtime --------------------------------------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class _Tally:
+    """Attempts that reached the provider, and attempts the ledger recorded."""
+
+    sent: int = 0
+    recorded: int = 0
+
+
 class _RunStop:
     """One stop token per run (Keputusan plan #6): the caller's cancel, the deadline or a lost lease cancels
     it, and the first reason wins. Providers and tools get the token."""
@@ -545,6 +556,7 @@ class _Run:
     input_json: str
     deadline: float
     stop: _RunStop = field(default_factory=_RunStop)
+    tally: _Tally = field(default_factory=_Tally)
     agent_run_id: uuid.UUID | None = None
     iterations: int = 0
     output: BaseModel | None = None
@@ -852,7 +864,12 @@ class AgentRuntime:
 
         try:
             response = await self._call_model(
-                call, provider, cancel=run.stop.token, on_text_delta=on_text_delta, on_restart=on_restart
+                call,
+                provider,
+                cancel=run.stop.token,
+                on_text_delta=on_text_delta,
+                on_restart=on_restart,
+                tally=run.tally,
             )
         except LLMError:
             await self._ports.events.usage_updated(scope)  # the call reached the provider
@@ -902,6 +919,8 @@ class AgentRuntime:
 
     async def _close(self, run: _Run, end: RunEnd) -> AgentRunResult:
         """Writes the end, shielded: a second cancel does not leave the run ``running``."""
+        if run.tally.sent != run.tally.recorded:
+            end = replace(end, usage_complete=False)
         usage = await asyncio.shield(self._write_end(run, end))
         assert run.agent_run_id is not None
         return AgentRunResult(
@@ -938,6 +957,7 @@ class AgentRuntime:
         cancel: CancelToken,
         on_text_delta: TextDeltaHandler | None = None,
         on_restart: RestartHandler | None = None,
+        tally: _Tally | None = None,
     ) -> LLMResponse:
         """The only create_with_retry in app/ (Keputusan Lead #17; tests/unit/test_model_call_guard.py).
 
@@ -954,6 +974,8 @@ class AgentRuntime:
             await ports.heartbeat.beat(scope.task_id)
             await ports.gate.check(scope.project_id)
             await ports.budget.before_model_attempt(call)
+            if tally is not None:
+                tally.sent += 1  # the hooks passed: this attempt goes to the provider
 
         record = ports.ledger.on_attempt(call)
 
@@ -964,6 +986,8 @@ class AgentRuntime:
                 raise UsageUnrecorded(
                     f"attempt {attempt.attempt} of call {call.call_id} was not recorded"
                 ) from error
+            if tally is not None:
+                tally.recorded += 1
 
         return await create_with_retry(
             provider,

@@ -786,3 +786,31 @@ async def test_an_input_for_another_task_is_refused() -> None:
     with pytest.raises(AgentInputInvalid, match="task"):
         await make_runtime(fakes).run(request)
     assert fakes.runs.starts == [] and fakes.log == []
+
+
+async def test_a_run_cut_while_its_ledger_write_runs_reports_incomplete_usage() -> None:
+    """Review H1: an attempt whose row was not written when the run closed (a second cancel while the
+    shielded write of the cancelled attempt still waits, AG-13 N-1) makes the run's usage incomplete."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    gate, writing = asyncio.Event(), asyncio.Event()
+
+    async def slow_record(record: Any) -> None:
+        writing.set()
+        await gate.wait()
+
+    fakes.ledger.on_attempt = lambda call: slow_record  # type: ignore[method-assign]
+    task = asyncio.create_task(make_runtime(fakes, clock=time.monotonic).run(run_request("B14")))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    await asyncio.wait_for(writing.wait(), 5)
+    task.cancel()  # the second cancel: the row is still not written
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+    gate.set()
+    assert ended(fakes).usage_complete is False
+
+
+async def test_a_complete_run_reports_complete_usage() -> None:
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert ended(fakes).usage_complete is True

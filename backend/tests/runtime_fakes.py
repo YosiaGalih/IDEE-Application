@@ -588,6 +588,8 @@ def compose(
     bus: Any = None,
     gate: Any = None,
     providers: Any = None,
+    ledger: Any = None,
+    runtime_config: RuntimeConfig | None = None,
 ) -> Composition:
     """The production ports over a real database; the events are ``TaskRunEvents`` over ``bus`` when one is
     given, else ``events`` or ``FakeEvents``; the provider is the given scripted one. ``build_agent_runtime``
@@ -612,7 +614,7 @@ def compose(
     ports = RuntimePorts(
         gate=gate if gate is not None else DbProviderGate(sessions, settings),
         budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
-        ledger=LedgerRecorder(UsageLedger(sessions, pricing)),
+        ledger=ledger if ledger is not None else LedgerRecorder(UsageLedger(sessions, pricing)),
         runs=runs,
         events=events,
         tools=tools,
@@ -623,7 +625,7 @@ def compose(
         registry=registry,
         prompts=PROMPTS,
         ports=ports,
-        config=config(scripted=settings.llm_provider == "scripted"),
+        config=runtime_config or config(scripted=settings.llm_provider == "scripted"),
         redactor=redactor,
         sleep=no_sleep,
     )

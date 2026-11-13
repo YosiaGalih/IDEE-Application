@@ -537,3 +537,69 @@ async def test_a_scenario_never_reaches_a_provider_that_is_not_scripted() -> Non
     fakes.providers.provider.name = "anthropic"  # type: ignore[misc]
     await make_runtime(fakes).run(unit_request("B14", scenario="calc"))
     assert "scenario" not in fakes.provider.requests[0].metadata
+
+
+class FailingSecond:
+    """The real ledger for the first logical call, a failing one for the next."""
+
+    def __init__(self, real: Any) -> None:
+        self.real = real
+        self.calls = 0
+
+    def on_attempt(self, call: Any) -> Any:
+        self.calls += 1
+        if self.calls == 1:
+            return self.real.on_attempt(call)
+
+        async def down(attempt: Any) -> None:
+            raise RuntimeError("usage_records is unavailable")
+
+        return down
+
+
+@pytest.mark.parametrize("recorded_first", [False, True], ids=["no-row", "one-row"])
+async def test_a_run_whose_usage_was_not_recorded_never_reads_zero(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+    recorded_first: bool,
+) -> None:
+    """Review H1: usage_unrecorded never shows "0 / estimated": no rows -> unknown, rows -> partial."""
+    from app.services.agent_runtime import LedgerRecorder
+    from app.services.usage import UsageLedger
+    from tests.runtime_fakes import FakeTools
+
+    settings = worker(CLAUDE_MODEL_DEFAULT="claude-haiku-5-5")  # a priced model: the known sum has a cost
+    project_id, task_id = await a_task(session, settings)
+    real = LedgerRecorder(UsageLedger(sessions, pricing))
+    ledger = FailingSecond(real) if recorded_first else FailingSecond(None)
+    if not recorded_first:
+        ledger.calls = 1  # the first call already fails
+    bus = RecordingBus()
+    run = compose(
+        sessions,
+        settings,
+        pricing,
+        scripted(tool_turn("repo.get_tree"), DONE),
+        tools=FakeTools([]),
+        bus=bus,
+        ledger=ledger,
+    )
+    result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert (result.status, result.error_code) == ("failed", "usage_unrecorded")
+    stored = await session.get(AgentRun, result.agent_run_id)
+    assert stored is not None
+    (finished,) = bus.of_type("agent.run_finished")
+    if recorded_first:
+        expected = (100, "partial")
+        assert stored.estimated_cost is not None
+    else:
+        expected = (None, "unavailable")
+        assert stored.estimated_cost is None and finished["payload"]["usage"]["estimated_cost"] is None
+    assert (stored.input_tokens, stored.cost_status) == expected
+    assert (result.usage.input_tokens, result.usage.cost_status) == expected
+    assert (
+        finished["payload"]["usage"]["input_tokens"],
+        finished["payload"]["usage"]["cost_status"],
+    ) == expected

@@ -321,3 +321,45 @@ async def test_run_finished_carries_status_code_and_usage(
     assert payload["usage"]["input_tokens"] == 100 and payload["usage"]["cost_status"] == "estimated"
     assert isinstance(payload["usage"]["estimated_cost"], str)
     assert finished["seq"] is not None  # stored, then published
+
+
+# --- usage truth (review H1 of 42bcb2e) ---------------------------------------------------------------------
+
+
+async def test_an_incomplete_run_without_rows_is_unavailable_never_zero(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    run_id = await writer.start(start(task_id, project_id))
+    usage = await writer.finish(run_id, RunEnd("failed", 1, "usage_unrecorded", "not recorded"))
+    row = await stored(session, run_id)
+    assert (row.input_tokens, row.output_tokens, row.estimated_cost, row.cost_status) == (
+        None,
+        None,
+        None,
+        "unavailable",
+    )
+    assert (usage.input_tokens, usage.estimated_cost, usage.cost_status) == (None, None, "unavailable")
+    (finished,) = bus.of_type("agent.run_finished")
+    assert finished["payload"]["usage"] == {
+        "input_tokens": None,
+        "output_tokens": None,
+        "estimated_cost": None,
+        "cost_status": "unavailable",
+    }
+
+
+async def test_an_incomplete_run_with_rows_is_the_known_sum_partial(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable
+) -> None:
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    run_id = await writer.start(start(task_id, project_id))
+    await ledger_row(sessions, pricing, project_id, task_id, run_id)
+    usage = await writer.finish(run_id, RunEnd("cancelled", 1, usage_complete=False))
+    row = await stored(session, run_id)
+    assert (row.input_tokens, row.cost_status) == (100, "partial")
+    assert row.estimated_cost is not None and row.estimated_cost > 0
+    assert (usage.input_tokens, usage.cost_status) == (100, "partial")
