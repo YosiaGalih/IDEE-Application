@@ -444,23 +444,11 @@ def test_workflow_types_match_the_task_model() -> None:
     assert get_args(c.WorkflowType) == WORKFLOW_TYPES
 
 
-def test_a_passed_claim_needs_evidence() -> None:
-    """Review A07 evidence (CLAUDE.md #1): ``passed`` with no evidence ref is refused by the contract, for a
-    criterion and for the report; every other status may name none."""
-    c.CriterionResult.model_validate(with_(CRITERION_RESULT, status="passed"))
-    with pytest.raises(ValidationError, match="passed needs evidence_refs"):
-        c.CriterionResult.model_validate(with_(CRITERION_RESULT, status="passed", evidence_refs=[]))
-    for status in ("failed", "blocked", "unverified"):
-        c.CriterionResult.model_validate(with_(CRITERION_RESULT, status=status, evidence_refs=[]))
-    passed = with_(CRITERION_RESULT, status="passed")
-    c.UserProxyOutput.model_validate(
-        with_(VALID[c.UserProxyOutput], status="passed", criteria_results=[passed])
-    )
-    without = with_(CRITERION_RESULT, evidence_refs=[])
-    for results in ([], [without]):
-        with pytest.raises(ValidationError, match="passed needs evidence_refs"):
-            c.UserProxyOutput.model_validate(
-                with_(VALID[c.UserProxyOutput], status="passed", criteria_results=results)
-            )
-    for status in ("needs_changes", "blocked", "unverified"):
-        c.UserProxyOutput.model_validate(with_(VALID[c.UserProxyOutput], status=status, criteria_results=[]))
+def test_a_passed_claim_without_evidence_stays_schema_valid() -> None:
+    """Lead decision 3.1f2 #36 (USER_PROXY_ACCEPTANCE §5 V1, UPA-02): ``passed`` with no evidence ref is
+    NOT a schema error. ``services/acceptance.verify_report`` downgrades it to ``unverified``/``no_evidence``
+    and audits ``acceptance.evidence_rejected``; refusing it here would lose that audit."""
+    bare = with_(CRITERION_RESULT, status="passed", evidence_refs=[])
+    c.CriterionResult.model_validate(bare)
+    report = with_(VALID[c.UserProxyOutput], status="passed", criteria_results=[bare])
+    c.UserProxyOutput.model_validate(report)

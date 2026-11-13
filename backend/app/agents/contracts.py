@@ -9,7 +9,6 @@ Rules every class follows:
 - keys follow their patterns (``REQ-n``, ``AC-n``, ``P1``..``P12``, evidence refs USER_PROXY_ACCEPTANCE §4);
 - a path is relative, inside the worktree, without a control character or a backslash;
 - no field claims a test status (only ``test_runs`` does) or an approval (only people decide those);
-- ``passed`` (a criterion, an A07 report) names at least one evidence ref;
 - validator messages name the rule, never the input.
 
 ``OUTPUT_CONTRACTS``/``INPUT_CONTRACTS`` stay module-level dict literals: ``scripts/validate_registry.py``
@@ -160,22 +159,11 @@ class EvidenceItem(Contract):
     label: Line
 
 
-# CLAUDE.md #1 (review of 42bcb2e, A07 evidence): a claim of "passed" names the evidence it rests on. The
-# backend still verifies every ref (USER_PROXY_ACCEPTANCE §5); this only refuses a claim that names none.
-_PASSED_NEEDS_EVIDENCE: Final = "status passed needs evidence_refs"
-
-
 class CriterionResult(Contract):
     criterion_key: CriterionKey
     status: Literal["passed", "failed", "blocked", "unverified"]
     evidence_refs: Annotated[list[EvidenceRef], Field(max_length=20)]
     rationale: Text
-
-    @model_validator(mode="after")
-    def _passed_has_evidence(self) -> Self:
-        if self.status == "passed" and not self.evidence_refs:
-            raise ValueError(_PASSED_NEEDS_EVIDENCE)
-        return self
 
 
 # ------------------------------------------------------------------------------------------- the six pairs
@@ -298,12 +286,6 @@ class UserProxyOutput(Contract):
     def _unique_criteria(self) -> Self:
         if _duplicates(r.criterion_key for r in self.criteria_results):
             raise ValueError("criterion keys must be unique")
-        return self
-
-    @model_validator(mode="after")
-    def _passed_has_evidence(self) -> Self:
-        if self.status == "passed" and not any(r.evidence_refs for r in self.criteria_results):
-            raise ValueError(_PASSED_NEEDS_EVIDENCE)
         return self
 
 
