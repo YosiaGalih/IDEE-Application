@@ -24,7 +24,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final, Literal
 
-from sqlalchemy import ColumnElement, func, select
+from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -214,6 +214,12 @@ _AGGREGATE = (
 )
 
 
+def _usage_in_projects(*where: ColumnElement[bool]) -> Select[UsageRecord]:
+    """Ledger rows joined to their project, filtered by ``where``: every report checks the project (its
+    visibility, that it is not deleted). Totals and series reuse it with ``with_only_columns``."""
+    return select(UsageRecord).join(Project, Project.id == UsageRecord.project_id).where(*where)
+
+
 def _totals(values: Sequence[Any]) -> UsageTotals:
     rows, partial, unavailable, counted, input_tokens, output_tokens, known_cost = values
     return aggregate(
@@ -340,25 +346,17 @@ async def usage_report(env: ProjectEnv, actor: Actor, query: UsageQuery) -> Usag
             "model": UsageRecord.model,
             "agent": UsageRecord.agent_id,
         }[query.group_by]
-        rows = select(UsageRecord).join(Project, Project.id == UsageRecord.project_id).where(*where)
-        joined = (
-            select(*_AGGREGATE).select_from(UsageRecord).join(Project, Project.id == UsageRecord.project_id)
-        )
-        totals_row = (await session.execute(joined.where(*where))).one()
+        in_scope = _usage_in_projects(*where)
+        totals_row = (await session.execute(in_scope.with_only_columns(*_AGGREGATE))).one()
         series_rows = (
             await session.execute(
-                select(key, *_AGGREGATE)
-                .select_from(UsageRecord)
-                .join(Project, Project.id == UsageRecord.project_id)
-                .where(*where)
-                .group_by(key)
-                .order_by(key.asc().nulls_last())
+                in_scope.with_only_columns(key, *_AGGREGATE).group_by(key).order_by(key.asc().nulls_last())
             )
         ).all()
         records = list(
             (
                 await session.scalars(
-                    rows.order_by(UsageRecord.created_at.desc(), UsageRecord.id)
+                    in_scope.order_by(UsageRecord.created_at.desc(), UsageRecord.id)
                     .limit(query.page_size)
                     .offset((query.page - 1) * query.page_size)
                 )
@@ -382,14 +380,8 @@ async def period_usage(
     session: AsyncSession, visible: ColumnElement[bool], start: datetime, end: datetime
 ) -> UsageTotals:
     """Totals of ``[start, end)`` over the projects ``visible`` selects, in the caller's session."""
-    row = (
-        await session.execute(
-            select(*_AGGREGATE)
-            .select_from(UsageRecord)
-            .join(Project, Project.id == UsageRecord.project_id)
-            .where(visible, UsageRecord.created_at >= start, UsageRecord.created_at < end)
-        )
-    ).one()
+    in_period = _usage_in_projects(visible, UsageRecord.created_at >= start, UsageRecord.created_at < end)
+    row = (await session.execute(in_period.with_only_columns(*_AGGREGATE))).one()
     return _totals(row)
 
 
