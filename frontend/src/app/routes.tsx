@@ -13,6 +13,8 @@ import { DashboardPage } from "@/features/dashboard/DashboardPage";
 import { ImportArchivePage } from "@/features/projects/ImportArchivePage";
 import { NewProjectPage } from "@/features/projects/NewProjectPage";
 import { ProjectsPage } from "@/features/projects/ProjectsPage";
+import { ProvidersPage } from "@/features/settings/ProvidersPage";
+import { SettingsPage } from "@/features/settings/SettingsPage";
 import { AUTH_PATHS } from "@/lib/safeNext";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { RouteErrorPage } from "./pages/RouteErrorPage";
@@ -65,7 +67,8 @@ export const routes: RouteObject[] = [
           { path: "agents", element: <AgentsPage /> },
           { path: "agents/:agentId", element: <AgentDetailPage /> },
           { path: "approvals", element: <ApprovalsPage /> },
-          { path: "settings/providers", element: page("providers") },
+          { path: "settings", element: <SettingsPage /> },
+          { path: "settings/providers", element: <ProvidersPage /> },
           { path: "settings/usage", element: page("usage") },
           { path: "settings/users", element: page("users") },
           { path: "settings/policies", element: page("policies") },

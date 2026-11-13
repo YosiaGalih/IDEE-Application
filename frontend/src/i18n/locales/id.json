@@ -37,7 +37,8 @@
     "policies": "Kebijakan",
     "audit": "Audit",
     "notFound": "Halaman tidak ditemukan",
-    "importArchive": "Impor arsip"
+    "importArchive": "Impor arsip",
+    "settings": "Pengaturan"
   },
   "placeholder": {
     "body": "Layar ini sedang dibangun. Fondasi (klien API, stream event, i18n, komponen) sudah siap."
@@ -898,5 +899,117 @@
       "project_delete": "Hapus project {{name}}. Workspace disimpan 7 hari, lalu dihapus permanen."
     },
     "pendingRefreshFailed": "Daftar tertunda gagal dimuat ulang; yang tampil mungkin sudah berubah."
+  },
+  "providers": {
+    "lead": "Status provider LLM seperti yang terakhir dilihat worker. Key tidak pernah diatur atau ditampilkan di sini.",
+    "dataFlowTitle": "Data yang dikirim ke Claude Platform API",
+    "dataFlow": "Untuk menjalankan agent, KodeKantor mengirim potongan kode yang relevan, instruksi Anda, ringkasan hasil tool, dan cuplikan log ke Claude Platform API (Anthropic). File rahasia (.env, kunci, kredensial), folder dependensi/build, dan path di .agentignore tidak pernah dikirim; secret yang terdeteksi disamarkan. Admin dapat menonaktifkan provider di Pengaturan → Provider & model. Pemanggilan provider juga dapat dihentikan per project lewat pengaturan project (saat ini lewat API; layarnya menyusul).",
+    "empty": "Belum ada provider.",
+    "none": "—",
+    "endpoint": "Endpoint",
+    "endpointDefault": "Bawaan SDK",
+    "mode": "Mode",
+    "pricing": "Versi tarif",
+    "key": {
+      "title": "API key",
+      "configured": "Terpasang di worker",
+      "missing": "Tidak ada di worker",
+      "unknown": "Belum dilaporkan worker",
+      "hint": "Petunjuk: {{hint}}",
+      "checkedAt": "Dilaporkan worker {{when}}",
+      "managedInEnv": "Key hanya diatur lewat env atau secret di worker, tidak pernah lewat layar ini."
+    },
+    "enabled": {
+      "on": "Aktif",
+      "off": "Nonaktif",
+      "disable": "Nonaktifkan provider",
+      "enable": "Aktifkan provider",
+      "help": "Selama nonaktif, agent tidak boleh memanggil provider ini di project mana pun. Smoke test tetap bisa dijalankan untuk memeriksa.",
+      "confirmTitle": "Nonaktifkan {{provider}}?",
+      "confirmBody": "Agent tidak boleh memanggil provider ini sampai diaktifkan lagi. Readiness tetap tercatat.",
+      "confirm": "Nonaktifkan",
+      "cancel": "Batal"
+    },
+    "models": {
+      "title": "Model",
+      "alias": {
+        "default": "Default",
+        "fast": "Cepat",
+        "complex": "Kompleks"
+      },
+      "effective": "Dipakai: {{model}}",
+      "placeholder": "Kosong = dari env",
+      "save": "Simpan model",
+      "saved": "Model disimpan. Readiness kembali belum diuji sampai smoke test berikutnya.",
+      "invalid": "Harus ID model Claude, mis. claude-sonnet-5-5."
+    },
+    "readiness": {
+      "title": "Readiness gate",
+      "state": {
+        "ready": "Siap",
+        "not_ready": "Belum siap",
+        "disabled": "Dinonaktifkan",
+        "unknown": "Perlu diuji"
+      },
+      "reason": {
+        "passed": "Laporan terakhir lulus untuk mode dan model ini.",
+        "readiness_not_required": "Readiness gate dimatikan (LLM_REQUIRE_READINESS=false). Hanya untuk dev/test, ditolak di production.",
+        "disabled": "Provider dinonaktifkan admin.",
+        "no_report": "Belum ada laporan untuk konfigurasi ini.",
+        "other_mode": "Laporan terakhir dari mode provider lain.",
+        "models_changed": "Model berubah sejak laporan terakhir.",
+        "key_rotated": "Key berubah sejak laporan terakhir.",
+        "key_missing": "Worker tidak memegang key.",
+        "endpoint_changed": "Endpoint berubah sejak laporan terakhir.",
+        "report_failed": "Laporan terakhir gagal.",
+        "other": "Alasan: {{reason}}"
+      },
+      "checkedAt": "Diuji {{when}}, mode {{mode}}",
+      "never": "Belum pernah diuji.",
+      "reportResult": {
+        "passed": "Hasil laporan itu: lulus",
+        "failed": "Hasil laporan itu: gagal"
+      },
+      "status": {
+        "passed": "Lulus",
+        "failed": "Gagal",
+        "skipped": "Dilewati"
+      },
+      "stale": "Readiness gagal dibaca ulang. Yang tampil adalah bacaan sebelumnya.",
+      "staleAt": "Dibaca pada {{when}}.",
+      "outdated": "Laporan ini tidak berlaku lagi untuk pengaturan sekarang. Jalankan smoke test lagi."
+    },
+    "checks": {
+      "api_key_valid": "API key diterima",
+      "model_accessible": "Model dapat diakses",
+      "messages_ok": "Messages API menjawab",
+      "streaming_ok": "Streaming mengirim jawaban",
+      "usage_reported": "Pemakaian token dilaporkan",
+      "tool_use_roundtrip": "Tool use bolak-balik",
+      "timeout_cancel_handled": "Timeout dan cancel ditangani",
+      "secret_not_in_logs": "Key tidak muncul di log",
+      "pricing_verified": "Tabel tarif terverifikasi"
+    },
+    "smoke": {
+      "run": "Jalankan smoke test",
+      "running": "Smoke test berjalan…",
+      "cost": "Menjalankan beberapa panggilan kecil berbayar ke provider, di worker.",
+      "finished": "Smoke test selesai. Hasilnya di bawah.",
+      "stillRunning": "Smoke test masih berjalan di worker. Hasilnya tampil di sini begitu tercatat.",
+      "endedWithout": "Smoke test berakhir tanpa laporan (dilewati worker atau gagal sebelum mencatat). Lihat audit, lalu coba lagi.",
+      "busy": "Smoke test lain sedang berjalan untuk provider ini.",
+      "rateLimited": "Terlalu banyak smoke test. Coba lagi nanti.",
+      "noAnswer": "Hasil permintaan tidak diketahui (tidak ada jawaban yang dapat dibaca dari server). Smoke test mungkin tetap berjalan; statusnya dibaca dari readiness.",
+      "stalled": "Belum ada laporan setelah 5 menit. Lihat audit, lalu jalankan lagi bila perlu.",
+      "readFailed": "Readiness tidak dapat dibaca saat menunggu smoke test.",
+      "loading": "Smoke test selesai di worker. Hasilnya sedang dibaca.",
+      "unconfirmed": "Ada laporan yang lebih baru daripada yang tampil saat Anda menekan tombol, tetapi belum pasti dari smoke test Anda. Lihat audit.",
+      "noRun": "Tidak ada smoke test yang berjalan dan tidak ada laporan baru. Permintaan mungkin tidak sampai ke server, atau run berakhir tanpa laporan. Lihat audit, lalu coba lagi.",
+      "unreadable": "Tidak dapat memeriksa apakah smoke test selesai: readiness terus gagal dibaca.",
+      "recheck": "Periksa lagi",
+      "checking": "Memeriksa readiness untuk melihat apakah smoke test berjalan…"
+    },
+    "listStale": "Daftar provider gagal dibaca ulang. Yang tampil mungkin sudah usang.",
+    "reread": "Baca ulang"
   }
 }

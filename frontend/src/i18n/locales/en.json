@@ -37,7 +37,8 @@
     "policies": "Policies",
     "audit": "Audit",
     "notFound": "Page not found",
-    "importArchive": "Import an archive"
+    "importArchive": "Import an archive",
+    "settings": "Settings"
   },
   "placeholder": {
     "body": "This screen is under construction. The foundation (API client, event stream, i18n, components) is ready."
@@ -898,5 +899,117 @@
       "project_delete": "Delete project {{name}}. The workspace is kept for 7 days, then removed for good."
     },
     "pendingRefreshFailed": "The pending list could not be reloaded; what you see may have changed."
+  },
+  "providers": {
+    "lead": "LLM provider status as the worker last saw it. The key is never set or shown here.",
+    "dataFlowTitle": "Data sent to the Claude Platform API",
+    "dataFlow": "To run agents, KodeKantor sends relevant code snippets, your instructions, tool result summaries and log excerpts to the Claude Platform API (Anthropic). Secret files (.env, keys, credentials), dependency/build folders and paths in .agentignore are never sent; detected secrets are masked. Admins can disable the provider in Settings → Providers & models. Provider calls can also be stopped per project through the project settings (through the API for now; the screen comes later).",
+    "empty": "No provider yet.",
+    "none": "—",
+    "endpoint": "Endpoint",
+    "endpointDefault": "SDK default",
+    "mode": "Mode",
+    "pricing": "Pricing version",
+    "key": {
+      "title": "API key",
+      "configured": "Set in the worker",
+      "missing": "Not in the worker",
+      "unknown": "Not reported by the worker yet",
+      "hint": "Hint: {{hint}}",
+      "checkedAt": "Reported by the worker {{when}}",
+      "managedInEnv": "The key is only set through the worker's env or secret, never on this screen."
+    },
+    "enabled": {
+      "on": "Enabled",
+      "off": "Disabled",
+      "disable": "Disable provider",
+      "enable": "Enable provider",
+      "help": "While disabled, agents may not call this provider in any project. Smoke tests can still run to check it.",
+      "confirmTitle": "Disable {{provider}}?",
+      "confirmBody": "Agents may not call this provider until it is enabled again. Readiness stays recorded.",
+      "confirm": "Disable",
+      "cancel": "Cancel"
+    },
+    "models": {
+      "title": "Models",
+      "alias": {
+        "default": "Default",
+        "fast": "Fast",
+        "complex": "Complex"
+      },
+      "effective": "In use: {{model}}",
+      "placeholder": "Empty = from env",
+      "save": "Save models",
+      "saved": "Models saved. Readiness is untested again until the next smoke test.",
+      "invalid": "Must be a Claude model id, e.g. claude-sonnet-5-5."
+    },
+    "readiness": {
+      "title": "Readiness gate",
+      "state": {
+        "ready": "Ready",
+        "not_ready": "Not ready",
+        "disabled": "Disabled",
+        "unknown": "Needs a test"
+      },
+      "reason": {
+        "passed": "The last report passed for this mode and these models.",
+        "readiness_not_required": "The readiness gate is off (LLM_REQUIRE_READINESS=false). Dev/test only, refused in production.",
+        "disabled": "An admin disabled the provider.",
+        "no_report": "No report for this configuration yet.",
+        "other_mode": "The last report is from another provider mode.",
+        "models_changed": "The models changed since the last report.",
+        "key_rotated": "The key changed since the last report.",
+        "key_missing": "The worker holds no key.",
+        "endpoint_changed": "The endpoint changed since the last report.",
+        "report_failed": "The last report failed.",
+        "other": "Reason: {{reason}}"
+      },
+      "checkedAt": "Tested {{when}}, mode {{mode}}",
+      "never": "Never tested.",
+      "reportResult": {
+        "passed": "That report's result: passed",
+        "failed": "That report's result: failed"
+      },
+      "status": {
+        "passed": "Passed",
+        "failed": "Failed",
+        "skipped": "Skipped"
+      },
+      "stale": "Readiness could not be read again. What is shown is the earlier read.",
+      "staleAt": "Read at {{when}}.",
+      "outdated": "This report no longer applies to the current settings. Run the smoke test again."
+    },
+    "checks": {
+      "api_key_valid": "API key accepted",
+      "model_accessible": "Models reachable",
+      "messages_ok": "Messages API answers",
+      "streaming_ok": "Streaming delivers the answer",
+      "usage_reported": "Token usage reported",
+      "tool_use_roundtrip": "Tool use round trip",
+      "timeout_cancel_handled": "Timeout and cancel handled",
+      "secret_not_in_logs": "Key absent from the logs",
+      "pricing_verified": "Pricing table verified"
+    },
+    "smoke": {
+      "run": "Run smoke test",
+      "running": "Smoke test running…",
+      "cost": "Makes a few small paid calls to the provider, from the worker.",
+      "finished": "Smoke test finished. The result is below.",
+      "stillRunning": "The smoke test is still running in the worker. Its result shows here once recorded.",
+      "endedWithout": "The smoke test ended without a report (skipped by the worker or failed before recording). Check the audit, then try again.",
+      "busy": "Another smoke test is running for this provider.",
+      "rateLimited": "Too many smoke tests. Try again later.",
+      "noAnswer": "The outcome of the request is unknown (no readable answer from the server). The smoke test may still be running; its status is read from readiness.",
+      "stalled": "No report after 5 minutes. Check the audit, then run it again if needed.",
+      "readFailed": "Readiness could not be read while waiting for the smoke test.",
+      "loading": "The smoke test finished in the worker. Its result is being read.",
+      "unconfirmed": "A newer report exists than the one shown when you pressed the button, but it is not certain it came from your smoke test. Check the audit.",
+      "noRun": "No smoke test is running and there is no new report. The request may not have reached the server, or the run ended without a report. Check the audit, then try again.",
+      "unreadable": "Cannot check whether the smoke test finished: readiness keeps failing to load.",
+      "recheck": "Check again",
+      "checking": "Checking readiness to see whether the smoke test is running…"
+    },
+    "listStale": "The provider list could not be read again. What is shown may be out of date.",
+    "reread": "Read again"
   }
 }
