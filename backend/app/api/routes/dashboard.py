@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any, Self
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -31,12 +32,14 @@ class UsageOut(BaseModel):
     cost_status: CostStatus
 
     @classmethod
-    def of(cls, totals: UsageTotals) -> UsageOut:
+    def of(cls, totals: UsageTotals, **extra: Any) -> Self:
+        """The one constructor from ledger totals; a subclass passes its own fields (the period)."""
         return cls(
             input_tokens=totals.input_tokens,
             output_tokens=totals.output_tokens,
             estimated_cost=totals.estimated_cost,
             cost_status=totals.cost_status,
+            **extra,
         )
 
 
@@ -116,13 +119,7 @@ class DashboardOut(BaseModel):
             recent_tasks=[summary(view) for view in board.recent_tasks],
             failed_queue=[summary(view) for view in board.failed_queue],
             agent_activity=[],
-            usage=DashboardUsageOut(
-                input_tokens=board.usage.input_tokens,
-                output_tokens=board.usage.output_tokens,
-                estimated_cost=board.usage.estimated_cost,
-                cost_status=board.usage.cost_status,
-                period=PeriodOut(start=start, end=end),
-            ),
+            usage=DashboardUsageOut.of(board.usage, period=PeriodOut(start=start, end=end)),
         )
 
 
