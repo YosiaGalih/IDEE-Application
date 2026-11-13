@@ -154,7 +154,7 @@ async def test_a_visible_change_that_drags_hidden_paths_is_refused(
     shutil.rmtree(ws.root / "config")
     write(ws.root / "config", "now a file\n")
     status, out = await commit_out(sessions, scope, ws, "swap")
-    assert status == "error" and "nothing was committed" in out, out
+    assert status == "denied" and "nothing was committed" in out, out  # LOW-2: a policy refusal
     assert await git.current_commit(target) == before
     assert (await git.status(target)).changes  # the worktree change is still there, unstaged
 
@@ -199,7 +199,7 @@ async def test_a_workflows_folder_replaced_by_a_file_is_refused(
     shutil.rmtree(ws.root / ".github")
     write(ws.root / ".github", "now a file\n")
     status, out = await commit_out(sessions, scope, ws, "drop the workflows")
-    assert status == "error" and "nothing was committed" in out, out
+    assert status == "denied" and "nothing was committed" in out, out  # LOW-2: a policy refusal
     assert await git.current_commit(target) == before
 
 

@@ -83,7 +83,7 @@ async def test_only_the_task_branch_takes_commits(
     for branch in ("main", "kk/task-99999999"):  # not a task branch; not the branch the worktree is on
         other = TaskWorkspace(ws.root, repo=ws.repo, branch=branch, base_commit=ws.base_commit)
         status, out = await run(sessions, scope, other, "wrong branch")
-        assert status == "error" and "task branch" in out, (branch, out)
+        assert status == "denied" and "task branch" in out, (branch, out)  # LOW-2: a policy refusal
     assert await head(ws) == before
 
 
@@ -100,7 +100,7 @@ async def test_a_worktree_on_a_non_task_branch_takes_no_commit(
     write(ws.root / "src" / "a.py", "changed\n")
     before = await head(on_feature)
     status, out = await run(sessions, scope, on_feature, "not a task branch")
-    assert status == "error" and "task branch" in out, out
+    assert status == "denied" and "task branch" in out, out
     assert await head(on_feature) == before
 
 
