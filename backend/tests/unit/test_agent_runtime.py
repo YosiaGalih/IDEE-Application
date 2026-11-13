@@ -180,8 +180,18 @@ def ended(fakes: Fakes) -> RunEnd:
 # --- refusals before any row --------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("agent_id", ["Z99", "A05", "A04", "A01", "C16"])
-async def test_unknown_disabled_tool_mode_and_absorbed_agents_are_refused(agent_id: str) -> None:
+@pytest.mark.parametrize(
+    ("agent_id", "reason"),
+    [
+        ("Z99", "not an enabled agent"),
+        ("A05", "not an enabled agent"),
+        ("A04", "not run by the agent runtime"),
+        ("A01", "absorbed"),
+        ("C16", "absorbed"),
+    ],
+)
+async def test_unknown_disabled_tool_mode_and_absorbed_agents_are_refused(agent_id: str, reason: str) -> None:
+    """Each refusal by its own check (the checks overlap: a profile without a prompt is refused anyway)."""
     spec = REGISTRY.by_id(agent_id)
     if agent_id == "A05":
         assert spec is not None and spec.mvp_mode == "planned" and not spec.enabled
@@ -189,7 +199,7 @@ async def test_unknown_disabled_tool_mode_and_absorbed_agents_are_refused(agent_
         assert spec is not None and spec.mvp_mode == "tool"
     fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
     request = run_request(agent_id, runtime_id="B14")
-    with pytest.raises(AgentNotRunnable):
+    with pytest.raises(AgentNotRunnable, match=reason):
         await make_runtime(fakes).run(request)
     assert fakes.runs.starts == [] and fakes.log == []
 

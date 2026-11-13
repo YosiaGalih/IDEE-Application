@@ -7,6 +7,7 @@ scripted.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 from typing import Any
@@ -148,11 +149,15 @@ async def test_a_lost_lease_ends_the_run_lease_lost(
 
 async def test_no_task_row_lock_is_held_while_a_tool_runs(
     session: AsyncSession,
-    sessions: async_sessionmaker[AsyncSession],
+    migrated_database: str,
     engine: AsyncEngine,
     settings: Settings,
     pricing: PricingTable,
 ) -> None:
+    """ADR-070: the runtime holds no task row lock across a step. Its sessions wait at most 5 s for a lock
+    here, so a lock left held (e.g. an uncommitted event) fails the run instead of hanging it."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
     project_id, task_id = await a_task(session, settings)
     updated: list[int] = []
 
@@ -165,15 +170,20 @@ async def test_no_task_row_lock_is_held_while_a_tool_runs(
             updated.append(result.rowcount)
         return ToolOutput("touched")
 
-    run = compose(
-        sessions,
-        settings,
-        pricing,
-        scripted(tool_turn("test.read", {"path": "README.md"}), DONE),
-        tools=gateway(sessions, spec("test.read", touch_the_task)),
-        registry=_tool_registry("test.read"),
-    )
-    result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    bounded = create_async_engine(migrated_database, connect_args={"server_settings": {"lock_timeout": "5s"}})
+    try:
+        sessions = async_sessionmaker(bounded, expire_on_commit=False)
+        run = compose(
+            sessions,
+            settings,
+            pricing,
+            scripted(tool_turn("test.read", {"path": "README.md"}), DONE),
+            tools=gateway(sessions, spec("test.read", touch_the_task)),
+            registry=_tool_registry("test.read"),
+        )
+        result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    finally:
+        await bounded.dispose()
     assert result.status == "succeeded"
     assert updated == [1]
 
@@ -368,7 +378,6 @@ async def test_the_provider_is_closed_after_every_run(
 ) -> None:
     """One provider per run, built by the factory and closed after it, whatever the ending (Keputusan Lead
     #28)."""
-    import asyncio
 
     from app.agents.runtime import ProviderBlocked
     from app.core.cancel import CancelToken
