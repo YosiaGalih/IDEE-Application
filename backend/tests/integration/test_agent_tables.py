@@ -154,7 +154,8 @@ async def test_every_run_error_code_is_accepted_on_a_failed_run(session: AsyncSe
 
 
 def test_run_error_codes_are_the_lead_decision_set() -> None:
-    # Keputusan Lead #15 plus #35 (internal_error); interrupted is the recovery code.
+    # Keputusan Lead #15 plus #35 (internal_error) and the 42bcb2e review (worker_cancelled); interrupted is
+    # the recovery code.
     assert set(AGENT_RUN_ERROR_CODES) == {
         "PROVIDER_DISABLED",
         "provider_not_ready",
@@ -166,6 +167,7 @@ def test_run_error_codes_are_the_lead_decision_set() -> None:
         "lease_lost",
         "model_error",
         "internal_error",
+        "worker_cancelled",
         "interrupted",
     }
     assert len(AGENT_RUN_ERROR_CODES) == len(set(AGENT_RUN_ERROR_CODES))

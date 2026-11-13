@@ -59,7 +59,8 @@ MODEL_TIERS = ("fast", "default", "complex")
 # ADR-025: approval_required is a run status of its own, not "failed" with a message.
 AGENT_RUN_STATUSES = ("running", "succeeded", "failed", "cancelled", "budget_exceeded", "approval_required")
 # agent_runs.error_code (spec WP-3.1f Keputusan Lead #15, #35): set exactly when a run failed. internal_error
-# is an unexpected internal failure; interrupted means the run's worker stopped under it (recovery, 3.1f2b).
+# is an unexpected internal failure; worker_cancelled an asyncio cancel of the runtime from outside;
+# interrupted is written by recovery for a run its worker left behind (WP-3.1f2b).
 AGENT_RUN_ERROR_CODES = (
     "PROVIDER_DISABLED",
     "provider_not_ready",
@@ -71,6 +72,7 @@ AGENT_RUN_ERROR_CODES = (
     "lease_lost",
     "model_error",
     "internal_error",
+    "worker_cancelled",
     "interrupted",
 )
 # ADR-025: "actual" is reserved for provider-reported costs.

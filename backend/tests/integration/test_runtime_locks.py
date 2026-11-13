@@ -82,12 +82,12 @@ async def test_poc_a_held_task_lock_no_longer_stalls_the_run_past_its_deadline(
     settings: Settings,
     pricing: PricingTable,
 ) -> None:
-    """The AG-13 PoC, with the lock held 6 s: the run (timeout 1 s) gives up its close after 1 s and says the
-    run is unfinished, instead of waiting for the lock."""
+    """The AG-13 PoC, with the lock held 6 s: the run (timeout 1 s) ends at its deadline and gives up its
+    bounded close, saying the run is unfinished, instead of waiting for the lock."""
     project_id, task_id = await a_task(session, settings)
     run = compose(sessions, settings, pricing, scripted(DONE), tools=FakeTools([]),
                   registry=registry_with("B14", limits={"timeout_seconds": 1}),
-                  runtime_config=config(close_timeout_s=1.0))  # fmt: skip
+                  runtime_config=config(close_timeout_s=0.5))  # fmt: skip
     locked = asyncio.Event()
     holder = asyncio.create_task(hold_task_row(engine, task_id, 6.0, locked))
     await locked.wait()
@@ -95,7 +95,9 @@ async def test_poc_a_held_task_lock_no_longer_stalls_the_run_past_its_deadline(
     with pytest.raises(AgentRunUnfinished):
         await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
     elapsed = time.monotonic() - started
-    assert elapsed < 3.0, elapsed  # the deadline (1 s) plus the bounded close (1 s), not the lock's 6 s
+    # The deadline (1 s), then the close bounded three times (wait, retry, minimal end): 1.5 s; not the 6 s
+    # the lock is held.
+    assert elapsed < 3.0, elapsed
     await holder
     assert run.provider.requests == []
 

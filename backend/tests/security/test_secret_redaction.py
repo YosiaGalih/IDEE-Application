@@ -252,7 +252,7 @@ async def test_a_secret_in_a_failed_run_error_is_redacted(
         await runtime.run(request)
     stored = (await session.scalars(select(AgentRun).where(AgentRun.task_id == request.task_id))).one()
     assert (stored.status, stored.error_code) == ("failed", "internal_error")
-    assert stored.error is not None and "RuntimeError" in stored.error and "[REDACTED]" in stored.error
+    assert stored.error == "RuntimeError: an internal error ended the run"  # a fixed sentence, never str(exc)
     assert leaks(stored.error) == []
     assert leaks(json.dumps(logs, default=str)) == []
     errors = [log for log in logs if log["event"] == "agent_run_internal_error"]

@@ -363,3 +363,39 @@ async def test_an_incomplete_run_with_rows_is_the_known_sum_partial(
     assert (row.input_tokens, row.cost_status) == (100, "partial")
     assert row.estimated_cost is not None and row.estimated_cost > 0
     assert (usage.input_tokens, usage.cost_status) == (100, "partial")
+
+
+async def test_fail_is_the_minimal_end_of_a_running_run(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Review M5: when finish could not be written, failed internal_error, once, only for a running row."""
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    run_id = await writer.start(start(task_id, project_id))
+    await writer.fail(run_id)
+    row = await stored(session, run_id)
+    assert (row.status, row.error_code, row.finished_at is not None) == ("failed", "internal_error", True)
+    with pytest.raises(AgentRunAlreadyFinished):
+        await writer.finish(run_id, RunEnd("succeeded", 1, output={}))
+    await writer.fail(run_id)  # a second time changes nothing
+    assert (await stored(session, run_id)).error_code == "internal_error"
+
+
+async def test_the_run_store_keeps_no_project_of_an_ended_run(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Review L1: the run -> project map does not grow when finish raises or the minimal end is used."""
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    first = await writer.start(start(task_id, project_id))
+    await writer.fail(first)
+    assert first not in writer._projects
+    second = await writer.start(start(task_id, project_id))
+    await writer.finish(second, RunEnd("cancelled", 0))
+    assert second not in writer._projects
+    with pytest.raises(AgentRunAlreadyFinished):
+        await writer.finish(second, RunEnd("cancelled", 0))
+    third = await writer.start(start(task_id, project_id))
+    with pytest.raises(AgentRunAlreadyFinished):
+        await writer.finish(first, RunEnd("cancelled", 0))
+    assert set(writer._projects) == {third}

@@ -39,6 +39,7 @@ from app.agents.runtime import (
 from app.core.audit import AuditWriter
 from app.core.config import Settings
 from app.core.events import EventBus, emit_task_event, publish_pending
+from app.core.logging import get_logger
 from app.core.money import decimal_str, stored_cost
 from app.core.redaction import Redactor
 from app.llm.base import LLMProvider
@@ -69,6 +70,7 @@ from app.workflow.lease import LeaseLost, renew_lease
 
 # Every port that writes the task row gives up on a lock and on a statement (reviews of 42bcb2e; as
 # claim_lease does): a lock held by another transaction never stalls a run.
+_log = get_logger(__name__)
 LOCK_TIMEOUT: Final = "5s"
 STATEMENT_TIMEOUT: Final = "10s"
 
@@ -339,6 +341,7 @@ class AgentRunWriter:
                 )
             ).one_or_none()
             if finished is None:
+                self._projects.pop(agent_run_id, None)  # finished elsewhere: nothing more to audit
                 raise AgentRunAlreadyFinished(f"agent run {agent_run_id} is not running")
             task_id, agent_id = finished
             usage = {
@@ -375,6 +378,25 @@ class AgentRunWriter:
             estimated_cost=cost,
             cost_status=totals.cost_status,
         )
+
+    async def fail(self, agent_run_id: uuid.UUID) -> None:
+        """The minimal end when ``finish`` could not be written (review M5): ``failed internal_error``,
+        nothing else, only for a row still ``running``."""
+        self._projects.pop(agent_run_id, None)
+        async with self._sessions() as session:
+            await _bounded(session)
+            await session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == agent_run_id, AgentRun.status == "running")
+                .values(
+                    status="failed",
+                    error_code="internal_error",
+                    error="the end of the run could not be recorded",
+                    finished_at=func.now(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
 
     async def _budget_exceeded(
         self,
@@ -472,6 +494,9 @@ class SettingsProviderFactory:
         try:
             yield provider
         finally:
-            close = getattr(provider, "aclose", None)  # LLMProvider stays as it is; both adapters have one
-            if close is not None:
-                await close()
+            try:
+                await provider.aclose()
+            except Exception as error:  # never discards the run's result (review L3)
+                _log.warning(
+                    "llm_provider_close_failed", provider=provider.name, error_type=type(error).__name__
+                )

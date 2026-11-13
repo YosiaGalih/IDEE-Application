@@ -57,6 +57,7 @@ from tests.runtime_fakes import (
     STEP,
     UUID_A,
     FakeClock,
+    FakeEvents,
     FakeGate,
     FakeHeartbeat,
     FakeRuns,
@@ -626,8 +627,8 @@ CLASSIFY: list[tuple[BaseException, StopReason | None, tuple[str, str | None]]] 
             "timeout",
         )
     ],
-    (asyncio.CancelledError(), None, ("failed", "interrupted")),
-    (asyncio.CancelledError(), "cancelled", ("failed", "interrupted")),
+    (asyncio.CancelledError(), None, ("failed", "worker_cancelled")),
+    (asyncio.CancelledError(), "cancelled", ("failed", "worker_cancelled")),
     (RuntimeError("db down"), None, ("failed", "internal_error")),
     (BudgetConfigError("bad budget"), None, ("failed", "internal_error")),
     (BudgetTaskMissing("gone"), None, ("failed", "internal_error")),
@@ -668,7 +669,7 @@ async def test_a_caller_cancel_mid_stream_ends_cancelled() -> None:
     assert record.status == "cancelled"
 
 
-async def test_an_asyncio_cancel_closes_the_run_interrupted_and_propagates() -> None:
+async def test_an_asyncio_cancel_closes_the_run_worker_cancelled_and_propagates() -> None:
     fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
     task = asyncio.create_task(make_runtime(fakes, clock=time.monotonic).run(run_request("B14")))
     await asyncio.sleep(0.1)
@@ -676,7 +677,7 @@ async def test_an_asyncio_cancel_closes_the_run_interrupted_and_propagates() -> 
     with pytest.raises(asyncio.CancelledError):
         await task
     end = ended(fakes)
-    assert (end.status, end.error_code) == ("failed", "interrupted")
+    assert (end.status, end.error_code) == ("failed", "worker_cancelled")
     assert fakes.providers.opened == fakes.providers.closed == 1
 
 
@@ -778,8 +779,8 @@ async def test_the_runtime_writes_no_task_title() -> None:
     fakes = Fakes(scripted(submit_turn(OUTPUTS["IntakeOutput"])))
     result = await make_runtime(fakes).run(run_request("A02"))
     assert isinstance(result.output, contracts.IntakeOutput)
-    # After the answer only the run is finished: no other port (and the runtime holds no task writer).
-    assert fakes.log[-1] == "record"
+    # After the answer only the final lease beat and the run's end: no other port (no task writer exists).
+    assert fakes.log[-2:] == ["record", "beat"]
     assert len(fakes.runs.finishes) == 1 and fakes.events.usage_updates == 1
 
 
@@ -933,3 +934,292 @@ async def test_a_hanging_close_is_bounded() -> None:
     finished, outcome = await within(3, runtime.run(run_request("B14")), release)
     assert finished, "the close hung"
     assert isinstance(outcome, AgentRunUnfinished)
+
+
+# --- end state (review of 42bcb2e: M1, M2, M5, L1, L3, worker cancel, error text) ---------------------------
+
+
+class IgnoresCancel:
+    """A provider that answers in full although the run's stop token fired (AG-13/silent PoC1)."""
+
+    def __init__(self, inner: Any, delay: float) -> None:
+        self.inner, self.delay, self.name = inner, delay, inner.name
+
+    async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+        await asyncio.sleep(self.delay)
+        return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=None)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_a_stop_during_an_attempt_wins_over_its_valid_submit_result() -> None:
+    """M1 / PoC1: the lease was lost while the provider answered; the answer is not a success."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = IgnoresCancel(fakes.providers.provider, 0.4)
+    for call in range(3, 50):
+        fakes.heartbeat.refuse[call] = LeaseLostError("lost")
+    result = await run_b14(fakes, runtime_config=config(heartbeat_interval_s=0.05), clock=time.monotonic)
+    assert (result.status, result.error_code) == ("failed", "lease_lost")
+
+
+async def test_a_final_beat_comes_before_success() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.heartbeat.refuse[3] = LeaseLostError("lost")  # 1: the run, 2: the attempt, 3: before the success
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("failed", "lease_lost")
+    assert fakes.log[-1] == "beat"
+
+
+async def test_a_stop_during_the_last_tool_is_not_iteration_limit() -> None:
+    """M2 / PoC2: the caller cancelled during the last allowed tool."""
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"})))
+    cancel = CancelToken()
+
+    async def tool(ctx: Any, raw: object) -> Any:
+        cancel.cancel()
+        await asyncio.sleep(0.05)
+        return ok_result()
+
+    fakes.tools.handlers["repo.read_file"] = tool
+    runtime = make_runtime(fakes, runtime_config=config(max_tool_iterations=1))
+    result = await runtime.run(run_request("B14", cancel=cancel))
+    assert (result.status, result.error_code) == ("cancelled", None)
+
+
+async def test_an_asyncio_cancel_from_outside_is_worker_cancelled() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    task = asyncio.create_task(make_runtime(fakes, clock=time.monotonic).run(run_request("B14")))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    end = ended(fakes)
+    assert (end.status, end.error_code) == ("failed", "worker_cancelled")
+    assert end.error is not None and "worker" in end.error
+
+
+class FlakyRuns(FakeRuns):
+    """``finish`` fails the given number of times first."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.failed: list[uuid.UUID] = []
+
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("database blip")
+        return await super().finish(agent_run_id, end)
+
+    async def fail(self, agent_run_id: uuid.UUID) -> None:
+        self.failed.append(agent_run_id)
+
+
+async def test_finish_is_retried_once() -> None:
+    from structlog.testing import capture_logs
+
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.runs = FlakyRuns(failures=1)
+    request = run_request("B14")
+    with capture_logs() as logs:
+        result = await make_runtime(fakes).run(request)
+    assert result.status == "succeeded"
+    unfinished = [log for log in logs if log["event"] == "agent_run_unfinished"]
+    assert len(unfinished) == 1
+    assert unfinished[0]["task_id"] == str(request.task_id)
+    assert unfinished[0]["agent_run_id"] == str(result.agent_run_id)
+    assert unfinished[0]["correlation_id"] == f"agent_run:{result.agent_run_id}"
+
+
+@pytest.mark.parametrize("path", ["normal", "error"])
+async def test_a_finish_that_fails_twice_marks_the_run_failed(path: str) -> None:
+    from structlog.testing import capture_logs
+
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+    runs = FlakyRuns(failures=2)
+    fakes.runs = runs
+    if path == "error":
+
+        async def broken(ctx: Any, raw: object) -> Any:
+            raise ValueError("boom")
+
+        fakes.tools.handlers["repo.read_file"] = broken
+    request = run_request("B14")
+    with capture_logs() as logs:
+        with pytest.raises(AgentRunUnfinished if path == "normal" else ValueError):
+            await make_runtime(fakes).run(request)
+    assert runs.failed == runs.ids  # the minimal UPDATE was tried on the run's row
+    unfinished = [log for log in logs if log["event"] == "agent_run_unfinished"]
+    assert len(unfinished) >= 2 and all(log["task_id"] == str(request.task_id) for log in unfinished)
+
+
+class BrokenCancel(CancelToken):
+    async def wait(self) -> None:
+        raise RuntimeError("waited from another loop")
+
+
+async def test_a_failing_watcher_is_logged_not_discarded() -> None:
+    from structlog.testing import capture_logs
+
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    with capture_logs() as logs:
+        result = await make_runtime(fakes).run(run_request("B14", cancel=BrokenCancel()))
+    assert result.status == "succeeded"
+    failed = [log for log in logs if log["event"] == "agent_run_watcher_failed"]
+    assert [log["error_type"] for log in failed] == ["RuntimeError"]
+
+
+class SlowRuns(FakeRuns):
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+        await asyncio.sleep(0.3)
+        return await super().finish(agent_run_id, end)
+
+
+async def test_a_second_cancel_during_the_close_still_records_the_end() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    fakes.runs = SlowRuns()
+    task = asyncio.create_task(make_runtime(fakes, clock=time.monotonic).run(run_request("B14")))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    await asyncio.sleep(0.1)
+    task.cancel()  # during the close
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.5)
+    assert ended(fakes).error_code == "worker_cancelled"
+
+
+class BrokenEvents(FakeEvents):
+    async def delta(self, scope: Any, text: str, *, reset: bool = False) -> None:
+        raise RuntimeError("redis down")
+
+    async def usage_updated(self, scope: Any) -> None:
+        raise RuntimeError("database blip")
+
+
+async def test_events_are_best_effort() -> None:
+    from structlog.testing import capture_logs
+
+    long_text = "The answer streams for a while before it is submitted. " * 20
+    turn = Reply(
+        (TextBlock(long_text), ToolUseBlock("toolu_submit", SUBMIT_RESULT, VALID_IMPLEMENT)),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(turn))
+    fakes.events = BrokenEvents()
+    with capture_logs() as logs:
+        result = await run_b14(fakes)
+    assert result.status == "succeeded"
+    failed = {
+        (log["event_type"], log["error_type"]) for log in logs if log["event"] == "agent_run_event_failed"
+    }
+    assert failed == {("usage.updated", "RuntimeError"), ("agent.delta", "RuntimeError")}
+
+
+async def test_no_usage_event_for_an_attempt_that_never_reached_the_provider() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.budget.attempts.refuse[1] = BudgetRefused("tokens", 1, 0, next_bound=2)
+    assert (await run_b14(fakes)).status == "budget_exceeded"
+    assert fakes.events.usage_updates == 0
+
+
+class ClosesBadly:
+    name = "scripted"
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def create_message(self, req: Any, **kwargs: Any) -> Any:
+        return await self.inner.create_message(req, **kwargs)
+
+    async def aclose(self) -> None:
+        raise RuntimeError("the connection pool was already gone")
+
+
+async def test_a_failing_aclose_never_discards_a_finished_run() -> None:
+    from structlog.testing import capture_logs
+
+    from app.core.config import load_settings
+    from app.services.agent_runtime import SettingsProviderFactory
+    from tests.conftest import make_test_env
+
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers = SettingsProviderFactory(  # type: ignore[assignment]
+        load_settings(make_test_env()), build=lambda _: ClosesBadly(fakes.provider)
+    )
+    with capture_logs() as logs:
+        result = await run_b14(fakes)
+    assert result.status == "succeeded"
+    assert [log["error_type"] for log in logs if log["event"] == "llm_provider_close_failed"] == [
+        "RuntimeError"
+    ]
+
+
+async def test_error_texts_never_carry_the_exception_message() -> None:
+    marker = "DETAIL-" + "q" * 12
+    fakes = Fakes(scripted(Fail("refusal")))
+    result = await run_b14(fakes)
+    assert result.error == "LLMError: the model call failed (refusal)"
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+
+    async def broken(ctx: Any, raw: object) -> Any:
+        raise RuntimeError(f"connection to db-host failed: {marker}")
+
+    fakes.tools.handlers["repo.read_file"] = broken
+    with pytest.raises(RuntimeError):
+        await make_runtime(fakes).run(run_request("B14"))
+    assert ended(fakes).error == "RuntimeError: an internal error ended the run"
+
+
+async def test_a_usage_event_follows_a_call_whose_retry_was_refused() -> None:
+    """Attempt 1 reached the provider (the ledger changed); the retry was refused by the budget."""
+    fakes = Fakes(scripted(in_order(Fail("overloaded"), submit_turn(VALID_IMPLEMENT))))
+    fakes.budget.attempts.refuse[2] = BudgetRefused("tokens", 1, 0, next_bound=2)
+    assert (await run_b14(fakes)).status == "budget_exceeded"
+    assert fakes.events.usage_updates == 1
+
+
+class SlowToStopHeartbeat(FakeHeartbeat):
+    """A beat that takes a while, and takes a while longer to stop when cancelled."""
+
+    async def beat(self, task_id: uuid.UUID) -> None:
+        await super().beat(task_id)
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.3)
+            raise
+
+
+async def test_a_second_cancel_while_the_watchers_stop_still_closes_the_run() -> None:
+    """Review L1: stopping the watchers is shielded with the close, so a cancel in that window cannot leave
+    the run without its end."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    fakes.heartbeat = SlowToStopHeartbeat(fakes.log)
+    runtime = make_runtime(fakes, runtime_config=config(heartbeat_interval_s=0.05), clock=time.monotonic)
+    task = asyncio.create_task(runtime.run(run_request("B14")))
+    await asyncio.sleep(0.6)  # the keep-alive is mid-beat most of the time
+    task.cancel()
+    await asyncio.sleep(0.1)  # the watchers are stopping: the keep-alive takes 0.3 s to stop
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(1.0)
+    assert ended(fakes).error_code == "worker_cancelled"
+
+
+async def test_a_run_stopped_during_its_attempt_does_not_beat_again() -> None:
+    """M1: the caller cancelled while the provider answered (ignoring the token): the answer is dropped at
+    once, with no further port call (no final beat)."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = IgnoresCancel(fakes.providers.provider, 0.3)
+    cancel = CancelToken()
+    runtime = make_runtime(fakes, clock=time.monotonic)
+    task = asyncio.create_task(runtime.run(run_request("B14", cancel=cancel)))
+    await asyncio.sleep(0.1)
+    cancel.cancel()
+    result = await task
+    assert (result.status, result.error_code) == ("cancelled", None)
+    assert fakes.log[-1] == "record"

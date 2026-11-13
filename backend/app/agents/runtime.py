@@ -17,7 +17,6 @@ carry ids and type names only.
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import re
 import time
@@ -73,6 +72,7 @@ RunErrorCode = Literal[
     "lease_lost",
     "model_error",
     "internal_error",
+    "worker_cancelled",
     "interrupted",
 ]
 StopReason = Literal["cancelled", "timeout", "lease_lost"]
@@ -209,8 +209,9 @@ def classify(error: BaseException, stop: StopReason | None) -> tuple[RunStatus, 
     """How a run that ended with ``error`` ends (Keputusan plan #8; Keputusan Lead #15, #20, #35).
 
     A ledger write that failed wins over everything, a cancel included (Keputusan Lead #20). A provider
-    error caused by the run's own stop token takes the stop's reason. An asyncio cancel of the runtime is
-    ``interrupted``; anything else unexpected is ``internal_error``."""
+    error caused by the run's own stop token takes the stop's reason. An asyncio cancel of the runtime from
+    outside is ``worker_cancelled`` (``interrupted`` is recovery's); anything else unexpected is
+    ``internal_error``."""
     if any(isinstance(e, UsageUnrecorded) for e in _chain(error)):
         return "failed", "usage_unrecorded"
     if isinstance(error, BudgetRefused):
@@ -220,7 +221,7 @@ def classify(error: BaseException, stop: StopReason | None) -> tuple[RunStatus, 
     if isinstance(error, LeaseLostError):
         return "failed", "lease_lost"
     if isinstance(error, asyncio.CancelledError):
-        return "failed", "interrupted"
+        return "failed", "worker_cancelled"
     if isinstance(error, LLMError):
         if stop == "cancelled":
             return "cancelled", None
@@ -492,6 +493,9 @@ class UsageLedgerPort(Protocol):
 class RunStore(Protocol):
     async def start(self, run: RunStart) -> uuid.UUID: ...
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage: ...
+    async def fail(self, agent_run_id: uuid.UUID) -> None:
+        """The minimal end when ``finish`` could not be written: ``failed internal_error``."""
+        ...
 
 
 class RunEvents(Protocol):
@@ -581,26 +585,34 @@ class _Run:
     pending: PendingTool | None = None
 
 
-async def _stop(watchers: list[asyncio.Task[None]]) -> None:
-    for watcher in watchers:
-        watcher.cancel()
-    await asyncio.gather(*watchers, return_exceptions=True)
-
-
 def _id(value: uuid.UUID | None) -> str | None:
     return str(value) if value is not None else None
 
 
-def _log_unwritten(run: _Run, write: asyncio.Future[RunUsage]) -> None:
-    """Done callback of the shielded close: a write that failed, also after its bound passed, is logged
-    (ids and type) and retrieved."""
-    if write.cancelled():
-        return
-    failure = write.exception()
-    if failure is not None:
-        _log.error(
-            "agent_run_unfinished", agent_run_id=_id(run.agent_run_id), error_type=type(failure).__name__
-        )
+def _ctx(run: _Run) -> dict[str, str | None]:
+    """What every runtime log line carries: ids only (review L5)."""
+    run_id = _id(run.agent_run_id)
+    return {
+        "task_id": str(run.request.task_id),
+        "agent_run_id": run_id,
+        "correlation_id": f"agent_run:{run_id}" if run_id is not None else None,
+    }
+
+
+async def _stop(watchers: list[asyncio.Task[None]], run: _Run) -> None:
+    """Cancel the watchers and wait for them; one that failed is logged, never discarded (review L1)."""
+    for watcher in watchers:
+        watcher.cancel()
+    for outcome in await asyncio.gather(*watchers, return_exceptions=True):
+        if isinstance(outcome, Exception):
+            _log.error("agent_run_watcher_failed", **_ctx(run), error_type=type(outcome).__name__)
+
+
+def _retrieve(write: asyncio.Future[Any]) -> None:
+    """Done callback of a close write: its error is retrieved (the close loop logged it, or gave up and said
+    the run is unfinished)."""
+    if not write.cancelled():
+        write.exception()
 
 
 class AgentRuntime:
@@ -634,24 +646,33 @@ class AgentRuntime:
         try:
             end = await self._execute(run)
         except asyncio.CancelledError as cancelled:
-            await _stop(watchers)
-            _log.warning(
-                "agent_run_interrupted", agent_run_id=_id(run.agent_run_id), agent_id=run.spec.agent_id
-            )
-            await self._close_after_error(run, self._end_for(cancelled, run))
+            _log.warning("agent_run_worker_cancelled", **_ctx(run), agent_id=run.spec.agent_id)
+            await asyncio.shield(self._wrap_up_after_error(watchers, run, self._end_for(cancelled, run)))
             raise
         except Exception as error:
-            await _stop(watchers)
             _log.error(
                 "agent_run_internal_error",
-                agent_run_id=_id(run.agent_run_id),
+                **_ctx(run),
                 agent_id=run.spec.agent_id,
                 error_type=type(error).__name__,
             )
-            await self._close_after_error(run, self._end_for(error, run))
+            await asyncio.shield(self._wrap_up_after_error(watchers, run, self._end_for(error, run)))
             raise
-        await _stop(watchers)
+        # Shielded with the watchers' stop (review L1): a cancel now cannot leave the run open.
+        return await asyncio.shield(self._wrap_up(watchers, run, end))
+
+    async def _wrap_up(self, watchers: list[asyncio.Task[None]], run: _Run, end: RunEnd) -> AgentRunResult:
+        await _stop(watchers, run)
         return await self._close(run, end)
+
+    async def _wrap_up_after_error(self, watchers: list[asyncio.Task[None]], run: _Run, end: RunEnd) -> None:
+        """Closes the run before the original error is raised again; a close that fails is already logged
+        and its row left to recovery (WP-3.1f2b)."""
+        await _stop(watchers, run)
+        try:
+            await self._close(run, end)
+        except AgentRunUnfinished:
+            pass
 
     # --- before the run -------------------------------------------------------------------------------------
 
@@ -800,11 +821,7 @@ class AgentRuntime:
                 if isinstance(error, TimeoutError) and run.deadline - self._clock() <= 0:
                     raise _DeadlineReached from None
                 failure = error
-                _log.warning(
-                    "agent_run_beat_failed",
-                    agent_run_id=_id(run.agent_run_id),
-                    error_type=type(error).__name__,
-                )
+                _log.warning("agent_run_beat_failed", **_ctx(run), error_type=type(error).__name__)
         raise LeaseLostError("the task lease could not be renewed") from failure
 
     async def _loop(self, run: _Run, provider: LLMProvider, model: str) -> RunEnd:
@@ -838,6 +855,8 @@ class AgentRuntime:
                 return self._timed_out(run)
             run.iterations += 1
             response = await self._attempt(run, provider, model, scope, tools, messages, remaining)
+            if run.stop.reason is not None:  # review M1: a stop during the attempt wins over its answer
+                return self._stopped(run)
             if response.content:
                 messages.append(Message("assistant", response.content))
             uses = [block for block in response.content if isinstance(block, ToolUseBlock)]
@@ -849,6 +868,9 @@ class AgentRuntime:
                 except ValidationError as error:
                     submit_error = _invalid_submit(run.output_contract, error)
                 else:
+                    await self._beat(run)  # review M1: no success without the lease, checked last
+                    if run.stop.reason is not None:
+                        return self._stopped(run)
                     run.output = output
                     return RunEnd("succeeded", run.iterations, output=output.model_dump(mode="json"))
             if not uses:
@@ -877,6 +899,8 @@ class AgentRuntime:
                     self._ports.tools.execute(ctx, block.name, block.input, tool_use_id=block.id),
                     grace=TOOL_STOP_GRACE_S,
                 )
+                if run.stop.reason is not None:  # review M1: after every tool too
+                    return self._stopped(run)
                 if result.status == "approval_required":
                     run.pending = PendingTool(block.id, block.name, result.tool_call_id)
                     pending = {
@@ -887,6 +911,8 @@ class AgentRuntime:
                     return RunEnd("approval_required", run.iterations, output={"pending_tool": pending})
                 results.append(ToolResultBlock(block.id, result.content, is_error=result.is_error))
             messages.append(Message("user", tuple(results)))
+        if run.stop.reason is not None:  # review M2: a stop during the last allowed step wins
+            return self._stopped(run)
         return RunEnd(
             "failed",
             run.iterations,
@@ -931,11 +957,12 @@ class AgentRuntime:
             scope=scope,
         )
         deltas = DeltaRedactor(self._redactor.redact)
+        sent = run.tally.sent
 
         async def on_text_delta(text: str) -> None:
             safe = deltas.feed(text)
             if safe:
-                await self._port(run, self._ports.events.delta(scope, safe))
+                await self._event(run, "agent.delta", self._ports.events.delta(scope, safe))
 
         async def on_restart(attempt: int) -> None:
             deltas.reset()  # the failed attempt's held text is dropped, never sent
@@ -949,14 +976,29 @@ class AgentRuntime:
                 on_restart=on_restart,
                 run=run,
             )
-        except LLMError:
-            await self._port(run, self._ports.events.usage_updated(scope))  # the call reached the provider
+        except Exception:
+            await self._usage_changed(run, scope, sent)
             raise
         rest = deltas.flush()
         if rest:
-            await self._port(run, self._ports.events.delta(scope, rest))
-        await self._port(run, self._ports.events.usage_updated(scope))
+            await self._event(run, "agent.delta", self._ports.events.delta(scope, rest))
+        await self._usage_changed(run, scope, sent)
         return response
+
+    async def _usage_changed(self, run: _Run, scope: RunScope, sent_before: int) -> None:
+        """``usage.updated`` only when an attempt of this call reached the provider (review L3)."""
+        if run.tally.sent > sent_before:
+            await self._event(run, "usage.updated", self._ports.events.usage_updated(scope))
+
+    async def _event(self, run: _Run, event_type: str, awaitable: Awaitable[None]) -> None:
+        """Events are best effort (review L3): the ledger is the truth; a failed event is logged (ids and
+        type) and the run goes on."""
+        try:
+            await self._port(run, awaitable)
+        except Exception as error:
+            _log.warning(
+                "agent_run_event_failed", **_ctx(run), event_type=event_type, error_type=type(error).__name__
+            )
 
     # --- how it ends ----------------------------------------------------------------------------------------
 
@@ -985,28 +1027,25 @@ class AgentRuntime:
         return RunEnd("failed", run.iterations, code, self._error_text(error, code))
 
     def _error_text(self, error: BaseException, code: RunErrorCode) -> str:
-        """A short text for ``agent_runs.error``: redacted here and again by the store."""
-        if code == "interrupted":
-            text = "the run was interrupted: its worker stopped"
+        """A short text for ``agent_runs.error``: identifiers and fixed sentences, never an exception's own
+        message (review: it may carry a host, a path or a value); the detail is logged by type only."""
+        if code == "worker_cancelled":
+            text = "the run was cancelled: its worker stopped"
         elif code == "usage_unrecorded":
-            text = str(next(e for e in _chain(error) if isinstance(e, UsageUnrecorded)))
+            text = str(next(e for e in _chain(error) if isinstance(e, UsageUnrecorded)))  # ids only
+        elif isinstance(error, LLMError):
+            text = f"LLMError: the model call failed ({error.kind})"
+        elif isinstance(error, ProviderBlocked):
+            text = f"ProviderBlocked: {error.code} ({error.reason})"
         else:
-            detail = str(error)
-            text = f"{type(error).__name__}: {detail}" if detail else type(error).__name__
+            text = f"{type(error).__name__}: an internal error ended the run"
         return self._redactor.redact(text)[:ERROR_TEXT_MAX]
 
     async def _close(self, run: _Run, end: RunEnd) -> AgentRunResult:
-        """Writes the end, shielded: a second cancel does not leave the run ``running``."""
+        """Writes the end and returns the result; ``AgentRunUnfinished`` when it could not be written."""
         if run.tally.sent != run.tally.recorded:
             end = replace(end, usage_complete=False)
-        write = asyncio.ensure_future(self._write_end(run, end))
-        write.add_done_callback(functools.partial(_log_unwritten, run))
-        try:
-            usage = await asyncio.wait_for(asyncio.shield(write), self._config.close_timeout_s)
-        except Exception as failure:  # a timeout or the store's error: the end is not recorded (yet)
-            raise AgentRunUnfinished(
-                f"the end of agent run {_id(run.agent_run_id)} was not recorded"
-            ) from failure
+        usage = await self._record_end(run, end)
         assert run.agent_run_id is not None
         return AgentRunResult(
             agent_run_id=run.agent_run_id,
@@ -1019,20 +1058,43 @@ class AgentRuntime:
             pending_tool=run.pending if end.status == "approval_required" else None,
         )
 
+    async def _record_end(self, run: _Run, end: RunEnd) -> RunUsage:
+        """The end, written shielded and bounded by ``close_timeout_s``, with one retry (review M5): a write
+        still running is waited for once more, a write that failed is tried again. Then, if the row exists,
+        a minimal ``failed internal_error``, and ``AgentRunUnfinished``. Every failure is logged with the
+        run's ids."""
+        failure: BaseException | None = None
+        write = self._write(run, end)
+        for attempt in (1, 2):
+            try:
+                return await asyncio.wait_for(asyncio.shield(write), self._config.close_timeout_s)
+            except Exception as error:  # a timeout or the store's error
+                failure = error
+                _log.error(
+                    "agent_run_unfinished", **_ctx(run), attempt=attempt, error_type=type(error).__name__
+                )
+                if write.done():
+                    write = self._write(run, end)
+        if run.agent_run_id is not None:
+            mark = asyncio.ensure_future(self._ports.runs.fail(run.agent_run_id))
+            mark.add_done_callback(_retrieve)
+            try:
+                await asyncio.wait_for(asyncio.shield(mark), self._config.close_timeout_s)
+            except Exception as error:
+                _log.error("agent_run_unmarked", **_ctx(run), error_type=type(error).__name__)
+        raise AgentRunUnfinished(
+            f"the end of agent run {_id(run.agent_run_id)} was not recorded"
+        ) from failure
+
+    def _write(self, run: _Run, end: RunEnd) -> asyncio.Future[RunUsage]:
+        write = asyncio.ensure_future(self._write_end(run, end))
+        write.add_done_callback(_retrieve)
+        return write
+
     async def _write_end(self, run: _Run, end: RunEnd) -> RunUsage:
         if run.agent_run_id is None:  # refused before the provider existed: the row names no model
             run.agent_run_id = await self._ports.runs.start(self._run_start(run, None, None))
         return await self._ports.runs.finish(run.agent_run_id, end)
-
-    async def _close_after_error(self, run: _Run, end: RunEnd) -> None:
-        """Closes the run before the original error is raised again; a close that fails is logged (ids and
-        type only), and the row left ``running`` belongs to recovery (WP-3.1f2b)."""
-        try:
-            await self._close(run, end)
-        except Exception as failure:
-            _log.error(
-                "agent_run_unfinished", agent_run_id=_id(run.agent_run_id), error_type=type(failure).__name__
-            )
 
     async def _call_model(
         self,

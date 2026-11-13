@@ -141,6 +141,7 @@ class FakeRuns:
         self.starts: list[RunStart] = []
         self.finishes: list[tuple[uuid.UUID, RunEnd]] = []
         self.ids: list[uuid.UUID] = []
+        self.failed_runs: list[uuid.UUID] = []
 
     async def start(self, run: RunStart) -> uuid.UUID:
         self.starts.append(run)
@@ -152,14 +153,19 @@ class FakeRuns:
         self.finishes.append((agent_run_id, end))
         return ZERO_USAGE
 
+    async def fail(self, agent_run_id: uuid.UUID) -> None:
+        self.failed_runs.append(agent_run_id)
+
 
 class FakeEvents:
     def __init__(self) -> None:
         self.deltas: list[str] = []
+        self.resets: list[bool] = []
         self.usage_updates = 0
 
-    async def delta(self, scope: RunScope, text: str) -> None:
+    async def delta(self, scope: RunScope, text: str, *, reset: bool = False) -> None:
         self.deltas.append(text)
+        self.resets.append(reset)
 
     async def usage_updated(self, scope: RunScope) -> None:
         self.usage_updates += 1
@@ -200,6 +206,9 @@ class LoggedProvider:
         self.inner = inner
         self.log = log
         self.name = inner.name
+
+    async def aclose(self) -> None:
+        return None
 
     async def create_message(
         self,

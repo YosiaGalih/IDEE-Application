@@ -29,6 +29,7 @@ ERROR_CODES = (
     "lease_lost",
     "model_error",
     "internal_error",
+    "worker_cancelled",
     "interrupted",
 )
 
