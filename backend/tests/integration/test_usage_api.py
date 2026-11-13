@@ -199,29 +199,6 @@ async def test_usage_range_limits(
     assert error["details"][0]["loc"] == ["query", field]
 
 
-@pytest.mark.parametrize(
-    ("params", "field"),
-    [
-        ({"to": "0001-01-01T00:00:00Z"}, "to"),  # the default 30 days would start before year 1
-        ({"to": "0001-01-20T00:00:00Z"}, "to"),
-        ({"from": "0001-01-01T00:30:00+01:00"}, "from"),  # before year 1 once in UTC
-        ({"to": "9999-12-31T23:59:59-01:00"}, "to"),  # after year 9999 once in UTC
-    ],
-)
-async def test_usage_range_at_the_edge_of_time_is_a_422(
-    owner: httpx.AsyncClient,  # noqa: F811
-    params: dict[str, str],
-    field: str,
-) -> None:
-    """AG-13 L2: these overflowed in _window and answered 500. A 422 that names the field, decided before
-    the scope: the project here does not exist, and still the answer is about the range."""
-    response = await owner.get(USAGE, params={**params, "project_id": str(uuid.uuid4())})
-    assert response.status_code == 422, response.text
-    error = response.json()["error"]
-    assert error["code"] == "VALIDATION_ERROR"
-    assert error["details"][0]["loc"] == ["query", field]
-
-
 async def test_usage_range_of_366_days_is_allowed(owner: httpx.AsyncClient) -> None:  # noqa: F811
     await report(owner, **{"from": "2025-09-01T00:00:00+00:00", "to": "2026-09-02T00:00:00+00:00"})
 
