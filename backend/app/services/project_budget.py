@@ -20,13 +20,20 @@ from app.services.projects import Actor, ProjectEnv
 from app.workflow.budget import (
     BUDGET_KEYS,
     BudgetConfigError,
-    BudgetDefaults,
-    BudgetFields,
     EffectiveBudget,
     dump_budget,
     effective_budget,
     parse_budget,
 )
+
+# Re-exported for the route, so app.api never imports app.workflow (ARCHITECTURE §3.2; import-linter): the
+# PATCH model validates with the same bounds parse_budget reads stored values with.
+from app.workflow.budget import BUDGET_MAX_COST_USD as BUDGET_MAX_COST_USD
+from app.workflow.budget import BUDGET_MAX_DURATION_MINUTES as BUDGET_MAX_DURATION_MINUTES
+from app.workflow.budget import BUDGET_MAX_TOKENS as BUDGET_MAX_TOKENS
+from app.workflow.budget import BUDGET_MAX_TOOL_ITERATIONS as BUDGET_MAX_TOOL_ITERATIONS
+from app.workflow.budget import BudgetDefaults as BudgetDefaults
+from app.workflow.budget import BudgetFields as BudgetFields
 
 BUDGET_SETTINGS_KEY: Final = "budget"
 AUDIT_ACTION: Final = "project.budget_updated"
