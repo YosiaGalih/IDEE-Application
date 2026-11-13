@@ -531,3 +531,34 @@ async def test_a_ledger_failure_during_a_cancel_still_cancels_and_is_logged() ->
         }
     ]
     assert "secret" not in repr(logs)  # no prompt or message text in the event
+
+
+async def test_a_second_cancel_while_the_cancel_is_recorded_does_not_lose_the_row() -> None:
+    """AG-13 L-D2: the report of a cancelled attempt is shielded. A second cancel while the ledger row is
+    being written still cancels the caller, and the row is still written."""
+    entered, reporting, gate, written = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+    records: list[AttemptRecord] = []
+
+    class Hanging(FakeProvider):
+        async def create_message(self, req, *, on_text_delta=None, cancel=None):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def on_attempt(record: AttemptRecord) -> None:
+        reporting.set()
+        await gate.wait()  # the ledger write is in progress
+        records.append(record)
+        written.set()
+
+    caller = asyncio.create_task(create_with_retry(Hanging([]), REQ, on_attempt=on_attempt))
+    await asyncio.wait_for(entered.wait(), 5)
+    caller.cancel()
+    await asyncio.wait_for(reporting.wait(), 5)
+    caller.cancel()  # a second cancel while the row is being written
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    gate.set()
+    await asyncio.wait_for(written.wait(), 5)
+    assert [(r.status, r.error_kind, r.usage) for r in records] == [("cancelled", "cancelled", None)]
