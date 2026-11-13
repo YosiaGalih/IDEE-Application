@@ -31,7 +31,7 @@ Error:
 | 429 | `RATE_LIMITED`, `QUOTA_EXCEEDED` |
 | 500 | `INTERNAL_ERROR` (tanpa stack trace / path absolut) |
 | 503 | `DEPENDENCY_UNAVAILABLE` |
-| – | `PROVIDER_DISABLED`: kode `error` task/agent run, bukan respons HTTP: kill switch project `provider_calls_enabled=false` menghentikan panggilan provider (FR-158, SECURITY_MODEL §7; ADR-073, ditegakkan WP-3.1f) |
+| – | `PROVIDER_DISABLED`: kode error agent run (`AgentRun.error_code`, §11.2), bukan respons HTTP. Provider dinonaktifkan (`enabled=false`), kill switch project `provider_calls_enabled` yang bukan `true` (tidak ada = `true`), atau baris project yang hilang (gagal tertutup) menghentikan run sebelum percobaan model berikutnya (FR-158, SECURITY_MODEL §7; ADR-073; ditegakkan runtime sejak WP-3.1f2a, ADR-075). Kode run lainnya ada di §11.2. Kode error task (`tasks.error_code`) dan pemetaan hasil run ke status task milik engine WP-3.2 (Keputusan Lead 3.1f #15) |
 
 Header: response selalu `X-Request-ID`. Client boleh kirim `X-Request-ID` (divalidasi `^[A-Za-z0-9_-]{8,64}$`). Mutating endpoint menerima `Idempotency-Key` (disimpan 24 jam di Redis; replay mengembalikan respons pertama).
 
@@ -150,8 +150,8 @@ data: {"task_id": "...", "seq": 12, "type": "tool.call_finished", "ts": "...", "
 | `task.status_changed` | `{from, to, reason}` |
 | `task.step_started` / `task.step_finished` | `{step, plan_step_id?, status?}` |
 | `task.plan_ready` | `{plan}` |
-| `agent.run_started` / `agent.run_finished` | `{agent_run_id, agent_id, status?, usage?}` |
-| `agent.delta` (ephemeral) | `{agent_run_id, text}` |
+| `agent.run_started` / `agent.run_finished` | `{agent_run_id, agent_id, status?, usage?}`. **WP-3.1f2a:** `agent.run_started` = `{agent_run_id, agent_id, status: "running"}`, di transaksi yang sama dengan INSERT `agent_runs`. `agent.run_finished` = `{agent_run_id, agent_id, status, error_code, usage:{input_tokens, output_tokens, estimated_cost, cost_status}}`, di transaksi yang sama dengan UPDATE `agent_runs`. `error_code` aditif (§11.2; `null` kecuali `status = failed`); `usage` = total ledger run (agregasi §11 #9, uang string desimal). Run yang ditolak gerbang provider sebelum provider dibangun tetap mendapat kedua event |
+| `agent.delta` (ephemeral) | `{agent_run_id, text}`. **WP-3.1f2a** (Keputusan Lead 3.1f #24, #34): `text` diredaksi lintas delta. Runtime meredaksi seluruh teks percobaan yang terkumpul (diulang setiap 256 karakter mentah baru) dan hanya mengirim bagian teredaksi di luar 256 karakter terakhir; sisanya dikirim teredaksi di akhir stream. Teks yang sudah terkirim tidak pernah ditulis ulang: bila redaksi atas teks yang lebih panjang mengubahnya, pengiriman berhenti sampai akhir stream, lalu teks akhir teredaksi dikirim mulai dari karakter pertama yang berbeda. Percobaan yang di-retry membuang teks yang masih ditahan, dan percobaan baru dikirim dari awal, sehingga klien dapat melihat awal jawaban dua kali (belum ada sinyal "buang teks parsial"; usul field aditif `attempt` di WP-3.2/5.2). Tanpa bus tidak dikirim; tidak pernah disimpan |
 | `agent.message` | `{agent_run_id, agent_id, text}` (ringkasan/narasi final, disimpan) |
 | `tool.call_started` / `tool.call_finished` | `{tool_call_id, tool_name, risk_level, status?, summary?}` |
 | `approval.requested` / `approval.decided` | `{approval}` |
@@ -159,8 +159,8 @@ data: {"task_id": "...", "seq": 12, "type": "tool.call_finished", "ts": "...", "
 | `test.output` (ephemeral) | `{test_run_id, stream:"stdout"\|"stderr", chunk}` |
 | `review.findings` | `{count_by_severity, finding_ids}` |
 | `acceptance.report` | `{report_id, status, passed, failed, unverified, waived, blocked}` |
-| `usage.updated` | `{input_tokens, output_tokens, estimated_cost, cost_status}` |
-| `usage.budget_exceeded` | `{limit, used}` |
+| `usage.updated` | `{input_tokens, output_tokens, estimated_cost, cost_status}`. **WP-3.1f2a:** total **task** dari ledger (agregasi §11 #9, uang string desimal). Runtime mengirimnya sekali per panggilan model logis yang berakhir dengan jawaban atau `LLMError` (sesudah semua retry-nya), di transaksinya sendiri |
+| `usage.budget_exceeded` | `{limit, used}`. **WP-3.1f2a:** `{kind, limit, used}`; `kind` aditif (`duration`, `tool_iterations`, `tokens`, `cost`). Biaya sebagai string desimal; `used = null` bila biaya tidak dapat dibatasi. Dikirim saat run berakhir `budget_exceeded` (BudgetGuard menolak sebelum percobaan model atau sebelum tool), di transaksi yang sama dengan `agent.run_finished` dan audit `budget.exceeded`. Approval `budget_increase` dan transisi task milik WP-3.2 |
 | `task.log` | `{level, message}` |
 
 ## 6. Agents (M07)
@@ -286,7 +286,7 @@ Catatan: `waive_criterion` **bukan** approval — waiver adalah aksi langsung us
 
 | Shape | Field |
 |---|---|
-| `AgentRun` | `{id, task_id, agent_id, agent_name, agent_version, step, model_provider, model_name, prompt_version, status: running\|succeeded\|failed\|cancelled\|budget_exceeded\|approval_required, iterations, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, estimated_cost, cost_status, error, started_at, finished_at, duration_ms}` |
+| `AgentRun` | `{id, task_id, agent_id, agent_name, agent_version, step, model_provider, model_name, prompt_version, status: running\|succeeded\|failed\|cancelled\|budget_exceeded\|approval_required, iterations, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, estimated_cost, cost_status, error, error_code, started_at, finished_at, duration_ms}`. **WP-3.1f2a** (aditif, migrasi 0011; Keputusan Lead 3.1f #15, #35; ADR-075): `error_code` terisi tepat bila `status = failed` (CHECK DB), dengan satu dari sebelas kode: `PROVIDER_DISABLED` (provider `enabled=false`, kill switch project bukan `true`, atau project hilang); `provider_not_ready` (readiness `not_ready`/`unknown`, atau worker tidak dapat membangun provider, mis. tanpa key); `provider_auth` (`LLMError` `auth`); `usage_unrecorded` (baris ledger gagal ditulis; mengalahkan semua alasan lain, termasuk cancel); `invalid_output` (respons kedua tanpa tool call sesudah satu nudge); `iteration_limit` (`min(limits.max_iterations, CLAUDE_MAX_TOOL_ITERATIONS)` panggilan model tanpa `submit_result` yang valid); `timeout` (wall-clock `limits.timeout_seconds` terlampaui); `lease_lost` (lease task gagal diperpanjang); `model_error` (`LLMError` lain: `refusal`, `bad_request`, `malformed`, `max_tokens`, atau jenis retryable yang retry-nya habis); `internal_error` (galat internal tak terduga; run ditutup, lalu galatnya diteruskan ke pemanggil); `interrupted` (worker berhenti di bawah run: pembatalan asyncio atas runtime, recovery WP-3.1f2b, dan isian migrasi 0011 untuk baris `failed` lama). `error` tetap teks pendek teredaksi (≤ 1000 karakter), bukan kode. `cancelled`, `budget_exceeded`, dan `approval_required` tanpa kode. `approval_required` menyimpan tool yang menunggu di `output = {pending_tool:{tool_use_id, tool_name, tool_call_id}}` (resume milik WP-3.2). `GET /tasks/{tid}/agent-runs` belum dibangun (WP-3.2) |
 | `AgentRunSummary` | `{id, task_id, project_id, agent_id, agent_name, status, started_at, duration_ms}` |
 | `ToolCall` | `{id, task_id, agent_run_id, tool_name, risk_level, status, output_summary, output_artifact_id, approval_id, duration_ms, created_at}` (input disanitasi, hanya untuk user ber-izin `task:read`) |
 | `Artifact` | `{id, task_id, type, mime, size_bytes, checksum, metadata, created_at, content_url}` |

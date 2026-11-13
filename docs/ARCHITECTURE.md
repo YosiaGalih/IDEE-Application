@@ -192,7 +192,8 @@ class LLMProvider(Protocol):
                              on_text_delta: Callable[[str], Awaitable[None]] | None = None,
                              cancel: CancelToken | None = None) -> LLMResponse: ...
 # LLMRequest(model, system: str, messages: list[Message], tools: list[ToolDef], max_tokens,
-#            metadata: dict (task_id, agent_id, agent_run_id), cache_system: bool = True, timeout_s)
+#            metadata: dict (call_id, task_id, agent_run_id, agent_id, output_contract[, scenario]),
+#            cache_system: bool = True, timeout_s)   # metadata yang ditulis AgentRuntime (WP-3.1f2a)
 # LLMResponse(content: list[TextBlock|ToolUseBlock], stop_reason, usage: Usage|None, model, request_id)
 # LLMError(kind: rate_limited|overloaded|transient|timeout|refusal|bad_request|auth|malformed|cancelled|max_tokens,
 #          retry_after_s: float|None, retryable: bool)
@@ -228,10 +229,38 @@ class ToolGateway:
     def tool_defs_for(self, grant: AgentGrant) -> list[ToolDef]   # allowlist ∩ terdaftar ∩ prasyarat izin terpenuhi
     async def execute(self, ctx: ToolContext, tool_name: str, raw_input: object, *, tool_use_id: str | None = None) -> ToolResult
 
-# app/agents/runtime.py
+# app/agents/runtime.py  (WP-3.1f2a, ADR-075; Keputusan Lead 3.1f #21): hanya bergantung pada port di bawah,
+# tanpa sesi DB; adaptor + perakitan (build_agent_runtime) di app/services/agent_runtime.py; proses api tidak
+# mengimpor keduanya (import-linter)
 class AgentRuntime:
-    async def run(self, agent_id: str, task: Task, agent_input: BaseModel, *, workspace: TaskWorkspace) -> AgentRunResult
-# AgentRunResult(agent_run_id, status, output: BaseModel | None, usage: UsageTotals, error: str | None)
+    def __init__(self, *, registry: AgentRegistry, prompts: PromptBook, ports: RuntimePorts, config: RuntimeConfig,
+                 redactor: Redactor, clock=time.monotonic, sleep=asyncio.sleep)
+    async def run(self, request: AgentRunRequest) -> AgentRunResult
+# AgentRunRequest(agent_id, task_id: UUID, project_id: UUID, agent_input: BaseModel, cancel: CancelToken,
+#                 workspace: TaskWorkspace | None = None, scenario: str | None = None)   # scenario: scripted saja (ADR-015)
+# AgentRunResult(agent_run_id, status: succeeded|failed|cancelled|budget_exceeded|approval_required,
+#                output: BaseModel | None, usage: RunUsage, error_code: RunErrorCode | None, error: str | None,
+#                budget: BudgetBreach | None, pending_tool: PendingTool | None)
+# Kesalahan pemanggil, ditolak sebelum ada baris agent_runs: AgentNotRunnable (tidak terdaftar, tidak enabled, mode
+# tool/planned, A01/C16, tanpa prompt), AgentInputInvalid (bukan kontrak input runtime-nya, atau task_id input ≠ task
+# run), AgentInputTooLarge (JSON input > 60 KB, ADR-011), ScenarioNotAllowed. Sesudahnya setiap jalan keluar
+# meninggalkan baris agent_runs yang tertutup.
+# RuntimeConfig(max_tool_iterations, max_output_tokens, request_timeout_s, scripted, heartbeat_interval_s=20, retry_policy)
+@dataclass(frozen=True)
+class RuntimePorts:          # Protocol                                                     | adaptor (app/services/agent_runtime.py)
+    gate: ProviderGate       # check(project_id) -> model efektif per tier | ProviderBlocked  | DbProviderGate
+    budget: BudgetCheck      # before_model_attempt(ModelCall), before_tool(RunScope) | BudgetRefused | GuardBudget (BudgetGuard)
+    ledger: UsageLedgerPort  # on_attempt(ModelCall) -> AttemptHandler                      | LedgerRecorder (UsageLedger)
+    runs: RunStore           # start(RunStart) -> UUID, finish(id, RunEnd) -> RunUsage        | AgentRunWriter
+    events: RunEvents        # delta(scope, text), usage_updated(scope)                     | TaskRunEvents
+    tools: ToolExecutor      # tool_defs_for(grant), execute(ctx, name, raw_input, *, tool_use_id) | ToolGateway
+    heartbeat: Heartbeat     # beat(task_id) | LeaseLostError                               | LeaseHeartbeat (renew_lease)
+    providers: ProviderFactory  # open() -> AsyncContextManager[LLMProvider], aclose() sesudah run; tanpa key ->
+                                # ProviderBlocked("provider_not_ready")                        | SettingsProviderFactory
+# ModelCall(request: LLMRequest, call_id, scope: RunScope(project_id, task_id, agent_run_id, agent_id)):
+#   model = request.model, output_token_cap = request.max_tokens, input_token_bound = byte UTF-8 JSON ringkas
+#   (system + messages + tools); task_id wajib UUID; request.metadata["call_id"] == call_id.
+#   bind_model_call(call) -> BoundCall(bound: CallBound, ledger: UsageCallContext): satu-satunya konstruktor keduanya.
 
 # app/sandbox/client.py
 class SandboxClient(Protocol):
@@ -356,56 +385,86 @@ Checkpoint (`tasks.checkpoint` JSONB): `{"phase": "...", "completed_steps": [...
 
 - Dispatch: `services/tasks.enqueue(task)` → Celery `jobs.run_task.delay(task_id)` (`acks_late=True`, `reject_on_worker_lost=True`). Job mengambil **lease**: `UPDATE tasks SET lease_owner=:w, lease_expires_at=now()+60s WHERE id=:id AND (lease_expires_at IS NULL OR lease_expires_at < now()) RETURNING id`. Gagal → job keluar (duplikat delivery aman, NFR-05).
 - Heartbeat tiap 20 dtk memperpanjang lease. Batas `MAX_ACTIVE_TASKS` ditegakkan dengan hitungan task `running|validating` saat claim.
+- Lease selama agent run (WP-3.1f2a, Keputusan Lead 3.1f #18, #33; ADR-075): runtime dipanggil dengan lease dipegang pemanggil, lalu memperpanjangnya sebelum run, sebelum setiap percobaan model (`before_attempt`, termasuk retry), dan sebelum setiap tool. Selain itu tugas latar memperpanjangnya tiap `HEARTBEAT_SECONDS` sepanjang run, karena lease 60 dtk lebih pendek dari satu percobaan (`CLAUDE_REQUEST_TIMEOUT_SECONDS` 120, `retry-after` sampai 60 dtk, timeout tool 60 dtk). Perpanjangan yang gagal (juga galat lain dari heartbeat latar) membatalkan token berhenti run: run `failed` `lease_lost` dan tidak ada yang dikirim lagi. Setiap perpanjangan di transaksinya sendiri; runtime tidak memegang sesi DB atau lock baris task selama panggilan model atau tool (ADR-070).
 - Cancel: `POST /tasks/{id}/cancel` → `cancel_requested=true`; bila task tidak sedang dieksekusi → langsung `cancelled`; bila dieksekusi → API juga memanggil `sandbox.kill_task(task_id)`; worker memeriksa `CancelToken` di antara langkah, sebelum setiap LLM call dan tool call, lalu transisi `cancelled`. Stream LLM dibatalkan via `CancelToken`.
 - Pause (ADR-031): `POST /tasks/{id}/pause` → `pause_requested=true`; worker berhenti di batas langkah berikutnya, menyimpan checkpoint, transisi `interrupted` dengan `status_reason=paused_by_user`; `resume` → `queued`.
-- Recovery (`workflow/recovery.py`, dipanggil saat startup worker dan tiap 30 dtk oleh beat): task `running|validating` dengan lease kedaluwarsa → `interrupted` (atau `cancelled` bila `cancel_requested`), agent_run `running` → `failed(error="interrupted")`. User/auto `resume` → `queued` → lanjut dari checkpoint (AC-17, UC-09).
+- Recovery (`workflow/recovery.py`, dipanggil saat startup worker dan tiap 30 dtk oleh beat): task `running|validating` dengan lease kedaluwarsa → `interrupted` (atau `cancelled` bila `cancel_requested`), agent_run `running` → `failed` dengan `error_code=interrupted` (kolom 0011; recovery `agent_runs` di WP-3.1f2b). User/auto `resume` → `queued` → lanjut dari checkpoint (AC-17, UC-09).
 
 ### 5.4 Budget (NFR-11, PRD §7.3.4)
 
-`workflow/budget.py::BudgetGuard.check_before_attempt(task_id, CallBound)` dipanggil sebelum **setiap** percobaan request LLM, termasuk retry: runtime menyerahkannya ke `create_with_retry` sebagai hook `before_attempt`, dan exception dari hook menghentikan panggilan tanpa mengirim request (WP-3.1f1, Keputusan Lead 3.1f #14; konflik M: retry mengirim sampai 5 percobaan). Setiap pemeriksaan membaca segar tanpa lock baris: pemakaian task di `usage_records` ditambah batas atas percobaan berikutnya (`CallBound` = model, `input_token_bound`, `output_token_cap`) dibandingkan dengan plafon efektif per field `tasks.budget_limit` → `projects.settings.budget` → env (`max_duration_minutes`, `max_tool_iterations`, `max_tokens`, `max_cost_usd`; `max_tool_iterations` tanpa default env). Terlampaui → `BudgetExceeded(kind, limit, used)` → pemanggil (3.1f2/3.2) membuat approval `budget_increase` (R3) + status `waiting_approval`, event `usage.budget_exceeded`. Biaya = estimasi dari `config/pricing.yaml` (berversi); `actual_cost` = `null` dan ditampilkan "unavailable" karena API tidak mengirim biaya (R-09).
+`workflow/budget.py::BudgetGuard.check_before_attempt(task_id, CallBound)` dipanggil sebelum **setiap** percobaan request LLM, termasuk retry: runtime menyerahkannya ke `create_with_retry` sebagai hook `before_attempt`, dan exception dari hook menghentikan panggilan tanpa mengirim request (WP-3.1f1, Keputusan Lead 3.1f #14; konflik M: retry mengirim sampai 5 percobaan). Setiap pemeriksaan membaca segar tanpa lock baris: pemakaian task di `usage_records` ditambah batas atas percobaan berikutnya (`CallBound` = model, `input_token_bound`, `output_token_cap`) dibandingkan dengan plafon efektif per field `tasks.budget_limit` → `projects.settings.budget` → env (`max_duration_minutes`, `max_tool_iterations`, `max_tokens`, `max_cost_usd`; `max_tool_iterations` tanpa default env). Terlampaui → `BudgetExceeded(kind, limit, used)` → pemanggil (3.1f2/3.2) membuat approval `budget_increase` (R3) + status `waiting_approval`, event `usage.budget_exceeded`. Sebelum setiap tool, runtime memanggil `BudgetGuard.check_before_tool(task_id)` (WP-3.1f2a, Keputusan Lead 3.1f #19, #32; AG-13 3.1f1 L5): durasi `elapsed ≥ limit`; iterasi tool `used + 1 > limit` (tool yang akan berjalan ikut dihitung, sehingga plafon N mengizinkan tepat N tool; panggilan `denied` dan `approval_required` tidak dihitung); token dan biaya terhadap bound nol (`used > limit`, biaya yang tidak dapat dibatasi ditolak). `CallBound` tetap menolak `output_token_cap = 0`. Di runtime 3.1f2a budget yang habis mengakhiri agent run `budget_exceeded` (dengan `BudgetBreach`, event `usage.budget_exceeded {kind, limit, used}`, audit `budget.exceeded`); approval `budget_increase` dan status task milik engine WP-3.2. Biaya = estimasi dari `config/pricing.yaml` (berversi); `actual_cost` = `null` dan ditampilkan "unavailable" karena API tidak mengirim biaya (R-09).
 
-Tambahan (review desain): `budget_limit.max_duration_minutes` (default `TASK_MAX_DURATION_MINUTES`) diperiksa di setiap batas langkah → perlakuan sama dengan budget habis. Approval `budget_increase` **ditolak** → `cancelled`. **Readiness gate (ADR-032):** bila `LLM_PROVIDER=anthropic` dan `provider_configs.readiness_status ≠ passed`, AgentRuntime menolak panggilan LLM dan task berhenti di `draft` dengan pesan jelas; UI menampilkan banner menuju Settings → Provider.
+Tambahan (review desain): `budget_limit.max_duration_minutes` (default `TASK_MAX_DURATION_MINUTES`) diperiksa di setiap batas langkah → perlakuan sama dengan budget habis. Approval `budget_increase` **ditolak** → `cancelled`. **Readiness gate (ADR-032, ADR-073):** sebelum run dan sebelum setiap percobaan model, AgentRuntime membaca gerbang provider segar dari DB: `provider_ready` dengan key worker lebih dulu, lalu kill switch project. Provider belum siap (`not_ready`/`unknown`, atau worker tanpa key) → run `failed` `provider_not_ready`; provider `disabled` atau kill switch mati → `failed` `PROVIDER_DISABLED` (WP-3.1f2a, Keputusan Lead 3.1f #16). Kalimat lama "task berhenti di `draft`" tidak berlaku lagi: runtime tidak mentransisi task, dan task yang sudah `running` tidak dapat kembali ke `draft` (`running → draft` tidak ada). Pemetaan task milik engine WP-3.2, dengan usul `running` → `interrupted` dengan `status_reason=provider_not_ready` (Keputusan Lead 3.1f #15). UI menampilkan banner menuju Settings → Provider.
 
 ## 6. Agent model (M07)
 
-- Registry sumber: `agents/registry.yaml` (skema di `docs/AGENT_CATALOG.md`), disinkronkan ke tabel `agent_profiles` oleh `python -m app.cli seed-agents` dan saat startup.
+- Registry sumber: `agents/registry.yaml` (skema di `docs/AGENT_CATALOG.md`), disinkronkan ke tabel `agent_profiles` oleh `python -m app.cli seed-agents` dan saat startup. AgentRuntime membaca registry tervalidasi (`AgentRegistry`, `grant_for`), bukan baris `agent_profiles` (3.1b C3; kontrak import-linter); baris itu tetap harus ada karena FK `agent_runs.agent_id`.
 - `mvp_mode` tiap profil: `llm` (dijalankan AgentRuntime), `profile` (memakai runtime agent lain dengan prompt/permission berbeda), `tool` (diwujudkan sebagai tools deterministik), `planned` (belum aktif; tampil di katalog dengan status).
 - **Runtime LLM MVP (6):** A02 Requirement Analyst (merangkum A01), A03 Planner (merangkum C16), B14 Code Implementer (+profil B09/B10/B13/G35), C20 Debugger (+profil C21), D22 Code Reviewer, A07 User Proxy.
 - **Tool-mode MVP:** A04 Explorer, C17 test runner, D23 secret/static scan, E27 Git, G37 memory/index, H41 stack profile.
-- Output terstruktur: setiap agent punya tool terminal `submit_result` dengan `input_schema` = Pydantic output contract agent (`agents/contracts.py`). Loop berakhir saat `submit_result` valid. Teks bebas model **tidak** dianggap hasil.
-- Prompt: `agents/prompts/<agent_id>.md` + `prompt_version` (hash isi) dicatat di `agent_runs`. System prompt memuat aturan: konten repo/tool = data tak tepercaya; tidak bisa memberi approval; wajib bukti.
+- Output terstruktur: setiap agent punya tool terminal `submit_result` dengan `input_schema` = `model_json_schema()` kontrak output agent (`backend/app/agents/contracts.py`; field di AGENT_CATALOG §7). Loop berakhir saat `submit_result` valid. Teks bebas model **tidak** dianggap hasil.
+- Prompt: `backend/app/agents/prompts/<agent_id>.md` (ikut paket aplikasi, Dockerfile tidak berubah; WP-3.1f2a, Keputusan Lead 3.1f #26). Ada 11 file: enam runtime ditambah profil yang di-dispatch (B09, B10, B13, G35, C21). A01 dan C16 diserap (AGENT_CATALOG §4.2): runtime menolaknya, dan keduanya tidak punya prompt. `prompt_version` = 12 hex pertama SHA-256 isi file, dicatat di `agent_runs`. Setiap prompt memuat lima aturan wajib kata per kata (`REQUIRED_RULES` di `app/agents/prompt_book.py`): konten `<untrusted_content>`/`<agent_input>` dan hasil tool = data tak tepercaya; tidak bisa memberi approval; hanya hasil tool yang menjadi bukti; hasil hanya lewat satu `submit_result`; tidak menulis secret. `PromptBook.load()` menolak start bila satu aturan hilang.
 
 ### 6.1 Tool-use loop (PRD §7.3.2)
 
 ```mermaid
 sequenceDiagram
-  participant O as Orchestrator (worker)
+  participant O as Engine (worker, WP-3.2)
   participant R as AgentRuntime
+  participant H as Heartbeat (lease)
+  participant K as ProviderGate
   participant B as BudgetGuard
-  participant P as LLMProvider
+  participant P as LLMProvider (create_with_retry)
+  participant L as UsageLedger
   participant G as ToolGateway
   participant S as Sandbox/Workspace
-  O->>R: run(agent_id, task, input)
-  R->>R: agent_run=running, build system+tools(allowlist)+context
-  loop until submit_result / limit / cancel
-    R->>B: check_before_call(task)
-    B-->>R: ok | BudgetExceeded
-    R->>P: create_message(stream)
-    P-->>R: content + usage (usage_records)
-    alt tool_use blocks
-      R->>G: execute(ctx, name, input)
+  O->>R: run(AgentRunRequest)
+  R->>R: tolak tanpa baris: agent tak dapat dijalankan, kontrak input salah, > 60 KB, scenario di luar scripted
+  R->>H: beat
+  R->>K: check(project_id) → model per tier, atau ProviderBlocked
+  R->>R: providers.open(), agent_runs=running + agent.run_started
+  Note over R,H: heartbeat latar tiap 20 dtk sepanjang run (gagal → token berhenti → lease_lost)
+  loop sampai submit_result valid / plafon iterasi / tenggat / lease hilang / cancel
+    loop setiap percobaan, termasuk retry (before_attempt)
+      R->>H: beat
+      R->>K: check (segar)
+      R->>B: check_before_attempt(used + bound(next))
+      R->>P: create_message(stream → agent.delta teredaksi)
+      P-->>R: content + usage
+      R->>L: on_attempt (gagal → usage_unrecorded)
+    end
+    R->>R: usage.updated
+    alt submit_result
+      R->>R: validasi kontrak output (valid → succeeded, tidak valid → tool_result is_error)
+    else tool_use lain, berurutan satu per satu
+      R->>B: check_before_tool(used + 1)
+      R->>H: beat
+      R->>G: execute(ctx, name, input, tool_use_id)
       G->>G: offered+allowlist → izin → schema → scope/path → replay → quota → risk/approval
       G->>S: handler (timeout)
       S-->>G: real output
-      G-->>R: tool_result (redacted, truncated) + tool_calls row + audit
-    else end_turn tanpa submit_result
-      R->>P: 1x nudge "panggil submit_result"
+      G-->>R: tool_result (redacted, truncated) + tool_calls row + audit, atau approval_required → run berhenti
+    else tanpa tool_use
+      R->>R: nudge sekali "panggil submit_result", kali kedua → failed invalid_output
     end
   end
-  R-->>O: AgentRunResult (output tervalidasi)
+  R->>R: agent_runs selesai + agent.run_finished (budget habis: + usage.budget_exceeded, audit budget.exceeded)
+  R-->>O: AgentRunResult (tanpa transisi task)
 ```
 
-Retry LLM: `rate_limited/overloaded/transient/timeout` → exponential backoff + jitter (maks 4, hormati `retry-after`). `refusal/bad_request/auth/malformed` → tidak di-retry, agent_run `failed`. Tool side effect **tidak** diulang tanpa idempotency (`tool_calls.idempotency_key = sha256(agent_run_id|tool_use_id)`).
+Realisasi WP-3.1f2a (ADR-075; Keputusan Lead 3.1f #15–#35):
+- **Satu jalur panggilan model** (Keputusan Lead #17). Di `app/`, `create_with_retry` hanya dipanggil dari `AgentRuntime._call_model`, dan selalu dengan dua hook. `before_attempt` = heartbeat → gerbang provider → BudgetGuard, sebelum setiap percobaan. `on_attempt` = ledger. `provider.create_message` hanya dipanggil di `app/llm/retry.py` dan runner readiness `app/llm/readiness.py` (test AST `tests/unit/test_model_call_guard.py`). Exception dari hook menghentikan panggilan tanpa request dan tanpa baris ledger. Kegagalan ledger menjadi `UsageUnrecorded`, sehingga jawaban berbayar yang tidak tercatat tidak pernah dikembalikan (`failed usage_unrecorded`). Bound budget dan konteks ledger dibangun dari `ModelCall` yang sama (`bind_model_call`).
+- **Iterasi** (Keputusan Lead #19). Satu iterasi = satu panggilan model logis beserta retry-nya. Plafon = `min(limits.max_iterations, CLAUDE_MAX_TOOL_ITERATIONS)`; `submit_result` yang tidak valid ikut dihitung; plafon habis → `failed iteration_limit`.
+- **`submit_result`** (ADR-013). Runtime mencegatnya, jadi ia tidak pernah dikirim ke gateway. Ia ditawarkan terakhir, sesudah `tool_defs_for(grant)`, dengan `input_schema` = `model_json_schema()` kontrak output. Satu yang valid → `succeeded`, dan tool lain di giliran yang sama tidak dijalankan. Yang tidak valid → `tool_result is_error` berisi lokasi field dan jenis galat tanpa nilai input, dan tool lain di giliran itu tetap dijalankan. Lebih dari satu dalam satu giliran → semuanya `is_error`. Teks bebas, juga JSON yang sah, bukan hasil.
+- **Nudge.** Respons tanpa `tool_use` mendapat satu pesan nudge per run; respons berikutnya tanpa `tool_use` → `failed invalid_output`.
+- **Tenggat dan timeout percobaan.** `limits.timeout_seconds` = wall-clock per run; lewat → `failed timeout`, termasuk memotong percobaan yang sedang berjalan. `timeout_s` per percobaan = `min(30 + max_tokens / 40, CLAUDE_REQUEST_TIMEOUT_SECONDS, sisa tenggat)` [Menebak untuk kedua konstanta; diuji ulang di WP-INT-07].
+- **Token berhenti.** Satu `CancelToken` per run diteruskan ke provider dan ke `ToolContext.cancel`. Alasan pertama yang membatalkannya menentukan akhir run: cancel pemanggil (`cancelled`), tenggat (`timeout`), atau heartbeat latar yang gagal (`lease_lost`).
+- **Tool** (syarat 3.1d2a #5). Satu per satu dan berurutan: `check_before_tool` → heartbeat → `ToolGateway.execute`. `approval_required` menghentikan run dengan tool yang menunggu di `agent_runs.output.pending_tool`; resume milik WP-3.2. Status lain kembali ke model sebagai `tool_result`.
+- **Akhir run** (Keputusan Lead #15, #30). Runtime hanya mengakhiri agent run (`succeeded`, `failed` + `error_code`, `cancelled`, `budget_exceeded`, `approval_required`; API §11.2). Ia tidak mentransisi task dan tidak menulis `tasks.error_code` atau `tasks.title` (kontrak import-linter "The runtime ends agent runs; it never moves a task"). Sesudah pemeriksaan awal, setiap jalan keluar meninggalkan baris `agent_runs` yang tertutup. Pembatalan asyncio (`interrupted`) dan galat tak terduga (`internal_error`) menutup run dengan tulisan yang di-shield, lalu diteruskan ke pemanggil.
+- **Provider per run** (Keputusan Lead #27, #28). `ProviderFactory.open()` membangun provider dari settings worker dan menutupnya (`aclose()`) sesudah run, juga saat run gagal atau dibatalkan. Worker tanpa key → `failed provider_not_ready`. Skenario scripted hanya lewat `AgentRunRequest.scenario` dan hanya untuk provider scripted (ADR-015).
+- **Isolasi** (Keputusan Lead #21, ADR-022). `app/agents/runtime.py` hanya bergantung pada port; import-linter melarangnya mengimpor `sqlalchemy`, `redis`, `app.models`, `app.core.db`, `app.core.events`, `app.core.audit`, factory/adaptor provider, `app.llm.readiness`, `app.llm.pricing`, dan `app.tools.gateway`. Proses `api` tidak mengimpor `app.agents.runtime` maupun `app.services.agent_runtime`.
+
+Retry LLM: `rate_limited/overloaded/transient/timeout` → exponential backoff + jitter (maks 4, hormati `retry-after`). `refusal/bad_request/auth/malformed` → tidak di-retry, agent_run `failed` (`provider_auth` untuk `auth`; `model_error` untuk jenis lain dan untuk jenis retryable yang retry-nya habis, WP-3.1f2a). Tool side effect **tidak** diulang tanpa idempotency (`tool_calls.idempotency_key = sha256(agent_run_id|tool_use_id)`).
 
 ## 7. Workspace & Git (M03/M04/M05/M15)
 
