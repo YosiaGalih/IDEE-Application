@@ -253,3 +253,42 @@ async def test_a_failed_attempt_leaves_no_held_text_behind(
     sent = "".join(d["payload"]["text"] for d in bus.of_type("agent.delta"))
     assert "FIRSTATTEMPT" not in sent  # held (under 256 characters), then dropped on restart
     assert sent.startswith("SECOND ")
+
+
+async def test_run_started_is_committed_before_the_first_model_call(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    """Moved here from Task 6: the run store writes ``agent.run_started`` (plan WP-3.1f2a Task 7)."""
+    project_id, task_id = await a_task(session, settings)
+    seen: list[list[str]] = []
+
+    class Peeking:
+        name = "scripted"
+
+        def __init__(self) -> None:
+            self.inner = scripted(DONE)
+            self.requests = self.inner.requests
+
+        async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+            async with engine.connect() as conn:  # another connection: only committed rows
+                found = await conn.execute(
+                    select(TaskEvent.type).where(TaskEvent.task_id == task_id).order_by(TaskEvent.seq)
+                )
+                seen.append([row[0] for row in found])
+            return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+    bus = RecordingBus(engine)
+    run = compose(sessions, settings, pricing, Peeking(), tools=FakeTools([]), bus=bus)  # type: ignore[arg-type]
+    result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert result.status == "succeeded"
+    assert seen == [["agent.run_started"]]
+    assert [m["type"] for m in bus.messages if m["seq"] is not None] == [
+        "agent.run_started",
+        "usage.updated",
+        "agent.run_finished",
+    ]
+    assert bus.unseen == []

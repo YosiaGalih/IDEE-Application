@@ -1,8 +1,8 @@
 """The AgentRuntime composed over a real database (plan WP-3.1f2a Task 5; spec WP-3.1f Keputusan Lead
 #15-#23, #33; ADR-070).
 
-Real provider gate, budget guard, usage ledger, lease heartbeat and tool gateway; the run store is the test
-``DbRunStore`` until the redacted writer of Task 7 and the events are fake until Task 6.
+Real provider gate, budget guard, usage ledger, lease heartbeat, run store and tool gateway; the provider is
+scripted.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from app.core.config import Settings
 from app.llm.pricing import PricingTable
 from app.models.agents import AgentRun
 from app.models.approvals import Approval
+from app.models.audit import AuditEvent
 from app.models.tools import ToolCall
 from app.models.usage import UsageRecord
 from app.services.tool_gateway import build_tool_gateway
@@ -30,6 +31,7 @@ from tests.runtime_fakes import (
     OUTPUTS,
     REGISTRY,
     Composition,
+    RecordingBus,
     compose,
     hold_lease,
     registry_with,
@@ -215,8 +217,8 @@ async def test_a_tool_budget_refusal_is_audited(
     settings: Settings,
     pricing: PricingTable,
 ) -> None:
-    """The refusal ends the run ``budget_exceeded`` before the second tool; the audit row and the
-    ``usage.budget_exceeded`` event belong to the run store (Task 7), asserted there."""
+    """The refusal ends the run ``budget_exceeded`` before the second tool, with the event
+    ``usage.budget_exceeded`` and the audit ``budget.exceeded`` written by the run store."""
     from app.llm.base import ToolUseBlock
     from app.llm.scenarios.model import Reply
 
@@ -229,11 +231,13 @@ async def test_a_tool_budget_refusal_is_audited(
         stop_reason="tool_use",
     )
     handler = Recorder()
+    bus = RecordingBus()
     run = compose(
         sessions,
         settings,
         pricing,
         scripted(two, DONE),
+        bus=bus,
         tools=gateway(sessions, spec("test.read", handler)),
         registry=_tool_registry("test.read"),
     )
@@ -243,6 +247,31 @@ async def test_a_tool_budget_refusal_is_audited(
     assert (result.budget.kind, result.budget.limit, result.budget.used) == ("tool_iterations", 1, 1)
     assert await count(session, ToolCall, task_id=task_id) == 1
     assert len(handler.calls) == 1
+    audits = list(
+        await session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "budget.exceeded", AuditEvent.resource_id == str(result.agent_run_id)
+            )
+        )
+    )
+    assert len(audits) == 1
+    assert (audits[0].actor_type, audits[0].actor_id, audits[0].result, audits[0].project_id) == (
+        "agent",
+        "B14",
+        "denied",
+        project_id,
+    )
+    assert audits[0].metadata_ == {
+        "task_id": str(task_id),
+        "kind": "tool_iterations",
+        "limit": 1,
+        "used": 1,
+        "next_bound": 0,
+    }
+    (event,) = bus.of_type("usage.budget_exceeded")
+    assert event["payload"] == {"kind": "tool_iterations", "limit": 1, "used": 1}
+    stored = await session.get(AgentRun, result.agent_run_id)
+    assert stored is not None and (stored.status, stored.error_code) == ("budget_exceeded", None)
 
 
 async def test_the_workspace_reaches_the_tools(
@@ -270,3 +299,38 @@ async def test_the_workspace_reaches_the_tools(
     )
     await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id, workspace=workspace))
     assert seen == [workspace]
+
+
+async def test_build_agent_runtime_assembles_the_production_ports(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    from app.core.audit import AuditWriter
+    from app.core.redaction import Redactor
+    from app.services.agent_runtime import build_agent_runtime
+    from tests.runtime_fakes import WORKER_ID, FakeProviders, FakeTools
+
+    project_id, task_id = await a_task(session, settings)
+    bus = RecordingBus()
+    runtime = build_agent_runtime(
+        sessions=sessions,
+        settings=settings,
+        registry=REGISTRY,
+        pricing=pricing,
+        audit=AuditWriter(Redactor(settings.secret_values())),
+        bus=bus,
+        worker_id=WORKER_ID,
+        tools=FakeTools([]),
+        providers=FakeProviders(scripted(DONE)),
+    )
+    result = await runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert result.status == "succeeded"
+    assert [m["type"] for m in bus.messages if m["seq"] is not None] == [
+        "agent.run_started",
+        "usage.updated",
+        "agent.run_finished",
+    ]
+    stored = await session.get(AgentRun, result.agent_run_id)
+    assert stored is not None and stored.status == "succeeded" and stored.input_tokens == 100

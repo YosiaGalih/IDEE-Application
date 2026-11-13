@@ -10,16 +10,38 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import Integer, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agents.runtime import BudgetRefused, LeaseLostError, ModelCall, ProviderBlocked, RunScope
+from app.agents.prompt_book import PromptBook
+from app.agents.registry import AgentRegistry
+from app.agents.runtime import (
+    ERROR_TEXT_MAX,
+    AgentRuntime,
+    BudgetBreach,
+    BudgetRefused,
+    LeaseLostError,
+    ModelCall,
+    ProviderBlocked,
+    ProviderFactory,
+    RunEnd,
+    RunScope,
+    RunStart,
+    RuntimeConfig,
+    RuntimePorts,
+    RunUsage,
+    ToolExecutor,
+)
+from app.core.audit import AuditWriter
 from app.core.config import Settings
 from app.core.events import EventBus, emit_task_event, publish_pending
-from app.core.money import decimal_str
+from app.core.money import decimal_str, stored_cost
 from app.core.redaction import Redactor
+from app.llm.pricing import PricingTable
 from app.llm.retry import AttemptHandler
+from app.models.agents import AgentRun
 from app.models.projects import Project
 from app.models.providers import ProviderConfig
 from app.services.provider_readiness import (
@@ -29,8 +51,9 @@ from app.services.provider_readiness import (
     provider_calls_allowed,
     provider_ready,
 )
-from app.services.usage import EMPTY_TOTALS, UsageCallContext, UsageLedger, task_usage
-from app.workflow.budget import BudgetExceeded, BudgetGuard, CallBound
+from app.services.tool_gateway import build_tool_gateway
+from app.services.usage import EMPTY_TOTALS, UsageCallContext, UsageLedger, run_usage, task_usage
+from app.workflow.budget import BudgetDefaults, BudgetExceeded, BudgetGuard, CallBound
 from app.workflow.lease import LeaseLost, renew_lease
 
 
@@ -189,3 +212,210 @@ class TaskRunEvents:
             await session.commit()
             if self._bus is not None:
                 await publish_pending(session, self._bus)
+
+
+class AgentRunAlreadyFinished(LookupError):
+    """The run is not ``running`` any more: a run is finished once (never overwritten)."""
+
+
+def _number(value: int | Decimal | None) -> int | str | None:
+    """A budget figure for an event or the audit: money as a decimal string, counts as they are."""
+    return decimal_str(value) if isinstance(value, Decimal) else value
+
+
+class AgentRunWriter:
+    """``RunStore``: the only writer of ``agent_runs`` in 3.1f2a (tests/unit/test_agent_run_writer_guard.py;
+    recovery joins in 3.1f2b). Everything stored goes through the audit's redactor, which knows the
+    configured secret literals (3.1b C4)."""
+
+    def __init__(
+        self, sessions: async_sessionmaker[AsyncSession], bus: EventBus | None, audit: AuditWriter
+    ) -> None:
+        self._sessions = sessions
+        self._bus = bus
+        self._audit = audit
+        self._projects: dict[uuid.UUID, uuid.UUID] = {}  # run -> project, for the audit of its end
+
+    async def start(self, run: RunStart) -> uuid.UUID:
+        """INSERT ``agent_runs`` (``running``, the input redacted) and ``agent.run_started``, one transaction,
+        committed, then published."""
+        redactor = self._audit.redactor
+        run_id = uuid.uuid4()
+        async with self._sessions() as session:
+            session.add(
+                AgentRun(
+                    id=run_id,
+                    task_id=run.task_id,
+                    agent_id=run.agent_id,
+                    agent_version=run.agent_version,
+                    step=run.step,
+                    model_provider=run.model_provider,
+                    model_name=run.model_name,
+                    prompt_version=run.prompt_version,
+                    status="running",
+                    input=redactor.redact_obj(dict(run.input)),
+                )
+            )
+            await session.flush()
+            await emit_task_event(
+                session,
+                self._bus,
+                run.task_id,
+                "agent.run_started",
+                {"agent_run_id": str(run_id), "agent_id": run.agent_id, "status": "running"},
+                redactor=redactor,
+            )
+            await session.commit()
+            if self._bus is not None:
+                await publish_pending(session, self._bus)
+        self._projects[run_id] = run.project_id
+        return run_id
+
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
+        """Totals from the run's ledger rows; UPDATE status, code, redacted error (cut) and output,
+        iterations, tokens, cost, ``finished_at`` (DB clock) and ``duration_ms``; ``agent.run_finished``;
+        for ``budget_exceeded`` also ``usage.budget_exceeded`` and the audit ``budget.exceeded``. One
+        transaction. Only a row still ``running`` is finished (``AgentRunAlreadyFinished``)."""
+        redactor = self._audit.redactor
+        async with self._sessions() as session:
+            run_totals = await run_usage(session, agent_run_id)
+            totals = run_totals.totals
+            cost = stored_cost(totals.estimated_cost) if totals.estimated_cost is not None else None
+            finished = (
+                await session.execute(
+                    update(AgentRun)
+                    .where(AgentRun.id == agent_run_id, AgentRun.status == "running")
+                    .values(
+                        status=end.status,
+                        error_code=end.error_code,
+                        error=redactor.redact(end.error)[:ERROR_TEXT_MAX] if end.error is not None else None,
+                        output=redactor.redact_obj(dict(end.output)) if end.output is not None else None,
+                        iterations=end.iterations,
+                        input_tokens=totals.input_tokens,
+                        output_tokens=totals.output_tokens,
+                        cache_read_tokens=run_totals.cache_read_tokens,
+                        cache_creation_tokens=run_totals.cache_creation_tokens,
+                        estimated_cost=cost,
+                        cost_status=totals.cost_status,
+                        finished_at=func.now(),
+                        duration_ms=cast(
+                            func.extract("epoch", func.now() - AgentRun.started_at) * 1000, Integer
+                        ),
+                    )
+                    .returning(AgentRun.task_id, AgentRun.agent_id)
+                    .execution_options(synchronize_session=False)
+                )
+            ).one_or_none()
+            if finished is None:
+                raise AgentRunAlreadyFinished(f"agent run {agent_run_id} is not running")
+            task_id, agent_id = finished
+            usage = {
+                "input_tokens": totals.input_tokens,
+                "output_tokens": totals.output_tokens,
+                "estimated_cost": decimal_str(cost) if cost is not None else None,
+                "cost_status": totals.cost_status,
+            }
+            await emit_task_event(
+                session,
+                self._bus,
+                task_id,
+                "agent.run_finished",
+                {
+                    "agent_run_id": str(agent_run_id),
+                    "agent_id": agent_id,
+                    "status": end.status,
+                    "error_code": end.error_code,
+                    "usage": usage,
+                },
+                redactor=redactor,
+            )
+            if end.budget is not None:
+                await self._budget_exceeded(session, agent_run_id, task_id, agent_id, end.budget)
+            await session.commit()
+            if self._bus is not None:
+                await publish_pending(session, self._bus)
+        self._projects.pop(agent_run_id, None)
+        return RunUsage(
+            input_tokens=totals.input_tokens,
+            output_tokens=totals.output_tokens,
+            cache_read_tokens=run_totals.cache_read_tokens,
+            cache_creation_tokens=run_totals.cache_creation_tokens,
+            estimated_cost=cost,
+            cost_status=totals.cost_status,
+        )
+
+    async def _budget_exceeded(
+        self,
+        session: AsyncSession,
+        agent_run_id: uuid.UUID,
+        task_id: uuid.UUID,
+        agent_id: str,
+        breach: BudgetBreach,
+    ) -> None:
+        await emit_task_event(
+            session,
+            self._bus,
+            task_id,
+            "usage.budget_exceeded",
+            {"kind": breach.kind, "limit": _number(breach.limit), "used": _number(breach.used)},
+            redactor=self._audit.redactor,
+        )
+        await self._audit.write(
+            session,
+            actor_type="agent",
+            actor_id=agent_id,
+            action="budget.exceeded",
+            result="denied",
+            resource_type="agent_run",
+            resource_id=str(agent_run_id),
+            project_id=self._projects.get(agent_run_id),
+            metadata={
+                "task_id": str(task_id),
+                "kind": breach.kind,
+                "limit": _number(breach.limit),
+                "used": _number(breach.used),
+                "next_bound": _number(breach.next_bound),
+            },
+        )
+
+
+def build_agent_runtime(
+    *,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    registry: AgentRegistry,
+    pricing: PricingTable,
+    audit: AuditWriter,
+    bus: EventBus | None,
+    worker_id: str,
+    tools: ToolExecutor | None = None,
+    providers: ProviderFactory | None = None,
+    prompts: PromptBook | None = None,
+) -> AgentRuntime:
+    """The worker's AgentRuntime: every port over the database, the production tool gateway, one redactor
+    (the audit's, with the configured secret literals) for everything the runtime writes or sends."""
+    if providers is None:
+        raise ValueError("a provider factory is needed (SettingsProviderFactory: plan WP-3.1f2a Task 8)")
+    redactor = audit.redactor
+    ports = RuntimePorts(
+        gate=DbProviderGate(sessions, settings),
+        budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
+        ledger=LedgerRecorder(UsageLedger(sessions, pricing)),
+        runs=AgentRunWriter(sessions, bus, audit),
+        events=TaskRunEvents(sessions, bus, redactor),
+        tools=tools if tools is not None else build_tool_gateway(sessions=sessions, audit=audit, bus=bus),
+        heartbeat=LeaseHeartbeat(sessions, worker_id),
+        providers=providers,
+    )
+    return AgentRuntime(
+        registry=registry,
+        prompts=prompts if prompts is not None else PromptBook.load(),
+        ports=ports,
+        config=RuntimeConfig(
+            max_tool_iterations=settings.claude_max_tool_iterations,
+            max_output_tokens=settings.claude_max_output_tokens,
+            request_timeout_s=float(settings.claude_request_timeout_seconds),
+            scripted=settings.llm_provider == "scripted",
+        ),
+        redactor=redactor,
+    )

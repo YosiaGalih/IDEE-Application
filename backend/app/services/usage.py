@@ -385,6 +385,35 @@ async def period_usage(
     return _totals(row)
 
 
+@dataclass(frozen=True, slots=True)
+class RunTotals:
+    """An agent run's totals: the report aggregate (Keputusan Lead #5) plus the cache tokens ``agent_runs``
+    keeps. Cache counts follow the token rule: 0 without rows, None when rows exist and none reported."""
+
+    totals: UsageTotals
+    cache_read_tokens: int | None
+    cache_creation_tokens: int | None
+
+
+async def run_usage(session: AsyncSession, agent_run_id: uuid.UUID) -> RunTotals:
+    """Totals of one agent run, from its own ledger rows only (plan WP-3.1f2a Task 7)."""
+    values: tuple[Any, ...] = tuple(
+        (
+            await session.execute(
+                select(
+                    *_AGGREGATE,
+                    func.coalesce(func.sum(UsageRecord.cache_read_tokens), 0),
+                    func.coalesce(func.sum(UsageRecord.cache_creation_tokens), 0),
+                ).where(UsageRecord.agent_run_id == agent_run_id)
+            )
+        ).one()
+    )
+    rows, counted = int(values[0]), int(values[3])
+    known = rows == 0 or counted > 0
+    cache_read, cache_creation = int(values[7]), int(values[8])
+    return RunTotals(_totals(values[:7]), cache_read if known else None, cache_creation if known else None)
+
+
 async def task_usage(session: AsyncSession, task_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, UsageTotals]:
     """Totals per task, for tasks the caller already selected in scope; a task without rows is absent."""
     if not task_ids:

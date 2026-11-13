@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents import contracts as c
@@ -516,68 +515,20 @@ def run_request(
     return AgentRunRequest(**values)
 
 
-# --- a database run store for the integration tests (until the real writer, plan Task 7) --------------------
-
-
-class DbRunStore:
-    """A minimal ``RunStore`` over ``agent_runs`` for tests: one row per run, so the ledger and the gateway
-    can name the run. The real writer (redaction, totals, events, audit) is ``AgentRunWriter`` (Task 7)."""
-
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
-        self._sessions = sessions
-        self.ends: list[RunEnd] = []
-
-    async def start(self, run: RunStart) -> uuid.UUID:
-        from app.models.agents import AgentProfile, AgentRun
-        from tests.integration.test_agent_tables import profile
-
-        run_id = uuid.uuid4()
-        async with self._sessions.begin() as session:
-            if await session.get(AgentProfile, run.agent_id) is None:
-                session.add(profile(run.agent_id))
-                await session.flush()
-            session.add(
-                AgentRun(
-                    id=run_id,
-                    task_id=run.task_id,
-                    agent_id=run.agent_id,
-                    agent_version=run.agent_version,
-                    step=run.step,
-                    model_provider=run.model_provider,
-                    model_name=run.model_name,
-                    prompt_version=run.prompt_version,
-                    input=dict(run.input),
-                )
-            )
-        return run_id
-
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
-        from app.models.agents import AgentRun
-
-        self.ends.append(end)
-        async with self._sessions.begin() as session:
-            await session.execute(
-                update(AgentRun)
-                .where(AgentRun.id == agent_run_id, AgentRun.status == "running")
-                .values(
-                    status=end.status,
-                    error_code=end.error_code,
-                    error=end.error,
-                    output=dict(end.output) if end.output is not None else None,
-                    iterations=end.iterations,
-                )
-            )
-        return ZERO_USAGE
-
-
 # --- a real composition for the integration tests -----------------------------------------------------------
 
 WORKER_ID = "worker-test-1"
 
 
 async def hold_lease(session: AsyncSession, task_id: uuid.UUID, worker_id: str = WORKER_ID) -> None:
+    """The registry synced (``agent_runs.agent_id`` points at ``agent_profiles``) and the task's lease held by
+    ``worker_id``, as the job that runs a task holds it."""
     from sqlalchemy import text
 
+    from app.core.audit import AuditWriter
+    from app.services.agents import sync_registry
+
+    await sync_registry(session, REGISTRY, AuditWriter(Redactor()))
     await session.execute(
         text(
             "UPDATE tasks SET lease_owner = :worker,"
@@ -618,8 +569,8 @@ class RecordingBus:
 class Composition:
     runtime: AgentRuntime
     provider: ScriptedProvider
-    runs: DbRunStore
-    events: FakeEvents
+    runs: Any  # AgentRunWriter
+    events: Any
     providers: FakeProviders
 
 
@@ -634,15 +585,27 @@ def compose(
     worker_id: str = WORKER_ID,
     redactor: Redactor | None = None,
     events: Any = None,
+    bus: Any = None,
 ) -> Composition:
-    """The production ports over a real database, except the run store (``DbRunStore`` until Task 7) and,
-    unless given, the events (``FakeEvents``); the provider is the given scripted one."""
-    from app.services.agent_runtime import DbProviderGate, GuardBudget, LeaseHeartbeat, LedgerRecorder
+    """The production ports over a real database; the events are ``TaskRunEvents`` over ``bus`` when one is
+    given, else ``events`` or ``FakeEvents``; the provider is the given scripted one. ``build_agent_runtime``
+    is the same assembly with the production provider factory and sleep."""
+    from app.core.audit import AuditWriter
+    from app.services.agent_runtime import (
+        AgentRunWriter,
+        DbProviderGate,
+        GuardBudget,
+        LeaseHeartbeat,
+        LedgerRecorder,
+        TaskRunEvents,
+    )
     from app.services.usage import UsageLedger
     from app.workflow.budget import BudgetDefaults, BudgetGuard
 
-    runs = DbRunStore(sessions)
-    events = events if events is not None else FakeEvents()
+    redactor = redactor or Redactor(settings.secret_values())
+    runs = AgentRunWriter(sessions, bus, AuditWriter(redactor))
+    if events is None:
+        events = TaskRunEvents(sessions, bus, redactor) if bus is not None else FakeEvents()
     providers = FakeProviders(provider)
     ports = RuntimePorts(
         gate=DbProviderGate(sessions, settings),
@@ -659,7 +622,7 @@ def compose(
         prompts=PROMPTS,
         ports=ports,
         config=config(scripted=settings.llm_provider == "scripted"),
-        redactor=redactor or Redactor(settings.secret_values()),
+        redactor=redactor,
         sleep=no_sleep,
     )
     return Composition(runtime, provider, runs, events, providers)

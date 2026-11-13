@@ -30,6 +30,7 @@ from app.core.redaction import Redactor
 from app.llm.pricing import PricingTable
 from app.llm.readiness import CHECK_KEYS, Check, ReadinessReport
 from app.llm.scenarios.model import Fail
+from app.models.agents import AgentRun
 from app.models.projects import Project
 from app.models.providers import ProviderConfig
 from app.models.usage import UsageRecord
@@ -401,7 +402,9 @@ async def test_a_disabled_provider_stops_the_run_before_any_request(
     assert composed.provider.requests == []
     assert composed.providers.opened == 0
     assert await ledger_rows(session) == 0
-    assert composed.runs.ends[-1].error_code == "PROVIDER_DISABLED"
+    run_row = await session.get(AgentRun, result.agent_run_id)
+    assert run_row is not None
+    assert (run_row.status, run_row.error_code, run_row.model_name) == ("failed", "PROVIDER_DISABLED", None)
 
 
 @pytest.mark.parametrize("value", [False, "false", 0, None], ids=repr)
