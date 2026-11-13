@@ -1181,7 +1181,18 @@ class AgentRuntime:
             await self._beat(run)
             await self._port(run, ports.gate.check(scope.project_id))
             await self._port(run, ports.budget.before_model_attempt(call))
-            run.tally.sent += 1  # the hooks passed: this attempt goes to the provider
+            run.tally.sent += 1  # the hooks passed: the request goes out, unless its restart stops it
+
+        async def restart(attempt: int) -> None:
+            # Between before_attempt and the request only the restart runs (retry.py): an attempt it stops (a
+            # cancel during the reset event) never went out, so it is not counted as sent (review N3).
+            assert on_restart is not None
+            try:
+                await on_restart(attempt)
+            except BaseException:
+                if run is not None:
+                    run.tally.sent -= 1
+                raise
 
         record = ports.ledger.on_attempt(call)
 
@@ -1205,7 +1216,7 @@ class AgentRuntime:
             call.request,
             policy=self._config.retry_policy,
             on_text_delta=on_text_delta,
-            on_restart=on_restart,
+            on_restart=restart if on_restart is not None else None,
             cancel=cancel,
             on_attempt=on_attempt,
             before_attempt=before_attempt,

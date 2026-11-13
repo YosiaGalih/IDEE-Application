@@ -43,7 +43,7 @@ from app.agents.runtime import (
 )
 from app.core.cancel import CancelToken
 from app.core.redaction import Redactor
-from app.llm.base import LLMError, Message, TextBlock, ToolResultBlock, ToolUseBlock
+from app.llm.base import LLMError, Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage
 from app.llm.scenarios.model import Fail, Reply
 from app.models.enums import AGENT_RUN_ERROR_CODES
 from app.tools.base import ToolResult
@@ -1349,3 +1349,47 @@ async def test_a_timeout_raised_inside_a_port_is_not_the_run_deadline(port: str)
     assert ended(fakes).error == "TimeoutError: an internal error ended the run"
     failed = [log for log in logs if log["event"] == "agent_run_internal_error"]
     assert [log["error_type"] for log in failed] == ["TimeoutError"]
+
+
+class StreamsThenFails:
+    """The first attempt streams some text, then fails with a transient error; later ones are the inner's."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.calls = 0
+
+    async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+        self.calls += 1
+        if self.calls == 1:
+            assert on_text_delta is not None
+            await on_text_delta("partial text ")
+            raise LLMError("overloaded", usage=Usage(input_tokens=5, output_tokens=1))
+        return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_an_attempt_stopped_during_its_restart_is_not_counted_as_sent() -> None:
+    """Review N3: an attempt counts as sent only when its request goes out. A cancel during the restart (the
+    reset event) stops the retry before its request: the one attempt sent is recorded, so the run's usage is
+    complete, not partial."""
+    holder: dict[str, asyncio.Task[Any]] = {}
+
+    class CancelsOnReset(FakeEvents):
+        async def delta(self, scope: Any, text: str, *, reset: bool = False) -> None:
+            await super().delta(scope, text, reset=reset)
+            if reset:
+                holder["run"].cancel()
+                await asyncio.sleep(5)
+
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = StreamsThenFails(fakes.providers.provider)  # type: ignore[assignment]
+    fakes.events = CancelsOnReset()
+    holder["run"] = asyncio.create_task(make_runtime(fakes).run(run_request("B14")))
+    with pytest.raises(asyncio.CancelledError):
+        await holder["run"]
+    end = ended(fakes)
+    assert (end.error_code, end.usage_complete) == ("worker_cancelled", True)
+    assert len(fakes.ledger.records) == 1 and fakes.events.resets == [True]
