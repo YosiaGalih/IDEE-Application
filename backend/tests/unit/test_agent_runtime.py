@@ -58,6 +58,7 @@ from tests.runtime_fakes import (
     FakeClock,
     Fakes,
     a_model_call,
+    agent_input,
     config,
     in_order,
     make_runtime,
@@ -214,7 +215,7 @@ def _intake_of_size(size: int) -> contracts.IntakeInput:
 @pytest.mark.parametrize(("size", "refused"), [(CONTEXT_MAX_BYTES, False), (CONTEXT_MAX_BYTES + 1, True)])
 async def test_input_over_sixty_kilobytes_is_refused(size: int, refused: bool) -> None:
     fakes = Fakes(scripted(submit_turn(OUTPUTS["IntakeOutput"])))
-    request = run_request("A02", agent_input=_intake_of_size(size))
+    request = run_request("A02", task_id=uuid.UUID(UUID_A), agent_input=_intake_of_size(size))
     if refused:
         with pytest.raises(AgentInputTooLarge):
             await make_runtime(fakes).run(request)
@@ -749,10 +750,13 @@ async def test_the_run_start_names_the_model_and_the_input() -> None:
 async def test_the_input_is_redacted_before_it_is_sent() -> None:
     secret = "sk-ant-" + "input-" + "z" * 30
     fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    task_id = uuid.uuid4()
     agent_input_ = contracts.ImplementInput(
-        task_id=uuid.uuid4(), step=STEP, requirements=[], gap_feedback=f"token={secret}"
+        task_id=task_id, step=STEP, requirements=[], gap_feedback=f"token={secret}"
     )
-    await make_runtime(fakes, redactor=Redactor([secret])).run(run_request("B14", agent_input=agent_input_))
+    await make_runtime(fakes, redactor=Redactor([secret])).run(
+        run_request("B14", task_id=task_id, agent_input=agent_input_)
+    )
     assert secret not in str(fakes.provider.requests[0].messages[0].content)
 
 
@@ -763,3 +767,12 @@ async def test_the_runtime_writes_no_task_title() -> None:
     # After the answer only the run is finished: no other port (and the runtime holds no task writer).
     assert fakes.log[-1] == "record"
     assert len(fakes.runs.finishes) == 1 and fakes.events.usage_updates == 1
+
+
+async def test_an_input_for_another_task_is_refused() -> None:
+    """The input names the task it was built for; a run for another task refuses it (no row)."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    request = run_request("B14", agent_input=agent_input("B14", uuid.uuid4()))
+    with pytest.raises(AgentInputInvalid, match="task"):
+        await make_runtime(fakes).run(request)
+    assert fakes.runs.starts == [] and fakes.log == []

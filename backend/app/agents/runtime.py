@@ -614,7 +614,7 @@ class AgentRuntime:
     # --- before the run -------------------------------------------------------------------------------------
 
     def _admit(self, request: AgentRunRequest) -> _Run:
-        """The checks that leave no row (Keputusan plan #10)."""
+        """The checks that leave no row (Keputusan plan #10), and the input's ``task_id`` is the run's."""
         grant = grant_for(self._registry, request.agent_id)  # AgentNotRunnable: unknown or not enabled
         spec = self._registry.by_id(request.agent_id)
         assert spec is not None
@@ -635,6 +635,8 @@ class AgentRuntime:
             raise AgentNotRunnable(f"{spec.agent_id} has no runtime prompt")
         if type(request.agent_input) is not input_contract:
             raise AgentInputInvalid(f"{spec.agent_id} takes a {input_contract.__name__}")
+        if getattr(request.agent_input, "task_id", None) != request.task_id:
+            raise AgentInputInvalid("the input names another task than the run")
         input_json = request.agent_input.model_dump_json()
         if len(input_json.encode("utf-8")) > CONTEXT_MAX_BYTES:
             raise AgentInputTooLarge(f"the input is over {CONTEXT_MAX_BYTES} bytes (ADR-011)")
