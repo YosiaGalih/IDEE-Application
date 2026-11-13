@@ -6,7 +6,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta, tzinfo
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 from sqlalchemy import text, update
@@ -14,9 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.cancel import CancelToken
 from app.core.config import Settings
-from app.core.db import make_sessionmaker
-from app.llm.base import LLMError, LLMRequest, Message, Usage
-from app.llm.pricing import PricingTable, load_pricing
+from app.llm.base import LLMError, Usage
+from app.llm.pricing import PricingTable
 from app.llm.retry import AttemptRecord, create_with_retry
 from app.llm.scripted_provider import ScriptedProvider
 from app.models.projects import Project
@@ -35,10 +33,9 @@ from app.workflow.budget import (
 from tests.conftest import reset_data
 from tests.integration.test_task_schema import make_project, make_task
 from tests.integration.test_tool_tables import call
+from tests.usage_fakes import CAP, HAIKU, no_sleep, request
 
-BACKEND = Path(__file__).resolve().parents[2]
-HAIKU = "claude-haiku-5-5"
-BOUND, CAP = 1_000, 8_192
+BOUND = 1_000
 NEXT = CallBound(HAIKU, BOUND, CAP)
 
 
@@ -48,25 +45,10 @@ async def clean(engine: AsyncEngine) -> None:
 
 
 @pytest.fixture
-def pricing() -> PricingTable:
-    return load_pricing(BACKEND / "config" / "pricing.yaml")
-
-
-@pytest.fixture
-def sessions(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return make_sessionmaker(engine)
-
-
-@pytest.fixture
 def guard(
     sessions: async_sessionmaker[AsyncSession], pricing: PricingTable, settings: Settings
 ) -> BudgetGuard:
     return BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))
-
-
-@pytest.fixture
-def ledger(sessions: async_sessionmaker[AsyncSession], pricing: PricingTable) -> UsageLedger:
-    return UsageLedger(sessions, pricing)
 
 
 async def committed_task(
@@ -103,20 +85,6 @@ def attempt(n: int = 1, **overrides: object) -> AttemptRecord:
     }
     values.update(overrides)
     return AttemptRecord(**values)  # type: ignore[arg-type]
-
-
-def request(scenario: str, agent_id: str) -> LLMRequest:
-    return LLMRequest(
-        model=HAIKU,
-        system="s",
-        messages=(Message("user", "hi"),),
-        max_tokens=CAP,
-        metadata={"scenario": scenario, "agent_id": agent_id},
-    )
-
-
-async def no_sleep(_: float) -> None:
-    return None
 
 
 async def test_guard_reads_task_project_and_env_levels(session: AsyncSession, guard: BudgetGuard) -> None:

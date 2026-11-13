@@ -20,6 +20,9 @@ from app.core.config import Settings, load_settings
 
 BACKEND = Path(__file__).resolve().parents[1]
 
+# Ledger fixtures (pricing, sessions, ledger) shared by the usage and budget tests.
+pytest_plugins = ("tests.usage_fakes",)
+
 TEST_SECRET_KEY = "test-secret-key-" + "k" * 32
 TEST_SANDBOX_TOKEN = "test-sandbox-token-" + "s" * 32
 
