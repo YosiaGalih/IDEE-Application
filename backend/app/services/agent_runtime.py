@@ -16,6 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.runtime import BudgetRefused, LeaseLostError, ModelCall, ProviderBlocked, RunScope
 from app.core.config import Settings
+from app.core.events import EventBus, emit_task_event, publish_pending
+from app.core.money import decimal_str
+from app.core.redaction import Redactor
 from app.llm.retry import AttemptHandler
 from app.models.projects import Project
 from app.models.providers import ProviderConfig
@@ -26,7 +29,7 @@ from app.services.provider_readiness import (
     provider_calls_allowed,
     provider_ready,
 )
-from app.services.usage import UsageCallContext, UsageLedger
+from app.services.usage import EMPTY_TOTALS, UsageCallContext, UsageLedger, task_usage
 from app.workflow.budget import BudgetExceeded, BudgetGuard, CallBound
 from app.workflow.lease import LeaseLost, renew_lease
 
@@ -137,3 +140,52 @@ class LeaseHeartbeat:
                 await renew_lease(session, task_id, self._worker_id)
         except LeaseLost as exc:
             raise LeaseLostError(str(exc)) from exc
+
+
+class TaskRunEvents:
+    """``RunEvents``: run events of a task (API_CONTRACTS §5.1)."""
+
+    def __init__(
+        self, sessions: async_sessionmaker[AsyncSession], bus: EventBus | None, redactor: Redactor
+    ) -> None:
+        self._sessions = sessions
+        self._bus = bus
+        self._redactor = redactor
+
+    async def delta(self, scope: RunScope, text: str) -> None:
+        """``agent.delta``, ephemeral; skipped without a bus (never stored)."""
+        if self._bus is None:
+            return
+        async with self._sessions() as session:  # unused for an ephemeral event: no connection is opened
+            await emit_task_event(
+                session,
+                self._bus,
+                scope.task_id,
+                "agent.delta",
+                {"agent_run_id": str(scope.agent_run_id), "text": text},
+                redactor=self._redactor,
+                ephemeral=True,
+            )
+
+    async def usage_updated(self, scope: RunScope) -> None:
+        """``usage.updated`` with the task's totals from the ledger, money as decimal strings; its own
+        transaction, committed, then published."""
+        async with self._sessions() as session:
+            totals = (await task_usage(session, [scope.task_id])).get(scope.task_id, EMPTY_TOTALS)
+            cost = totals.estimated_cost
+            await emit_task_event(
+                session,
+                self._bus,
+                scope.task_id,
+                "usage.updated",
+                {
+                    "input_tokens": totals.input_tokens,
+                    "output_tokens": totals.output_tokens,
+                    "estimated_cost": decimal_str(cost) if cost is not None else None,
+                    "cost_status": totals.cost_status,
+                },
+                redactor=self._redactor,
+            )
+            await session.commit()
+            if self._bus is not None:
+                await publish_pending(session, self._bus)

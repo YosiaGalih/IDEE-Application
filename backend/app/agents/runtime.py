@@ -97,7 +97,69 @@ MIN_OUTPUT_TOKENS_PER_S: Final = 40.0  # the slowest output rate still waited fo
 # A field location is named only when it looks like a field name: a key the model invented is input too.
 _FIELD = re.compile(r"[a-z_][a-z0-9_]{0,39}")
 
+DELTA_HOLD_CHARS: Final = 256  # Keputusan Lead #24, #34: the redacted tail held back
+# The whole text is redacted again only after this many more raw characters (Keputusan Lead #34 keeps the
+# whole text; one redaction per 16-character delta took 5.3 s for 32 000 characters, measured in Task 6).
+DELTA_RELEASE_CHARS: Final = 256
+
 _log = get_logger(__name__)
+
+
+class DeltaRedactor:
+    """Streamed text of one attempt, redacted across deltas (Keputusan Lead #24, #34; Keputusan plan #12).
+
+    The whole text received so far is redacted, never a piece of it, so a secret cut across deltas is seen
+    whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
+    characters, minus what already went out. What went out is never rewritten: if redacting a longer text
+    changes it, nothing more goes out until the end, which then sends the final redacted text from the first
+    character that differs. ``reset`` (a retried attempt) drops the held text, never sending it."""
+
+    def __init__(
+        self,
+        redact: Callable[[str], str],
+        *,
+        hold: int = DELTA_HOLD_CHARS,
+        release: int = DELTA_RELEASE_CHARS,
+    ) -> None:
+        self._redact = redact
+        self._hold = hold
+        self._release = max(release, 1)
+        self.reset()
+
+    def feed(self, text: str) -> str:
+        """The redacted text that is now safe to send; "" when nothing is yet."""
+        self._text += text
+        if self._diverged or len(self._text) - self._redacted_at < self._release:
+            return ""
+        self._redacted_at = len(self._text)
+        redacted = self._redact(self._text)
+        if not redacted.startswith(self._sent):
+            self._diverged = True
+            return ""
+        stable = redacted[: max(len(redacted) - self._hold, 0)]
+        if len(stable) <= len(self._sent):
+            return ""
+        out = stable[len(self._sent) :]
+        self._sent = stable
+        return out
+
+    def flush(self) -> str:
+        """End of the stream: the rest, redacted; then a fresh start."""
+        redacted = self._redact(self._text)
+        common = 0
+        for sent_char, char in zip(self._sent, redacted, strict=False):
+            if sent_char != char:
+                break
+            common += 1
+        out = redacted[len(self._sent) :] if common == len(self._sent) else redacted[common:]
+        self.reset()
+        return out
+
+    def reset(self) -> None:
+        self._text = ""
+        self._sent = ""
+        self._redacted_at = 0
+        self._diverged = False
 
 
 class AgentInputInvalid(ValueError):
@@ -776,11 +838,26 @@ class AgentRuntime:
             call_id=call_id,
             scope=scope,
         )
+        deltas = DeltaRedactor(self._redactor.redact)
+
+        async def on_text_delta(text: str) -> None:
+            safe = deltas.feed(text)
+            if safe:
+                await self._ports.events.delta(scope, safe)
+
+        async def on_restart(attempt: int) -> None:
+            deltas.reset()  # the failed attempt's held text is dropped, never sent
+
         try:
-            response = await self._call_model(call, provider, cancel=run.stop.token)
+            response = await self._call_model(
+                call, provider, cancel=run.stop.token, on_text_delta=on_text_delta, on_restart=on_restart
+            )
         except LLMError:
             await self._ports.events.usage_updated(scope)  # the call reached the provider
             raise
+        rest = deltas.flush()
+        if rest:
+            await self._ports.events.delta(scope, rest)
         await self._ports.events.usage_updated(scope)
         return response
 

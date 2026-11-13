@@ -588,6 +588,32 @@ async def hold_lease(session: AsyncSession, task_id: uuid.UUID, worker_id: str =
     await session.commit()
 
 
+class RecordingBus:
+    """An ``EventBus`` that keeps every message. With ``engine``, each stored event (one with a seq) is looked
+    up from another connection as it is published: a publish before commit fails the test."""
+
+    def __init__(self, engine: Any = None) -> None:
+        self.messages: list[dict[str, Any]] = []
+        self.engine = engine
+        self.unseen: list[dict[str, Any]] = []
+
+    async def publish(self, channel: str, message: dict[str, Any]) -> None:
+        self.messages.append(message)
+        if self.engine is not None and message["seq"] is not None:
+            from sqlalchemy import text
+
+            async with self.engine.connect() as conn:
+                found = await conn.scalar(
+                    text("SELECT count(*) FROM task_events WHERE task_id = :t AND seq = :s"),
+                    {"t": uuid.UUID(message["task_id"]), "s": message["seq"]},
+                )
+            if not found:
+                self.unseen.append(message)
+
+    def of_type(self, event_type: str) -> list[dict[str, Any]]:
+        return [m for m in self.messages if m["type"] == event_type]
+
+
 @dataclass
 class Composition:
     runtime: AgentRuntime
@@ -607,15 +633,16 @@ def compose(
     registry: AgentRegistry = REGISTRY,
     worker_id: str = WORKER_ID,
     redactor: Redactor | None = None,
+    events: Any = None,
 ) -> Composition:
-    """The production ports over a real database, except the run store (``DbRunStore`` until Task 7) and
-    the events (``FakeEvents`` until Task 6); the provider is the given scripted one."""
+    """The production ports over a real database, except the run store (``DbRunStore`` until Task 7) and,
+    unless given, the events (``FakeEvents``); the provider is the given scripted one."""
     from app.services.agent_runtime import DbProviderGate, GuardBudget, LeaseHeartbeat, LedgerRecorder
     from app.services.usage import UsageLedger
     from app.workflow.budget import BudgetDefaults, BudgetGuard
 
     runs = DbRunStore(sessions)
-    events = FakeEvents()
+    events = events if events is not None else FakeEvents()
     providers = FakeProviders(provider)
     ports = RuntimePorts(
         gate=DbProviderGate(sessions, settings),
