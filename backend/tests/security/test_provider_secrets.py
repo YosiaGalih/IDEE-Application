@@ -102,7 +102,13 @@ def test_no_module_the_api_imports_reads_the_key() -> None:
     ).stdout
     loaded = json.loads(out.strip().splitlines()[-1])
     assert "app.api.routes.settings" in loaded and "app.services.provider_settings" in loaded
-    forbidden = {"app.llm.factory", "app.llm.anthropic_provider", "app.services.provider_smoke"}
+    forbidden = {
+        "app.llm.factory",
+        "app.llm.anthropic_provider",
+        "app.services.provider_smoke",
+        "app.services.agent_runtime",  # the worker's runtime assembly (plan WP-3.1f2a Task 3)
+        "app.agents.runtime",
+    }
     assert forbidden.isdisjoint(loaded), forbidden & set(loaded)
     readers = []
     for name in loaded:

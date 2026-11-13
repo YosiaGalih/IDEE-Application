@@ -121,7 +121,8 @@ forbidden_modules = ["app.models.agents"]
 name = "The api process never builds a provider or reads its key (spec 3.1e Lead decision #2, ADR-053)"
 type = "forbidden"
 source_modules = ["app.main", "app.api"]
-forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.services.provider_smoke", "app.worker"]
+forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.services.provider_smoke", "app.worker",
+                     "app.services.agent_runtime", "app.agents.runtime"]
 
 [[tool.importlinter.contracts]]
 name = "Routes reach the workflow only through services (thin routes, ARCHITECTURE §3.2; WP-3.1f1 review)"
@@ -137,6 +138,22 @@ type = "forbidden"
 source_modules = ["app.workflow.budget"]
 forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.llm.scripted_provider",
                      "app.llm.retry", "app.llm.readiness", "app.tools", "app.agents"]
+
+[[tool.importlinter.contracts]]
+name = "The agent runtime reaches the database, providers and events only through its ports (spec 3.1f #17, #21; ADR-022)"
+type = "forbidden"
+source_modules = ["app.agents.runtime"]
+forbidden_modules = ["sqlalchemy", "redis", "app.models", "app.core.db", "app.core.events", "app.core.audit",
+                     "app.llm.factory", "app.llm.anthropic_provider", "app.llm.scripted_provider",
+                     "app.llm.readiness", "app.llm.pricing", "app.tools.gateway"]
+allow_indirect_imports = true   # app.agents.grants -> app.tools.base -> sqlalchemy is a type import
+
+[[tool.importlinter.contracts]]
+name = "The runtime ends agent runs; it never moves a task (spec 3.1f #15, #30)"
+type = "forbidden"
+source_modules = ["app.agents.runtime", "app.services.agent_runtime"]
+forbidden_modules = ["app.workflow.states", "app.models.tasks"]
+allow_indirect_imports = true   # emit_task_event and the lease functions touch Task on their own
 
 [tool.ruff.lint.isort]
 known-third-party = ["alembic"]
