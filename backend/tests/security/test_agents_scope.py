@@ -34,7 +34,11 @@ async def test_runs_and_stats_only_from_visible_projects(app: FastAPI, engine: A
         engine, await add_task(engine, alices, alice, "running", "Private"), status="succeeded"
     )
     shared_run = await add_run(
-        engine, await add_task(engine, shared, alice, "running", "Shared"), status="failed", duration_ms=500
+        engine,
+        await add_task(engine, shared, alice, "running", "Shared"),
+        status="failed",
+        error_code="model_error",
+        duration_ms=500,
     )
 
     async def seen(email: str) -> dict[str, object]:

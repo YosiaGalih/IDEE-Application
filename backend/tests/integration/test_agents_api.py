@@ -152,7 +152,7 @@ async def test_detail_lists_runs_newest_first_with_stats(
     project = await add_project(engine, owner_id, "Runs")
     task = await add_task(engine, project, owner_id, "running", "Run task")
     await add_run(engine, task, status="succeeded", duration_ms=1000)
-    await add_run(engine, task, status="failed", duration_ms=3000)
+    await add_run(engine, task, status="failed", error_code="model_error", duration_ms=3000)
     await add_run(engine, task, status="running")
     body = (await owner.get(f"{AGENTS}/A02")).json()["data"]
     assert [run["status"] for run in body["recent_runs"]] == ["running", "failed", "succeeded"]
