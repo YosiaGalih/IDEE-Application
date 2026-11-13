@@ -154,6 +154,7 @@ async def test_deltas_are_redacted_and_never_stored(
     deltas = bus.of_type("agent.delta")
     assert len(deltas) >= 2  # streamed in more than one piece
     assert all(d["seq"] is None and d["payload"]["agent_run_id"] == str(result.agent_run_id) for d in deltas)
+    assert all(d["payload"]["reset"] is False for d in deltas)
     sent = "".join(d["payload"]["text"] for d in deltas)
     assert KEY not in sent and KEY[7:-4] not in sent
     assert sent == redactor.redact(text)
@@ -250,9 +251,12 @@ async def test_a_failed_attempt_leaves_no_held_text_behind(
     )
     result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
     assert result.status == "succeeded" and streamed == [1]
-    sent = "".join(d["payload"]["text"] for d in bus.of_type("agent.delta"))
+    events = bus.of_type("agent.delta")
+    sent = "".join(d["payload"]["text"] for d in events)
     assert "FIRSTATTEMPT" not in sent  # held (under 256 characters), then dropped on restart
-    assert sent.startswith("SECOND ")
+    # M4: the restart voids what the failed attempt showed: an empty reset first, then the retry's text.
+    assert (events[0]["payload"]["text"], events[0]["payload"]["reset"]) == ("", True)
+    assert sent.startswith("SECOND ") and not any(d["payload"]["reset"] for d in events[1:])
 
 
 async def test_run_started_is_committed_before_the_first_model_call(

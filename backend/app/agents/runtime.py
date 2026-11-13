@@ -112,14 +112,41 @@ DELTA_RELEASE_CHARS: Final = 256
 _log = get_logger(__name__)
 
 
+# Where a secret may still be growing at the end of the text: nothing goes out from the start of one until
+# it closes or the stream ends (reviews of 42bcb2e: M3, AG-13 INFO-3). Searched in the redacted text, so a
+# candidate the redactor already replaced holds nothing.
+_OPEN_CANDIDATES: Final = (
+    re.compile(r"eyJ[A-Za-z0-9_.\-]*\Z"),  # a token run that has not ended
+    re.compile(  # an open quote after a secret-like key
+        r"(?i)(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key"
+        r"|credentials?|authorization|cookie|session|jwt|bearer)"
+        r"\\?[\"']?\s*[:=]\s*\\?([\"'])(?:(?!\1).)*\Z",
+        re.DOTALL,
+    ),
+    re.compile(r"-----BEGIN(?:(?!-----END).)*\Z", re.DOTALL),  # a marker with no end yet
+)
+# Candidates are looked for from a little before what already went out: one straddling it holds the rest.
+_CANDIDATE_OVERLAP: Final = 32
+
+
+@dataclass(frozen=True, slots=True)
+class Delta:
+    """One ``agent.delta``: ``text`` is appended to what the client shows, or replaces it when ``reset``."""
+
+    text: str
+    reset: bool = False
+
+
 class DeltaRedactor:
-    """Streamed text of one attempt, redacted across deltas (Keputusan Lead #24, #34; Keputusan plan #12).
+    """Streamed text of one attempt, redacted across deltas (Keputusan Lead #24, #34; Keputusan plan #12;
+    reviews of 42bcb2e: M3, AG-13 INFO-3).
 
     The whole text received so far is redacted, never a piece of it, so a secret cut across deltas is seen
     whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
-    characters, minus what already went out. What went out is never rewritten: if redacting a longer text
-    changes it, nothing more goes out until the end, which then sends the final redacted text from the first
-    character that differs. ``reset`` (a retried attempt) drops the held text, never sending it."""
+    characters, and nothing from the start of a candidate still open at its end (``_OPEN_CANDIDATES``), minus
+    what already went out. When redacting a longer text changes what already went out, a ``reset`` delta
+    carries the whole stable text instead: the client replaces, never appends. ``reset()`` (a retried
+    attempt) drops the held text, never sending it."""
 
     def __init__(
         self,
@@ -133,32 +160,17 @@ class DeltaRedactor:
         self._release = max(release, 1)
         self.reset()
 
-    def feed(self, text: str) -> str:
-        """The redacted text that is now safe to send; "" when nothing is yet."""
+    def feed(self, text: str) -> Delta | None:
+        """What is now safe to send; ``None`` when nothing is yet."""
         self._text += text
-        if self._diverged or len(self._text) - self._redacted_at < self._release:
-            return ""
+        if len(self._text) - self._redacted_at < self._release:
+            return None
         self._redacted_at = len(self._text)
-        redacted = self._redact(self._text)
-        if not redacted.startswith(self._sent):
-            self._diverged = True
-            return ""
-        stable = redacted[: max(len(redacted) - self._hold, 0)]
-        if len(stable) <= len(self._sent):
-            return ""
-        out = stable[len(self._sent) :]
-        self._sent = stable
-        return out
+        return self._emit(self._redact(self._text), final=False)
 
-    def flush(self) -> str:
+    def flush(self) -> Delta | None:
         """End of the stream: the rest, redacted; then a fresh start."""
-        redacted = self._redact(self._text)
-        common = 0
-        for sent_char, char in zip(self._sent, redacted, strict=False):
-            if sent_char != char:
-                break
-            common += 1
-        out = redacted[len(self._sent) :] if common == len(self._sent) else redacted[common:]
+        out = self._emit(self._redact(self._text), final=True)
         self.reset()
         return out
 
@@ -166,7 +178,28 @@ class DeltaRedactor:
         self._text = ""
         self._sent = ""
         self._redacted_at = 0
-        self._diverged = False
+
+    def _emit(self, redacted: str, *, final: bool) -> Delta | None:
+        consistent = redacted.startswith(self._sent)
+        safe = len(redacted)
+        if not final:
+            origin = len(self._sent) if consistent else 0
+            safe = min(len(redacted) - self._hold, _open_from(redacted, max(origin - _CANDIDATE_OVERLAP, 0)))
+        stable = redacted[: max(safe, 0)]
+        if not consistent:
+            self._sent = stable
+            return Delta(stable, reset=True)
+        if len(stable) <= len(self._sent):
+            return None
+        out = Delta(stable[len(self._sent) :])
+        self._sent = stable
+        return out
+
+
+def _open_from(text: str, start: int) -> int:
+    """Where the first candidate still open at the end of ``text`` starts; ``len(text)`` when none is."""
+    found = [match.start() for pattern in _OPEN_CANDIDATES if (match := pattern.search(text, start))]
+    return min(found, default=len(text))
 
 
 class AgentInputInvalid(ValueError):
@@ -499,7 +532,7 @@ class RunStore(Protocol):
 
 
 class RunEvents(Protocol):
-    async def delta(self, scope: RunScope, text: str) -> None: ...
+    async def delta(self, scope: RunScope, text: str, *, reset: bool = False) -> None: ...
     async def usage_updated(self, scope: RunScope) -> None: ...
 
 
@@ -960,12 +993,11 @@ class AgentRuntime:
         sent = run.tally.sent
 
         async def on_text_delta(text: str) -> None:
-            safe = deltas.feed(text)
-            if safe:
-                await self._event(run, "agent.delta", self._ports.events.delta(scope, safe))
+            await self._delta(run, scope, deltas.feed(text))
 
         async def on_restart(attempt: int) -> None:
             deltas.reset()  # the failed attempt's held text is dropped, never sent
+            await self._delta(run, scope, Delta("", reset=True))  # M4: and what it did send is void
 
         try:
             response = await self._call_model(
@@ -979,11 +1011,15 @@ class AgentRuntime:
         except Exception:
             await self._usage_changed(run, scope, sent)
             raise
-        rest = deltas.flush()
-        if rest:
-            await self._event(run, "agent.delta", self._ports.events.delta(scope, rest))
+        await self._delta(run, scope, deltas.flush())
         await self._usage_changed(run, scope, sent)
         return response
+
+    async def _delta(self, run: _Run, scope: RunScope, delta: Delta | None) -> None:
+        if delta is not None:
+            await self._event(
+                run, "agent.delta", self._ports.events.delta(scope, delta.text, reset=delta.reset)
+            )
 
     async def _usage_changed(self, run: _Run, scope: RunScope, sent_before: int) -> None:
         """``usage.updated`` only when an attempt of this call reached the provider (review L3)."""

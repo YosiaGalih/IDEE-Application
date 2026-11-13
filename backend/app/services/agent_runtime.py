@@ -204,8 +204,9 @@ class TaskRunEvents:
         self._bus = bus
         self._redactor = redactor
 
-    async def delta(self, scope: RunScope, text: str) -> None:
-        """``agent.delta``, ephemeral; skipped without a bus (never stored)."""
+    async def delta(self, scope: RunScope, text: str, *, reset: bool = False) -> None:
+        """``agent.delta``, ephemeral; skipped without a bus (never stored). With ``reset`` the client
+        replaces its text with ``text`` instead of appending it."""
         if self._bus is None:
             return
         async with self._sessions() as session:  # unused for an ephemeral event: no connection is opened
@@ -214,7 +215,7 @@ class TaskRunEvents:
                 self._bus,
                 scope.task_id,
                 "agent.delta",
-                {"agent_run_id": str(scope.agent_run_id), "text": text},
+                {"agent_run_id": str(scope.agent_run_id), "text": text, "reset": reset},
                 redactor=self._redactor,
                 ephemeral=True,
             )
