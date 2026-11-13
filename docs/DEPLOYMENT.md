@@ -75,7 +75,7 @@ Prinsip:
 | `migrate` | `kodekantor/backend` | 10001 | app | idem, `restart: "no"` | 0.5 / 512M / 256 | — (one-shot; api/worker/scheduler menunggu `service_completed_successfully`) |
 | `worker` | `kodekantor/backend` | 10001 | app, outbound | idem | 2.0 / 2G / 1024 | `celery inspect ping` |
 | `scheduler` | `kodekantor/backend` | 10001 | app | idem, schedule di tmpfs | 0.25 / 256M / 128 | mtime file schedule beat |
-| `postgres` | `postgres:16.15-alpine` | 70 | app | cap_drop ALL, read-only + tmpfs socket, scram-sha-256 | 1.0 / 2G / 512 | `pg_isready` |
+| `postgres` | `postgres:16.16-alpine` | 70 | app | cap_drop ALL, read-only + tmpfs socket, scram-sha-256 | 1.0 / 2G / 512 | `pg_isready` |
 | `redis` | `redis:7.4.11-alpine` | 999 | app | cap_drop ALL, read-only, `requirepass` (file 0600 di tmpfs), AOF, `noeviction` | 0.5 / 512M / 128 | `redis-cli ping` (`REDISCLI_AUTH`) |
 | `sandbox-manager` | `kodekantor/sandbox-manager` (build `sandbox_manager/`) | 10001 (image) | app, exec | cap_drop ALL, read-only, **tanpa docker.sock** | 0.5 / 512M / 256 | `GET :8100/healthz` |
 | `docker-socket-proxy` | `kodekantor/socket-proxy` (tecnativa/docker-socket-proxy v0.5.0 + paket Alpine diperbaiki; `infra/socket-proxy/Dockerfile`) | root tanpa cap | exec | read-only, socket `:ro`, allowlist env | 0.25 / 128M / 128 | `GET :2375/_ping` |
