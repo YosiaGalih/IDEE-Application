@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -16,14 +15,13 @@ from pydantic import BaseModel
 
 from app.api.deps import CurrentActor
 from app.api.routes.projects import EnvDep, ProjectOut, _respond
+from app.api.routes.usage_out import CostStatus
 from app.core.money import Money
 from app.services import dashboard
 from app.services.dashboard import Dashboard, TaskSummaryView
 from app.services.usage import EMPTY_TOTALS, UsageTotals
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
-
-CostStatus = Literal["estimated", "partial", "actual", "unavailable"]
 
 
 class UsageOut(BaseModel):

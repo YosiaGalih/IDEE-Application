@@ -154,6 +154,15 @@ def test_repo_pricing_file_loads() -> None:
     assert table.version
 
 
+def test_api_usage_literals_match_the_ledger_checks() -> None:
+    """One CostStatus for the API (code review), equal to the values the ledger's CHECKs allow."""
+    from app.api.routes.usage_out import AttemptStatus, CostStatus
+    from app.models.enums import COST_STATUSES
+
+    assert get_args(CostStatus) == COST_STATUSES
+    assert get_args(AttemptStatus) == USAGE_ATTEMPT_STATUSES
+
+
 def test_ledger_enums_match_the_llm_port() -> None:
     """``app.models`` cannot import ``app.llm``: the ledger CHECKs copy the port's values, kept equal here."""
     assert set(LLM_ERROR_KINDS) == ERROR_KINDS

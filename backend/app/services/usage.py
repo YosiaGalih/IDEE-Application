@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.errors import AppError
 from app.core.money import stored_cost
-from app.llm.pricing import CostStatus, PricingTable
+from app.llm.pricing import EstimateStatus, PricingTable
 from app.llm.retry import AttemptHandler, AttemptRecord
 from app.models.agents import AgentRun
 from app.models.projects import Project
@@ -172,7 +172,7 @@ class UsageTotals:
     input_tokens: int | None
     output_tokens: int | None
     estimated_cost: Decimal | None  # None only when no row could be priced
-    cost_status: CostStatus
+    cost_status: EstimateStatus
 
 
 EMPTY_TOTALS: Final = UsageTotals(0, 0, Decimal(0), "estimated")
@@ -198,7 +198,7 @@ def aggregate(
     if unavailable == rows:
         return UsageTotals(known_input, known_output, None, "unavailable")
     cost = known_cost if known_cost is not None else Decimal(0)
-    status: CostStatus = "partial" if partial or unavailable else "estimated"
+    status: EstimateStatus = "partial" if partial or unavailable else "estimated"
     return UsageTotals(known_input, known_output, cost, status)
 
 

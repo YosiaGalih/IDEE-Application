@@ -13,18 +13,17 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.api.deps import CurrentActor
 from app.api.routes.projects import EnvDep, _respond
+from app.api.routes.usage_out import AttemptStatus, CostStatus
 from app.core.money import Money
 from app.models.usage import UsageRecord
 from app.services import usage
 from app.services.usage import PAGE_SIZE_DEFAULT, PAGE_SIZE_MAX, UsagePoint, UsageQuery, UsageTotals
 
 router = APIRouter(prefix="/usage", tags=["usage"])
-
-CostStatus = Literal["estimated", "partial", "actual", "unavailable"]
 
 
 class UsageTotalsOut(BaseModel):
@@ -63,7 +62,10 @@ class UsagePointOut(BaseModel):
 
 
 class UsageRecordOut(BaseModel):
-    """``UsageRecord`` (API_CONTRACTS §11.2) + the attempt fields FR-133 asks to show (additive)."""
+    """``UsageRecord`` (API_CONTRACTS §11.2) + the attempt fields FR-133 asks to show (additive). Read from
+    the ORM row, so ``status`` and ``cost_status`` are checked against their literals."""
+
+    model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     project_id: uuid.UUID
@@ -73,7 +75,7 @@ class UsageRecordOut(BaseModel):
     call_id: uuid.UUID
     attempt: int
     retry_count: int
-    status: str
+    status: AttemptStatus
     error_kind: str | None
     request_id: str | None
     provider: str
@@ -84,37 +86,14 @@ class UsageRecordOut(BaseModel):
     cache_read_tokens: int | None
     estimated_cost: Money | None
     actual_cost: None = None
-    cost_status: str  # ck_usage_records_cost_status
+    cost_status: CostStatus
     pricing_version: str | None
     duration_ms: int
     created_at: datetime
 
     @classmethod
     def of(cls, row: UsageRecord) -> UsageRecordOut:
-        return cls(
-            id=row.id,
-            project_id=row.project_id,
-            task_id=row.task_id,
-            agent_run_id=row.agent_run_id,
-            agent_id=row.agent_id,
-            call_id=row.call_id,
-            attempt=row.attempt,
-            retry_count=row.retry_count,
-            status=row.status,
-            error_kind=row.error_kind,
-            request_id=row.request_id,
-            provider=row.provider,
-            model=row.model,
-            input_tokens=row.input_tokens,
-            output_tokens=row.output_tokens,
-            cache_creation_tokens=row.cache_creation_tokens,
-            cache_read_tokens=row.cache_read_tokens,
-            estimated_cost=row.estimated_cost,
-            cost_status=row.cost_status,
-            pricing_version=row.pricing_version,
-            duration_ms=row.duration_ms,
-            created_at=row.created_at,
-        )
+        return cls.model_validate(row)
 
 
 class UsageOut(BaseModel):

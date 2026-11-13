@@ -18,7 +18,8 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 
 from app.llm.base import Usage
 
-CostStatus = Literal["estimated", "partial", "unavailable"]
+# What an estimate can say about its cost; "actual" (provider-reported, ADR-025) is never estimated.
+EstimateStatus = Literal["estimated", "partial", "unavailable"]
 
 _MILLION = Decimal(1_000_000)
 
@@ -77,7 +78,7 @@ class ModelPrice(_Prices):
 @dataclass(frozen=True, slots=True)
 class CostEstimate:
     estimated_cost: Decimal | None
-    cost_status: CostStatus
+    cost_status: EstimateStatus
     pricing_version: str
 
 
