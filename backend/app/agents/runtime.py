@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import string
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
@@ -138,23 +139,54 @@ DELTA_HOLD_CHARS: Final = 256  # Keputusan Lead #24, #34: the redacted tail held
 # The whole text is redacted again only after this many more raw characters (Keputusan Lead #34 keeps the
 # whole text; one redaction per 16-character delta took 5.3 s for 32 000 characters, measured in Task 6).
 DELTA_RELEASE_CHARS: Final = 256
+# Past DELTA_RELEASE_CHARS x DELTA_RELEASE_SHARE characters (8 KiB) the step grows with the text, to 1/32
+# of it: a 64 KiB attempt is redacted about 100 times instead of 256, in well under a second (AG-13 D-M1).
+DELTA_RELEASE_SHARE: Final = 32
 
 _log = get_logger(__name__)
 
 
-# Where a secret may still be growing at the end of the text: nothing goes out from the start of one until
-# it closes or the stream ends (reviews of 42bcb2e: M3, AG-13 INFO-3). Searched in the redacted text, so a
-# candidate the redactor already replaced holds nothing.
-_OPEN_CANDIDATES: Final = (
-    re.compile(r"eyJ[A-Za-z0-9_.\-]*\Z"),  # a token run that has not ended
-    re.compile(  # an open quote after a key the redactor treats as secret (one list: SENSITIVE_KEY_TAIL)
-        rf"(?i)(?:{SENSITIVE_KEY_TAIL})" r"\\?[\"']?\s*[:=]\s*\\?([\"'])(?:(?!\1).)*\Z",
-        re.DOTALL,
-    ),
-    re.compile(r"-----BEGIN(?:(?!-----END).)*\Z", re.DOTALL),  # a marker with no end yet
-)
-# Candidates are looked for from a little before what already went out: one straddling it holds the rest.
-_CANDIDATE_OVERLAP: Final = 32
+# Where a secret may still be growing at the end of the RAW text: nothing goes out from the start of one until
+# it closes or the call's stream ends (reviews of 42bcb2e: M3, AG-13 INFO-3; of 073e68d: AG-13 D-M1, D-L1).
+# Each check is a scan from the end at C speed, linear in the text: a `\Z`-anchored search tried from every
+# start was quadratic (a 64 KiB attempt took 90 s). The raw text, not the redacted one: _NETRC rewrites
+# `password = "…` to `password [REDACTED] "…` before the quote could be seen.
+_TOKEN_CHARS: Final = string.ascii_letters + string.digits + "_.-"
+_PEM_BEGIN: Final = "-----BEGIN"
+_PEM_END: Final = "-----END"
+# A key the redactor treats as secret (one list: SENSITIVE_KEY_TAIL) and its separator, right before a quote.
+_KEY_BEFORE_QUOTE: Final = re.compile(rf"(?i)(?:{SENSITIVE_KEY_TAIL})" r"\\?[\"']?\s*[:=]\s*\\?\Z")
+_KEY_WINDOW: Final = 128  # how far before the quote the key and its separator are looked for
+
+
+def open_candidate(text: str) -> int | None:
+    """Where the first candidate still open at the end of ``text`` starts, or None: an ``eyJ`` token run that
+    has not ended, a ``-----BEGIN`` with no ``-----END`` after it, an opening quote with no closing one after
+    it, right after a secret-like key."""
+    found: list[int] = []
+    run = text.find("eyJ", len(text.rstrip(_TOKEN_CHARS)))
+    if run != -1:
+        found.append(run)
+    last_end = text.rfind(_PEM_END)
+    begin = text.find(_PEM_BEGIN, 0 if last_end == -1 else last_end + 1)
+    if begin != -1:
+        found.append(begin)
+    for quote in "\"'":
+        at = text.rfind(quote)  # the last one: no quote of its kind closes it
+        if at != -1 and (key := _KEY_BEFORE_QUOTE.search(text, max(at - _KEY_WINDOW, 0), at)):
+            found.append(key.start())
+    return min(found, default=None)
+
+
+def _common_prefix(a: str, b: str) -> int:
+    low, high = 0, min(len(a), len(b))
+    while low < high:  # slices compared at C speed: O(n log n)
+        middle = (low + high + 1) // 2
+        if a[:middle] == b[:middle]:
+            low = middle
+        else:
+            high = middle - 1
+    return low
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,15 +198,19 @@ class Delta:
 
 
 class DeltaRedactor:
-    """Streamed text of one attempt, redacted across deltas (Keputusan Lead #24, #34; Keputusan plan #12;
-    reviews of 42bcb2e: M3, AG-13 INFO-3).
+    """The streamed text of a run, redacted across deltas (Keputusan Lead #24, #34; Keputusan plan #12;
+    reviews of 42bcb2e: M3, AG-13 INFO-3, M4; of 073e68d: item 11, AG-13 D-M1, D-L1).
 
-    The whole text received so far is redacted, never a piece of it, so a secret cut across deltas is seen
-    whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
-    characters, and nothing from the start of a candidate still open at its end (``_OPEN_CANDIDATES``), minus
-    what already went out. When redacting a longer text changes what already went out, a ``reset`` delta
-    carries the whole stable text instead: the client replaces, never appends. ``reset()`` (a retried
-    attempt) drops the held text, never sending it."""
+    The text of the current model call is redacted whole, never a piece of it, so a secret cut across deltas
+    is seen whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
+    characters, and nothing from the start of a candidate still open at the end of the raw text
+    (``open_candidate``), minus what already went out. ``flush`` ends the call: its final redacted text goes
+    out and is committed, never redacted again. When redacting a longer text changes what already went out, a
+    ``reset`` delta carries the committed text of the calls before, then the current call's stable text: the
+    client replaces, never appends. ``restart`` (a retried attempt) voids the current call's text, held or
+    sent: its reset carries the committed text. The whole text is redacted again every ``release`` raw
+    characters, or every 1/``DELTA_RELEASE_SHARE`` of the text once that is longer, so a stream costs about
+    ``DELTA_RELEASE_SHARE`` redactions of its length, never a quadratic number."""
 
     def __init__(
         self,
@@ -186,48 +222,63 @@ class DeltaRedactor:
         self._redact = redact
         self._hold = hold
         self._release = max(release, 1)
+        self._committed = ""
         self.reset()
 
     def feed(self, text: str) -> Delta | None:
         """What is now safe to send; ``None`` when nothing is yet."""
         self._text += text
-        if len(self._text) - self._redacted_at < self._release:
+        step = max(self._release, len(self._text) // DELTA_RELEASE_SHARE)
+        if len(self._text) - self._redacted_at < step:
             return None
         self._redacted_at = len(self._text)
         return self._emit(self._redact(self._text), final=False)
 
     def flush(self) -> Delta | None:
-        """End of the stream: the rest, redacted; then a fresh start."""
-        out = self._emit(self._redact(self._text), final=True)
+        """End of the call: the rest, redacted; the call's text is committed; the next call starts empty."""
+        redacted = self._redact(self._text)
+        out = self._emit(redacted, final=True)
+        self._committed += redacted
         self.reset()
         return out
 
+    def restart(self) -> Delta:
+        """A retried attempt: its text is void; the client goes back to the committed text."""
+        self.reset()
+        return Delta(self._committed, reset=True)
+
     def reset(self) -> None:
+        """Drops the current call's text, never sending what is held."""
         self._text = ""
         self._sent = ""
         self._redacted_at = 0
+        self._before: tuple[int, str] | None = None  # (candidate start, redaction of the raw text before it)
 
     def _emit(self, redacted: str, *, final: bool) -> Delta | None:
         consistent = redacted.startswith(self._sent)
         safe = len(redacted)
         if not final:
-            origin = len(self._sent) if consistent else 0
-            safe = min(len(redacted) - self._hold, _open_from(redacted, max(origin - _CANDIDATE_OVERLAP, 0)))
+            safe -= self._hold
+            start = open_candidate(self._text)
+            if start is not None:
+                safe = min(safe, self._redacted_before(start, redacted))
         stable = redacted[: max(safe, 0)]
         if not consistent:
             self._sent = stable
-            return Delta(stable, reset=True)
+            return Delta(self._committed + stable, reset=True)
         if len(stable) <= len(self._sent):
             return None
         out = Delta(stable[len(self._sent) :])
         self._sent = stable
         return out
 
-
-def _open_from(text: str, start: int) -> int:
-    """Where the first candidate still open at the end of ``text`` starts; ``len(text)`` when none is."""
-    found = [match.start() for pattern in _OPEN_CANDIDATES if (match := pattern.search(text, start))]
-    return min(found, default=len(text))
+    def _redacted_before(self, start: int, redacted: str) -> int:
+        """How much of ``redacted`` comes from the raw text before ``start`` alone: its common prefix with the
+        redaction of that text (kept while the same candidate stays open)."""
+        if self._before is None or self._before[0] != start:
+            self._before = (start, self._redact(self._text[:start]))
+        before = self._before[1]
+        return len(before) if redacted.startswith(before) else _common_prefix(before, redacted)
 
 
 class AgentInputInvalid(ValueError):
@@ -699,6 +750,9 @@ class _Run:
     output_contract: type[Contract]
     input_content: str  # the <agent_input> content: redacted, escaped, within CONTEXT_MAX_BYTES
     deadline: float
+    deltas: (
+        DeltaRedactor  # the run's streamed text, one for all its model calls (a reset shows the run's text)
+    )
     stop: _RunStop = field(default_factory=_RunStop)
     tally: _Tally = field(default_factory=_Tally)
     agent_run_id: uuid.UUID | None = None
@@ -835,6 +889,7 @@ class AgentRuntime:
             runtime_id=runtime_id,
             output_contract=output_contract,
             input_content=content,
+            deltas=DeltaRedactor(self._redactor.redact),
             deadline=self._clock() + spec.limits.timeout_seconds,
         )
 
@@ -1071,15 +1126,15 @@ class AgentRuntime:
             call_id=call_id,
             scope=scope,
         )
-        deltas = DeltaRedactor(self._redactor.redact)
+        deltas = run.deltas
         sent = run.tally.sent
 
         async def on_text_delta(text: str) -> None:
             await self._delta(run, scope, deltas.feed(text))
 
         async def on_restart(attempt: int) -> None:
-            deltas.reset()  # the failed attempt's held text is dropped, never sent
-            await self._delta(run, scope, Delta("", reset=True))  # M4: and what it did send is void
+            # M4: the failed attempt's text, held or sent, is void; the client goes back to the calls before.
+            await self._delta(run, scope, deltas.restart())
 
         try:
             response = await self._call_model(

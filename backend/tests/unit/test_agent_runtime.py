@@ -1566,3 +1566,46 @@ async def test_the_input_limit_is_measured_on_what_is_sent() -> None:
     with pytest.raises(AgentInputTooLarge):
         await make_runtime(fakes).run(run_request("A02", task_id=uuid.UUID(UUID_A), agent_input=value))
     assert fakes.runs.starts == [] and fakes.log == []
+
+
+class StreamsByPlan:
+    """Each request streams its planned text first; a planned failure then raises a transient error, else the
+    inner provider answers."""
+
+    def __init__(self, inner: Any, plan: list[tuple[str, bool]]) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.plan = list(plan)
+
+    async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+        text, fails = self.plan.pop(0)
+        assert on_text_delta is not None
+        await on_text_delta(text)
+        if fails:
+            raise LLMError("overloaded")
+        return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_a_restart_in_the_second_call_keeps_the_first_calls_text() -> None:
+    """Item 11 (/code-review Spec of 073e68d, API_CONTRACTS §5.1): a reset replaces the run's whole text, so
+    the restart of the second call goes back to the first call's text, not to an empty one, and the client
+    ends with the first call's text and the retried second call's."""
+    secret = 'password="' + "Zq7" * 200
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+    plan = [
+        ("First call text. ", False),
+        ("Second call, failed. " + secret, True),
+        ("Second, retried.", False),
+    ]
+    fakes.providers.provider = StreamsByPlan(fakes.providers.provider, plan)  # type: ignore[assignment]
+    assert (await run_b14(fakes)).status == "succeeded"
+    shown = ""
+    for text, reset in zip(fakes.events.deltas, fakes.events.resets, strict=True):
+        shown = text if reset else shown + text
+    assert shown == "First call text. Second, retried."
+    assert fakes.events.resets.count(True) == 1
+    assert fakes.events.deltas[fakes.events.resets.index(True)] == "First call text. "
+    assert not any("Zq7" in text for text in fakes.events.deltas)
