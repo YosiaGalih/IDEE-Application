@@ -174,3 +174,12 @@ async def test_requests_are_not_kept_unless_asked() -> None:
     scripted = ScriptedProvider()
     await scripted.create_message(request(scenario="generic"))
     assert scripted.requests == []  # prompts are not held in memory by a long-running demo worker
+
+
+async def test_aclose_keeps_recorded_requests() -> None:
+    provider = ScriptedProvider(record_requests=True)
+    request = LLMRequest(model="m", system="s", messages=(Message("user", "hi"),))
+    await provider.create_message(request)
+    await provider.aclose()
+    await provider.aclose()
+    assert provider.requests == [request]

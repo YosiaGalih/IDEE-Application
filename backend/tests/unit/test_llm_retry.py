@@ -562,3 +562,70 @@ async def test_a_second_cancel_while_the_cancel_is_recorded_does_not_lose_the_ro
     gate.set()
     await asyncio.wait_for(written.wait(), 5)
     assert [(r.status, r.error_kind, r.usage) for r in records] == [("cancelled", "cancelled", None)]
+
+
+async def test_a_ledger_failure_after_a_second_cancel_is_still_logged() -> None:
+    """AG-13 3.1f1 N-1: the shielded ledger write of a cancelled attempt fails only after a second cancel
+    has already stopped the caller. The failure is logged once, ids only, and retrieved: never left as
+    "Task exception was never retrieved"."""
+    import gc
+
+    from structlog.testing import capture_logs
+
+    entered, reporting, gate = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    failed = asyncio.Event()
+
+    class Hanging(FakeProvider):
+        async def create_message(self, req, *, on_text_delta=None, cancel=None):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class LedgerDown(Exception):
+        pass
+
+    async def on_attempt(record: AttemptRecord) -> None:
+        reporting.set()
+        await gate.wait()
+        failed.set()
+        raise LedgerDown("usage_records is unavailable")
+
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, object]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _, context: unhandled.append(context))
+    req = LLMRequest(
+        model="claude-test-model",
+        system="the secret system prompt",
+        messages=(Message("user", "the secret user text"),),
+        metadata={"call_id": "call-9"},
+    )
+    try:
+        with capture_logs() as logs:
+            caller = asyncio.create_task(create_with_retry(Hanging([]), req, on_attempt=on_attempt))
+            await asyncio.wait_for(entered.wait(), 5)
+            caller.cancel()
+            await asyncio.wait_for(reporting.wait(), 5)
+            caller.cancel()  # the second cancel: nobody awaits the ledger write any more
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            gate.set()
+            await asyncio.wait_for(failed.wait(), 5)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous)
+    assert [log for log in logs if log["event"] == "usage_attempt_unrecorded"] == [
+        {
+            "event": "usage_attempt_unrecorded",
+            "log_level": "error",
+            "call_id": "call-9",
+            "attempt": 1,
+            "error_type": "LedgerDown",
+        }
+    ]
+    assert "secret" not in repr(logs)
+    assert not [c for c in unhandled if "never retrieved" in str(c.get("message", ""))]

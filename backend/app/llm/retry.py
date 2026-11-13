@@ -19,6 +19,7 @@ error is passed on rather than streaming the answer twice.
 from __future__ import annotations
 
 import asyncio
+import functools
 import random
 import time
 from collections.abc import Awaitable, Callable
@@ -104,17 +105,19 @@ async def create_with_retry(
         except asyncio.CancelledError as cancelled:
             # The caller was cancelled mid-attempt: the request still reached the provider. Its usage is not
             # known here, so the record says so (None, priced "unavailable"), never zero.
+            report = asyncio.ensure_future(
+                _report(on_attempt, provider, req, attempt, started, cancelled=True)
+            )
+            # A failed write is logged by the callback, also when a second cancel left nobody awaiting it
+            # (AG-13 3.1f1 N-1).
+            report.add_done_callback(
+                functools.partial(_log_if_unrecorded, req.metadata.get("call_id"), attempt)
+            )
             try:
                 # Shielded (AG-13 L-D2, as in the gateway): a second cancel cannot stop the ledger write.
-                await asyncio.shield(_report(on_attempt, provider, req, attempt, started, cancelled=True))
+                await asyncio.shield(report)
             except Exception as unrecorded:
-                # The cancel still wins (review L7), but a lost ledger row is never silent: ids only, no text.
-                _log.error(
-                    "usage_attempt_unrecorded",
-                    call_id=req.metadata.get("call_id"),
-                    attempt=attempt,
-                    error_type=type(unrecorded).__name__,
-                )
+                # The cancel still wins (review L7); the callback has logged the lost row.
                 raise cancelled from unrecorded
             raise
         except Exception:
@@ -122,6 +125,18 @@ async def create_with_retry(
             raise
         await _report(on_attempt, provider, req, attempt, started, response=response)
         return response
+
+
+def _log_if_unrecorded(call_id: str | None, attempt: int, report: asyncio.Future[None]) -> None:
+    """Done callback of a shielded cancel report: a failed write is logged once, ids only, and retrieved,
+    whether or not anyone still awaits it (AG-13 3.1f1 N-1). A lost ledger row is never silent."""
+    if report.cancelled():
+        return
+    unrecorded = report.exception()
+    if unrecorded is not None:
+        _log.error(
+            "usage_attempt_unrecorded", call_id=call_id, attempt=attempt, error_type=type(unrecorded).__name__
+        )
 
 
 def _delay(policy: RetryPolicy, attempt: int, error: LLMError, rng: Callable[[], float]) -> float | None:

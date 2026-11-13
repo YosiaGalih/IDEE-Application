@@ -334,3 +334,113 @@ async def test_build_agent_runtime_assembles_the_production_ports(
     ]
     stored = await session.get(AgentRun, result.agent_run_id)
     assert stored is not None and stored.status == "succeeded" and stored.input_tokens == 100
+
+
+class ClosingProvider:
+    """A scripted provider that may answer slowly and counts its ``aclose``."""
+
+    name = "scripted"
+
+    def __init__(self, *turns: Any, slow: float = 0.0) -> None:
+        from tests.runtime_fakes import SlowProvider
+
+        self.inner = scripted(*turns)
+        self.requests = self.inner.requests
+        self.answer: Any = SlowProvider(self.inner, slow) if slow else self.inner
+        self.closed = 0
+
+    async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+        return await self.answer.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+@pytest.mark.parametrize(
+    "ending", ["succeeded", "model_error", "caller_cancel", "asyncio_cancel", "gate_after_open"]
+)
+async def test_the_provider_is_closed_after_every_run(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+    ending: str,
+) -> None:
+    """One provider per run, built by the factory and closed after it, whatever the ending (Keputusan Lead
+    #28)."""
+    import asyncio
+
+    from app.agents.runtime import ProviderBlocked
+    from app.core.cancel import CancelToken
+    from app.llm.scenarios.model import Fail
+    from app.services.agent_runtime import SettingsProviderFactory
+    from tests.runtime_fakes import FakeGate, FakeTools
+
+    project_id, task_id = await a_task(session, settings)
+    slow = 5.0 if ending in {"caller_cancel", "asyncio_cancel"} else 0.0
+    built: list[ClosingProvider] = []
+
+    def build(_: Settings) -> Any:
+        built.append(ClosingProvider(Fail("refusal") if ending == "model_error" else DONE, slow=slow))
+        return built[-1]
+
+    gate = None
+    if ending == "gate_after_open":
+        gate = FakeGate([], refuse={2: ProviderBlocked("PROVIDER_DISABLED", "kill_switch")})
+    run = compose(
+        sessions,
+        settings,
+        pricing,
+        scripted(DONE),
+        tools=FakeTools([]),
+        gate=gate,
+        providers=SettingsProviderFactory(settings, build=build),
+    )
+    cancel = CancelToken()
+    task = asyncio.create_task(
+        run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id, cancel=cancel))
+    )
+    if ending == "caller_cancel":
+        await asyncio.sleep(0.2)
+        cancel.cancel()
+    if ending == "asyncio_cancel":
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        result = await asyncio.wait_for(task, 5)
+        expected = {
+            "succeeded": ("succeeded", None),
+            "model_error": ("failed", "model_error"),
+            "caller_cancel": ("cancelled", None),
+            "gate_after_open": ("failed", "PROVIDER_DISABLED"),
+        }[ending]
+        assert (result.status, result.error_code) == expected
+    assert len(built) == 1 and built[0].closed == 1
+
+
+async def test_a_worker_without_a_key_ends_provider_not_ready(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable
+) -> None:
+    """``LLM_PROVIDER=anthropic`` without a key and without required readiness: the gate passes
+    (``readiness_not_required``), the factory cannot build a provider, the run ends ``provider_not_ready``
+    with no request. With readiness required, the gate refuses first (``key_missing``, Task 4)."""
+    from app.services.agent_runtime import SettingsProviderFactory
+    from tests.runtime_fakes import FakeTools
+
+    settings = worker(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="", LLM_REQUIRE_READINESS="false")
+    project_id, task_id = await a_task(session, settings)
+    run = compose(
+        sessions,
+        settings,
+        pricing,
+        scripted(DONE),
+        tools=FakeTools([]),
+        providers=SettingsProviderFactory(settings),
+    )
+    result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert (result.status, result.error_code) == ("failed", "provider_not_ready")
+    assert result.error is not None and "no_provider" in result.error
+    stored = await session.get(AgentRun, result.agent_run_id)
+    assert stored is not None and (stored.model_provider, stored.model_name) == (None, None)

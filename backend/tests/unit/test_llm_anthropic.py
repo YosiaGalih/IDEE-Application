@@ -513,3 +513,21 @@ async def test_odd_request_ids_are_dropped(request_id: str) -> None:
 async def test_a_long_plain_request_id_is_kept() -> None:
     response = await call(FakeAnthropic(lambda _: stream_response(HELLO, request_id="req_" + "a" * 124)))
     assert response.request_id == "req_" + "a" * 124
+
+
+async def test_aclose_closes_the_http_client() -> None:
+    adapter = provider(FakeAnthropic(lambda _: stream_response(HELLO)))
+    assert not adapter._client.is_closed()
+    await adapter.aclose()
+    assert adapter._client.is_closed()
+    await adapter.aclose()  # a second close is harmless
+
+
+async def test_a_call_after_aclose_does_not_reach_the_transport() -> None:
+    fake = FakeAnthropic(lambda _: stream_response(HELLO))
+    adapter = AnthropicClaudeProvider("sk-ant-api03-" + "closed-" + "k" * 20, transport=fake.transport())
+    await adapter.aclose()
+    with pytest.raises(LLMError) as raised:
+        await adapter.create_message(REQ)
+    assert fake.requests == []
+    assert "closed-" not in str(raised.value) and "sk-ant" not in str(raised.value)

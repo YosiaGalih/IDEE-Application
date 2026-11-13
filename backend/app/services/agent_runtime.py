@@ -8,7 +8,8 @@ worker builds a provider and holds the key: import-linter, tests/security/test_p
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -39,6 +40,8 @@ from app.core.config import Settings
 from app.core.events import EventBus, emit_task_event, publish_pending
 from app.core.money import decimal_str, stored_cost
 from app.core.redaction import Redactor
+from app.llm.base import LLMProvider
+from app.llm.factory import ProviderNotConfigured, build_provider
 from app.llm.pricing import PricingTable
 from app.llm.retry import AttemptHandler
 from app.models.agents import AgentRun
@@ -394,8 +397,6 @@ def build_agent_runtime(
 ) -> AgentRuntime:
     """The worker's AgentRuntime: every port over the database, the production tool gateway, one redactor
     (the audit's, with the configured secret literals) for everything the runtime writes or sends."""
-    if providers is None:
-        raise ValueError("a provider factory is needed (SettingsProviderFactory: plan WP-3.1f2a Task 8)")
     redactor = audit.redactor
     ports = RuntimePorts(
         gate=DbProviderGate(sessions, settings),
@@ -405,7 +406,7 @@ def build_agent_runtime(
         events=TaskRunEvents(sessions, bus, redactor),
         tools=tools if tools is not None else build_tool_gateway(sessions=sessions, audit=audit, bus=bus),
         heartbeat=LeaseHeartbeat(sessions, worker_id),
-        providers=providers,
+        providers=providers if providers is not None else SettingsProviderFactory(settings),
     )
     return AgentRuntime(
         registry=registry,
@@ -419,3 +420,29 @@ def build_agent_runtime(
         ),
         redactor=redactor,
     )
+
+
+class SettingsProviderFactory:
+    """``ProviderFactory``: one provider per run, built from the worker's settings and closed after the run
+    (Keputusan Lead #28; syarat 3.1a #6)."""
+
+    def __init__(
+        self, settings: Settings, *, build: Callable[[Settings], LLMProvider] = build_provider
+    ) -> None:
+        self._settings = settings
+        self._build = build
+
+    @asynccontextmanager
+    async def open(self) -> AsyncIterator[LLMProvider]:
+        """``ProviderNotConfigured`` (no key in this process) -> ``ProviderBlocked('provider_not_ready',
+        'no_provider')``; ``aclose()`` in ``finally``, also when the run fails or is cancelled."""
+        try:
+            provider = self._build(self._settings)
+        except ProviderNotConfigured as exc:
+            raise ProviderBlocked("provider_not_ready", "no_provider") from exc
+        try:
+            yield provider
+        finally:
+            close = getattr(provider, "aclose", None)  # LLMProvider stays as it is; both adapters have one
+            if close is not None:
+                await close()

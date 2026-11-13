@@ -586,6 +586,8 @@ def compose(
     redactor: Redactor | None = None,
     events: Any = None,
     bus: Any = None,
+    gate: Any = None,
+    providers: Any = None,
 ) -> Composition:
     """The production ports over a real database; the events are ``TaskRunEvents`` over ``bus`` when one is
     given, else ``events`` or ``FakeEvents``; the provider is the given scripted one. ``build_agent_runtime``
@@ -606,9 +608,9 @@ def compose(
     runs = AgentRunWriter(sessions, bus, AuditWriter(redactor))
     if events is None:
         events = TaskRunEvents(sessions, bus, redactor) if bus is not None else FakeEvents()
-    providers = FakeProviders(provider)
+    providers = providers if providers is not None else FakeProviders(provider)
     ports = RuntimePorts(
-        gate=DbProviderGate(sessions, settings),
+        gate=gate if gate is not None else DbProviderGate(sessions, settings),
         budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
         ledger=LedgerRecorder(UsageLedger(sessions, pricing)),
         runs=runs,

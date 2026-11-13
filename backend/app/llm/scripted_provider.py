@@ -34,6 +34,10 @@ class ScriptedProvider:
         self._record_requests = record_requests  # tests only: a demo worker must not keep every prompt
         self.requests: list[LLMRequest] = []
 
+    async def aclose(self) -> None:
+        """Nothing to release; the same shape as the adapter's (one provider per run, Keputusan Lead #28).
+        ``requests`` stay readable for tests."""
+
     async def create_message(
         self,
         req: LLMRequest,
