@@ -7,10 +7,25 @@ worker builds a provider and holds the key: import-linter, tests/security/test_p
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from app.agents.runtime import BudgetRefused, ModelCall, RunScope
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.agents.runtime import BudgetRefused, ModelCall, ProviderBlocked, RunScope
+from app.core.config import Settings
 from app.llm.retry import AttemptHandler
+from app.models.projects import Project
+from app.models.providers import ProviderConfig
+from app.services.provider_readiness import (
+    PROVIDER,
+    WorkerCredentials,
+    effective_models,
+    provider_calls_allowed,
+    provider_ready,
+)
 from app.services.usage import UsageCallContext, UsageLedger
 from app.workflow.budget import BudgetExceeded, BudgetGuard, CallBound
 
@@ -69,3 +84,35 @@ class LedgerRecorder:
 
     def on_attempt(self, call: ModelCall) -> AttemptHandler:
         return self._ledger.recorder(bind_model_call(call).ledger)
+
+
+class DbProviderGate:
+    """``ProviderGate``: the provider readiness gate and the project's kill switch (Keputusan Lead #16)."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession], settings: Settings) -> None:
+        """Holds WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url): the worker's own
+        key and endpoint, read once (the process env). The api process never imports this module."""
+        self._sessions = sessions
+        self._settings = settings
+        self._held = WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url)
+
+    async def check(self, project_id: uuid.UUID) -> Mapping[str, str]:
+        """One short read-only session per call: a switch flipped mid-run counts on the next attempt.
+        ``provider_ready`` first ('disabled' -> PROVIDER_DISABLED; 'not_ready'/'unknown' ->
+        provider_not_ready), then the kill switch (anything but true -> PROVIDER_DISABLED). A missing project
+        fails closed. Returns the effective model per tier."""
+        async with self._sessions() as session:
+            row = (
+                await session.scalars(select(ProviderConfig).where(ProviderConfig.provider == PROVIDER))
+            ).one_or_none()
+            project = (await session.scalars(select(Project).where(Project.id == project_id))).one_or_none()
+        verdict = provider_ready(row, self._settings, held=self._held)
+        if verdict.state == "disabled":
+            raise ProviderBlocked("PROVIDER_DISABLED", verdict.reason)
+        if not verdict.ready:
+            raise ProviderBlocked("provider_not_ready", verdict.reason)
+        if project is None:
+            raise ProviderBlocked("PROVIDER_DISABLED", "project_missing")
+        if not provider_calls_allowed(project):
+            raise ProviderBlocked("PROVIDER_DISABLED", "kill_switch")
+        return effective_models(self._settings, (row.model_policy or {}) if row is not None else {})
