@@ -381,6 +381,37 @@ async def test_fail_is_the_minimal_end_of_a_running_run(
     assert (await stored(session, run_id)).error_code == "internal_error"
 
 
+async def test_the_minimal_end_publishes_run_finished_once(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Review N6 of 073e68d: ``fail`` emits ``agent.run_finished`` in its UPDATE's transaction, only when the
+    UPDATE matched a running row: ``failed internal_error``, usage unknown (tokens and cost null,
+    ``unavailable``), in the envelope ``finish`` uses."""
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus(engine)
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    run_id = await writer.start(start(task_id, project_id))
+    await writer.fail(run_id)
+    (finished,) = bus.of_type("agent.run_finished")
+    assert finished["payload"] == {
+        "agent_run_id": str(run_id),
+        "agent_id": "B14",
+        "status": "failed",
+        "error_code": "internal_error",
+        "usage": {
+            "input_tokens": None,
+            "output_tokens": None,
+            "estimated_cost": None,
+            "cost_status": "unavailable",
+        },
+    }
+    assert finished["seq"] is not None and bus.unseen == []  # stored, committed, then published
+    row = await stored(session, run_id)
+    assert (row.input_tokens, row.estimated_cost, row.cost_status) == (None, None, "unavailable")
+    await writer.fail(run_id)  # nothing matched: no second event
+    assert len(bus.of_type("agent.run_finished")) == 1
+
+
 async def test_the_run_store_keeps_no_project_of_an_ended_run(
     session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
 ) -> None:

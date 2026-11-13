@@ -33,6 +33,7 @@ from app.agents.runtime import (
     LeaseLostError,
     PendingTool,
     ProviderBlocked,
+    RunAlreadyFinished,
     RunEnd,
     ScenarioNotAllowed,
     StopReason,
@@ -1393,3 +1394,37 @@ async def test_an_attempt_stopped_during_its_restart_is_not_counted_as_sent() ->
     end = ended(fakes)
     assert (end.error_code, end.usage_complete) == ("worker_cancelled", True)
     assert len(fakes.ledger.records) == 1 and fakes.events.resets == [True]
+
+
+class AckLostRuns(FakeRuns):
+    """The first finish commits, then its ack is lost; the retry finds the run already finished."""
+
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+        if not self.finishes:
+            await super().finish(agent_run_id, end)
+            raise ConnectionError("the commit's ack was lost")
+        raise RunAlreadyFinished(f"agent run {agent_run_id} is not running")
+
+
+async def test_a_retried_finish_that_finds_the_run_finished_is_not_unfinished() -> None:
+    """Review N4: the retry finds the row terminal, so the first write committed and only its ack was lost.
+    That is logged as ``agent_run_already_finished`` with the run's ids, no minimal end is written over it,
+    and the caller still gets ``AgentRunUnfinished``: the outcome is not known to it; the row is the truth."""
+    from structlog.testing import capture_logs
+
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.runs = AckLostRuns()
+    request = run_request("B14")
+    with capture_logs() as logs:
+        with pytest.raises(AgentRunUnfinished):
+            await make_runtime(fakes).run(request)
+    assert fakes.runs.failed_runs == []
+    assert len(fakes.runs.finishes) == 1 and fakes.runs.finishes[0][1].status == "succeeded"
+    lines = [log for log in logs if log["event"].startswith("agent_run_")]
+    assert [(log["event"], log["attempt"]) for log in lines] == [
+        ("agent_run_unfinished", 1),
+        ("agent_run_already_finished", 2),
+    ]
+    (run_id,) = fakes.runs.ids
+    assert lines[1]["task_id"] == str(request.task_id)
+    assert lines[1]["correlation_id"] == f"agent_run:{run_id}"

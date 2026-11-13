@@ -27,6 +27,7 @@ from app.agents.runtime import (
     ModelCall,
     ProviderBlocked,
     ProviderFactory,
+    RunAlreadyFinished,
     RunEnd,
     RunScope,
     RunStart,
@@ -231,8 +232,9 @@ class TaskRunEvents:
                 await publish_pending(session, self._bus)
 
 
-class AgentRunAlreadyFinished(LookupError):
-    """The run is not ``running`` any more: a run is finished once (never overwritten)."""
+class AgentRunAlreadyFinished(RunAlreadyFinished):
+    """The run is not ``running`` any more: a run is finished once (never overwritten). The runtime knows it
+    as the port's ``RunAlreadyFinished``."""
 
 
 def _number(value: int | Decimal | None) -> int | str | None:
@@ -367,23 +369,48 @@ class AgentRunWriter:
         )
 
     async def fail(self, agent_run_id: uuid.UUID) -> None:
-        """The minimal end when ``finish`` could not be written (review M5): ``failed internal_error``,
-        nothing else, only for a row still ``running``."""
+        """The minimal end when ``finish`` could not be written (review M5): ``failed internal_error`` with
+        its usage unknown, only for a row still ``running``; then, in the same transaction,
+        ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d)."""
         self._projects.pop(agent_run_id, None)
         async with self._sessions() as session:
             await bound_transaction(session)
-            await session.execute(
-                update(AgentRun)
-                .where(AgentRun.id == agent_run_id, AgentRun.status == "running")
-                .values(
-                    status="failed",
-                    error_code="internal_error",
-                    error="the end of the run could not be recorded",
-                    finished_at=func.now(),
+            ended = (
+                await session.execute(
+                    update(AgentRun)
+                    .where(AgentRun.id == agent_run_id, AgentRun.status == "running")
+                    .values(
+                        status="failed",
+                        error_code="internal_error",
+                        error="the end of the run could not be recorded",
+                        cost_status="unavailable",
+                        finished_at=func.now(),
+                    )
+                    .returning(AgentRun.task_id, AgentRun.agent_id)
+                    .execution_options(synchronize_session=False)
                 )
-                .execution_options(synchronize_session=False)
+            ).one_or_none()
+            if ended is None:  # finished elsewhere: its end was already published
+                return
+            task_id, agent_id = ended
+            unknown = {"input_tokens": None, "output_tokens": None, "estimated_cost": None}
+            await emit_task_event(
+                session,
+                self._bus,
+                task_id,
+                "agent.run_finished",
+                {
+                    "agent_run_id": str(agent_run_id),
+                    "agent_id": agent_id,
+                    "status": "failed",
+                    "error_code": "internal_error",
+                    "usage": {**unknown, "cost_status": "unavailable"},
+                },
+                redactor=self._audit.redactor,
             )
             await session.commit()
+            if self._bus is not None:
+                await publish_pending(session, self._bus)
 
     async def _budget_exceeded(
         self,

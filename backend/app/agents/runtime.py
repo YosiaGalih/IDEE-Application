@@ -343,8 +343,14 @@ class UsageUnrecorded(Exception):
 
 
 class AgentRunUnfinished(Exception):
-    """The run's end could not be written within ``close_timeout_s``: its row may stay ``running`` (recovery,
-    WP-3.1f2b). Raised from the cause; a result without its record is never returned."""
+    """The run's end is not known to the caller: it could not be written within ``close_timeout_s``, or a
+    retried write found the row already finished (the first write committed, its ack was lost). The
+    ``agent_runs`` row is the truth: ``running`` (recovery, WP-3.1f2b), the minimal ``failed internal_error``
+    or the end already written. Raised from the cause; a result without its record is never returned."""
+
+
+class RunAlreadyFinished(LookupError):
+    """``RunStore.finish``: the run is not ``running`` any more; a run is finished once, never overwritten."""
 
 
 class _DeadlineReached(Exception):
@@ -540,7 +546,10 @@ class UsageLedgerPort(Protocol):
 
 class RunStore(Protocol):
     async def start(self, run: RunStart) -> uuid.UUID: ...
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage: ...
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
+        """Raises ``RunAlreadyFinished`` for a row that is not ``running``."""
+        ...
+
     async def fail(self, agent_run_id: uuid.UUID) -> None:
         """The minimal end when ``finish`` could not be written: ``failed internal_error``."""
         ...
@@ -1123,6 +1132,13 @@ class AgentRuntime:
         for attempt in (1, 2):
             try:
                 return await asyncio.wait_for(asyncio.shield(write), self._config.close_timeout_s)
+            except RunAlreadyFinished as error:
+                # The row is terminal: an earlier write committed and its ack was lost (review N4). Nothing is
+                # written over it; the caller still does not know the end.
+                _log.warning("agent_run_already_finished", **_ctx(run), attempt=attempt)
+                raise AgentRunUnfinished(
+                    f"the end of agent run {_id(run.agent_run_id)} was already recorded"
+                ) from error
             except Exception as error:  # a timeout or the store's error
                 failure = error
                 _log.error(
