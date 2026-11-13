@@ -24,6 +24,7 @@ from app.agents.runtime import (
     BudgetBreach,
     BudgetRefused,
     LeaseLostError,
+    LogContext,
     ModelCall,
     ProviderBlocked,
     ProviderFactory,
@@ -498,9 +499,10 @@ class SettingsProviderFactory:
         self._build = build
 
     @asynccontextmanager
-    async def open(self) -> AsyncIterator[LLMProvider]:
+    async def open(self, log_context: LogContext) -> AsyncIterator[LLMProvider]:
         """``ProviderNotConfigured`` (no key in this process) -> ``ProviderBlocked('provider_not_ready',
-        'no_provider')``; ``aclose()`` in ``finally``, also when the run fails or is cancelled."""
+        'no_provider')``; ``aclose()`` in ``finally``, also when the run fails or is cancelled. A failed close
+        is logged with the run's ids from ``log_context``."""
         try:
             provider = self._build(self._settings)
         except ProviderNotConfigured as exc:
@@ -512,5 +514,8 @@ class SettingsProviderFactory:
                 await provider.aclose()
             except Exception as error:  # never discards the run's result (review L3)
                 _log.warning(
-                    "llm_provider_close_failed", provider=provider.name, error_type=type(error).__name__
+                    "llm_provider_close_failed",
+                    **log_context(),
+                    provider=provider.name,
+                    error_type=type(error).__name__,
                 )

@@ -263,7 +263,7 @@ class FakeProviders:
         finally:
             self.closed += 1
 
-    def open(self) -> Any:
+    def open(self, log_context: Any = None) -> Any:
         return self._open()
 
 

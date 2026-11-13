@@ -12,7 +12,7 @@ import json
 import time
 import uuid
 from decimal import Decimal
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
@@ -20,6 +20,7 @@ from app.agents import contracts
 from app.agents.grants import AgentNotRunnable
 from app.agents.runtime import (
     CONTEXT_MAX_BYTES,
+    ERROR_TEXTS,
     MIN_OUTPUT_TOKENS_PER_S,
     NUDGE,
     REQUEST_BASE_S,
@@ -35,11 +36,13 @@ from app.agents.runtime import (
     ProviderBlocked,
     RunAlreadyFinished,
     RunEnd,
+    RunErrorCode,
     ScenarioNotAllowed,
     StopReason,
     UsageUnrecorded,
     attempt_timeout_s,
     classify,
+    end_text,
     run_cap,
 )
 from app.core.cancel import CancelToken
@@ -616,10 +619,14 @@ CLASSIFY: list[tuple[BaseException, StopReason | None, tuple[str, str | None]]] 
     (ProviderBlocked("PROVIDER_DISABLED", "kill_switch"), None, ("failed", "PROVIDER_DISABLED")),
     (ProviderBlocked("provider_not_ready", "no_report"), None, ("failed", "provider_not_ready")),
     (LLMError("auth", status_code=401), None, ("failed", "provider_auth")),
-    (UsageUnrecorded("x"), None, ("failed", "usage_unrecorded")),
-    (UsageUnrecorded("x"), "cancelled", ("failed", "usage_unrecorded")),
-    (_chained(asyncio.CancelledError(), UsageUnrecorded("x")), None, ("failed", "usage_unrecorded")),
-    (_chained(LLMError("cancelled"), UsageUnrecorded("x")), "cancelled", ("failed", "usage_unrecorded")),
+    (UsageUnrecorded(1, UUID_A), None, ("failed", "usage_unrecorded")),
+    (UsageUnrecorded(1, UUID_A), "cancelled", ("failed", "usage_unrecorded")),
+    (_chained(asyncio.CancelledError(), UsageUnrecorded(1, UUID_A)), None, ("failed", "usage_unrecorded")),
+    (
+        _chained(LLMError("cancelled"), UsageUnrecorded(1, UUID_A)),
+        "cancelled",
+        ("failed", "usage_unrecorded"),
+    ),
     (LeaseLostError("lost"), None, ("failed", "lease_lost")),
     (LLMError("cancelled"), "lease_lost", ("failed", "lease_lost")),
     (LLMError("cancelled"), "timeout", ("failed", "timeout")),
@@ -1159,19 +1166,22 @@ async def test_a_failing_aclose_never_discards_a_finished_run() -> None:
     fakes.providers = SettingsProviderFactory(  # type: ignore[assignment]
         load_settings(make_test_env()), build=lambda _: ClosesBadly(fakes.provider)
     )
+    request = run_request("B14")
     with capture_logs() as logs:
-        result = await run_b14(fakes)
+        result = await make_runtime(fakes).run(request)
     assert result.status == "succeeded"
-    assert [log["error_type"] for log in logs if log["event"] == "llm_provider_close_failed"] == [
-        "RuntimeError"
-    ]
+    closed = [log for log in logs if log["event"] == "llm_provider_close_failed"]
+    assert [log["error_type"] for log in closed] == ["RuntimeError"]
+    # Code review of 073e68d (ARCHITECTURE §6.1): the line names the task and the run.
+    assert closed[0]["task_id"] == str(request.task_id)
+    assert closed[0]["correlation_id"] == f"agent_run:{result.agent_run_id}"
 
 
 async def test_error_texts_never_carry_the_exception_message() -> None:
     marker = "DETAIL-" + "q" * 12
     fakes = Fakes(scripted(Fail("refusal")))
     result = await run_b14(fakes)
-    assert result.error == "LLMError: the model call failed (refusal)"
+    assert result.error == "the model call failed (refusal)"
     fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
 
     async def broken(ctx: Any, raw: object) -> Any:
@@ -1428,3 +1438,90 @@ async def test_a_retried_finish_that_finds_the_run_finished_is_not_unfinished() 
     (run_id,) = fakes.runs.ids
     assert lines[1]["task_id"] == str(request.task_id)
     assert lines[1]["correlation_id"] == f"agent_run:{run_id}"
+
+
+async def test_a_line_before_the_run_row_still_names_the_task() -> None:
+    from structlog.testing import capture_logs
+
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.heartbeat.refuse[1] = RuntimeError("database blip")  # the run's first beat, before its row
+    request = run_request("B14")
+    with capture_logs() as logs:
+        assert (await make_runtime(fakes).run(request)).status == "succeeded"
+    (line,) = [log for log in logs if log["event"] == "agent_run_beat_failed"]
+    assert (line["task_id"], line["agent_run_id"], line["correlation_id"]) == (
+        str(request.task_id),
+        None,
+        None,
+    )
+
+
+ERROR_MARKER = "DETAIL-" + "q" * 12
+
+
+def _errors_carrying_the_marker() -> dict[str, BaseException]:
+    unrecorded = UsageUnrecorded(3, UUID_A)
+    unrecorded.__cause__ = RuntimeError(ERROR_MARKER)
+    return {
+        "PROVIDER_DISABLED": ProviderBlocked("PROVIDER_DISABLED", "kill_switch"),
+        "provider_not_ready": ProviderBlocked("provider_not_ready", "no_provider"),
+        "provider_auth": LLMError("auth", vendor_type=ERROR_MARKER),
+        "model_error": LLMError("overloaded", vendor_type=ERROR_MARKER),
+        "usage_unrecorded": _chained(LLMError("cancelled", vendor_type=ERROR_MARKER), unrecorded),
+        "lease_lost": LeaseLostError(ERROR_MARKER),
+        "worker_cancelled": asyncio.CancelledError(ERROR_MARKER),
+    }
+
+
+DETAILS = {
+    "PROVIDER_DISABLED": "kill_switch",
+    "provider_not_ready": "no_provider",
+    "provider_auth": "auth",
+    "model_error": "overloaded",
+    "usage_unrecorded": f"attempt 3 of call {UUID_A}",
+}
+
+
+@pytest.mark.parametrize("code", get_args(RunErrorCode))
+def test_every_error_code_has_one_fixed_sentence(code: RunErrorCode) -> None:
+    """Code review of 073e68d: ``agent_runs.error`` is the code's one fixed sentence, plus in brackets an
+    identifier the error carries as a field; never an exception's message. Only ``internal_error`` names the
+    exception's type."""
+    sentence = ERROR_TEXTS[code]
+    assert sentence and ERROR_MARKER not in sentence
+    error = _errors_carrying_the_marker().get(code, RuntimeError(ERROR_MARKER))
+    text = end_text(code, error)
+    assert ERROR_MARKER not in text
+    if code == "internal_error":
+        assert text == f"RuntimeError: {sentence}"
+    elif code in DETAILS:
+        assert text == f"{sentence} ({DETAILS[code]})"
+    else:
+        assert text == sentence
+    assert end_text("timeout", detail="900 s") == f"{ERROR_TEXTS['timeout']} (900 s)"
+
+
+async def test_a_lost_lease_reads_the_same_however_it_is_seen() -> None:
+    """Code review of 073e68d: a lease lost at a beat and a lease lost by the keep-alive (a stop) end with
+    the same text."""
+    at_a_beat = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    at_a_beat.heartbeat.refuse[2] = LeaseLostError("lost")
+    stopped = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=0.5)
+    for call in range(3, 50):
+        stopped.heartbeat.refuse[call] = LeaseLostError("lost")
+    first = await run_b14(at_a_beat)
+    second = await run_b14(stopped, runtime_config=config(heartbeat_interval_s=0.05), clock=time.monotonic)
+    assert (first.error_code, second.error_code) == ("lease_lost", "lease_lost")
+    assert first.error == second.error == ERROR_TEXTS["lease_lost"]
+
+
+def test_the_ports_share_the_literal_types_of_their_owners() -> None:
+    """Code review of 073e68d: ``RunUsage.cost_status`` and ``BudgetRefused.kind`` are Literal types. The
+    runtime may not import the ledger's or the budget's module (import-linter), so it names the same
+    values; this keeps them equal."""
+    from app.agents.runtime import BudgetKind, CostStatus
+    from app.llm.pricing import EstimateStatus
+    from app.workflow import budget
+
+    assert set(get_args(CostStatus)) == set(get_args(EstimateStatus))
+    assert set(get_args(BudgetKind)) == set(get_args(budget.BudgetKind))

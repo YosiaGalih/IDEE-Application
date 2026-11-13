@@ -36,7 +36,7 @@ from app.agents.prompt_book import Prompt, PromptBook
 from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.cancel import CancelToken
 from app.core.logging import get_logger
-from app.core.redaction import Redactor
+from app.core.redaction import SENSITIVE_KEY_TAIL, Redactor
 from app.llm.base import (
     ContentBlock,
     LLMError,
@@ -76,6 +76,33 @@ RunErrorCode = Literal[
     "interrupted",
 ]
 StopReason = Literal["cancelled", "timeout", "lease_lost"]
+# The same values as app.workflow.budget.BudgetKind and app.llm.pricing.EstimateStatus, which the runtime may
+# not import (layers; the runtime contract in pyproject.toml): the services that fill these ports pass the
+# owners' values in, so pyright checks the two agree there, and tests/unit/test_agent_runtime.py keeps them
+# equal.
+BudgetKind = Literal["duration", "tool_iterations", "tokens", "cost"]
+CostStatus = Literal["estimated", "partial", "unavailable"]
+
+# One fixed sentence per error code for agent_runs.error (code review of 073e68d). A run's error text is its
+# code's sentence plus, in brackets, an identifier: one the runtime knows (the time limit, the iteration
+# cap) or one the error carries as a field (an LLMError's kind, a ProviderBlocked reason, an unrecorded
+# attempt's ids). Never an exception's own message, which may carry a host, a path or a value.
+ERROR_TEXTS: Final[Mapping[RunErrorCode, str]] = MappingProxyType(
+    {
+        "PROVIDER_DISABLED": "the provider is switched off",
+        "provider_not_ready": "the provider is not ready",
+        "provider_auth": "the provider refused its credentials",
+        "usage_unrecorded": "the usage of a model call was not recorded",
+        "invalid_output": "the model ended its turn twice without submit_result",
+        "iteration_limit": "the run used its iterations without a valid submit_result",
+        "timeout": "the run passed its time limit",
+        "lease_lost": "the task lease was lost",
+        "model_error": "the model call failed",
+        "internal_error": "an internal error ended the run",
+        "worker_cancelled": "the run was cancelled: its worker stopped",
+        "interrupted": "the run was interrupted: its worker is gone",
+    }
+)
 
 CONTEXT_MAX_BYTES: Final = 60 * 1024  # ADR-011: the first input of a run
 ABSORBED_PROFILES: Final = frozenset({"A01", "C16"})  # AGENT_CATALOG §4.2: never dispatched alone
@@ -120,10 +147,8 @@ _log = get_logger(__name__)
 # candidate the redactor already replaced holds nothing.
 _OPEN_CANDIDATES: Final = (
     re.compile(r"eyJ[A-Za-z0-9_.\-]*\Z"),  # a token run that has not ended
-    re.compile(  # an open quote after a secret-like key
-        r"(?i)(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key"
-        r"|credentials?|authorization|cookie|session|jwt|bearer)"
-        r"\\?[\"']?\s*[:=]\s*\\?([\"'])(?:(?!\1).)*\Z",
+    re.compile(  # an open quote after a key the redactor treats as secret (one list: SENSITIVE_KEY_TAIL)
+        rf"(?i)(?:{SENSITIVE_KEY_TAIL})" r"\\?[\"']?\s*[:=]\s*\\?([\"'])(?:(?!\1).)*\Z",
         re.DOTALL,
     ),
     re.compile(r"-----BEGIN(?:(?!-----END).)*\Z", re.DOTALL),  # a marker with no end yet
@@ -279,6 +304,28 @@ def classify(error: BaseException, stop: StopReason | None) -> tuple[RunStatus, 
     return "failed", "internal_error"
 
 
+def end_text(code: RunErrorCode, error: BaseException | None = None, *, detail: str | None = None) -> str:
+    """``agent_runs.error`` for ``code`` (``ERROR_TEXTS``): the sentence, and ``detail`` or the identifier
+    ``error`` carries as a field, in brackets. Only ``internal_error`` names the exception's type."""
+    sentence = ERROR_TEXTS[code]
+    if code == "internal_error":
+        return f"{type(error).__name__}: {sentence}" if error is not None else sentence
+    if detail is None and error is not None:
+        detail = _error_detail(error)
+    return f"{sentence} ({detail})" if detail else sentence
+
+
+def _error_detail(error: BaseException) -> str | None:
+    unrecorded = next((e for e in _chain(error) if isinstance(e, UsageUnrecorded)), None)
+    if unrecorded is not None:
+        return f"attempt {unrecorded.attempt} of call {unrecorded.call_id}"
+    if isinstance(error, ProviderBlocked):
+        return error.reason
+    if isinstance(error, LLMError):
+        return error.kind
+    return None
+
+
 def _field_location(loc: Iterable[int | str]) -> str:
     parts = [str(p) if isinstance(p, int) or _FIELD.fullmatch(p) else "<key>" for p in loc]
     return ".".join(parts) or "(root)"
@@ -321,14 +368,14 @@ class BudgetRefused(Exception):
 
     def __init__(
         self,
-        kind: str,
+        kind: BudgetKind,
         limit: int | Decimal,
         used: int | Decimal | None,
         *,
         next_bound: int | Decimal | None,
     ) -> None:
         super().__init__(f"budget exceeded: {kind}")
-        self.kind = kind
+        self.kind: BudgetKind = kind
         self.limit = limit
         self.used = used
         self.next_bound = next_bound
@@ -339,7 +386,13 @@ class LeaseLostError(Exception):
 
 
 class UsageUnrecorded(Exception):
-    """The ledger port failed to record an attempt: raised by the runtime, from the ledger's error."""
+    """The ledger port failed to record an attempt: raised by the runtime, from the ledger's error. It carries
+    the attempt's ids only."""
+
+    def __init__(self, attempt: int, call_id: uuid.UUID | str) -> None:
+        super().__init__(f"attempt {attempt} of call {call_id} was not recorded")
+        self.attempt = attempt
+        self.call_id = call_id
 
 
 class AgentRunUnfinished(Exception):
@@ -451,12 +504,12 @@ class RunUsage:
     cache_read_tokens: int | None
     cache_creation_tokens: int | None
     estimated_cost: Decimal | None
-    cost_status: str
+    cost_status: CostStatus
 
 
 @dataclass(frozen=True, slots=True)
 class BudgetBreach:
-    kind: str
+    kind: BudgetKind
     limit: int | Decimal
     used: int | Decimal | None
     next_bound: int | Decimal | None
@@ -571,8 +624,14 @@ class Heartbeat(Protocol):
     async def beat(self, task_id: uuid.UUID) -> None: ...
 
 
+LogContext = Callable[[], Mapping[str, str | None]]
+
+
 class ProviderFactory(Protocol):
-    def open(self) -> AbstractAsyncContextManager[LLMProvider]: ...
+    def open(self, log_context: LogContext) -> AbstractAsyncContextManager[LLMProvider]:
+        """``log_context()`` gives the ids a log line of the run carries; it is read when the line is
+        written, so a line after ``runs.start`` names the run too (ARCHITECTURE §6.1)."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -829,7 +888,7 @@ class AgentRuntime:
         try:
             await self._beat(run)
             models = await self._port(run, self._ports.gate.check(request.project_id))
-            async with self._ports.providers.open() as provider:
+            async with self._ports.providers.open(lambda: _ctx(run)) as provider:
                 model = models[run.spec.model_tier]
                 start = self._run_start(run, provider.name, model)
                 run.agent_run_id = await self._port(run, self._ports.runs.start(start))
@@ -936,12 +995,7 @@ class AgentRuntime:
                     return RunEnd("succeeded", run.iterations, output=output.model_dump(mode="json"))
             if not uses:
                 if nudged:
-                    return RunEnd(
-                        "failed",
-                        run.iterations,
-                        "invalid_output",
-                        "the model ended its turn twice without submit_result",
-                    )
+                    return self._failed(run, "invalid_output")
                 nudged = True
                 messages.append(Message("user", NUDGE))
                 continue
@@ -974,12 +1028,7 @@ class AgentRuntime:
             messages.append(Message("user", tuple(results)))
         if run.stop.reason is not None:  # review M2: a stop during the last allowed step wins
             return self._stopped(run)
-        return RunEnd(
-            "failed",
-            run.iterations,
-            "iteration_limit",
-            f"the run used its {cap} iterations without a valid submit_result",
-        )
+        return self._failed(run, "iteration_limit", detail=f"{cap} iterations")
 
     async def _attempt(
         self,
@@ -1071,11 +1120,16 @@ class AgentRuntime:
             return RunEnd("cancelled", run.iterations)
         if run.stop.reason == "timeout":
             return self._timed_out(run)
-        return RunEnd("failed", run.iterations, "lease_lost", "the task lease was lost")
+        return self._failed(run, "lease_lost")
 
     def _timed_out(self, run: _Run) -> RunEnd:
-        limit = run.spec.limits.timeout_seconds
-        return RunEnd("failed", run.iterations, "timeout", f"the run passed its time limit ({limit} s)")
+        return self._failed(run, "timeout", detail=f"{run.spec.limits.timeout_seconds} s")
+
+    def _failed(
+        self, run: _Run, code: RunErrorCode, error: BaseException | None = None, *, detail: str | None = None
+    ) -> RunEnd:
+        text = self._redactor.redact(end_text(code, error, detail=detail))[:ERROR_TEXT_MAX]
+        return RunEnd("failed", run.iterations, code, text)
 
     def _end_for(self, error: BaseException, run: _Run) -> RunEnd:
         status, code = classify(error, run.stop.reason)
@@ -1086,24 +1140,9 @@ class AgentRuntime:
             return RunEnd("cancelled", run.iterations)
         if code == "timeout":
             return self._timed_out(run)
-        if code == "lease_lost" and not isinstance(error, LeaseLostError):
-            return RunEnd("failed", run.iterations, "lease_lost", "the task lease was lost")
-        return RunEnd("failed", run.iterations, code, self._error_text(error, code))
-
-    def _error_text(self, error: BaseException, code: RunErrorCode) -> str:
-        """A short text for ``agent_runs.error``: identifiers and fixed sentences, never an exception's own
-        message (review: it may carry a host, a path or a value); the detail is logged by type only."""
-        if code == "worker_cancelled":
-            text = "the run was cancelled: its worker stopped"
-        elif code == "usage_unrecorded":
-            text = str(next(e for e in _chain(error) if isinstance(e, UsageUnrecorded)))  # ids only
-        elif isinstance(error, LLMError):
-            text = f"LLMError: the model call failed ({error.kind})"
-        elif isinstance(error, ProviderBlocked):
-            text = f"ProviderBlocked: {error.code} ({error.reason})"
-        else:
-            text = f"{type(error).__name__}: an internal error ended the run"
-        return self._redactor.redact(text)[:ERROR_TEXT_MAX]
+        if code == run.stop.reason:  # the run's own stop ended the call: the stop, not the call, is the cause
+            return self._failed(run, code)
+        return self._failed(run, code, error)  # the error's detail is logged by type only
 
     async def _close(self, run: _Run, end: RunEnd) -> AgentRunResult:
         """Writes the end and returns the result; ``AgentRunUnfinished`` when it could not be written."""
@@ -1221,9 +1260,7 @@ class AgentRuntime:
                 async with asyncio.timeout(limit):
                     await record(attempt)
             except Exception as error:  # the bound or the ledger's own error: the attempt is unrecorded
-                raise UsageUnrecorded(
-                    f"attempt {attempt.attempt} of call {call.call_id} was not recorded"
-                ) from error
+                raise UsageUnrecorded(attempt.attempt, call.call_id) from error
             if run is not None:
                 run.tally.recorded += 1
 
