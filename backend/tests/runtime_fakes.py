@@ -10,6 +10,7 @@ attempt or only a retry.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
@@ -18,9 +19,15 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.agents import contracts as c
 from app.agents.prompt_book import PromptBook
-from app.agents.registry import AgentRegistry, load_registry
+from app.agents.registry import AgentRegistry, AgentSpec, load_registry
 from app.agents.runtime import (
+    AgentRunRequest,
     AgentRuntime,
     ModelCall,
     RunEnd,
@@ -33,6 +40,7 @@ from app.agents.runtime import (
 from app.core.cancel import CancelToken
 from app.core.redaction import Redactor
 from app.llm.base import (
+    LLMError,
     LLMProvider,
     LLMRequest,
     LLMResponse,
@@ -41,6 +49,7 @@ from app.llm.base import (
     TextDeltaHandler,
     ToolDef,
     ToolUseBlock,
+    Usage,
 )
 from app.llm.retry import AttemptHandler, AttemptRecord
 from app.llm.scenarios.model import Fail, Reply, Scenario, Turn
@@ -204,6 +213,34 @@ class LoggedProvider:
         return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
 
 
+class SlowProvider:
+    """Answers after ``delay`` seconds of wall clock; a cancel during the wait ends the attempt like a stream
+    cut short (``LLMError("cancelled")`` with the prompt's usage and no output)."""
+
+    def __init__(self, inner: LLMProvider, delay: float) -> None:
+        self.inner = inner
+        self.delay = delay
+        self.name = inner.name
+
+    async def create_message(
+        self,
+        req: LLMRequest,
+        *,
+        on_text_delta: TextDeltaHandler | None = None,
+        cancel: CancelToken | None = None,
+    ) -> LLMResponse:
+        if cancel is not None:
+            try:
+                await asyncio.wait_for(cancel.wait(), timeout=self.delay)
+            except TimeoutError:
+                pass
+            else:
+                raise LLMError("cancelled", request_id="slow", usage=Usage(input_tokens=10, output_tokens=0))
+        else:
+            await asyncio.sleep(self.delay)
+        return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+
 class FakeProviders:
     def __init__(self, provider: LLMProvider) -> None:
         self.provider = provider
@@ -265,6 +302,7 @@ def scripted(*turns: Turn, delta_size: int = 16) -> ScriptedProvider:
 @dataclass
 class Fakes:
     provider: ScriptedProvider
+    slow: float = 0.0  # wall-clock seconds each attempt takes (SlowProvider)
     log: list[str] = field(default_factory=list)
     gate: FakeGate = field(init=False)
     heartbeat: FakeHeartbeat = field(init=False)
@@ -283,7 +321,8 @@ class Fakes:
         self.runs = FakeRuns()
         self.events = FakeEvents()
         self.tools = FakeTools(self.log)
-        self.providers = FakeProviders(LoggedProvider(self.provider, self.log))
+        inner: LLMProvider = SlowProvider(self.provider, self.slow) if self.slow else self.provider
+        self.providers = FakeProviders(LoggedProvider(inner, self.log))
 
     def ports(self) -> RuntimePorts:
         return RuntimePorts(
@@ -352,3 +391,248 @@ def a_model_call(scope: RunScope | None = None, *, max_tokens: int = 1024, **req
     }
     values.update(request)
     return ModelCall(request=LLMRequest(**values), call_id=call_id, scope=scope)
+
+
+class FakeClock:
+    """``time.monotonic`` stand-in a test moves forward."""
+
+    def __init__(self, now: float = 1_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def registry_with(agent_id: str, **changes: Any) -> AgentRegistry:
+    """The real registry with one entry changed, unvalidated (``model_copy``): test tools, short limits."""
+    agents: list[AgentSpec] = []
+    for agent in REGISTRY.agents:
+        if agent.agent_id == agent_id:
+            update_: dict[str, Any] = dict(changes)
+            if "limits" in update_ and isinstance(update_["limits"], dict):
+                update_["limits"] = agent.limits.model_copy(update=update_["limits"])
+            agent = agent.model_copy(update=update_)
+        agents.append(agent)
+    return AgentRegistry(agents=tuple(agents))
+
+
+# --- contract examples --------------------------------------------------------------------------------------
+
+UUID_A = "123e4567-e89b-42d3-a456-426614174000"
+CRITERION = c.Criterion(key="AC-1", criterion="It adds.", verification_method="test", mandatory=True)
+REQUIREMENT = c.Requirement(
+    key="REQ-1", title="Add", description="Add two numbers.", priority="must", acceptance_criteria=[CRITERION]
+)
+STEP = c.PlanStep(
+    id="P1",
+    title="Implement add",
+    specialist="B14",
+    description="Write add().",
+    depends_on=[],
+    requirement_keys=["REQ-1"],
+    files_hint=["src/calc.py"],
+)
+
+
+def agent_input(runtime_id: str, task_id: uuid.UUID | None = None) -> BaseModel:
+    """A valid input of the runtime's contract."""
+    task = task_id or uuid.uuid4()
+    inputs: dict[str, BaseModel] = {
+        "A02": c.IntakeInput(task_id=task, prompt="Add a calculator."),
+        "A03": c.PlanInput(task_id=task, workflow_type="create", requirements=[REQUIREMENT]),
+        "B14": c.ImplementInput(task_id=task, step=STEP, requirements=[REQUIREMENT]),
+        "C20": c.DebugInput(
+            task_id=task,
+            failure=c.FailureReport(category="assertion", summary="add(1, 2) returned 4"),
+            attempt=1,
+            requirements=[],
+        ),
+        "D22": c.ReviewInput(task_id=task, diff_ref=f"diff:{task}", changed_files=[], requirements=[]),
+        "A07": c.UserProxyInput(task_id=task, baseline_version=1, criteria=[], evidence=[]),
+    }
+    return inputs[runtime_id]
+
+
+OUTPUTS: Mapping[str, dict[str, Any]] = {
+    "IntakeOutput": {
+        "title": "Add a calculator",
+        "summary": "A calculator that adds.",
+        "workflow_type": "create",
+        "complexity": "low",
+        "risk": "low",
+        "requirements": [REQUIREMENT.model_dump(mode="json")],
+        "constraints": [],
+        "detected_stack_hints": [],
+        "clarification_questions": [],
+    },
+    "PlanOutput": {
+        "steps": [STEP.model_dump(mode="json")],
+        "test_plan": {"summary": "Unit tests.", "criterion_keys": ["AC-1"]},
+        "risks": [],
+    },
+    "ImplementOutput": {
+        "summary": "Nothing changed.",
+        "changed_files": [],
+        "evidence_refs": [],
+        "follow_ups": [],
+    },
+    "DebugOutput": {
+        "root_cause": "Off by one.",
+        "category": "assertion",
+        "fix_summary": "Fixed add().",
+        "changed_files": [],
+        "next_step": "retest",
+        "evidence_refs": [],
+    },
+    "ReviewOutput": {"summary": "No findings.", "findings": []},
+    "UserProxyOutput": {
+        "status": "unverified",
+        "summary": "Nothing verified.",
+        "criteria_results": [],
+        "next_actions": [],
+        "confidence": "low",
+    },
+}
+
+
+def run_request(
+    agent_id: str = "B14",
+    *,
+    runtime_id: str | None = None,
+    task_id: uuid.UUID | None = None,
+    project_id: uuid.UUID | None = None,
+    cancel: CancelToken | None = None,
+    **overrides: Any,
+) -> AgentRunRequest:
+    task = task_id or uuid.uuid4()
+    values: dict[str, Any] = {
+        "agent_id": agent_id,
+        "task_id": task,
+        "project_id": project_id or uuid.uuid4(),
+        "agent_input": agent_input(runtime_id or agent_id, task),
+        "cancel": cancel or CancelToken(),
+    }
+    values.update(overrides)
+    return AgentRunRequest(**values)
+
+
+# --- a database run store for the integration tests (until the real writer, plan Task 7) --------------------
+
+
+class DbRunStore:
+    """A minimal ``RunStore`` over ``agent_runs`` for tests: one row per run, so the ledger and the gateway
+    can name the run. The real writer (redaction, totals, events, audit) is ``AgentRunWriter`` (Task 7)."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+        self.ends: list[RunEnd] = []
+
+    async def start(self, run: RunStart) -> uuid.UUID:
+        from app.models.agents import AgentProfile, AgentRun
+        from tests.integration.test_agent_tables import profile
+
+        run_id = uuid.uuid4()
+        async with self._sessions.begin() as session:
+            if await session.get(AgentProfile, run.agent_id) is None:
+                session.add(profile(run.agent_id))
+                await session.flush()
+            session.add(
+                AgentRun(
+                    id=run_id,
+                    task_id=run.task_id,
+                    agent_id=run.agent_id,
+                    agent_version=run.agent_version,
+                    step=run.step,
+                    model_provider=run.model_provider,
+                    model_name=run.model_name,
+                    prompt_version=run.prompt_version,
+                    input=dict(run.input),
+                )
+            )
+        return run_id
+
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
+        from app.models.agents import AgentRun
+
+        self.ends.append(end)
+        async with self._sessions.begin() as session:
+            await session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == agent_run_id, AgentRun.status == "running")
+                .values(
+                    status=end.status,
+                    error_code=end.error_code,
+                    error=end.error,
+                    output=dict(end.output) if end.output is not None else None,
+                    iterations=end.iterations,
+                )
+            )
+        return ZERO_USAGE
+
+
+# --- a real composition for the integration tests -----------------------------------------------------------
+
+WORKER_ID = "worker-test-1"
+
+
+async def hold_lease(session: AsyncSession, task_id: uuid.UUID, worker_id: str = WORKER_ID) -> None:
+    from sqlalchemy import text
+
+    await session.execute(
+        text(
+            "UPDATE tasks SET lease_owner = :worker,"
+            " lease_expires_at = clock_timestamp() + interval '60 seconds' WHERE id = :id"
+        ),
+        {"worker": worker_id, "id": task_id},
+    )
+    await session.commit()
+
+
+@dataclass
+class Composition:
+    runtime: AgentRuntime
+    provider: ScriptedProvider
+    runs: DbRunStore
+    events: FakeEvents
+    providers: FakeProviders
+
+
+def compose(
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Any,
+    pricing: Any,
+    provider: ScriptedProvider,
+    *,
+    tools: Any,
+    registry: AgentRegistry = REGISTRY,
+    worker_id: str = WORKER_ID,
+    redactor: Redactor | None = None,
+) -> Composition:
+    """The production ports over a real database, except the run store (``DbRunStore`` until Task 7) and
+    the events (``FakeEvents`` until Task 6); the provider is the given scripted one."""
+    from app.services.agent_runtime import DbProviderGate, GuardBudget, LeaseHeartbeat, LedgerRecorder
+    from app.services.usage import UsageLedger
+    from app.workflow.budget import BudgetDefaults, BudgetGuard
+
+    runs = DbRunStore(sessions)
+    events = FakeEvents()
+    providers = FakeProviders(provider)
+    ports = RuntimePorts(
+        gate=DbProviderGate(sessions, settings),
+        budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
+        ledger=LedgerRecorder(UsageLedger(sessions, pricing)),
+        runs=runs,
+        events=events,
+        tools=tools,
+        heartbeat=LeaseHeartbeat(sessions, worker_id),
+        providers=providers,
+    )
+    runtime = AgentRuntime(
+        registry=registry,
+        prompts=PROMPTS,
+        ports=ports,
+        config=config(scripted=settings.llm_provider == "scripted"),
+        redactor=redactor or Redactor(settings.secret_values()),
+        sleep=no_sleep,
+    )
+    return Composition(runtime, provider, runs, events, providers)

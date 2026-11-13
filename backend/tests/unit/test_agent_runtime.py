@@ -7,15 +7,68 @@ hook sends nothing and records nothing; a ledger failure fails the call as ``usa
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
+import uuid
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
-from app.agents.runtime import BudgetRefused, LeaseLostError, ProviderBlocked, UsageUnrecorded
+from app.agents import contracts
+from app.agents.grants import AgentNotRunnable
+from app.agents.runtime import (
+    CONTEXT_MAX_BYTES,
+    MIN_OUTPUT_TOKENS_PER_S,
+    NUDGE,
+    REQUEST_BASE_S,
+    SUBMIT_RESULT,
+    AgentInputInvalid,
+    AgentInputTooLarge,
+    AgentRunResult,
+    BudgetBreach,
+    BudgetRefused,
+    LeaseLostError,
+    PendingTool,
+    ProviderBlocked,
+    RunEnd,
+    ScenarioNotAllowed,
+    StopReason,
+    UsageUnrecorded,
+    attempt_timeout_s,
+    classify,
+    run_cap,
+)
 from app.core.cancel import CancelToken
-from app.llm.base import LLMError, TextBlock
+from app.core.redaction import Redactor
+from app.llm.base import LLMError, Message, TextBlock, ToolResultBlock, ToolUseBlock
 from app.llm.scenarios.model import Fail, Reply
-from tests.runtime_fakes import Fakes, a_model_call, in_order, make_runtime, scripted, submit_turn
+from app.models.enums import AGENT_RUN_ERROR_CODES
+from app.tools.base import ToolResult
+from app.tools.gateway import TaskMissing
+from app.workflow.budget import BudgetConfigError, BudgetTaskMissing
+from tests.runtime_fakes import (
+    MODEL,
+    OUTPUTS,
+    PROMPTS,
+    REGISTRY,
+    STEP,
+    UUID_A,
+    FakeClock,
+    Fakes,
+    a_model_call,
+    config,
+    in_order,
+    make_runtime,
+    ok_result,
+    registry_with,
+    run_request,
+    scripted,
+    submit_turn,
+    text_turn,
+    tool_turn,
+)
 
 ONE_ROUND = ["beat", "gate", "budget", "send", "record"]
 ANSWER = Reply((TextBlock("done"),))
@@ -105,3 +158,608 @@ def test_budget_refused_keeps_its_numbers() -> None:
     )
     blocked = ProviderBlocked("provider_not_ready", "no_report")
     assert (blocked.code, blocked.reason) == ("provider_not_ready", "no_report")
+
+
+# === Task 5: the run loop ===================================================================================
+
+ImplementOutput = contracts.ImplementOutput
+VALID_IMPLEMENT = OUTPUTS["ImplementOutput"]
+
+
+async def run_b14(fakes: Fakes, **kwargs: Any) -> AgentRunResult:
+    runtime = make_runtime(fakes, **{k: v for k, v in kwargs.items() if k != "request"})
+    return await runtime.run(kwargs.get("request") or run_request("B14"))
+
+
+def ended(fakes: Fakes) -> RunEnd:
+    assert len(fakes.runs.finishes) == 1
+    return fakes.runs.finishes[0][1]
+
+
+# --- refusals before any row --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("agent_id", ["Z99", "A05", "A04", "A01", "C16"])
+async def test_unknown_disabled_tool_mode_and_absorbed_agents_are_refused(agent_id: str) -> None:
+    spec = REGISTRY.by_id(agent_id)
+    if agent_id == "A05":
+        assert spec is not None and spec.mvp_mode == "planned" and not spec.enabled
+    if agent_id == "A04":
+        assert spec is not None and spec.mvp_mode == "tool"
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    request = run_request(agent_id, runtime_id="B14")
+    with pytest.raises(AgentNotRunnable):
+        await make_runtime(fakes).run(request)
+    assert fakes.runs.starts == [] and fakes.log == []
+
+
+async def test_input_of_another_contract_is_refused() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    with pytest.raises(AgentInputInvalid):
+        await make_runtime(fakes).run(run_request("B14", runtime_id="A02"))
+    assert fakes.runs.starts == []
+
+
+def _intake_of_size(size: int) -> contracts.IntakeInput:
+    """An IntakeInput whose JSON is exactly ``size`` bytes: a 60 000-byte prompt, padded by stack_summary."""
+
+    def make(pad: int) -> contracts.IntakeInput:
+        return contracts.IntakeInput(task_id=uuid.UUID(UUID_A), prompt="日" * 20_000, stack_summary="y" * pad)
+
+    value = make(size - len(make(1).model_dump_json().encode("utf-8")) + 1)
+    assert len(value.model_dump_json().encode("utf-8")) == size
+    return value
+
+
+@pytest.mark.parametrize(("size", "refused"), [(CONTEXT_MAX_BYTES, False), (CONTEXT_MAX_BYTES + 1, True)])
+async def test_input_over_sixty_kilobytes_is_refused(size: int, refused: bool) -> None:
+    fakes = Fakes(scripted(submit_turn(OUTPUTS["IntakeOutput"])))
+    request = run_request("A02", agent_input=_intake_of_size(size))
+    if refused:
+        with pytest.raises(AgentInputTooLarge):
+            await make_runtime(fakes).run(request)
+        assert fakes.runs.starts == []
+    else:
+        assert (await make_runtime(fakes).run(request)).status == "succeeded"
+
+
+async def test_a_scenario_is_refused_outside_scripted() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    runtime = make_runtime(fakes, runtime_config=config(scripted=False))
+    with pytest.raises(ScenarioNotAllowed):
+        await runtime.run(run_request("B14", scenario="calc"))
+    assert fakes.runs.starts == []
+
+
+# --- what is offered ----------------------------------------------------------------------------------------
+
+
+async def test_only_built_and_granted_tools_are_offered_with_submit_result_last() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    await run_b14(fakes)
+    tools = fakes.provider.requests[0].tools
+    names = [t.name for t in tools]
+    assert names[-1] == SUBMIT_RESULT and names.count(SUBMIT_RESULT) == 1
+    assert "tests.run" not in names and "memory.retrieve_context" not in names  # in the grant, not built
+    assert names[:-1] == sorted(names[:-1])
+    spec = REGISTRY.by_id("B14")
+    assert spec is not None and set(names[:-1]) < set(spec.tools)
+    assert tools[-1].input_schema == ImplementOutput.model_json_schema()
+
+
+async def test_offered_never_holds_submit_result() -> None:
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "README.md"}), submit_turn(VALID_IMPLEMENT)))
+    await run_b14(fakes)
+    ((ctx, _, _, _),) = fakes.tools.executed
+    assert SUBMIT_RESULT not in ctx.offered
+    assert ctx.offered == frozenset(t.name for t in fakes.provider.requests[0].tools[:-1])
+
+
+async def test_a_tools_unavailable_agent_still_runs() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    result = await run_b14(fakes)
+    assert result.status == "succeeded"
+
+
+# --- submit_result ------------------------------------------------------------------------------------------
+
+
+async def test_a_valid_submit_result_succeeds_with_the_validated_output() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    result = await run_b14(fakes)
+    assert result.status == "succeeded" and result.error_code is None
+    assert isinstance(result.output, ImplementOutput)
+    assert result.output == ImplementOutput.model_validate(VALID_IMPLEMENT)
+    end = ended(fakes)
+    assert (end.status, end.iterations, end.output) == ("succeeded", 1, result.output.model_dump(mode="json"))
+
+
+async def test_an_invalid_submit_result_is_an_error_result_and_counts_an_iteration() -> None:
+    marker = "ECHO-ME-NOT-" + "q" * 20
+    bad = {**VALID_IMPLEMENT, "changed_files": marker, marker: 1}
+    fakes = Fakes(scripted(submit_turn(bad), submit_turn(VALID_IMPLEMENT)))
+    result = await run_b14(fakes)
+    assert result.status == "succeeded" and ended(fakes).iterations == 2
+    (error,) = fakes.provider.requests[1].messages[-1].content
+    assert isinstance(error, ToolResultBlock) and error.is_error
+    assert error.tool_use_id == "toolu_submit"
+    assert "changed_files" in error.content and "list_type" in error.content
+    assert marker not in error.content
+
+
+async def test_submit_result_never_reaches_the_gateway() -> None:
+    fakes = Fakes(scripted(submit_turn({"summary": ""}), submit_turn(VALID_IMPLEMENT)))
+    await run_b14(fakes)
+    assert fakes.tools.executed == []
+
+
+async def test_tools_beside_a_valid_submit_result_are_not_run() -> None:
+    turn = Reply(
+        (
+            ToolUseBlock("toolu_read", "repo.read_file", {"path": "a"}),
+            ToolUseBlock("toolu_submit", SUBMIT_RESULT, VALID_IMPLEMENT),
+        ),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(turn))
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert fakes.tools.executed == []
+
+
+async def test_tools_beside_an_invalid_submit_result_still_run() -> None:
+    turn = Reply(
+        (
+            ToolUseBlock("toolu_read", "repo.read_file", {"path": "a"}),
+            ToolUseBlock("toolu_submit", SUBMIT_RESULT, {}),
+        ),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(turn, submit_turn(VALID_IMPLEMENT)))
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert [name for _, name, _, _ in fakes.tools.executed] == ["repo.read_file"]
+    results = fakes.provider.requests[1].messages[-1].content
+    assert [(r.tool_use_id, r.is_error) for r in results] == [("toolu_read", False), ("toolu_submit", True)]  # type: ignore[union-attr]
+
+
+async def test_two_submit_results_in_one_turn_are_both_errors() -> None:
+    turn = Reply(
+        (
+            ToolUseBlock("toolu_a", SUBMIT_RESULT, VALID_IMPLEMENT),
+            ToolUseBlock("toolu_b", SUBMIT_RESULT, VALID_IMPLEMENT),
+        ),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(turn, submit_turn(VALID_IMPLEMENT)))
+    assert (await run_b14(fakes)).status == "succeeded"
+    results = fakes.provider.requests[1].messages[-1].content
+    assert all(isinstance(r, ToolResultBlock) and r.is_error for r in results)
+    assert all("one submit_result per turn" in r.content for r in results)  # type: ignore[union-attr]
+    assert ended(fakes).iterations == 2
+
+
+async def test_free_text_is_never_a_result() -> None:
+    fakes = Fakes(scripted(text_turn(json.dumps(VALID_IMPLEMENT))))
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code, result.output) == ("failed", "invalid_output", None)
+
+
+# --- nudge --------------------------------------------------------------------------------------------------
+
+
+async def test_end_turn_without_submit_result_gets_one_nudge() -> None:
+    fakes = Fakes(scripted(text_turn(), submit_turn(VALID_IMPLEMENT)))
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert fakes.provider.requests[1].messages[-1] == Message("user", NUDGE)
+
+
+async def test_a_second_end_turn_fails_invalid_output() -> None:
+    fakes = Fakes(scripted(text_turn(), text_turn()))
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("failed", "invalid_output")
+    assert len(fakes.provider.requests) == 2
+
+
+async def test_end_turn_without_content_is_nudged() -> None:
+    # No empty assistant message goes back (the API refuses one), so the turns are taken in order here.
+    fakes = Fakes(scripted(in_order(Reply(()), submit_turn(VALID_IMPLEMENT))))
+    assert (await run_b14(fakes)).status == "succeeded"
+    second = fakes.provider.requests[1].messages
+    assert second[-1] == Message("user", NUDGE)
+    assert all(m.content for m in second)  # no empty message is sent
+
+
+# --- limits -------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("registry_max", "global_max", "cap"), [(8, 40, 8), (40, 5, 5)])
+async def test_the_iteration_cap_is_the_smaller_limit(registry_max: int, global_max: int, cap: int) -> None:
+    assert run_cap(registry_max, global_max) == cap
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"})))
+    registry = registry_with("B14", limits={"max_iterations": registry_max})
+    result = await run_b14(fakes, registry=registry, runtime_config=config(max_tool_iterations=global_max))
+    assert (result.status, result.error_code) == ("failed", "iteration_limit")
+    assert len(fakes.provider.requests) == cap == ended(fakes).iterations
+
+
+async def test_a_looping_script_stops_at_the_cap() -> None:
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"})))
+    result = await run_b14(fakes, runtime_config=config(max_tool_iterations=6))
+    assert result.error_code == "iteration_limit"
+    assert len(fakes.provider.requests) == 6
+
+
+async def test_the_last_iteration_ending_without_a_result_is_iteration_limit() -> None:
+    fakes = Fakes(scripted(text_turn()))
+    result = await run_b14(fakes, runtime_config=config(max_tool_iterations=1))
+    assert result.error_code == "iteration_limit"
+
+
+# --- deadline -----------------------------------------------------------------------------------------------
+
+
+async def test_a_run_past_its_wall_clock_fails_timeout_without_sending() -> None:
+    clock = FakeClock()
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+
+    async def slow_tool(ctx: Any, raw: object) -> Any:
+        clock.now += 901  # B14 limits.timeout_seconds = 900
+        return ok_result()
+
+    fakes.tools.handlers["repo.read_file"] = slow_tool
+    result = await run_b14(fakes, clock=clock)
+    assert (result.status, result.error_code) == ("failed", "timeout")
+    assert len(fakes.provider.requests) == 1
+    assert fakes.log.count("send") == 1
+
+
+async def test_the_deadline_cancels_an_attempt_in_flight() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    registry = registry_with("B14", limits={"timeout_seconds": 0.3})
+    started = time.monotonic()
+    result = await run_b14(fakes, registry=registry, clock=time.monotonic)
+    assert time.monotonic() - started < 3
+    assert (result.status, result.error_code) == ("failed", "timeout")
+    ((_, record),) = fakes.ledger.records
+    assert (record.status, record.error_kind) == ("cancelled", "cancelled")
+    assert record.usage is not None and record.usage.output_tokens == 0  # partial, never unknown-as-zero
+
+
+def test_attempt_timeout_follows_max_tokens_up_to_the_cap() -> None:
+    assert attempt_timeout_s(1024, cap_s=120, remaining_s=10_000) == pytest.approx(55.6)
+    assert attempt_timeout_s(8192, cap_s=120, remaining_s=10_000) == 120
+    assert (REQUEST_BASE_S, MIN_OUTPUT_TOKENS_PER_S) == (30.0, 40.0)
+
+
+def test_attempt_timeout_never_outlives_the_run() -> None:
+    assert attempt_timeout_s(8192, cap_s=120, remaining_s=7.5) == 7.5
+
+
+async def test_the_request_carries_the_attempt_timeout() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    await run_b14(fakes, runtime_config=config(max_output_tokens=1024), clock=FakeClock())
+    request = fakes.provider.requests[0]
+    assert request.max_tokens == 1024
+    assert request.timeout_s == pytest.approx(55.6)
+
+
+# --- lease --------------------------------------------------------------------------------------------------
+
+
+async def test_a_lost_lease_before_an_attempt_sends_nothing() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.heartbeat.refuse[2] = LeaseLostError("lost")  # 1: the run's first beat; 2: before attempt 1
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("failed", "lease_lost")
+    assert fakes.provider.requests == [] and "send" not in fakes.log
+
+
+async def test_a_lost_lease_before_a_tool_runs_nothing() -> None:
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+    fakes.heartbeat.refuse[3] = LeaseLostError("lost")  # 3: before the tool
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("failed", "lease_lost")
+    assert fakes.tools.executed == []
+    assert len(fakes.provider.requests) == 1
+
+
+async def test_the_keep_alive_beats_during_a_long_attempt() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=0.3)
+    result = await run_b14(fakes, runtime_config=config(heartbeat_interval_s=0.05), clock=time.monotonic)
+    assert result.status == "succeeded"
+    during = fakes.log[fakes.log.index("send") : fakes.log.index("record")]
+    assert during.count("beat") >= 3
+
+
+async def test_a_lease_lost_by_the_keep_alive_cancels_the_attempt() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    for call in range(3, 50):  # 1 and 2: the run's beat and the attempt's; then every keep-alive beat fails
+        fakes.heartbeat.refuse[call] = LeaseLostError("lost")
+    started = time.monotonic()
+    result = await run_b14(fakes, runtime_config=config(heartbeat_interval_s=0.05), clock=time.monotonic)
+    assert time.monotonic() - started < 3
+    assert (result.status, result.error_code) == ("failed", "lease_lost")
+
+
+async def test_tools_run_one_at_a_time() -> None:
+    turn = Reply(
+        (
+            ToolUseBlock("toolu_a", "repo.read_file", {"path": "a"}),
+            ToolUseBlock("toolu_b", "repo.read_file", {"path": "b"}),
+            ToolUseBlock("toolu_c", "repo.get_tree", {}),
+        ),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(turn, submit_turn(VALID_IMPLEMENT)))
+    running = 0
+    overlaps = 0
+
+    async def handler(ctx: Any, raw: object) -> Any:
+        nonlocal running, overlaps
+        running += 1
+        overlaps += running > 1
+        await asyncio.sleep(0.01)
+        running -= 1
+        return ok_result()
+
+    fakes.tools.handlers["repo.read_file"] = handler
+    fakes.tools.handlers["repo.get_tree"] = handler
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert overlaps == 0
+    assert [use_id for _, _, _, use_id in fakes.tools.executed] == ["toolu_a", "toolu_b", "toolu_c"]
+
+
+# --- budget -------------------------------------------------------------------------------------------------
+
+
+async def test_budget_is_checked_before_every_tool() -> None:
+    turn = Reply(
+        (
+            ToolUseBlock("toolu_a", "repo.read_file", {"path": "a"}),
+            ToolUseBlock("toolu_b", "repo.get_tree", {}),
+        ),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(turn, submit_turn(VALID_IMPLEMENT)))
+    await run_b14(fakes)
+    tool_part = [e for e in fakes.log if e.startswith(("budget:tool", "tool:"))]
+    assert tool_part == ["budget:tool", "tool:repo.read_file", "budget:tool", "tool:repo.get_tree"]
+
+
+async def test_a_budget_refusal_before_a_tool_ends_budget_exceeded() -> None:
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+    fakes.budget.tools.refuse[1] = BudgetRefused("tool_iterations", 3, 3, next_bound=0)
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("budget_exceeded", None)
+    assert result.budget == BudgetBreach("tool_iterations", 3, 3, 0)
+    assert fakes.tools.executed == []
+    assert ended(fakes).budget == result.budget
+
+
+async def test_a_budget_refusal_before_an_attempt_ends_budget_exceeded() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.budget.attempts.refuse[1] = BudgetRefused(
+        "cost", Decimal("2"), Decimal("1.9"), next_bound=Decimal("0.2")
+    )
+    result = await run_b14(fakes)
+    assert result.status == "budget_exceeded"
+    assert result.budget == BudgetBreach("cost", Decimal("2"), Decimal("1.9"), Decimal("0.2"))
+    assert fakes.provider.requests == []
+
+
+# --- approval -----------------------------------------------------------------------------------------------
+
+
+async def test_approval_required_stops_the_run_with_the_pending_tool() -> None:
+    turn = Reply(
+        (
+            ToolUseBlock("toolu_r3", "repo.read_file", {"path": "a"}),
+            ToolUseBlock("toolu_next", "repo.get_tree", {}),
+        ),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(turn, submit_turn(VALID_IMPLEMENT)))
+    call_id = uuid.uuid4()
+
+    async def needs_approval(ctx: Any, raw: object) -> ToolResult:
+        return ToolResult(call_id, "approval_required", "waiting for approval", False)
+
+    fakes.tools.handlers["repo.read_file"] = needs_approval
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("approval_required", None)
+    assert result.pending_tool == PendingTool("toolu_r3", "repo.read_file", call_id)
+    assert ended(fakes).output == {
+        "pending_tool": {
+            "tool_use_id": "toolu_r3",
+            "tool_name": "repo.read_file",
+            "tool_call_id": str(call_id),
+        }
+    }
+    assert [name for _, name, _, _ in fakes.tools.executed] == ["repo.read_file"]
+    assert len(fakes.provider.requests) == 1
+
+
+# --- how a run ends -----------------------------------------------------------------------------------------
+
+
+def _chained(outer: BaseException, cause: BaseException) -> BaseException:
+    outer.__cause__ = cause
+    return outer
+
+
+CLASSIFY: list[tuple[BaseException, StopReason | None, tuple[str, str | None]]] = [
+    (ProviderBlocked("PROVIDER_DISABLED", "kill_switch"), None, ("failed", "PROVIDER_DISABLED")),
+    (ProviderBlocked("provider_not_ready", "no_report"), None, ("failed", "provider_not_ready")),
+    (LLMError("auth", status_code=401), None, ("failed", "provider_auth")),
+    (UsageUnrecorded("x"), None, ("failed", "usage_unrecorded")),
+    (UsageUnrecorded("x"), "cancelled", ("failed", "usage_unrecorded")),
+    (_chained(asyncio.CancelledError(), UsageUnrecorded("x")), None, ("failed", "usage_unrecorded")),
+    (_chained(LLMError("cancelled"), UsageUnrecorded("x")), "cancelled", ("failed", "usage_unrecorded")),
+    (LeaseLostError("lost"), None, ("failed", "lease_lost")),
+    (LLMError("cancelled"), "lease_lost", ("failed", "lease_lost")),
+    (LLMError("cancelled"), "timeout", ("failed", "timeout")),
+    (LLMError("cancelled"), "cancelled", ("cancelled", None)),
+    *[
+        (LLMError(kind), None, ("failed", "model_error"))  # type: ignore[arg-type]
+        for kind in (
+            "refusal",
+            "bad_request",
+            "malformed",
+            "max_tokens",
+            "rate_limited",
+            "overloaded",
+            "transient",
+            "timeout",
+        )
+    ],
+    (asyncio.CancelledError(), None, ("failed", "interrupted")),
+    (asyncio.CancelledError(), "cancelled", ("failed", "interrupted")),
+    (RuntimeError("db down"), None, ("failed", "internal_error")),
+    (BudgetConfigError("bad budget"), None, ("failed", "internal_error")),
+    (BudgetTaskMissing("gone"), None, ("failed", "internal_error")),
+    (TaskMissing("gone"), None, ("failed", "internal_error")),
+    (BudgetRefused("tokens", 1, 2, next_bound=3), None, ("budget_exceeded", None)),
+]
+
+
+@pytest.mark.parametrize(("error", "stop", "expected"), CLASSIFY)
+def test_classify(error: BaseException, stop: StopReason | None, expected: tuple[str, str | None]) -> None:
+    assert classify(error, stop) == expected
+
+
+@pytest.mark.parametrize(
+    "status", ["succeeded", "failed", "cancelled", "budget_exceeded", "approval_required"]
+)
+@pytest.mark.parametrize("code", [None, *AGENT_RUN_ERROR_CODES])
+def test_every_failed_end_carries_a_code_and_no_other_does(status: str, code: str | None) -> None:
+    # Every exit of the loop goes through RunEnd; this is its invariant over every status and code.
+    budget = BudgetBreach("tokens", 1, 1, 0) if status == "budget_exceeded" else None
+    if (status == "failed") == (code is not None):
+        RunEnd(status, 0, code, budget=budget)  # type: ignore[arg-type]
+    else:
+        with pytest.raises(ValueError):
+            RunEnd(status, 0, code, budget=budget)  # type: ignore[arg-type]
+
+
+async def test_a_caller_cancel_mid_stream_ends_cancelled() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    cancel = CancelToken()
+    runtime = make_runtime(fakes, clock=time.monotonic)
+    task = asyncio.create_task(runtime.run(run_request("B14", cancel=cancel)))
+    await asyncio.sleep(0.1)
+    cancel.cancel()
+    result = await asyncio.wait_for(task, 3)
+    assert (result.status, result.error_code) == ("cancelled", None)
+    ((_, record),) = fakes.ledger.records
+    assert record.status == "cancelled"
+
+
+async def test_an_asyncio_cancel_closes_the_run_interrupted_and_propagates() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    task = asyncio.create_task(make_runtime(fakes, clock=time.monotonic).run(run_request("B14")))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    end = ended(fakes)
+    assert (end.status, end.error_code) == ("failed", "interrupted")
+    assert fakes.providers.opened == fakes.providers.closed == 1
+
+
+async def test_an_unexpected_error_closes_the_run_internal_error_and_propagates() -> None:
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+    secret = "sk-ant-" + "unexpected-" + "x" * 24
+
+    async def broken(ctx: Any, raw: object) -> ToolResult:
+        raise RuntimeError(f"database is down ({secret})")
+
+    fakes.tools.handlers["repo.read_file"] = broken
+    runtime = make_runtime(fakes, redactor=Redactor([secret]))
+    with pytest.raises(RuntimeError):
+        await runtime.run(run_request("B14"))
+    end = ended(fakes)
+    assert (end.status, end.error_code) == ("failed", "internal_error")
+    assert end.error is not None and "RuntimeError" in end.error and secret not in end.error
+
+
+async def test_a_cancelled_run_whose_ledger_failed_is_usage_unrecorded() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    fakes.ledger.counter.refuse[1] = RuntimeError("database is down")
+    cancel = CancelToken()
+    task = asyncio.create_task(
+        make_runtime(fakes, clock=time.monotonic).run(run_request("B14", cancel=cancel))
+    )
+    await asyncio.sleep(0.1)
+    cancel.cancel()
+    result = await asyncio.wait_for(task, 3)
+    assert (result.status, result.error_code) == ("failed", "usage_unrecorded")
+
+
+async def test_an_asyncio_cancelled_run_whose_ledger_failed_is_usage_unrecorded() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    fakes.ledger.counter.refuse[1] = RuntimeError("database is down")
+    task = asyncio.create_task(make_runtime(fakes, clock=time.monotonic).run(run_request("B14")))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (ended(fakes).status, ended(fakes).error_code) == ("failed", "usage_unrecorded")
+
+
+async def test_a_refusal_before_the_provider_still_closes_a_row() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.gate.refuse[1] = ProviderBlocked("PROVIDER_DISABLED", "kill_switch")
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("failed", "PROVIDER_DISABLED")
+    (start,) = fakes.runs.starts
+    assert (start.model_provider, start.model_name) == (None, None)
+    assert fakes.providers.opened == 0 and fakes.provider.requests == []
+    assert result.agent_run_id == fakes.runs.ids[0]
+
+
+async def test_a_profile_runs_with_its_runtime_contract_and_its_own_identity() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    result = await make_runtime(fakes).run(run_request("B09", runtime_id="B14"))
+    assert isinstance(result.output, ImplementOutput)
+    (start,) = fakes.runs.starts
+    b09 = PROMPTS.get("B09")
+    assert b09 is not None
+    assert (start.agent_id, start.step, start.prompt_version) == ("B09", "implement", b09.version)
+    request = fakes.provider.requests[0]
+    assert request.system == b09.text
+    assert request.metadata["agent_id"] == "B09"
+    assert request.metadata["output_contract"] == "ImplementOutput"
+    assert fakes.budget.calls[0].scope.agent_id == "B09"
+    spec = REGISTRY.by_id("B09")
+    assert spec is not None and start.agent_version == spec.version
+
+
+async def test_the_run_start_names_the_model_and_the_input() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    request = run_request("B14")
+    await make_runtime(fakes).run(request)
+    (start,) = fakes.runs.starts
+    assert (start.model_provider, start.model_name) == ("scripted", MODEL)
+    assert (start.task_id, start.project_id) == (request.task_id, request.project_id)
+    assert start.input == request.agent_input.model_dump(mode="json")
+    first = fakes.provider.requests[0].messages[0]
+    assert first.role == "user" and isinstance(first.content, str)
+    assert first.content.startswith("<agent_input>\n") and first.content.endswith("\n</agent_input>")
+
+
+async def test_the_input_is_redacted_before_it_is_sent() -> None:
+    secret = "sk-ant-" + "input-" + "z" * 30
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    agent_input_ = contracts.ImplementInput(
+        task_id=uuid.uuid4(), step=STEP, requirements=[], gap_feedback=f"token={secret}"
+    )
+    await make_runtime(fakes, redactor=Redactor([secret])).run(run_request("B14", agent_input=agent_input_))
+    assert secret not in str(fakes.provider.requests[0].messages[0].content)
+
+
+async def test_the_runtime_writes_no_task_title() -> None:
+    fakes = Fakes(scripted(submit_turn(OUTPUTS["IntakeOutput"])))
+    result = await make_runtime(fakes).run(run_request("A02"))
+    assert isinstance(result.output, contracts.IntakeOutput)
+    # After the answer only the run is finished: no other port (and the runtime holds no task writer).
+    assert fakes.log[-1] == "record"
+    assert len(fakes.runs.finishes) == 1 and fakes.events.usage_updates == 1

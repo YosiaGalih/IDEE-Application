@@ -18,29 +18,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from decimal import Decimal
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from app.agents.prompt_book import PromptBook
-from app.agents.registry import AgentRegistry
+from app.agents.contracts import INPUT_CONTRACTS, OUTPUT_CONTRACTS, Contract
+from app.agents.grants import AgentNotRunnable, grant_for
+from app.agents.prompt_book import Prompt, PromptBook
+from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.cancel import CancelToken
 from app.core.logging import get_logger
 from app.core.redaction import Redactor
 from app.llm.base import (
     ContentBlock,
+    LLMError,
     LLMProvider,
     LLMRequest,
     LLMResponse,
+    Message,
     TextBlock,
     TextDeltaHandler,
     ToolDef,
+    ToolResultBlock,
     ToolUseBlock,
 )
 from app.llm.retry import AttemptHandler, AttemptRecord, RestartHandler, RetryPolicy, create_with_retry
@@ -69,7 +76,112 @@ RunErrorCode = Literal[
 ]
 StopReason = Literal["cancelled", "timeout", "lease_lost"]
 
+CONTEXT_MAX_BYTES: Final = 60 * 1024  # ADR-011: the first input of a run
+ABSORBED_PROFILES: Final = frozenset({"A01", "C16"})  # AGENT_CATALOG §4.2: never dispatched alone
+STEPS: Final[Mapping[str, str]] = MappingProxyType(
+    {"A02": "intake", "A03": "plan", "B14": "implement", "C20": "debug", "D22": "review", "A07": "user_proxy"}
+)
+NUDGE: Final = (
+    "You ended your turn without calling submit_result. Call submit_result now with input that matches its "
+    "schema."
+)
+SUBMIT_DESCRIPTION: Final = (
+    "Submit the result of this run: call it exactly once, with input that matches this schema. It ends the "
+    "run."
+)
+ONE_SUBMIT: Final = "Only one submit_result per turn is accepted: none of them was taken. Call it once."
+ERROR_TEXT_MAX: Final = 1000
+VALIDATION_ERRORS_SHOWN: Final = 20
+REQUEST_BASE_S: Final = 30.0  # connect + time to first token for a long prompt [Menebak]
+MIN_OUTPUT_TOKENS_PER_S: Final = 40.0  # the slowest output rate still waited for [Menebak]
+# A field location is named only when it looks like a field name: a key the model invented is input too.
+_FIELD = re.compile(r"[a-z_][a-z0-9_]{0,39}")
+
 _log = get_logger(__name__)
+
+
+class AgentInputInvalid(ValueError):
+    """The input is not an instance of the runtime agent's input contract (a caller error: no run row)."""
+
+
+class AgentInputTooLarge(AgentInputInvalid):
+    """The input is over ``CONTEXT_MAX_BYTES`` (ADR-011)."""
+
+
+class ScenarioNotAllowed(ValueError):
+    """A scripted scenario was asked of a provider that is not scripted (ADR-015)."""
+
+
+def run_cap(registry_max_iterations: int, global_max: int) -> int:
+    """Model calls a run may make (Keputusan Lead #19): the smaller of the agent's and the global cap."""
+    return min(registry_max_iterations, global_max)
+
+
+def attempt_timeout_s(max_tokens: int, *, cap_s: float, remaining_s: float) -> float:
+    """Time one attempt may take (Keputusan Lead #19, syarat 3.1a): a base plus the output cap at the slowest
+    rate still waited for, never past ``CLAUDE_REQUEST_TIMEOUT_SECONDS`` or the run's deadline."""
+    return min(REQUEST_BASE_S + max_tokens / MIN_OUTPUT_TOKENS_PER_S, cap_s, remaining_s)
+
+
+def _chain(error: BaseException) -> Iterator[BaseException]:
+    """``error`` and every exception it was raised from or during (``__cause__`` and ``__context__``)."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.extend(e for e in (current.__cause__, current.__context__) if e is not None)
+
+
+def classify(error: BaseException, stop: StopReason | None) -> tuple[RunStatus, RunErrorCode | None]:
+    """How a run that ended with ``error`` ends (Keputusan plan #8; Keputusan Lead #15, #20, #35).
+
+    A ledger write that failed wins over everything, a cancel included (Keputusan Lead #20). A provider
+    error caused by the run's own stop token takes the stop's reason. An asyncio cancel of the runtime is
+    ``interrupted``; anything else unexpected is ``internal_error``."""
+    if any(isinstance(e, UsageUnrecorded) for e in _chain(error)):
+        return "failed", "usage_unrecorded"
+    if isinstance(error, BudgetRefused):
+        return "budget_exceeded", None
+    if isinstance(error, ProviderBlocked):
+        return "failed", error.code
+    if isinstance(error, LeaseLostError):
+        return "failed", "lease_lost"
+    if isinstance(error, asyncio.CancelledError):
+        return "failed", "interrupted"
+    if isinstance(error, LLMError):
+        if stop == "cancelled":
+            return "cancelled", None
+        if stop is not None:
+            return "failed", stop
+        return "failed", "provider_auth" if error.kind == "auth" else "model_error"
+    return "failed", "internal_error"
+
+
+def _field_location(loc: Iterable[int | str]) -> str:
+    parts = [str(p) if isinstance(p, int) or _FIELD.fullmatch(p) else "<key>" for p in loc]
+    return ".".join(parts) or "(root)"
+
+
+def _invalid_submit(contract: type[Contract], error: ValidationError) -> str:
+    """Field locations and error types only, never a value the model sent (Global Constraints)."""
+    problems = [
+        f"{_field_location(e['loc'])}: {e['type']}"
+        for e in error.errors(include_input=False, include_url=False, include_context=False)
+    ]
+    shown = "; ".join(problems[:VALIDATION_ERRORS_SHOWN])
+    more = (
+        f" (and {len(problems) - VALIDATION_ERRORS_SHOWN} more)"
+        if len(problems) > VALIDATION_ERRORS_SHOWN
+        else ""
+    )
+    return (
+        f"submit_result input does not match the {contract.__name__} schema: {shown}{more}. Call "
+        "submit_result again with input that matches its schema."
+    )
 
 
 # --- port exceptions: adapters translate domain errors into these (ADR-022) ---------------------------------
@@ -346,6 +458,47 @@ class RuntimeConfig:
 # --- the runtime --------------------------------------------------------------------------------------------
 
 
+class _RunStop:
+    """One stop token per run (Keputusan plan #6): the caller's cancel, the deadline or a lost lease cancels
+    it, and the first reason wins. Providers and tools get the token."""
+
+    def __init__(self) -> None:
+        self.token = CancelToken()
+        self.reason: StopReason | None = None
+
+    def stop(self, reason: StopReason) -> None:
+        if self.reason is None:
+            self.reason = reason
+        self.token.cancel()
+
+
+@dataclass(slots=True)
+class _Run:
+    request: AgentRunRequest
+    spec: AgentSpec
+    grant: AgentGrant
+    prompt: Prompt
+    runtime_id: str
+    output_contract: type[Contract]
+    input_json: str
+    deadline: float
+    stop: _RunStop = field(default_factory=_RunStop)
+    agent_run_id: uuid.UUID | None = None
+    iterations: int = 0
+    output: BaseModel | None = None
+    pending: PendingTool | None = None
+
+
+async def _stop(watchers: list[asyncio.Task[None]]) -> None:
+    for watcher in watchers:
+        watcher.cancel()
+    await asyncio.gather(*watchers, return_exceptions=True)
+
+
+def _id(value: uuid.UUID | None) -> str | None:
+    return str(value) if value is not None else None
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -365,6 +518,338 @@ class AgentRuntime:
         self._redactor = redactor
         self._clock = clock
         self._sleep = sleep
+
+    async def run(self, request: AgentRunRequest) -> AgentRunResult:
+        """One agent run (plan WP-3.1f2a Task 5). A caller error (unknown or disabled agent, tool mode, an
+        absorbed profile, no prompt, the wrong input contract, an input over 60 KB, a scenario outside
+        scripted) raises before any row exists. From then on every exit leaves a closed ``agent_runs`` row:
+        a classified end is returned; an asyncio cancel or an unexpected error closes the run and is raised
+        again."""
+        run = self._admit(request)
+        watchers = self._watch(run)
+        try:
+            end = await self._execute(run)
+        except asyncio.CancelledError as cancelled:
+            await _stop(watchers)
+            _log.warning(
+                "agent_run_interrupted", agent_run_id=_id(run.agent_run_id), agent_id=run.spec.agent_id
+            )
+            await self._close_after_error(run, self._end_for(cancelled, run))
+            raise
+        except Exception as error:
+            await _stop(watchers)
+            _log.error(
+                "agent_run_internal_error",
+                agent_run_id=_id(run.agent_run_id),
+                agent_id=run.spec.agent_id,
+                error_type=type(error).__name__,
+            )
+            await self._close_after_error(run, self._end_for(error, run))
+            raise
+        await _stop(watchers)
+        return await self._close(run, end)
+
+    # --- before the run -------------------------------------------------------------------------------------
+
+    def _admit(self, request: AgentRunRequest) -> _Run:
+        """The checks that leave no row (Keputusan plan #10)."""
+        grant = grant_for(self._registry, request.agent_id)  # AgentNotRunnable: unknown or not enabled
+        spec = self._registry.by_id(request.agent_id)
+        assert spec is not None
+        if spec.mvp_mode == "llm":
+            runtime_id = spec.agent_id
+        elif spec.mvp_mode == "profile" and spec.runtime_agent is not None:
+            runtime_id = spec.runtime_agent
+        else:
+            raise AgentNotRunnable(f"{spec.agent_id} is not run by the agent runtime ({spec.mvp_mode})")
+        if spec.agent_id in ABSORBED_PROFILES:
+            raise AgentNotRunnable(f"{spec.agent_id} is absorbed into its runtime agent's run")
+        output_contract = OUTPUT_CONTRACTS.get(runtime_id)
+        input_contract = INPUT_CONTRACTS.get(runtime_id)
+        if output_contract is None or input_contract is None or runtime_id not in STEPS:
+            raise AgentNotRunnable(f"{spec.agent_id} has no runtime contract")
+        prompt = self._prompts.get(spec.agent_id)
+        if prompt is None:
+            raise AgentNotRunnable(f"{spec.agent_id} has no runtime prompt")
+        if type(request.agent_input) is not input_contract:
+            raise AgentInputInvalid(f"{spec.agent_id} takes a {input_contract.__name__}")
+        input_json = request.agent_input.model_dump_json()
+        if len(input_json.encode("utf-8")) > CONTEXT_MAX_BYTES:
+            raise AgentInputTooLarge(f"the input is over {CONTEXT_MAX_BYTES} bytes (ADR-011)")
+        if request.scenario is not None and not self._config.scripted:
+            raise ScenarioNotAllowed("a scenario is only for the scripted provider (ADR-015)")
+        return _Run(
+            request=request,
+            spec=spec,
+            grant=grant,
+            prompt=prompt,
+            runtime_id=runtime_id,
+            output_contract=output_contract,
+            input_json=input_json,
+            deadline=self._clock() + spec.limits.timeout_seconds,
+        )
+
+    def _run_start(self, run: _Run, provider: str | None, model: str | None) -> RunStart:
+        return RunStart(
+            task_id=run.request.task_id,
+            project_id=run.request.project_id,
+            agent_id=run.spec.agent_id,
+            agent_version=run.spec.version,
+            step=STEPS[run.runtime_id],
+            model_provider=provider,
+            model_name=model,
+            prompt_version=run.prompt.version,
+            input=run.request.agent_input.model_dump(mode="json"),
+        )
+
+    # --- the stop token and its sources (Keputusan plan #5, #6; Keputusan Lead #33) -------------------------
+
+    def _watch(self, run: _Run) -> list[asyncio.Task[None]]:
+        return [
+            asyncio.create_task(self._on_caller_cancel(run)),
+            asyncio.create_task(self._on_deadline(run)),
+            asyncio.create_task(self._keep_alive(run)),
+        ]
+
+    async def _on_caller_cancel(self, run: _Run) -> None:
+        await run.request.cancel.wait()
+        run.stop.stop("cancelled")
+
+    async def _on_deadline(self, run: _Run) -> None:
+        # Wall clock: an attempt in flight is cut at the deadline. Between attempts the loop also compares the
+        # deadline with ``clock``.
+        remaining = run.deadline - self._clock()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        run.stop.stop("timeout")
+
+    async def _keep_alive(self, run: _Run) -> None:
+        """The lease (60 s) is shorter than one request may take: renew it every ``heartbeat_interval_s``
+        for as long as the run is active. A renewal that fails stops the run: without a lease nothing may go
+        on (any failure counts as a lost lease, logged with its type)."""
+        while True:
+            await asyncio.sleep(self._config.heartbeat_interval_s)
+            try:
+                await self._ports.heartbeat.beat(run.request.task_id)
+            except LeaseLostError:
+                run.stop.stop("lease_lost")
+                return
+            except Exception as error:
+                _log.error(
+                    "agent_run_keep_alive_failed",
+                    agent_run_id=_id(run.agent_run_id),
+                    error_type=type(error).__name__,
+                )
+                run.stop.stop("lease_lost")
+                return
+
+    # --- the run --------------------------------------------------------------------------------------------
+
+    async def _execute(self, run: _Run) -> RunEnd:
+        request = run.request
+        try:
+            await self._ports.heartbeat.beat(request.task_id)
+            models = await self._ports.gate.check(request.project_id)
+            async with self._ports.providers.open() as provider:
+                model = models[run.spec.model_tier]
+                run.agent_run_id = await self._ports.runs.start(self._run_start(run, provider.name, model))
+                return await self._loop(run, provider, model)
+        except (ProviderBlocked, LeaseLostError, BudgetRefused, UsageUnrecorded, LLMError) as error:
+            return self._end_for(error, run)
+
+    async def _loop(self, run: _Run, provider: LLMProvider, model: str) -> RunEnd:
+        assert run.agent_run_id is not None
+        request = run.request
+        scope = RunScope(request.project_id, request.task_id, run.agent_run_id, run.spec.agent_id)
+        # What the gateway offers (grant ∩ registered ∩ preconditions, sorted; spec #22), then submit_result
+        # last: a stable prompt prefix.
+        defs = [d for d in self._ports.tools.tool_defs_for(run.grant) if d.name != SUBMIT_RESULT]
+        tools = (*defs, ToolDef(SUBMIT_RESULT, SUBMIT_DESCRIPTION, run.output_contract.model_json_schema()))
+        ctx = ToolContext(
+            task_id=request.task_id,
+            project_id=request.project_id,
+            agent_run_id=run.agent_run_id,
+            grant=run.grant,
+            offered=frozenset(d.name for d in defs),
+            correlation_id=f"agent_run:{run.agent_run_id}",
+            cancel=run.stop.token,
+            workspace=request.workspace,
+        )
+        messages = [
+            Message("user", f"<agent_input>\n{self._redactor.redact(run.input_json)}\n</agent_input>")
+        ]
+        cap = run_cap(run.spec.limits.max_iterations, self._config.max_tool_iterations)
+        nudged = False
+        while run.iterations < cap:
+            if run.stop.reason is not None:
+                return self._stopped(run)
+            remaining = run.deadline - self._clock()
+            if remaining <= 0:
+                return self._timed_out(run)
+            run.iterations += 1
+            response = await self._attempt(run, provider, model, scope, tools, messages, remaining)
+            if response.content:
+                messages.append(Message("assistant", response.content))
+            uses = [block for block in response.content if isinstance(block, ToolUseBlock)]
+            submits = [block for block in uses if block.name == SUBMIT_RESULT]
+            submit_error = ONE_SUBMIT
+            if len(submits) == 1:
+                try:
+                    output = run.output_contract.model_validate(submits[0].input)
+                except ValidationError as error:
+                    submit_error = _invalid_submit(run.output_contract, error)
+                else:
+                    run.output = output
+                    return RunEnd("succeeded", run.iterations, output=output.model_dump(mode="json"))
+            if not uses:
+                if nudged:
+                    return RunEnd(
+                        "failed",
+                        run.iterations,
+                        "invalid_output",
+                        "the model ended its turn twice without submit_result",
+                    )
+                nudged = True
+                messages.append(Message("user", NUDGE))
+                continue
+            results: list[ToolResultBlock] = []
+            for block in uses:
+                if block.name == SUBMIT_RESULT:
+                    results.append(ToolResultBlock(block.id, submit_error, is_error=True))
+                    continue
+                if run.stop.reason is not None:
+                    return self._stopped(run)
+                # One tool at a time (syarat 3.1d2a #5): budget, then the lease, then the gateway.
+                await self._ports.budget.before_tool(scope)
+                await self._ports.heartbeat.beat(request.task_id)
+                result = await self._ports.tools.execute(ctx, block.name, block.input, tool_use_id=block.id)
+                if result.status == "approval_required":
+                    run.pending = PendingTool(block.id, block.name, result.tool_call_id)
+                    pending = {
+                        "tool_use_id": block.id,
+                        "tool_name": block.name,
+                        "tool_call_id": str(result.tool_call_id),
+                    }
+                    return RunEnd("approval_required", run.iterations, output={"pending_tool": pending})
+                results.append(ToolResultBlock(block.id, result.content, is_error=result.is_error))
+            messages.append(Message("user", tuple(results)))
+        return RunEnd(
+            "failed",
+            run.iterations,
+            "iteration_limit",
+            f"the run used its {cap} iterations without a valid submit_result",
+        )
+
+    async def _attempt(
+        self,
+        run: _Run,
+        provider: LLMProvider,
+        model: str,
+        scope: RunScope,
+        tools: tuple[ToolDef, ...],
+        messages: list[Message],
+        remaining_s: float,
+    ) -> LLMResponse:
+        call_id = uuid.uuid4()
+        metadata = {
+            "call_id": str(call_id),
+            "task_id": str(scope.task_id),
+            "agent_run_id": str(scope.agent_run_id),
+            "agent_id": scope.agent_id,
+            "output_contract": run.output_contract.__name__,
+        }
+        if run.request.scenario is not None and provider.name == "scripted":
+            metadata["scenario"] = run.request.scenario
+        max_tokens = self._config.max_output_tokens
+        call = ModelCall(
+            request=LLMRequest(
+                model=model,
+                system=run.prompt.text,
+                messages=tuple(messages),
+                tools=tools,
+                max_tokens=max_tokens,
+                metadata=metadata,
+                timeout_s=attempt_timeout_s(
+                    max_tokens, cap_s=self._config.request_timeout_s, remaining_s=remaining_s
+                ),
+            ),
+            call_id=call_id,
+            scope=scope,
+        )
+        try:
+            response = await self._call_model(call, provider, cancel=run.stop.token)
+        except LLMError:
+            await self._ports.events.usage_updated(scope)  # the call reached the provider
+            raise
+        await self._ports.events.usage_updated(scope)
+        return response
+
+    # --- how it ends ----------------------------------------------------------------------------------------
+
+    def _stopped(self, run: _Run) -> RunEnd:
+        if run.stop.reason == "cancelled":
+            return RunEnd("cancelled", run.iterations)
+        if run.stop.reason == "timeout":
+            return self._timed_out(run)
+        return RunEnd("failed", run.iterations, "lease_lost", "the task lease was lost")
+
+    def _timed_out(self, run: _Run) -> RunEnd:
+        limit = run.spec.limits.timeout_seconds
+        return RunEnd("failed", run.iterations, "timeout", f"the run passed its time limit ({limit} s)")
+
+    def _end_for(self, error: BaseException, run: _Run) -> RunEnd:
+        status, code = classify(error, run.stop.reason)
+        if status == "budget_exceeded" and isinstance(error, BudgetRefused):
+            breach = BudgetBreach(error.kind, error.limit, error.used, error.next_bound)
+            return RunEnd("budget_exceeded", run.iterations, budget=breach)
+        if status == "cancelled" or code is None:
+            return RunEnd("cancelled", run.iterations)
+        if code == "timeout":
+            return self._timed_out(run)
+        if code == "lease_lost" and not isinstance(error, LeaseLostError):
+            return RunEnd("failed", run.iterations, "lease_lost", "the task lease was lost")
+        return RunEnd("failed", run.iterations, code, self._error_text(error, code))
+
+    def _error_text(self, error: BaseException, code: RunErrorCode) -> str:
+        """A short text for ``agent_runs.error``: redacted here and again by the store."""
+        if code == "interrupted":
+            text = "the run was interrupted: its worker stopped"
+        elif code == "usage_unrecorded":
+            text = str(next(e for e in _chain(error) if isinstance(e, UsageUnrecorded)))
+        else:
+            detail = str(error)
+            text = f"{type(error).__name__}: {detail}" if detail else type(error).__name__
+        return self._redactor.redact(text)[:ERROR_TEXT_MAX]
+
+    async def _close(self, run: _Run, end: RunEnd) -> AgentRunResult:
+        """Writes the end, shielded: a second cancel does not leave the run ``running``."""
+        usage = await asyncio.shield(self._write_end(run, end))
+        assert run.agent_run_id is not None
+        return AgentRunResult(
+            agent_run_id=run.agent_run_id,
+            status=end.status,
+            output=run.output if end.status == "succeeded" else None,
+            usage=usage,
+            error_code=end.error_code,
+            error=end.error,
+            budget=end.budget,
+            pending_tool=run.pending if end.status == "approval_required" else None,
+        )
+
+    async def _write_end(self, run: _Run, end: RunEnd) -> RunUsage:
+        if run.agent_run_id is None:  # refused before the provider existed: the row names no model
+            run.agent_run_id = await self._ports.runs.start(self._run_start(run, None, None))
+        return await self._ports.runs.finish(run.agent_run_id, end)
+
+    async def _close_after_error(self, run: _Run, end: RunEnd) -> None:
+        """Closes the run before the original error is raised again; a close that fails is logged (ids and
+        type only), and the row left ``running`` belongs to recovery (WP-3.1f2b)."""
+        try:
+            await self._close(run, end)
+        except Exception as failure:
+            _log.error(
+                "agent_run_unfinished", agent_run_id=_id(run.agent_run_id), error_type=type(failure).__name__
+            )
 
     async def _call_model(
         self,

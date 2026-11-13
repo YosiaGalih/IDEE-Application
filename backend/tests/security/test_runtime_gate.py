@@ -22,7 +22,7 @@ import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.agents.runtime import ProviderBlocked, RunScope
+from app.agents.runtime import AgentRunResult, ProviderBlocked, RunScope
 from app.core.audit import AuditWriter
 from app.core.cancel import CancelToken
 from app.core.config import Settings, load_settings
@@ -41,13 +41,21 @@ from app.workflow.budget import BudgetDefaults, BudgetGuard
 from tests.conftest import make_test_env, reset_data
 from tests.integration.test_task_schema import make_project, make_task
 from tests.runtime_fakes import (
+    OUTPUTS,
+    Composition,
     FakeHeartbeat,
     Fakes,
+    FakeTools,
     a_model_call,
+    compose,
+    hold_lease,
     in_order,
     make_runtime,
+    ok_result,
+    run_request,
     scripted,
     submit_turn,
+    tool_turn,
 )
 from tests.tool_fakes import make_run
 
@@ -352,4 +360,111 @@ async def test_a_switch_flipped_between_retries_stops_the_retry(
         )
     assert (exc.value.code, exc.value.reason) == ("PROVIDER_DISABLED", "kill_switch")
     assert len(fakes.provider.requests) == 1
+    assert await ledger_rows(session) == 1
+
+
+# --- the run ends with the code (plan WP-3.1f2a Task 5) -----------------------------------------------------
+
+
+async def run_task(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
+    project = await make_project(session)
+    task = await make_task(session, project)
+    await session.commit()
+    await hold_lease(session, task.id)
+    return project.id, task.id
+
+
+async def a_run(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    pricing: PricingTable,
+    settings: Settings,
+    *turns: Any,
+    tools: FakeTools | None = None,
+) -> tuple[Composition, AgentRunResult]:
+    project_id, task_id = await run_task(session)
+    composed = compose(sessions, settings, pricing, scripted(*turns), tools=tools or FakeTools([]))
+    result = await composed.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    return composed, result
+
+
+async def test_a_disabled_provider_stops_the_run_before_any_request(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable
+) -> None:
+    settings = worker()
+    await record(session, settings)
+    await set_enabled(session, False)
+    composed, result = await a_run(
+        session, sessions, pricing, settings, submit_turn(OUTPUTS["ImplementOutput"])
+    )
+    assert (result.status, result.error_code) == ("failed", "PROVIDER_DISABLED")
+    assert composed.provider.requests == []
+    assert composed.providers.opened == 0
+    assert await ledger_rows(session) == 0
+    assert composed.runs.ends[-1].error_code == "PROVIDER_DISABLED"
+
+
+@pytest.mark.parametrize("value", [False, "false", 0, None], ids=repr)
+async def test_the_kill_switch_stops_the_run_before_any_request(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable, value: object
+) -> None:
+    settings = worker()
+    await record(session, settings)
+    project_id, task_id = await run_task(session)
+    await set_kill_switch(session, project_id, value)
+    composed = compose(
+        sessions, settings, pricing, scripted(submit_turn(OUTPUTS["ImplementOutput"])), tools=FakeTools([])
+    )
+    result = await composed.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert (result.status, result.error_code) == ("failed", "PROVIDER_DISABLED")
+    assert composed.provider.requests == []
+    assert await ledger_rows(session) == 0
+
+
+@pytest.mark.parametrize("case", list(NOT_READY))
+async def test_a_provider_not_ready_stops_the_run(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable, case: str
+) -> None:
+    arrangement, _ = NOT_READY[case]
+    settings = await arrange_not_ready(session, arrangement)
+    composed, result = await a_run(
+        session, sessions, pricing, settings, submit_turn(OUTPUTS["ImplementOutput"])
+    )
+    assert (result.status, result.error_code) == ("failed", "provider_not_ready")
+    assert composed.provider.requests == []
+    assert await ledger_rows(session) == 0
+
+
+@pytest.mark.parametrize("switch", ["kill_switch", "enabled"])
+async def test_a_switch_flipped_mid_run_stops_the_next_attempt(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    pricing: PricingTable,
+    switch: str,
+) -> None:
+    settings = worker()
+    await record(session, settings)
+    project_id, task_id = await run_task(session)
+    tools = FakeTools([])
+
+    async def flip(ctx: Any, raw: object) -> Any:
+        async with async_sessionmaker(engine)() as other:
+            if switch == "kill_switch":
+                await set_kill_switch(other, project_id, False)
+            else:
+                await set_enabled(other, False)
+        return ok_result()
+
+    tools.handlers["repo.get_tree"] = flip
+    composed = compose(
+        sessions,
+        settings,
+        pricing,
+        scripted(tool_turn("repo.get_tree"), submit_turn(OUTPUTS["ImplementOutput"])),
+        tools=tools,
+    )
+    result = await composed.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert (result.status, result.error_code) == ("failed", "PROVIDER_DISABLED")
+    assert len(composed.provider.requests) == 1  # no restart of the worker needed
     assert await ledger_rows(session) == 1

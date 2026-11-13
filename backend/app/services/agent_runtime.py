@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agents.runtime import BudgetRefused, ModelCall, ProviderBlocked, RunScope
+from app.agents.runtime import BudgetRefused, LeaseLostError, ModelCall, ProviderBlocked, RunScope
 from app.core.config import Settings
 from app.llm.retry import AttemptHandler
 from app.models.projects import Project
@@ -28,6 +28,7 @@ from app.services.provider_readiness import (
 )
 from app.services.usage import UsageCallContext, UsageLedger
 from app.workflow.budget import BudgetExceeded, BudgetGuard, CallBound
+from app.workflow.lease import LeaseLost, renew_lease
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +74,10 @@ class GuardBudget:
             raise _refused(exc) from exc
 
     async def before_tool(self, scope: RunScope) -> None:
-        raise NotImplementedError  # plan WP-3.1f2a Task 5
+        try:
+            await self._guard.check_before_tool(scope.task_id)
+        except BudgetExceeded as exc:
+            raise _refused(exc) from exc
 
 
 class LedgerRecorder:
@@ -116,3 +120,20 @@ class DbProviderGate:
         if not provider_calls_allowed(project):
             raise ProviderBlocked("PROVIDER_DISABLED", "kill_switch")
         return effective_models(self._settings, (row.model_policy or {}) if row is not None else {})
+
+
+class LeaseHeartbeat:
+    """``Heartbeat`` over the task lease (Keputusan Lead #18, #33)."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession], worker_id: str) -> None:
+        self._sessions = sessions
+        self._worker_id = worker_id
+
+    async def beat(self, task_id: uuid.UUID) -> None:
+        """``renew_lease`` in its own transaction, committed at once (never held across a tool or a model
+        call); ``LeaseLost`` -> ``LeaseLostError``."""
+        try:
+            async with self._sessions.begin() as session:
+                await renew_lease(session, task_id, self._worker_id)
+        except LeaseLost as exc:
+            raise LeaseLostError(str(exc)) from exc
