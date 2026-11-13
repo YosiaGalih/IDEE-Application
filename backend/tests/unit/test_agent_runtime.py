@@ -1223,3 +1223,55 @@ async def test_a_run_stopped_during_its_attempt_does_not_beat_again() -> None:
     result = await task
     assert (result.status, result.error_code) == ("cancelled", None)
     assert fakes.log[-1] == "record"
+
+
+async def test_every_runtime_log_line_names_its_task_and_run() -> None:
+    """Review L5: a runtime log line carries ``task_id`` and ``correlation_id`` ``agent_run:<id>``, so it can
+    be found from the task and from the run."""
+    from structlog.testing import capture_logs
+
+    long_text = "The answer streams for a while before it is submitted. " * 20
+    turn = Reply(
+        (TextBlock(long_text), ToolUseBlock("toolu_submit", SUBMIT_RESULT, VALID_IMPLEMENT)),
+        stop_reason="tool_use",
+    )
+    noisy = Fakes(scripted(turn))
+    noisy.events = BrokenEvents()
+    noisy.runs = FlakyRuns(failures=1)
+    noisy.heartbeat.refuse[2] = RuntimeError("database blip")
+    broken = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+
+    async def failing(ctx: Any, raw: object) -> Any:
+        raise ValueError("boom")
+
+    broken.tools.handlers["repo.read_file"] = failing
+    stopped = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=5.0)
+    runs: dict[str, Fakes] = {}
+    with capture_logs() as logs:
+        request = run_request("B14", cancel=BrokenCancel())
+        runs[str(request.task_id)] = noisy
+        assert (await make_runtime(noisy).run(request)).status == "succeeded"
+        request = run_request("B14")
+        runs[str(request.task_id)] = broken
+        with pytest.raises(ValueError):
+            await make_runtime(broken).run(request)
+        request = run_request("B14")
+        runs[str(request.task_id)] = stopped
+        task = asyncio.create_task(make_runtime(stopped, clock=time.monotonic).run(request))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    lines = [log for log in logs if log["event"].startswith("agent_run_")]
+    assert {line["event"] for line in lines} >= {
+        "agent_run_event_failed",
+        "agent_run_watcher_failed",
+        "agent_run_beat_failed",
+        "agent_run_unfinished",
+        "agent_run_internal_error",
+        "agent_run_worker_cancelled",
+    }
+    for line in lines:
+        (run_id,) = runs[line["task_id"]].runs.ids
+        assert line["agent_run_id"] == str(run_id), line
+        assert line["correlation_id"] == f"agent_run:{run_id}", line

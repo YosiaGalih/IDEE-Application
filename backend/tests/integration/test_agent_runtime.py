@@ -34,6 +34,7 @@ from tests.runtime_fakes import (
     Composition,
     RecordingBus,
     compose,
+    config,
     hold_lease,
     registry_with,
     run_request,
@@ -603,3 +604,40 @@ async def test_a_run_whose_usage_was_not_recorded_never_reads_zero(
         finished["payload"]["usage"]["input_tokens"],
         finished["payload"]["usage"]["cost_status"],
     ) == expected
+
+
+async def test_the_lease_is_renewed_while_a_tool_runs(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    """Review LOW-3 (backend): a tool that runs longer than the heartbeat interval does not let the lease
+    lapse: the keep-alive renews ``lease_expires_at`` while the tool runs."""
+    project_id, task_id = await a_task(session, settings)
+    seen: list[Any] = []
+
+    async def expires() -> Any:
+        async with engine.connect() as conn:
+            query = text("SELECT lease_expires_at FROM tasks WHERE id = :id")
+            return (await conn.execute(query, {"id": task_id})).scalar_one()
+
+    async def slow(ctx: ToolContext, validated: Any) -> ToolOutput:
+        seen.append(await expires())
+        await asyncio.sleep(0.4)  # eight heartbeat intervals
+        seen.append(await expires())
+        return ToolOutput("slow")
+
+    run = compose(
+        sessions,
+        settings,
+        pricing,
+        scripted(tool_turn("test.read", {"path": "README.md"}), DONE),
+        tools=gateway(sessions, spec("test.read", slow)),
+        registry=_tool_registry("test.read"),
+        runtime_config=config(heartbeat_interval_s=0.05),
+    )
+    result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert result.status == "succeeded"
+    assert seen[1] > seen[0], seen

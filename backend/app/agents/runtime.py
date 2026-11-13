@@ -214,6 +214,18 @@ class ScenarioNotAllowed(ValueError):
     """A scripted scenario was asked of a provider that is not scripted (ADR-015)."""
 
 
+# AG-13 3.1f2a LOW-1: "<" occurs in JSON only inside a string, so its JSON escape keeps the document valid and
+# its value the same, and no tag in the input (a closing </agent_input>, a forged <untrusted_content>) can
+# start. The fullwidth brackets app.tools.untrusted also treats as "<" are escaped the same way.
+_INPUT_BRACKETS: Final = str.maketrans({"<": "\\u003c", "\uff1c": "\\uff1c", "\ufe64": "\\ufe64"})
+
+
+def input_block(input_json: str) -> str:
+    """The run's first message: the (redacted) input JSON inside ``<agent_input>``, with no bracket that
+    could open a tag."""
+    return f"<agent_input>\n{input_json.translate(_INPUT_BRACKETS)}\n</agent_input>"
+
+
 def run_cap(registry_max_iterations: int, global_max: int) -> int:
     """Model calls a run may make (Keputusan Lead #19): the smaller of the agent's and the global cap."""
     return min(registry_max_iterations, global_max)
@@ -875,9 +887,7 @@ class AgentRuntime:
             cancel=run.stop.token,
             workspace=request.workspace,
         )
-        messages = [
-            Message("user", f"<agent_input>\n{self._redactor.redact(run.input_json)}\n</agent_input>")
-        ]
+        messages = [Message("user", input_block(self._redactor.redact(run.input_json)))]
         cap = run_cap(run.spec.limits.max_iterations, self._config.max_tool_iterations)
         nudged = False
         while run.iterations < cap:
