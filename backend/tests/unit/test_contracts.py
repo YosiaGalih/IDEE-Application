@@ -452,3 +452,26 @@ def test_a_passed_claim_without_evidence_stays_schema_valid() -> None:
     c.CriterionResult.model_validate(bare)
     report = with_(VALID[c.UserProxyOutput], status="passed", criteria_results=[bare])
     c.UserProxyOutput.model_validate(report)
+
+
+@pytest.mark.parametrize("ref", ["test_run:abc", "commit:" + str(UUID1), f"test_run:{UUID1}".upper(), "x"])
+def test_a_malformed_ref_in_an_a07_criterion_stays_schema_valid(ref: str) -> None:
+    """Lead decision 3.1f2 #45 (USER_PROXY_ACCEPTANCE §5 V2): a malformed evidence ref reaches
+    ``verify_report``, which downgrades a passed criterion to ``malformed_ref`` (or drops the ref of another)
+    and audits it; refusing the whole ``submit_result`` here would lose that, as in #36. The other contracts
+    keep the ref pattern."""
+    for status in ("passed", "failed"):
+        criterion = with_(CRITERION_RESULT, status=status, evidence_refs=[ref, f"test_run:{UUID1}"])
+        c.CriterionResult.model_validate(criterion)
+        c.UserProxyOutput.model_validate(with_(VALID[c.UserProxyOutput], criteria_results=[criterion]))
+    with pytest.raises(ValidationError):
+        c.ImplementOutput.model_validate(with_(VALID[c.ImplementOutput], evidence_refs=[ref]))
+    with pytest.raises(ValidationError):
+        c.EvidenceItem.model_validate({"ref": ref, "label": "l"})
+
+
+@pytest.mark.parametrize("ref", ["", "x" * 81, "test_run:\nabc", "a\x00b", "a\x7fb"])
+def test_an_a07_ref_is_still_a_bounded_line(ref: str) -> None:
+    """Not a pattern, but bounded: 1-80 characters, no control character; at most 20 refs."""
+    with pytest.raises(ValidationError):
+        c.CriterionResult.model_validate(with_(CRITERION_RESULT, evidence_refs=[ref]))

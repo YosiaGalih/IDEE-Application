@@ -6,7 +6,8 @@ agents use their runtime agent's pair (AGENT_CATALOG §4.2).
 
 Rules every class follows:
 - ``extra="forbid"`` and frozen; every string and list has a maximum length;
-- keys follow their patterns (``REQ-n``, ``AC-n``, ``P1``..``P12``, evidence refs USER_PROXY_ACCEPTANCE §4);
+- keys follow their patterns (``REQ-n``, ``AC-n``, ``P1``..``P12``, evidence refs USER_PROXY_ACCEPTANCE §4),
+  except an A07 criterion's evidence refs, which ``verify_report`` checks (Lead decision 3.1f2 #45);
 - a path is relative, inside the worktree, without a control character or a backslash;
 - no field claims a test status (only ``test_runs`` does) or an approval (only people decide those);
 - validator messages name the rule, never the input.
@@ -61,6 +62,13 @@ RequirementKey = Annotated[str, StringConstraints(pattern=r"^REQ-[1-9][0-9]{0,2}
 CriterionKey = Annotated[str, StringConstraints(pattern=r"^AC-[1-9][0-9]{0,2}$")]
 StepId = Annotated[str, StringConstraints(pattern=r"^P(?:[1-9]|1[0-2])$")]
 EvidenceRef = Annotated[str, StringConstraints(pattern=EVIDENCE_REF)]
+# Lead decision 3.1f2 #45 (USER_PROXY_ACCEPTANCE §5 V2): an A07 criterion's ref is not pattern-checked here.
+# verify_report sorts malformed refs out itself (``malformed_ref`` for a passed criterion, dropped for
+# another, audited either way); a schema error would refuse the whole submit_result first and lose that, as
+# in #36. Still one bounded line: 1-80 characters, no control character.
+CriterionEvidenceRef = Annotated[
+    str, StringConstraints(min_length=1, max_length=80, pattern=r"^[^\x00-\x1f\x7f]+$")
+]
 DiffRef = Annotated[str, StringConstraints(pattern=r"^diff:" + UUID_HEX + r"$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Category = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,59}$")]
@@ -162,7 +170,7 @@ class EvidenceItem(Contract):
 class CriterionResult(Contract):
     criterion_key: CriterionKey
     status: Literal["passed", "failed", "blocked", "unverified"]
-    evidence_refs: Annotated[list[EvidenceRef], Field(max_length=20)]
+    evidence_refs: Annotated[list[CriterionEvidenceRef], Field(max_length=20)]
     rationale: Text
 
 
