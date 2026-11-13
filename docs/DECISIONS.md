@@ -391,6 +391,18 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 6. Kill switch `projects.settings.provider_calls_enabled` (boolean, tidak ada = `true`; nilai lain = mati). Mematikan cukup `project:write`; menyalakan kembali butuh `settings:providers` (Keputusan Lead 3.1e #10: admin global tidak melihat project orang lain, AC-01, jadi "hanya admin, dua arah" membuat project developer tidak bisa dimatikan). Penegakan runtime (`PROVIDER_DISABLED`, draft bila belum siap) di 3.1f.
 **Konsekuensi:** ADR-004 dikoreksi (catatan di atas); SECURITY_MODEL §1/§6.1, CONFIGURATION, DEPLOYMENT, IMPLEMENTATION_DESIGN_V2 dan RUNBOOK diselaraskan; API §1 menambah `PROVIDER_DISABLED`; DATA_MODEL `provider_configs` menambah kolom status key dan `llm_provider_mode`. Konflik dilaporkan ke #72.
 
+## ADR-074 — Ledger usage per percobaan, BudgetGuard konservatif, budget project sebagai default (WP-3.1f1)
+**Status:** Proposed (Lead, 11–13 Nov 2026, di bawah mandat PO "jalan tanpa menunggu, catat keputusan Lead, laporkan konflik ke #72"; Keputusan Lead 3.1f #1–#14). Spec: `docs/superpowers/specs/2026-11-11-wp-3.1f-runtime-budget-usage-design.md`; plan `docs/superpowers/plans/2026-11-11-wp-3.1f1-usage-budget.md`.
+**Konteks:** FR-132/FR-133 dan ARCHITECTURE §5.4 meminta budget yang diperiksa sebelum setiap request dan usage per request, sedangkan `create_with_retry` (3.1a) mengirim sampai lima percobaan dan usage percobaan yang gagal hanya batas bawah (syarat AG-13 3.1a M2). API §9 menyebut budget project "default", FR-132 dan v2.2 menyebutnya plafon. DATA_MODEL `numeric(12,6)` membulatkan biaya kecil menjadi 0.
+**Keputusan:**
+1. Satu baris `usage_records` per percobaan yang sampai ke provider (`call_id` + `attempt`, unik; `retry_count = attempt - 1`), ditulis di transaksinya sendiri; ledger gagal ditulis = panggilan gagal.
+2. BudgetGuard (`app/workflow/budget.py`) diperiksa sebelum **setiap** percobaan lewat hook `before_attempt`: `used + bound(next) > limit` untuk token dan biaya, `elapsed ≥ limit` untuk durasi (sejak `started_at`), iterasi tool dari `tool_calls` yang sampai ke handler. Akuntansi konservatif: percobaan gagal atau di-cancel tanpa usage dihitung `input_token_bound + output_token_cap` dengan harga kasus terburuk; hanya `rate_limited`, `overloaded`, `bad_request`, `auth` tanpa usage yang dihitung 0; `cache_read` di luar hitungan token.
+3. Budget project = default untuk task (`projects.settings.budget`), bukan plafon kumulatif; urutan task → project → env.
+4. Uang `numeric(20,10)` dibulatkan ke atas saat disimpan; di API selalu string desimal atau `null`; di layar biaya di bawah satu sen tampil "< US$0,01" dan sisanya dibulatkan ke atas ke sen.
+5. `GET /usage` hanya atas project yang terlihat; `usage:read_all` tidak memperluas di v1 (AC-01); tanpa izin baru `usage:read`.
+6. Tabel tarif dimuat bootstep worker; file rusak, hilang, atau tanpa model membuat worker menolak start.
+**Konsekuensi:** DATA_MODEL `usage_records`, `agent_runs.estimated_cost`, `projects.settings.budget`, `tasks.budget_limit`; API §3/§9/§11 #9/§11.2; CONFIGURATION `PRICING_PATH`/`TASK_MAX_COST_USD`; SECURITY_MODEL T4; ARCHITECTURE §5.4 (`check_before_attempt`). Penegakan di runtime (wrapper yang mewajibkan kedua hook, satu percobaan berjalan per task, `usage_unrecorded`) di 3.1f2. Konflik A, B, F, I, K, L dilaporkan ke #72.
+
 ## Pengecualian keamanan (SECURITY_MODEL §11)
 
 Temuan audit yang belum dapat diperbaiki dicatat di sini: siapa, alasan, mitigasi, tanggal kedaluwarsa. Job CI yang mengabaikan temuan hanya mengabaikannya sampai tanggal kedaluwarsa, lalu merah lagi.
