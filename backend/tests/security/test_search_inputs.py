@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ from fastapi import FastAPI
 
 from app.core.audit import AuditWriter
 from app.core.redaction import Redactor
+from app.gitops import adapter
 from app.services import projects, repo_index
 from app.workspace.policy import Access
 from tests.integration.test_project_imports import owner_actor
@@ -166,6 +169,37 @@ async def test_a_large_search_output_never_blocks_the_loop(
     assert response.status_code == 200, response.text
     assert response.json()["meta"]["truncated"] is True  # the output cap was reached
     assert max(gaps, default=0) < 0.5
+
+
+async def test_a_large_search_parses_and_filters_off_the_event_loop_thread(
+    owner: httpx.AsyncClient,  # noqa: F811
+    workspace_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AG-13 M-D1: the structural half of the M2 guard, with no timing in it. Parsing git's output
+    (``_parse_grep``) and filtering the matches (``keep``, which calls ``_visible``) must both run in a worker
+    thread, never on the event-loop thread, however fast the machine or however frozen the heap."""
+    loop_thread = threading.get_ident()
+    seen: dict[str, list[int]] = {"_parse_grep": [], "_visible": []}
+
+    def recorded(name: str, real: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            seen[name].append(threading.get_ident())
+            return real(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(adapter, "_parse_grep", recorded("_parse_grep", adapter._parse_grep))  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(repo_index, "_visible", recorded("_visible", repo_index._visible))  # pyright: ignore[reportPrivateUsage]
+    project = await blank(owner)
+    repo = repo_of(workspace_root, project)
+    for index in range(50):
+        (repo / f"m{index}.txt").write_text("e e e e\n" * 200)
+    response = await search(owner, project, q="e", glob="*.nomatch")
+    assert response.status_code == 200, response.text
+    assert seen["_parse_grep"] and seen["_visible"]  # both ran for this search
+    assert loop_thread not in seen["_parse_grep"], "git's output was parsed on the event-loop thread"
+    assert loop_thread not in seen["_visible"], "the matches were filtered on the event-loop thread"
 
 
 async def test_text_searches_run_one_at_a_time_per_user(
