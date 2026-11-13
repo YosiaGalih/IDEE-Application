@@ -92,6 +92,14 @@ async def test_every_attempt_beats_checks_the_gate_and_the_budget_first() -> Non
     assert all(seen is call for seen in fakes.budget.calls)
 
 
+async def test_every_attempt_of_a_run_beats_checks_the_gate_and_the_budget_first() -> None:
+    """The same order on a run's own path, where each hook is bounded by the run's deadline: the run's beat
+    and gate check, then beat, gate, budget before every attempt, and a last beat before ``succeeded``."""
+    fakes = Fakes(scripted(in_order(Fail("overloaded"), submit_turn(VALID_IMPLEMENT))))
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert fakes.log == ["beat", "gate", *ONE_ROUND * 2, "beat"]
+
+
 REFUSALS = {
     "heartbeat": LeaseLostError("lost"),
     "gate": ProviderBlocked("PROVIDER_DISABLED", "kill_switch"),
