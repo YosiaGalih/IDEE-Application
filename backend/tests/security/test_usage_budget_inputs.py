@@ -11,7 +11,6 @@ for security findings live here (.claude/rules/backend.md).
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 import httpx
 import pytest
@@ -89,47 +88,80 @@ def assert_budget_invalid(response: httpx.Response) -> None:
     assert error["details"][0]["reason"] == "budget_invalid"
 
 
-@pytest.mark.parametrize(
-    "raw",
-    ['{"max_cost_usd": 2.5}', '{"max_tokens": -1}', '"not a mapping"', BIG_JUNK],
-    ids=["float cost", "negative tokens", "not a mapping", "5000 characters of junk"],
-)
-async def test_a_malformed_stored_budget_is_a_conflict(
+# (stored raw JSON, a marker that must never be echoed back). Each marker is distinctive enough that it
+# cannot appear by chance in a uuid or a timestamp of the response.
+MALFORMED = [
+    pytest.param('{"max_cost_usd": 2.5}', "2.5", id="JSON float 2.5"),
+    pytest.param('{"max_cost_usd": "2.50"}', "2.50", id="non-canonical 2.50"),
+    pytest.param('{"max_cost_usd": "1_0"}', "1_0", id="1_0"),
+    pytest.param('{"max_tokens": 100000001}', "100000001", id="tokens above the bound"),
+    pytest.param('{"max_tokens": -918273645}', "918273645", id="negative tokens"),
+    pytest.param('"not a mapping"', "not a mapping", id="not a mapping"),
+    pytest.param(BIG_JUNK, "xxxx", id="5000 characters of junk"),
+]
+
+
+@pytest.mark.parametrize(("raw", "marker"), MALFORMED)
+async def test_get_of_a_malformed_stored_budget_is_a_conflict(
     owner: httpx.AsyncClient,  # noqa: F811
     engine: AsyncEngine,
     raw: str,
+    marker: str,
 ) -> None:
     project_id = await new_project(owner)
     await corrupt(engine, project_id, raw)
     response = await owner.get(budget_url(project_id))
     assert_budget_invalid(response)
-    assert "xxxx" not in response.text
+    assert marker not in response.text
 
 
-@pytest.mark.parametrize("repair", [ALL_FOUR, dict.fromkeys(ALL_FOUR)], ids=["values", "all inherit"])
-async def test_a_patch_with_all_four_keys_repairs_a_malformed_budget(
-    owner: httpx.AsyncClient,  # noqa: F811
-    engine: AsyncEngine,
-    repair: dict[str, Any],
-) -> None:
-    project_id = await new_project(owner)
-    await corrupt(engine, project_id, BIG_JUNK)
-    response = await patch(owner, project_id, repair)
-    assert response.status_code == 200, response.text
-    assert (await stored_settings(engine, project_id))["budget"] == repair
-    assert (await owner.get(budget_url(project_id))).status_code == 200
-    audits = await budget_audits(engine, project_id)
-    assert audits == [{"fields": list(ALL_FOUR), "budget": repair, "previous": "<invalid>"}]
-    assert "xxxx" not in str(audits)  # the malformed value is never echoed into the audit trail
-
-
+@pytest.mark.parametrize(("raw", "marker"), MALFORMED)
 async def test_a_partial_patch_of_a_malformed_budget_is_a_conflict(
     owner: httpx.AsyncClient,  # noqa: F811
     engine: AsyncEngine,
+    raw: str,
+    marker: str,
 ) -> None:
     project_id = await new_project(owner)
-    await corrupt(engine, project_id, '{"max_cost_usd": 2.5}')
+    await corrupt(engine, project_id, raw)
+    stored = (await stored_settings(engine, project_id))["budget"]
     response = await patch(owner, project_id, {"max_tokens": 5})
     assert_budget_invalid(response)
-    assert (await stored_settings(engine, project_id))["budget"] == {"max_cost_usd": 2.5}  # untouched
+    assert marker not in response.text
+    assert (await stored_settings(engine, project_id))["budget"] == stored  # untouched
     assert await budget_audits(engine, project_id) == []
+
+
+@pytest.mark.parametrize(("raw", "marker"), MALFORMED)
+async def test_a_patch_with_all_four_keys_repairs_a_malformed_budget(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+    raw: str,
+    marker: str,
+) -> None:
+    project_id = await new_project(owner)
+    await corrupt(engine, project_id, raw)
+    response = await patch(owner, project_id, ALL_FOUR)
+    assert response.status_code == 200, response.text
+    assert marker not in response.text
+    assert (await stored_settings(engine, project_id))["budget"] == ALL_FOUR
+    read = await owner.get(budget_url(project_id))
+    assert read.status_code == 200 and marker not in read.text
+    audits = await budget_audits(engine, project_id)
+    assert audits == [{"fields": list(ALL_FOUR), "budget": ALL_FOUR, "previous": "<invalid>"}]
+    assert marker not in str(audits)  # the malformed value is never echoed into the audit trail
+
+
+async def test_a_patch_of_four_nulls_repairs_to_inheriting_everything(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    project_id = await new_project(owner)
+    await corrupt(engine, project_id, BIG_JUNK)
+    inherit = dict.fromkeys(ALL_FOUR)
+    response = await patch(owner, project_id, inherit)
+    assert response.status_code == 200, response.text
+    assert (await stored_settings(engine, project_id))["budget"] == inherit
+    assert await budget_audits(engine, project_id) == [
+        {"fields": list(ALL_FOUR), "budget": inherit, "previous": "<invalid>"}
+    ]
