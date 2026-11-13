@@ -60,6 +60,7 @@ from tests.runtime_fakes import (
     FakeEvents,
     FakeGate,
     FakeHeartbeat,
+    FakeLedger,
     FakeRuns,
     Fakes,
     a_model_call,
@@ -1283,3 +1284,40 @@ async def test_every_runtime_log_line_names_its_task_and_run() -> None:
         (run_id,) = runs[line["task_id"]].runs.ids
         assert line["agent_run_id"] == str(run_id), line
         assert line["correlation_id"] == f"agent_run:{run_id}", line
+
+
+# --- delta review of 073e68d --------------------------------------------------------------------------------
+
+
+class HangingLedger(FakeLedger):
+    """The ledger write waits for ``release``: a usage row behind a held task-row lock."""
+
+    def __init__(self, log: list[str], release: asyncio.Event) -> None:
+        super().__init__(log)
+        self.release = release
+
+    def on_attempt(self, call: Any) -> Any:
+        record = super().on_attempt(call)
+
+        async def held(attempt: Any) -> None:
+            await self.release.wait()
+            await record(attempt)
+
+        return held
+
+
+async def test_a_hanging_ledger_write_is_usage_unrecorded_within_its_bound() -> None:
+    """Review N1: a paid attempt's ledger write is bounded by the run's remaining time plus
+    ``ledger_grace_s``; past that the attempt is unrecorded (``failed usage_unrecorded``), never a stalled
+    run."""
+    release = asyncio.Event()
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.ledger = HangingLedger(fakes.log, release)
+    registry = registry_with("B14", limits={"timeout_seconds": 0.3})
+    runtime = make_runtime(
+        fakes, registry=registry, runtime_config=config(ledger_grace_s=0.2), clock=time.monotonic
+    )
+    finished, result = await within(2, runtime.run(run_request("B14")), release)
+    assert finished, "the run hung on the ledger write"
+    assert (result.status, result.error_code) == ("failed", "usage_unrecorded")
+    assert fakes.ledger.records == []

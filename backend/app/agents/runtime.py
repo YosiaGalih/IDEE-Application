@@ -100,6 +100,9 @@ MIN_OUTPUT_TOKENS_PER_S: Final = 40.0  # the slowest output rate still waited fo
 BEAT_RETRIES: Final = 2  # a failed beat is tried again twice before the lease counts as lost
 BEAT_TIMEOUT_MIN_S: Final = 1.0
 CLOSE_TIMEOUT_S: Final = 5.0
+# A paid attempt's ledger write may end this long after the run's deadline (review N1 of 073e68d): the money
+# is spent, so its row gets a short grace; past it the attempt is unrecorded.
+LEDGER_GRACE_S: Final = 5.0
 TOOL_STOP_GRACE_S: Final = 10.0  # past the deadline, for the gateway to record a cancelled tool
 # A field location is named only when it looks like a field name: a key the model invented is input too.
 _FIELD = re.compile(r"[a-z_][a-z0-9_]{0,39}")
@@ -584,6 +587,7 @@ class RuntimeConfig:
     heartbeat_interval_s: float = HEARTBEAT_INTERVAL_S
     beat_timeout_s: float | None = None  # one try of a beat; None: max(interval / 3, BEAT_TIMEOUT_MIN_S)
     close_timeout_s: float = CLOSE_TIMEOUT_S
+    ledger_grace_s: float = LEDGER_GRACE_S
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
 
 
@@ -1177,9 +1181,14 @@ class AgentRuntime:
         record = ports.ledger.on_attempt(call)
 
         async def on_attempt(attempt: AttemptRecord) -> None:
+            # Bounded (review N1 of 073e68d), also on retry.py's shielded cancel path, which awaits this.
+            limit = (
+                None if run is None else max(run.deadline - self._clock(), 0) + self._config.ledger_grace_s
+            )
             try:
-                await record(attempt)
-            except Exception as error:
+                async with asyncio.timeout(limit):
+                    await record(attempt)
+            except Exception as error:  # the bound or the ledger's own error: the attempt is unrecorded
                 raise UsageUnrecorded(
                     f"attempt {attempt.attempt} of call {call.call_id} was not recorded"
                 ) from error

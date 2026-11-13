@@ -1,7 +1,8 @@
 """A held task row lock never stalls a run (reviews of 42bcb2e: silent H2, AG-13 LOW-2, backend lock note).
 
-Every runtime port that writes the task row (the lease heartbeat, the run store, the usage event) gives up on
-a lock after ``lock_timeout`` 5 s and on a statement after ``statement_timeout``, as ``claim_lease`` does; the
+Every runtime port that writes the task row (the lease heartbeat, the run store, the usage event, and the
+ledger's usage row, whose foreign key locks the task row: review N1 of 073e68d) gives up on a lock after
+``lock_timeout`` 5 s and on a statement after ``statement_timeout``, as ``claim_lease`` does; the
 runtime bounds each port by the run's deadline and the close by ``close_timeout_s``. AG-13's PoC (a lock held
 across the run, run timeout 1 s) returned after 3.03 s, when the lock was released; now the run ends at its
 deadline.
@@ -24,9 +25,13 @@ from app.agents.runtime import AgentRunUnfinished, RunEnd, RunScope, RunStart
 from app.core.audit import AuditWriter
 from app.core.config import Settings
 from app.core.redaction import Redactor
+from app.llm.base import Usage
 from app.llm.pricing import PricingTable
+from app.llm.retry import AttemptRecord
 from app.models.agents import AgentRun
+from app.services import usage as usage_module
 from app.services.agent_runtime import AgentRunWriter, LeaseHeartbeat, TaskRunEvents
+from app.services.usage import UsageCallContext, UsageLedger
 from tests.conftest import reset_data
 from tests.integration.test_task_schema import make_project, make_task
 from tests.runtime_fakes import (
@@ -67,10 +72,18 @@ async def a_task(session: AsyncSession, settings: Settings) -> tuple[uuid.UUID, 
 
 
 async def hold_task_row(
-    engine: AsyncEngine, task_id: uuid.UUID, seconds: float, locked: asyncio.Event
+    engine: AsyncEngine,
+    task_id: uuid.UUID,
+    seconds: float,
+    locked: asyncio.Event,
+    mode: str = "NO KEY UPDATE",
 ) -> None:
+    statement = {
+        "NO KEY UPDATE": "SELECT 1 FROM tasks WHERE id = :id FOR NO KEY UPDATE",
+        "UPDATE": "SELECT 1 FROM tasks WHERE id = :id FOR UPDATE",  # also blocks a foreign key's KEY SHARE
+    }[mode]
     async with engine.begin() as conn:
-        await conn.execute(text("SELECT 1 FROM tasks WHERE id = :id FOR NO KEY UPDATE"), {"id": task_id})
+        await conn.execute(text(statement), {"id": task_id})
         locked.set()
         await asyncio.sleep(seconds)
 
@@ -201,4 +214,71 @@ async def test_ports_bound_their_statements(
         await LeaseHeartbeat(sessions, WORKER_ID).beat(task_id)
     finally:
         module.renew_lease = original  # type: ignore[assignment]
+    assert seen == {"lock": "5s", "statement": "10s"}
+
+
+def _paid_attempt(scope: RunScope) -> tuple[UsageCallContext, AttemptRecord]:
+    ctx = UsageCallContext(
+        project_id=scope.project_id,
+        call_id=uuid.uuid4(),
+        input_token_bound=1000,
+        output_token_cap=100,
+        task_id=scope.task_id,
+        agent_run_id=scope.agent_run_id,
+        agent_id="B14",
+    )
+    attempt = AttemptRecord(
+        "scripted", "claude-haiku-5-5", 1, "r", Usage(input_tokens=1, output_tokens=1), 5, "ok", None
+    )
+    return ctx, attempt
+
+
+async def test_the_ledger_gives_up_on_a_held_task_lock(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    """Review N1 (the rest of H2, AG-13 LOW-2): a usage row's INSERT takes a key-share lock on the task row
+    (its foreign key). Behind a ``FOR UPDATE`` it gives up after ``lock_timeout`` 5 s; the PoC waited 7 s,
+    until the lock was released."""
+    project_id, task_id = await a_task(session, settings)
+    run_id = await AgentRunWriter(sessions, None, AUDIT).start(_start(task_id, project_id))
+    ctx, attempt = _paid_attempt(RunScope(project_id, task_id, run_id, "B14"))
+    locked = asyncio.Event()
+    holder = asyncio.create_task(hold_task_row(engine, task_id, 9.0, locked, mode="UPDATE"))
+    await locked.wait()
+    started = time.monotonic()
+    with pytest.raises(DBAPIError) as raised:
+        await UsageLedger(sessions, pricing).record(ctx, attempt)
+    elapsed = time.monotonic() - started
+    holder.cancel()
+    await asyncio.gather(holder, return_exceptions=True)
+    assert 4.0 < elapsed < 8.0, elapsed  # lock_timeout 5 s
+    assert "lock" in str(raised.value.orig).lower()
+
+
+async def test_the_ledger_bounds_its_statements(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    project_id, task_id = await a_task(session, settings)
+    run_id = await AgentRunWriter(sessions, None, AUDIT).start(_start(task_id, project_id))
+    ctx, attempt = _paid_attempt(RunScope(project_id, task_id, run_id, "B14"))
+    seen: dict[str, Any] = {}
+    original = usage_module._check_context
+
+    async def spy(db: AsyncSession, call: UsageCallContext) -> None:
+        seen["lock"] = await db.scalar(text("SELECT current_setting('lock_timeout')"))
+        seen["statement"] = await db.scalar(text("SELECT current_setting('statement_timeout')"))
+        await original(db, call)
+
+    usage_module._check_context = spy  # type: ignore[assignment]
+    try:
+        await UsageLedger(sessions, pricing).record(ctx, attempt)
+    finally:
+        usage_module._check_context = original  # type: ignore[assignment]
     assert seen == {"lock": "5s", "statement": "10s"}

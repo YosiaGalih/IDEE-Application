@@ -28,6 +28,7 @@ from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.db import bound_transaction
 from app.core.errors import AppError
 from app.core.money import stored_cost
 from app.llm.pricing import EstimateStatus, PricingTable
@@ -110,6 +111,9 @@ class UsageLedger:
         """Store one attempt in its own transaction and return its row id. Never swallows an error."""
         row = build_row(ctx, attempt, self._pricing)
         async with self._sessions.begin() as session:
+            # Its foreign key takes a key-share lock on the task row: bounded like the run's other writes
+            # (review N1 of 073e68d), so a held task lock never stalls the attempt past the run's deadline.
+            await bound_transaction(session)
             await _check_context(session, ctx)
             inserted = await session.scalar(
                 pg_insert(UsageRecord)
