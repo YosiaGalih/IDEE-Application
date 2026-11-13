@@ -27,6 +27,7 @@ from app.agents.runtime import (
     AgentInputInvalid,
     AgentInputTooLarge,
     AgentRunResult,
+    AgentRunUnfinished,
     BudgetBreach,
     BudgetRefused,
     LeaseLostError,
@@ -56,6 +57,9 @@ from tests.runtime_fakes import (
     STEP,
     UUID_A,
     FakeClock,
+    FakeGate,
+    FakeHeartbeat,
+    FakeRuns,
     Fakes,
     a_model_call,
     agent_input,
@@ -814,3 +818,118 @@ async def test_a_complete_run_reports_complete_usage() -> None:
     fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
     assert (await run_b14(fakes)).status == "succeeded"
     assert ended(fakes).usage_complete is True
+
+
+# --- hangs and locks (review of 42bcb2e: silent H2, AG-13 LOW-2, L2) ---------------------------------------
+
+
+RELEASE = "release"  # every hanging fake below waits on its test's release event, set in the test's finally
+
+
+class HangingHeartbeat(FakeHeartbeat):
+    """Beats that do not return on the given calls (a held task row lock) until released."""
+
+    def __init__(self, log: list[str], hang: set[int], release: asyncio.Event) -> None:
+        super().__init__(log)
+        self.hang = hang
+        self.release = release
+
+    async def beat(self, task_id: uuid.UUID) -> None:
+        await super().beat(task_id)
+        if self.calls in self.hang:
+            await self.release.wait()
+
+
+async def within(seconds: float, run: Any, release: asyncio.Event) -> tuple[bool, Any]:
+    """Runs ``run`` for at most ``seconds``: (finished, its result or its exception). A run that hangs is a
+    failure, never a stalled test run."""
+    task = asyncio.ensure_future(run)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=seconds)
+    finally:
+        release.set()
+    if task not in done:
+        await asyncio.wait({task}, timeout=5)
+        return False, None
+    return True, task.exception() or task.result()
+
+
+async def test_a_failed_beat_is_retried_twice_before_the_lease_is_lost() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.heartbeat.refuse[2] = RuntimeError("database blip")
+    fakes.heartbeat.refuse[3] = RuntimeError("database blip")  # two failures, then the third try works
+    assert (await run_b14(fakes)).status == "succeeded"
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    for call in (2, 3, 4):
+        fakes.heartbeat.refuse[call] = RuntimeError("database down")
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("failed", "lease_lost")
+    assert fakes.provider.requests == []
+
+
+async def test_a_lost_lease_is_not_retried() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.heartbeat.refuse[2] = LeaseLostError("lost")
+    result = await run_b14(fakes)
+    assert result.error_code == "lease_lost"
+    assert fakes.heartbeat.calls == 2
+
+
+async def test_a_hanging_beat_is_a_lease_failure_within_its_bound() -> None:
+    release = asyncio.Event()
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.heartbeat = HangingHeartbeat(fakes.log, {2, 3, 4}, release)
+    runtime = make_runtime(fakes, runtime_config=config(beat_timeout_s=0.05), clock=time.monotonic)
+    finished, result = await within(2, runtime.run(run_request("B14")), release)
+    assert finished, "the run hung on a beat"
+    assert (result.status, result.error_code) == ("failed", "lease_lost")
+    assert fakes.provider.requests == []
+
+
+async def test_the_keep_alive_retries_before_it_stops_the_run() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)), slow=0.5)
+    fakes.heartbeat.refuse[3] = RuntimeError("database blip")  # the first keep-alive beat fails once
+    result = await run_b14(fakes, runtime_config=config(heartbeat_interval_s=0.05), clock=time.monotonic)
+    assert result.status == "succeeded"
+
+
+class HangingGate(FakeGate):
+    def __init__(self, log: list[str], release: asyncio.Event) -> None:
+        super().__init__(log)
+        self.release = release
+
+    async def check(self, project_id: uuid.UUID) -> Any:
+        self.tick()
+        await self.release.wait()
+        return self.models
+
+
+async def test_a_hanging_port_ends_the_run_at_its_deadline() -> None:
+    release = asyncio.Event()
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.gate = HangingGate(fakes.log, release)
+    registry = registry_with("B14", limits={"timeout_seconds": 0.3})
+    runtime = make_runtime(fakes, registry=registry, clock=time.monotonic)
+    finished, result = await within(2, runtime.run(run_request("B14")), release)
+    assert finished, "the run hung on a port past its deadline"
+    assert (result.status, result.error_code) == ("failed", "timeout")
+
+
+class HangingRuns(FakeRuns):
+    def __init__(self, release: asyncio.Event) -> None:
+        super().__init__()
+        self.release = release
+
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+        await self.release.wait()
+        return await super().finish(agent_run_id, end)
+
+
+async def test_a_hanging_close_is_bounded() -> None:
+    release = asyncio.Event()
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.runs = HangingRuns(release)
+    runtime = make_runtime(fakes, runtime_config=config(close_timeout_s=0.2), clock=time.monotonic)
+    finished, outcome = await within(3, runtime.run(run_request("B14")), release)
+    assert finished, "the close hung"
+    assert isinstance(outcome, AgentRunUnfinished)

@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Final
 
 from sqlalchemy import Integer, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -65,6 +66,21 @@ from app.services.usage import (
 )
 from app.workflow.budget import BudgetDefaults, BudgetExceeded, BudgetGuard, CallBound
 from app.workflow.lease import LeaseLost, renew_lease
+
+# Every port that writes the task row gives up on a lock and on a statement (reviews of 42bcb2e; as
+# claim_lease does): a lock held by another transaction never stalls a run.
+LOCK_TIMEOUT: Final = "5s"
+STATEMENT_TIMEOUT: Final = "10s"
+
+
+async def _bounded(session: AsyncSession) -> None:
+    """``SET LOCAL lock_timeout`` and ``statement_timeout`` for the transaction that starts here."""
+    await session.execute(
+        select(
+            func.set_config("lock_timeout", LOCK_TIMEOUT, True),
+            func.set_config("statement_timeout", STATEMENT_TIMEOUT, True),
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +186,7 @@ class LeaseHeartbeat:
         call); ``LeaseLost`` -> ``LeaseLostError``."""
         try:
             async with self._sessions.begin() as session:
+                await _bounded(session)
                 await renew_lease(session, task_id, self._worker_id)
         except LeaseLost as exc:
             raise LeaseLostError(str(exc)) from exc
@@ -204,6 +221,7 @@ class TaskRunEvents:
         """``usage.updated`` with the task's totals from the ledger, money as decimal strings; its own
         transaction, committed, then published."""
         async with self._sessions() as session:
+            await _bounded(session)
             totals = (await task_usage(session, [scope.task_id])).get(scope.task_id, EMPTY_TOTALS)
             cost = totals.estimated_cost
             await emit_task_event(
@@ -252,6 +270,7 @@ class AgentRunWriter:
         redactor = self._audit.redactor
         run_id = uuid.uuid4()
         async with self._sessions() as session:
+            await _bounded(session)
             session.add(
                 AgentRun(
                     id=run_id,
@@ -288,6 +307,7 @@ class AgentRunWriter:
         transaction. Only a row still ``running`` is finished (``AgentRunAlreadyFinished``)."""
         redactor = self._audit.redactor
         async with self._sessions() as session:
+            await _bounded(session)
             run_totals = await run_usage(session, agent_run_id)
             if not end.usage_complete or end.error_code == "usage_unrecorded":
                 run_totals = incomplete_run_totals(run_totals)

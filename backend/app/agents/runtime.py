@@ -17,6 +17,7 @@ carry ids and type names only.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import re
 import time
@@ -94,6 +95,12 @@ ERROR_TEXT_MAX: Final = 1000
 VALIDATION_ERRORS_SHOWN: Final = 20
 REQUEST_BASE_S: Final = 30.0  # connect + time to first token for a long prompt [Menebak]
 MIN_OUTPUT_TOKENS_PER_S: Final = 40.0  # the slowest output rate still waited for [Menebak]
+# A held task row lock must never stall a run (reviews of 42bcb2e): every port the runtime awaits is bounded
+# by the run's deadline, a beat try by its own timeout, the close by CLOSE_TIMEOUT_S.
+BEAT_RETRIES: Final = 2  # a failed beat is tried again twice before the lease counts as lost
+BEAT_TIMEOUT_MIN_S: Final = 1.0
+CLOSE_TIMEOUT_S: Final = 5.0
+TOOL_STOP_GRACE_S: Final = 10.0  # past the deadline, for the gateway to record a cancelled tool
 # A field location is named only when it looks like a field name: a key the model invented is input too.
 _FIELD = re.compile(r"[a-z_][a-z0-9_]{0,39}")
 
@@ -284,6 +291,15 @@ class LeaseLostError(Exception):
 
 class UsageUnrecorded(Exception):
     """The ledger port failed to record an attempt: raised by the runtime, from the ledger's error."""
+
+
+class AgentRunUnfinished(Exception):
+    """The run's end could not be written within ``close_timeout_s``: its row may stay ``running`` (recovery,
+    WP-3.1f2b). Raised from the cause; a result without its record is never returned."""
+
+
+class _DeadlineReached(Exception):
+    """A port was still waiting when the run's deadline came: the run ends ``timeout``."""
 
 
 # --- the call -----------------------------------------------------------------------------------------------
@@ -517,6 +533,8 @@ class RuntimeConfig:
     request_timeout_s: float  # CLAUDE_REQUEST_TIMEOUT_SECONDS
     scripted: bool  # LLM_PROVIDER == "scripted"
     heartbeat_interval_s: float = HEARTBEAT_INTERVAL_S
+    beat_timeout_s: float | None = None  # one try of a beat; None: max(interval / 3, BEAT_TIMEOUT_MIN_S)
+    close_timeout_s: float = CLOSE_TIMEOUT_S
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
 
 
@@ -571,6 +589,18 @@ async def _stop(watchers: list[asyncio.Task[None]]) -> None:
 
 def _id(value: uuid.UUID | None) -> str | None:
     return str(value) if value is not None else None
+
+
+def _log_unwritten(run: _Run, write: asyncio.Future[RunUsage]) -> None:
+    """Done callback of the shielded close: a write that failed, also after its bound passed, is logged
+    (ids and type) and retrieved."""
+    if write.cancelled():
+        return
+    failure = write.exception()
+    if failure is not None:
+        _log.error(
+            "agent_run_unfinished", agent_run_id=_id(run.agent_run_id), error_type=type(failure).__name__
+        )
 
 
 class AgentRuntime:
@@ -701,37 +731,81 @@ class AgentRuntime:
 
     async def _keep_alive(self, run: _Run) -> None:
         """The lease (60 s) is shorter than one request may take: renew it every ``heartbeat_interval_s``
-        for as long as the run is active. A renewal that fails stops the run: without a lease nothing may go
-        on (any failure counts as a lost lease, logged with its type)."""
+        for as long as the run is active. A renewal that fails after its retries stops the run: without a
+        lease nothing may go on."""
         while True:
             await asyncio.sleep(self._config.heartbeat_interval_s)
             try:
-                await self._ports.heartbeat.beat(run.request.task_id)
+                await self._beat(run)
             except LeaseLostError:
                 run.stop.stop("lease_lost")
                 return
-            except Exception as error:
-                _log.error(
-                    "agent_run_keep_alive_failed",
-                    agent_run_id=_id(run.agent_run_id),
-                    error_type=type(error).__name__,
-                )
-                run.stop.stop("lease_lost")
-                return
+            except _DeadlineReached:
+                return  # the deadline watcher stops the run
 
     # --- the run --------------------------------------------------------------------------------------------
 
     async def _execute(self, run: _Run) -> RunEnd:
         request = run.request
         try:
-            await self._ports.heartbeat.beat(request.task_id)
-            models = await self._ports.gate.check(request.project_id)
+            await self._beat(run)
+            models = await self._port(run, self._ports.gate.check(request.project_id))
             async with self._ports.providers.open() as provider:
                 model = models[run.spec.model_tier]
-                run.agent_run_id = await self._ports.runs.start(self._run_start(run, provider.name, model))
+                start = self._run_start(run, provider.name, model)
+                run.agent_run_id = await self._port(run, self._ports.runs.start(start))
                 return await self._loop(run, provider, model)
+        except _DeadlineReached:
+            return self._timed_out(run)
         except (ProviderBlocked, LeaseLostError, BudgetRefused, UsageUnrecorded, LLMError) as error:
             return self._end_for(error, run)
+
+    # --- bounded ports (reviews of 42bcb2e: a held lock never stalls a run) ---------------------------------
+
+    async def _port[T](self, run: _Run, awaitable: Awaitable[T], *, grace: float = 0.0) -> T:
+        """``awaitable`` bounded by the run's remaining time (plus ``grace``): then, ``_DeadlineReached``."""
+        limit = run.deadline - self._clock() + grace
+        if limit <= 0:
+            if asyncio.iscoroutine(awaitable):
+                awaitable.close()
+            raise _DeadlineReached
+        try:
+            async with asyncio.timeout(limit):
+                return await awaitable
+        except TimeoutError:
+            raise _DeadlineReached from None
+
+    def _beat_timeout(self) -> float:
+        configured = self._config.beat_timeout_s
+        if configured is not None:
+            return configured
+        return max(self._config.heartbeat_interval_s / 3, BEAT_TIMEOUT_MIN_S)
+
+    async def _beat(self, run: _Run) -> None:
+        """Renew the lease: each try bounded, a failed try retried ``BEAT_RETRIES`` times. ``LeaseLostError``
+        at once when the lease is gone, or when no try succeeded (a beat that cannot be confirmed is a lost
+        lease); ``_DeadlineReached`` when the run's time ran out first."""
+        failure: BaseException | None = None
+        for _ in range(1 + BEAT_RETRIES):
+            remaining = run.deadline - self._clock()
+            if remaining <= 0:
+                raise _DeadlineReached
+            try:
+                async with asyncio.timeout(min(self._beat_timeout(), remaining)):
+                    await self._ports.heartbeat.beat(run.request.task_id)
+                return
+            except LeaseLostError:
+                raise
+            except Exception as error:  # a timeout or a database error: tried again
+                if isinstance(error, TimeoutError) and run.deadline - self._clock() <= 0:
+                    raise _DeadlineReached from None
+                failure = error
+                _log.warning(
+                    "agent_run_beat_failed",
+                    agent_run_id=_id(run.agent_run_id),
+                    error_type=type(error).__name__,
+                )
+        raise LeaseLostError("the task lease could not be renewed") from failure
 
     async def _loop(self, run: _Run, provider: LLMProvider, model: str) -> RunEnd:
         assert run.agent_run_id is not None
@@ -796,9 +870,13 @@ class AgentRuntime:
                 if run.stop.reason is not None:
                     return self._stopped(run)
                 # One tool at a time (syarat 3.1d2a #5): budget, then the lease, then the gateway.
-                await self._ports.budget.before_tool(scope)
-                await self._ports.heartbeat.beat(request.task_id)
-                result = await self._ports.tools.execute(ctx, block.name, block.input, tool_use_id=block.id)
+                await self._port(run, self._ports.budget.before_tool(scope))
+                await self._beat(run)
+                result = await self._port(
+                    run,
+                    self._ports.tools.execute(ctx, block.name, block.input, tool_use_id=block.id),
+                    grace=TOOL_STOP_GRACE_S,
+                )
                 if result.status == "approval_required":
                     run.pending = PendingTool(block.id, block.name, result.tool_call_id)
                     pending = {
@@ -857,7 +935,7 @@ class AgentRuntime:
         async def on_text_delta(text: str) -> None:
             safe = deltas.feed(text)
             if safe:
-                await self._ports.events.delta(scope, safe)
+                await self._port(run, self._ports.events.delta(scope, safe))
 
         async def on_restart(attempt: int) -> None:
             deltas.reset()  # the failed attempt's held text is dropped, never sent
@@ -869,15 +947,15 @@ class AgentRuntime:
                 cancel=run.stop.token,
                 on_text_delta=on_text_delta,
                 on_restart=on_restart,
-                tally=run.tally,
+                run=run,
             )
         except LLMError:
-            await self._ports.events.usage_updated(scope)  # the call reached the provider
+            await self._port(run, self._ports.events.usage_updated(scope))  # the call reached the provider
             raise
         rest = deltas.flush()
         if rest:
-            await self._ports.events.delta(scope, rest)
-        await self._ports.events.usage_updated(scope)
+            await self._port(run, self._ports.events.delta(scope, rest))
+        await self._port(run, self._ports.events.usage_updated(scope))
         return response
 
     # --- how it ends ----------------------------------------------------------------------------------------
@@ -921,7 +999,14 @@ class AgentRuntime:
         """Writes the end, shielded: a second cancel does not leave the run ``running``."""
         if run.tally.sent != run.tally.recorded:
             end = replace(end, usage_complete=False)
-        usage = await asyncio.shield(self._write_end(run, end))
+        write = asyncio.ensure_future(self._write_end(run, end))
+        write.add_done_callback(functools.partial(_log_unwritten, run))
+        try:
+            usage = await asyncio.wait_for(asyncio.shield(write), self._config.close_timeout_s)
+        except Exception as failure:  # a timeout or the store's error: the end is not recorded (yet)
+            raise AgentRunUnfinished(
+                f"the end of agent run {_id(run.agent_run_id)} was not recorded"
+            ) from failure
         assert run.agent_run_id is not None
         return AgentRunResult(
             agent_run_id=run.agent_run_id,
@@ -957,7 +1042,7 @@ class AgentRuntime:
         cancel: CancelToken,
         on_text_delta: TextDeltaHandler | None = None,
         on_restart: RestartHandler | None = None,
-        tally: _Tally | None = None,
+        run: _Run | None = None,
     ) -> LLMResponse:
         """The only create_with_retry in app/ (Keputusan Lead #17; tests/unit/test_model_call_guard.py).
 
@@ -971,11 +1056,15 @@ class AgentRuntime:
         scope = call.scope
 
         async def before_attempt(attempt: int) -> None:
-            await ports.heartbeat.beat(scope.task_id)
-            await ports.gate.check(scope.project_id)
-            await ports.budget.before_model_attempt(call)
-            if tally is not None:
-                tally.sent += 1  # the hooks passed: this attempt goes to the provider
+            if run is None:  # tests of the call path alone: no run, no deadline
+                await ports.heartbeat.beat(scope.task_id)
+                await ports.gate.check(scope.project_id)
+                await ports.budget.before_model_attempt(call)
+                return
+            await self._beat(run)
+            await self._port(run, ports.gate.check(scope.project_id))
+            await self._port(run, ports.budget.before_model_attempt(call))
+            run.tally.sent += 1  # the hooks passed: this attempt goes to the provider
 
         record = ports.ledger.on_attempt(call)
 
@@ -986,8 +1075,8 @@ class AgentRuntime:
                 raise UsageUnrecorded(
                     f"attempt {attempt.attempt} of call {call.call_id} was not recorded"
                 ) from error
-            if tally is not None:
-                tally.recorded += 1
+            if run is not None:
+                run.tally.recorded += 1
 
         return await create_with_retry(
             provider,
