@@ -8,7 +8,6 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -16,9 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.cancel import CancelToken
-from app.core.db import make_sessionmaker
-from app.llm.base import LLMError, LLMRequest, Message, TextBlock, Usage
-from app.llm.pricing import PricingTable, load_pricing
+from app.llm.base import LLMError, TextBlock, Usage
 from app.llm.retry import AttemptRecord, create_with_retry
 from app.llm.scenarios import SCENARIOS
 from app.llm.scenarios.model import Reply, Scenario
@@ -35,10 +32,7 @@ from app.services.usage import (
 from tests.conftest import reset_data
 from tests.integration.test_task_schema import make_project, make_task
 from tests.tool_fakes import make_run
-
-BACKEND = Path(__file__).resolve().parents[2]
-HAIKU = "claude-haiku-5-5"
-CAP = 8_192
+from tests.usage_fakes import CAP, HAIKU, no_sleep, request
 
 
 @pytest.fixture(autouse=True)
@@ -47,35 +41,10 @@ async def clean(engine: AsyncEngine) -> None:
 
 
 @pytest.fixture
-def pricing() -> PricingTable:
-    return load_pricing(BACKEND / "config" / "pricing.yaml")
-
-
-@pytest.fixture
-def sessions(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return make_sessionmaker(engine)
-
-
-@pytest.fixture
-def ledger(sessions: async_sessionmaker[AsyncSession], pricing: PricingTable) -> UsageLedger:
-    return UsageLedger(sessions, pricing)
-
-
-@pytest.fixture
 async def project_id(session: AsyncSession) -> AsyncIterator[uuid.UUID]:
     project = await make_project(session)
     await session.commit()
     yield project.id
-
-
-def request(scenario: str, agent_id: str, model: str = HAIKU) -> LLMRequest:
-    return LLMRequest(
-        model=model,
-        system="s",
-        messages=(Message("user", "hi"),),
-        max_tokens=CAP,
-        metadata={"scenario": scenario, "agent_id": agent_id},
-    )
 
 
 def context(project_id: uuid.UUID, **overrides: object) -> UsageCallContext:
@@ -87,10 +56,6 @@ def context(project_id: uuid.UUID, **overrides: object) -> UsageCallContext:
     }
     values.update(overrides)
     return UsageCallContext(**values)  # type: ignore[arg-type]
-
-
-async def no_sleep(_: float) -> None:
-    return None
 
 
 async def rows(sessions: async_sessionmaker[AsyncSession]) -> list[UsageRecord]:

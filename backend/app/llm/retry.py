@@ -105,7 +105,8 @@ async def create_with_retry(
             # The caller was cancelled mid-attempt: the request still reached the provider. Its usage is not
             # known here, so the record says so (None, priced "unavailable"), never zero.
             try:
-                await _report(on_attempt, provider, req, attempt, started, cancelled=True)
+                # Shielded (AG-13 L-D2, as in the gateway): a second cancel cannot stop the ledger write.
+                await asyncio.shield(_report(on_attempt, provider, req, attempt, started, cancelled=True))
             except Exception as unrecorded:
                 # The cancel still wins (review L7), but a lost ledger row is never silent: ids only, no text.
                 _log.error(

@@ -124,6 +124,14 @@ source_modules = ["app.main", "app.api"]
 forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.services.provider_smoke", "app.worker"]
 
 [[tool.importlinter.contracts]]
+name = "Routes reach the workflow only through services (thin routes, ARCHITECTURE §3.2; WP-3.1f1 review)"
+type = "forbidden"
+source_modules = ["app.api"]
+forbidden_modules = ["app.workflow"]
+# Through app.services is the intended path; only a direct import from a route is refused.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
 name = "Budget accounting reads the ledger and prices; it never calls a provider (WP-3.1f1)"
 type = "forbidden"
 source_modules = ["app.workflow.budget"]

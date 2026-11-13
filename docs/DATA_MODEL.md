@@ -78,7 +78,7 @@ Index `(project_id, kind)`, `(project_id, symbol)`; trigram index pada `path` bi
 | status_reason | varchar(200) null | mis. `budget_exceeded` |
 | current_step | varchar(40) null | `intake`,`context`,`plan`,`implement`,`test`,`debug`,`review`,`user_proxy`,`gate`,`apply` |
 | priority | check in (`low`,`normal`,`high`) | |
-| budget_limit | jsonb | `{max_cost_usd, max_tokens, max_tool_iterations}` |
+| budget_limit | jsonb | `{max_cost_usd, max_tokens, max_tool_iterations, max_duration_minutes}` — WP-3.1f1: setiap kunci opsional; tidak ada atau `null` = mewarisi `projects.settings.budget`, lalu env `TASK_MAX_*` (Keputusan Lead 3.1f #2). `max_cost_usd` string desimal kanonik (≤ 6 desimal; JSONB mengembalikan angka sebagai float), field lain integer; batas yang sama dengan `PATCH /projects/{id}/budget` (`BUDGET_MAX_*`). Nilai yang tidak lolos membuat BudgetGuard gagal tertutup (`BudgetConfigError`); 3.2 menyalin budget efektif ke sini saat task dibuat dan memvalidasi usulan `budget_increase` terhadap batas yang sama |
 | checkpoint | jsonb default `{}` | |
 | branch_name | varchar(120) null | `kk/task-<8hex>` |
 | base_commit | varchar(64) null | commit default branch saat worktree dibuat |

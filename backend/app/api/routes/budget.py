@@ -19,14 +19,15 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from app.api.routes.projects import EnvDep, ProjectReader, ProjectWriter, _respond
 from app.core.money import Money
 from app.services import project_budget
-from app.services.project_budget import BudgetChanges, ProjectBudgetView
-from app.workflow.budget import (
+from app.services.project_budget import (
     BUDGET_MAX_COST_USD,
     BUDGET_MAX_DURATION_MINUTES,
     BUDGET_MAX_TOKENS,
     BUDGET_MAX_TOOL_ITERATIONS,
+    BudgetChanges,
     BudgetDefaults,
     BudgetFields,
+    ProjectBudgetView,
 )
 
 router = APIRouter(prefix="/projects", tags=["budget"])
