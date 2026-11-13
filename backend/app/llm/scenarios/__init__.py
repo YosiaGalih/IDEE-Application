@@ -1,4 +1,6 @@
-"""Scripted scenarios by name (ADR-015). Per-agent scenarios (``calc``, …) come with the runtime (3.1f)."""
+"""Scripted scenarios by name (ADR-015). A run picks one with its ``scenario`` argument, for the scripted
+provider only (WP-3.1f2a); without one it is ``generic``. The per-agent ``calc*`` scenarios come in
+WP-3.1f3."""
 
 from __future__ import annotations
 

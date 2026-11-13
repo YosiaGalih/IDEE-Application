@@ -444,3 +444,87 @@ async def test_a_worker_without_a_key_ends_provider_not_ready(
     assert result.error is not None and "no_provider" in result.error
     stored = await session.get(AgentRun, result.agent_run_id)
     assert stored is not None and (stored.model_provider, stored.model_name) == (None, None)
+
+
+DISPATCHED = ["A02", "A03", "B14", "C20", "D22", "A07", "B09", "B10", "B13", "G35", "C21"]
+
+
+@pytest.mark.parametrize("agent_id", DISPATCHED)
+async def test_every_runtime_and_profile_succeeds_on_generic(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+    agent_id: str,
+) -> None:
+    from app.agents.contracts import OUTPUT_CONTRACTS
+    from app.llm.scripted_provider import ScriptedProvider
+    from tests.runtime_fakes import FakeTools
+
+    spec = REGISTRY.by_id(agent_id)
+    assert spec is not None
+    runtime_id = agent_id if spec.mvp_mode == "llm" else spec.runtime_agent
+    assert runtime_id is not None
+    project_id, task_id = await a_task(session, settings)
+    provider = ScriptedProvider(record_requests=True)  # the shipped scenarios, generic by default
+    run = compose(sessions, settings, pricing, provider, tools=FakeTools([]))
+    result = await run.runtime.run(
+        run_request(agent_id, runtime_id=runtime_id, task_id=task_id, project_id=project_id)
+    )
+    assert (result.status, result.error_code) == ("succeeded", None), result.error
+    assert type(result.output) is OUTPUT_CONTRACTS[runtime_id]
+
+
+async def test_the_scenario_argument_picks_the_scripted_scenario(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    from app.llm.scenarios import SCENARIOS
+    from app.llm.scenarios.model import Scenario
+    from app.llm.scripted_provider import ScriptedProvider
+    from tests.runtime_fakes import FakeTools
+
+    project_id, task_id = await a_task(session, settings)
+    test_one = Scenario(
+        name="test_one", default=(submit_turn({**OUTPUTS["ImplementOutput"], "summary": "From test_one."}),)
+    )
+    provider = ScriptedProvider({**SCENARIOS, "test_one": test_one}, record_requests=True)
+    run = compose(sessions, settings, pricing, provider, tools=FakeTools([]))
+    result = await run.runtime.run(
+        run_request("B14", task_id=task_id, project_id=project_id, scenario="test_one")
+    )
+    assert result.status == "succeeded"
+    assert result.output is not None and result.output.model_dump()["summary"] == "From test_one."
+    assert provider.requests[0].metadata["scenario"] == "test_one"
+
+
+async def test_no_scenario_means_generic(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    from app.llm.scripted_provider import ScriptedProvider
+    from tests.runtime_fakes import FakeTools
+
+    project_id, task_id = await a_task(session, settings)
+    provider = ScriptedProvider(record_requests=True)
+    run = compose(sessions, settings, pricing, provider, tools=FakeTools([]))
+    result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert result.status == "succeeded"
+    assert "scenario" not in provider.requests[0].metadata
+    assert provider.requests[0].metadata["output_contract"] == "ImplementOutput"
+
+
+async def test_a_scenario_never_reaches_a_provider_that_is_not_scripted() -> None:
+    """W65: the scenario goes into the metadata only for the scripted provider, even when the runtime is
+    configured scripted (a test double named otherwise stands for the adapter)."""
+    from tests.runtime_fakes import Fakes, make_runtime
+    from tests.runtime_fakes import run_request as unit_request
+
+    fakes = Fakes(scripted(DONE))
+    fakes.providers.provider.name = "anthropic"  # type: ignore[misc]
+    await make_runtime(fakes).run(unit_request("B14", scenario="calc"))
+    assert "scenario" not in fakes.provider.requests[0].metadata
