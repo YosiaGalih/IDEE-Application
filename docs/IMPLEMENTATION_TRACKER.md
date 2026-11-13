@@ -2479,3 +2479,64 @@ $ npx vite build && npm audit --omit=dev --audit-level=high
 - **AG-13 3.1e1 N1:** handler 422 mengganti segmen `loc` dari kunci dict dan field asing (semua route).
 - **PO:** ratifikasi ADR-073 (#6 pemegang kill switch) dan EX-03 postgres (sampai 2026-11-30).
 - **Shell 390 px:** sidebar tetap menggulung horizontal di layar ponsel (sudah tercatat sejak WP-3.1c2).
+
+
+### WP-3.1f1 (🔒 ledger usage, BudgetGuard, budget project) — `usage_records`, hook `before_attempt`, tarif saat worker start, `GET /usage`, `GET/PATCH /projects/{id}/budget`, usage di dashboard (FR-132 sebagian, FR-133, FR-011 usage; AC-16; T4 budget LLM, T6; ADR-074)
+
+Spec: `docs/superpowers/specs/2026-11-11-wp-3.1f-runtime-budget-usage-design.md` (pembagian 3.1f1/3.1f2/3.1f3, Keputusan Lead 3.1f #1–#14, Review Focus 3.1f1). Plan: `docs/superpowers/plans/2026-11-11-wp-3.1f1-usage-budget.md`. ADR-074 (Proposed).
+
+**Syarat WP-3.1e2 yang dicatat di sini [Pasti]:** PR #28 CI 9/9 `success` di 208bdee; di-merge PO 13 Nov 2026 (merge commit 3cf872a); tree `main` sesudah merge identik dengan 208bdee (`git diff --quiet`). Syarat AG-13 3.1e2 (1) tracker dan (3) CI hijau terpenuhi; (2) penegakan `enabled`/`provider_calls_enabled` dibawa ke 3.1f2.
+
+**Jalannya PR (fakta):**
+- PR #29 (draft, lalu ditandai siap dan di-merge PO 13 Nov 2026, merge commit 424f773, head a170e0a) masuk `main` **sebelum** putaran review per WP selesai: item 10 (AG-13 L3), review ulang frontend, `/code-review`, delta AG-13 untuk perbaikan, dan tracker ini belum ada saat itu. CI PR #29 di a170e0a 9/9 `success`.
+- Sisa pekerjaan masuk PR lanjutan (81393ac..bf798bf di atas 424f773). Bagian ini mencatat keduanya.
+
+**Dua merah CI di PR #29 dan akar masalahnya:**
+- `security-scan`: advisory baru CVE-2026-125350 (`libxslt` 1.1.43-r3) di image upstream `postgres:16.15-alpine`, bukan kode WP ini. Digest terbaru tag 16.15 (13 Nov) masih membawa versi lama (dibaca dari `lib/apk/db/installed` layer amd64 lewat registry); `postgres:16.16-alpine@sha256:0adbf25a…` membawa `libxslt` 1.1.43-r4 dan `krb5-libs` 1.22.3-r0. Image dinaikkan (a170e0a, keputusan PO di sesi ini), entri EX-03 postgres (19 CVE) dihapus, EX-04 mengikuti nama image. Penambahan CVE ke EX-03 sempat dicoba dan ditolak classifier sebagai "CI bypass"; keputusannya diserahkan ke PO.
+- `backend-test`: `test_a_large_search_output_never_blocks_the_loop` (WP-2.1d) `0.578 < 0.5`. Diukur dengan callback GC di suite penuh: ~780 ribu objek hidup di akhir suite; satu full collection di dalam pengukuran menahan GIL 0,48–0,58 dtk (0,11 dtk bila test sendirian). Perbaikan aced1fb: `_loop_gaps` membekukan heap lama selama pengukuran (jeda di dalam pengukuran 0,48 → 0,04 dtk). **Klaim awal saya bahwa test tetap diskriminatif tidak lengkap:** saya hanya menguji mutan langkah `keep`; delta AG-13 menunjukkan parse grep di loop (0,45–0,48 dtk) lolos. Ditutup di 3361c47 dengan test struktural tanpa timing (lihat AG-13 M-D1).
+
+**Bukti (kode akhir bf798bf):**
+
+```text
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 292 files already formatted · 0 errors · Contracts: 8 kept, 0 broken
+$ f1-pytest.sh -q                       # suite backend penuh, sendirian, DB kodekantor_test_f1
+3158 passed
+$ npm run format:check && npm run lint && npm run lint:guards && npm run typecheck && npm test   # @ 38298b5 (frontend tidak berubah sesudahnya)
+Test Files 45 passed · Tests 600 passed · vite build OK · npm audit: 0 vulnerabilities
+$ python3 -m unittest discover -s infra/tests   # @ a170e0a
+Ran 112 tests · OK (skipped=1)
+```
+
+- Kontrak import baru: "Budget accounting reads the ledger and prices; it never calls a provider" dan "`app.api` never imports `app.workflow`".
+- Test per bagian: `tests/integration/test_usage_tables.py` (migrasi 0010, CHECK, round trip, presisi `agent_runs`), `test_usage_ledger.py` (satu baris per percobaan, idempoten, konflik isi, konteks), `tests/unit/test_llm_retry.py` (`before_attempt` sebelum setiap percobaan; cancel + ledger gagal; shield), `tests/unit/test_budget.py` + `tests/integration/test_budget_guard.py` (tabel Keputusan #6, durasi jam DB, iterasi tool, budget rusak gagal tertutup), `tests/unit/test_celery_app.py` + `tests/integration/test_worker_start.py` (bootstep tarif, worker menolak start), `tests/integration/test_usage_api.py`, `test_project_budget.py`, `test_dashboard_api.py`, `tests/security/test_usage_scope.py`, `test_usage_budget_inputs.py` (AG-13 L2/L3/C-D2), `test_search_inputs.py` (M-D1), `tests/unit/test_usage_writer_guard.py` (penulis tunggal ledger); frontend `src/lib/__tests__/money.test.ts`, `src/api/__tests__/dashboard.test.ts`, `DashboardPage.test.tsx`.
+- Mutan satu per run pada kode akhir: U1–U58 (108 varian) **108/108 merah**, dijalankan ulang sesudah perbaikan 89/89; V1–V13 (perbaikan review, 29 varian) **29/29 merah** (`scratchpad/mutants_3_1f1.py`, keluaran `mutants-3.1f1.out`). Dua mutan U butuh test baru (3463de5 durasi jam DB, 1860724 PATCH budget tidak menimpa settings lain).
+- **Penyimpangan proses:** bukti merah-dulu ada di laporan implementer per task, tidak terpisah per commit (commit memuat test + implementasi). Kompensasinya mutan di atas.
+
+**Review:**
+
+| Review | Hasil | Penutupan |
+|---|---|---|
+| `kk-backend-reviewer` @ 7d61b8e | **APPROVE**, 2 LOW | LOW overloaded di tengah stream dihitung 0: tidak terjadi, adapter melampirkan usage `message_start` (`test_stream_error_event_after_text`). LOW budget rusak → 500: ditutup item 10 (81393ac). |
+| `kk-silent-failure-hunter` @ 7d61b8e | 0 HIGH, 3 MEDIUM, 7 LOW | M1 token `null` (9e83b5d), L1 tabel tanpa model (c878d32), L2 budget ketat (c99f333), L5 jam DB (aca599b), L6 pembulatan ke atas (8317a7f), L7 cancel + ledger (fef648e). **Diterima:** M2 (task tanpa baris = `estimated 0`: belum ada pemanggil model sebelum 0010 dan Keputusan #8 menggagalkan panggilan yang tidak tercatat), L3 (durasi sejak `started_at`, Keputusan #11). **Ke 3.1f2:** M3 (wrapper yang mewajibkan kedua hook), L4 (satu percobaan berjalan per task). |
+| `kk-frontend-reviewer` @ 7d61b8e | **BLOCK** (HIGH label `partial`), 2 MEDIUM | 1ac40cf "estimasi sebagian"/"partial estimate", 8317a7f pembulatan ke atas, fea1744 zod `cost_status`↔biaya. |
+| `kk-frontend-reviewer` ulang @ a170e0a | **APPROVE**, 2 LOW | Diterima: badge estimasi di samping token (token batas bawah saat `partial`), `actual` + `null` (dicadangkan, CHECK DB). |
+| AG-13 @ 7d61b8e | **SIGNED OFF WITH CONDITIONS 🔒**, 0 CRITICAL/HIGH; M2 3.1a tertutup untuk percobaan yang tercatat; C10 `retry.py` diterima | L2 422 (38298b5), L3 (81393ac). Ke 3.1f2: M1 (reservasi/satu percobaan berjalan), L1 (satu konstruktor dari `LLMRequest`), L5 (iterasi tool sebelum setiap tool). Ke 3.2: L4 (salin budget efektif ke `tasks.budget_limit`). |
+| AG-13 delta @ a170e0a | **SIGNED OFF WITH CONDITIONS 🔒**, 1 MEDIUM | M-D1 freeze GC membutakan guard parse grep: test struktural 3361c47 (mutan `parse`/`keep` merah, sendiri dan di suite penuh). C-D2 kasus budget rusak 0797711. C-D3 kontrak token `null` e56e8e3. L-D2 `asyncio.shield` bf798bf. |
+| `/code-review` Standards @ 81393ac | Keras: test regresi AG-13 bukan di `tests/security/`; route budget mengimpor `app.workflow`; ADR belum ada; proses (merge sebelum review). Smell: `CostStatus` ganda, `Literal`, konstruktor usage dashboard, join berulang, fixture ganda. | aeb6011, 0ce2862 (+ kontrak import), e56e8e3 (ADR-074), e7d31af, 1e26aa5, 9b17c1d, ad6adcb. **Tidak dikerjakan (penilaian):** `response_model` (tidak dipakai route mana pun di repo; dicatat di #72), `LedgerRow` posisional, nama field budget sebagai string, regex ganda `money.ts`, sentinel `"<invalid>"`, jalur biaya `None` (pengaman gagal tertutup). |
+| `/code-review` Spec @ 81393ac | Tujuh Goals terpenuhi. DATA_MODEL `tasks.budget_limit`; 409 `budget_invalid` belum di API; batas `BUDGET_MAX_*` juga untuk budget task; token `null` vs kontrak; cancel menelan ledger (hanya `__cause__`). | e56e8e3 (DATA_MODEL, API §3/§9/§11 #9, #72). Keputusan Lead: batas yang sama berlaku untuk budget task, 3.2 memvalidasi `budget_increase` terhadapnya. Ke 3.1f2: run yang di-cancel dengan `__cause__` ledger berakhir `failed usage_unrecorded`. |
+| AG-13 delta @ bf798bf | **SIGNED OFF 🔒**, 0 CRITICAL/HIGH/MEDIUM. C-D1 (probe ulang berbasis frame pemanggil `to_thread`: mutan `parse`, `keep`, keduanya RED), C-D2 (26 kasus; PoC otorisasi: stranger/admin global 404 tanpa oracle 409, reader 409 GET + 403 PATCH, tanpa CSRF 403; mutan `stored_500`, `lenient` RED), C-D3, L-D1, L-D2 (mutan `noshield` RED) tertutup. Refactor 9b17c1d: keempat query tetap `JOIN projects`, scope tidak berubah. Suite penuh 3158 passed.<br>- N-1 (LOW): tulis ledger yang di-shield lalu gagal sesudah cancel kedua tidak menghasilkan `usage_attempt_unrecorded` (hanya log asyncio "Task exception was never retrieved").<br>- N-2 (INFO): `GET /projects` dan `/projects/{id}` mengembalikan `settings` apa adanya, termasuk `budget` rusak (perilaku lama; hanya lewat edit DB). | N-1 ke 3.1f2 (wrapper `usage_unrecorded`, ADR-074). N-2 ke WP yang menyentuh `ProjectOut` (3.2). |
+
+**Status sign-off AG-13 WP-3.1f1: SIGNED OFF 🔒** (7d61b8e; delta a170e0a; delta bf798bf). Syarat merge PR lanjutan: CI 9/9 hijau (termasuk `security-scan`: gitleaks, semgrep) di head yang sama dengan bf798bf, ditambah commit dokumen/tracker saja; perubahan lain sesudah bf798bf butuh delta AG-13. Sign-off ini dicatat di PR yang sama.
+
+**Syarat yang dibawa:**
+- **3.1f2 (prasyarat wiring, blocking):**
+  - wrapper tunggal yang mewajibkan `before_attempt` + `on_attempt`, dengan test penjaga atas setiap pemanggil `create_with_retry` (silent M3);
+  - satu percobaan berjalan per task (lease dipegang selama run) dan akuntansi percobaan yang mati di tengah panggilan, atau reservasi di bawah lock (AG-13 M1, silent L4);
+  - `CallBound` dan konteks ledger dari satu konstruktor berbasis `LLMRequest`, `task_id` wajib (AG-13 L1);
+  - plafon iterasi tool diperiksa sebelum setiap eksekusi tool (AG-13 L5);
+  - run yang di-cancel dengan kegagalan ledger sebagai penyebab berakhir `failed usage_unrecorded`;
+  - syarat warisan 3.1e1/3.1e2 (gerbang provider dan kill switch), ratifikasi PO ADR-073 #6, `tests/security/test_secret_redaction.py` (3.1a C3), 3.1d1 C3 (`grant_for`), 3.1d2b LOW-2;
+  - AG-13 N-1: kegagalan tulis ledger yang di-shield sesudah cancel kedua dicatat `usage_attempt_unrecorded` (atau lewat wrapper `usage_unrecorded`).
+- **3.2:** setiap penulis `tasks.budget_limit` (salinan budget efektif saat task dibuat, usulan `budget_increase`) menulis lewat `dump_budget` dan divalidasi terhadap `BUDGET_MAX_*`, kalau tidak BudgetGuard gagal tertutup (AG-13 L4, `/code-review` Spec); AG-13 N-2: `ProjectOut` hanya mengekspos `SETTINGS_KEYS` dan budget yang sudah di-parse.
+- **PO:** ratifikasi ADR-074; konflik baru di #72 (budget project = default, satu baris per percobaan, `usage:read_all`, smoke di luar ledger, agregasi `cost_status`, presisi, `cache_read`, token `null`, `response_model`, tag postgres di PRD).
