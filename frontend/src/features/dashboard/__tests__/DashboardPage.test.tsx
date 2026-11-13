@@ -5,6 +5,7 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { agentRun, dashboardData, dashboardMeta, project, task } from "@/__tests__/dashboardFixtures";
 import { API, deferred, fail, pendingApprovals, renderApp, signedIn, user } from "@/__tests__/harness";
+import en from "@/i18n/locales/en.json";
 import id from "@/i18n/locales/id.json";
 
 const server = setupServer(pendingApprovals());
@@ -97,7 +98,7 @@ describe("DashboardPage", () => {
       ...data.usage,
       input_tokens: 275306,
       output_tokens: 4143,
-      estimated_cost: 0.5,
+      estimated_cost: "0.5",
       cost_status: "estimated",
     };
     backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
@@ -110,13 +111,13 @@ describe("DashboardPage", () => {
     expect(cost).toHaveTextContent(id.dashboard.costStatus.estimated);
   });
 
-  it("never prints a cost whose status says it is unknown", async () => {
+  it("shows an unknown cost as not available, next to the counted tokens", async () => {
     const data = dashboardData();
     data.usage = {
       ...data.usage,
       input_tokens: 0,
       output_tokens: 12,
-      estimated_cost: 0,
+      estimated_cost: null,
       cost_status: "unavailable",
     };
     backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
@@ -126,6 +127,91 @@ describe("DashboardPage", () => {
     expect(input).toHaveTextContent(/^0$/); // a counted 0 is a real 0
     expect(output).toHaveTextContent(/^12$/);
     expect(cost).toHaveTextContent(id.dashboard.unavailable);
+  });
+
+  it("shows a tiny cost as less than a cent, never as zero", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 0,
+      output_tokens: 1,
+      estimated_cost: "0.0000005",
+      cost_status: "estimated",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const cost = within(usage).getAllByRole("definition")[2];
+    expect(cost).toHaveTextContent(`< US$0,01${id.dashboard.costStatus.estimated}`);
+    expect(cost).not.toHaveTextContent("US$0,00");
+  });
+
+  it("names a partial total a partial estimate (API_CONTRACTS §11 #3)", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 160,
+      output_tokens: 25,
+      estimated_cost: "0.5",
+      cost_status: "partial",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const cost = within(usage).getAllByRole("definition")[2];
+    expect(cost).toHaveTextContent("US$0,50estimasi sebagian");
+    expect(en.dashboard.costStatus.partial).toBe("partial estimate");
+  });
+
+  it("rounds a cost up to the cent, never down", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 1,
+      output_tokens: 1,
+      estimated_cost: "1.001",
+      cost_status: "estimated",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const cost = within(usage).getAllByRole("definition")[2];
+    expect(cost).toHaveTextContent(`US$1,01${id.dashboard.costStatus.estimated}`);
+  });
+
+  it("shows tokens no attempt reported as not available, never as 0", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: null,
+      output_tokens: null,
+      estimated_cost: null,
+      cost_status: "unavailable",
+    };
+    // Recorded usage (not listed as unavailable) whose attempts never reported tokens (silent-failure M1).
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const values = within(usage).getAllByRole("definition");
+    expect(values.map((value) => value.textContent)).toEqual(Array(3).fill(id.dashboard.unavailable));
+    expect(within(usage).queryByText(id.dashboard.usage.body)).not.toBeInTheDocument();
+  });
+
+  it("shows a counted zero cost as zero", async () => {
+    const data = dashboardData();
+    data.usage = {
+      ...data.usage,
+      input_tokens: 0,
+      output_tokens: 0,
+      estimated_cost: "0",
+      cost_status: "estimated",
+    };
+    backend(() => answer(data, dashboardMeta({ unavailable: ["agent_activity"] })));
+    renderApp("/");
+    const usage = await screen.findByRole("region", { name: id.dashboard.usage.title });
+    const cost = within(usage).getAllByRole("definition")[2];
+    expect(cost).toHaveTextContent(`US$0,00${id.dashboard.costStatus.estimated}`);
+    expect(cost).not.toHaveTextContent("<");
   });
 
   it("lists agent runs once they are recorded, and says when there are none", async () => {

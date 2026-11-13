@@ -397,6 +397,7 @@
       "inputTokens": "Input tokens",
       "outputTokens": "Output tokens",
       "cost": "Cost",
+      "belowCent": "< {{amount}}",
       "body": "Tokens and cost are not recorded yet, so they show as not available, not as zero."
     },
     "recentProjects": {
@@ -421,7 +422,7 @@
     },
     "costStatus": {
       "estimated": "estimate",
-      "partial": "partial (not all priced)",
+      "partial": "partial estimate",
       "actual": "actual"
     }
   },

@@ -5,7 +5,7 @@ const OWNER_ID = "0b6a3f1e-6a1f-4e0e-9a51-6c1c8d7f2a10";
 const UNAVAILABLE_USAGE = {
   input_tokens: null as number | null,
   output_tokens: null as number | null,
-  estimated_cost: null as number | null,
+  estimated_cost: null as string | null, // a plain decimal string (WP-3.1f1)
   cost_status: "unavailable" as string,
 };
 

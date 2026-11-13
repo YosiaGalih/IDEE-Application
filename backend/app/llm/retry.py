@@ -6,6 +6,11 @@ failure of ``on_attempt`` itself propagates: losing a ledger entry is not silent
 retried; ``retry-after`` is honoured up to a ceiling, past which the error is passed on instead of holding a
 worker (and its task lease) asleep.
 
+``before_attempt(attempt)`` runs before every attempt, the first and each retry, ahead of any restart
+notice (ARCHITECTURE §5.4, "before every request"; WP-3.1f1). An exception from it stops the call as it is:
+no request is sent and nothing is reported through ``on_attempt``, since that attempt never reached the
+provider. The previous attempt's ``on_attempt`` has already completed, so a budget check sees it.
+
 Text already streamed to ``on_text_delta`` cannot be taken back. After such text, an attempt is retried only
 when ``on_restart(attempt)`` is given, so the consumer can discard the partial text first; without it the
 error is passed on rather than streaming the answer twice.
@@ -21,6 +26,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from app.core.cancel import CancelToken
+from app.core.logging import get_logger
 from app.llm.base import ErrorKind, LLMError, LLMProvider, LLMRequest, LLMResponse, TextDeltaHandler, Usage
 
 
@@ -45,8 +51,11 @@ class AttemptRecord:
     error_kind: ErrorKind | None  # None for an unexpected (non-LLMError) failure
 
 
+_log = get_logger(__name__)
+
 AttemptHandler = Callable[[AttemptRecord], Awaitable[None]]
 RestartHandler = Callable[[int], Awaitable[None]]
+BeforeAttemptHandler = Callable[[int], Awaitable[None]]
 
 
 async def create_with_retry(
@@ -58,6 +67,7 @@ async def create_with_retry(
     on_restart: RestartHandler | None = None,
     cancel: CancelToken | None = None,
     on_attempt: AttemptHandler | None = None,
+    before_attempt: BeforeAttemptHandler | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: Callable[[], float] = random.random,
 ) -> LLMResponse:
@@ -67,6 +77,8 @@ async def create_with_retry(
         if cancel is not None and cancel.cancelled:
             raise LLMError("cancelled")
         attempt += 1
+        if before_attempt is not None:
+            await before_attempt(attempt)  # raises to refuse: nothing sent, nothing to record
         if streamed and on_restart is not None:
             await on_restart(attempt)
         streamed = False
@@ -89,10 +101,20 @@ async def create_with_retry(
                 raise
             await _pause(delay, sleep, cancel)
             continue
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             # The caller was cancelled mid-attempt: the request still reached the provider. Its usage is not
             # known here, so the record says so (None, priced "unavailable"), never zero.
-            await _report(on_attempt, provider, req, attempt, started, cancelled=True)
+            try:
+                await _report(on_attempt, provider, req, attempt, started, cancelled=True)
+            except Exception as unrecorded:
+                # The cancel still wins (review L7), but a lost ledger row is never silent: ids only, no text.
+                _log.error(
+                    "usage_attempt_unrecorded",
+                    call_id=req.metadata.get("call_id"),
+                    attempt=attempt,
+                    error_type=type(unrecorded).__name__,
+                )
+                raise cancelled from unrecorded
             raise
         except Exception:
             await _report(on_attempt, provider, req, attempt, started, unexpected=True)

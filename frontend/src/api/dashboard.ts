@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DECIMAL_STRING } from "@/lib/money";
 import { apiRequest } from "./client";
 import { ApiError } from "./errors";
 import { ProjectSchema } from "./projects";
@@ -6,12 +7,33 @@ import { TASK_STATUSES } from "./taskStatus";
 
 /** `cost_status` (DATA_MODEL usage_records): `unavailable` is unknown, never 0 (AC-16). */
 export const COST_STATUSES = ["estimated", "partial", "actual", "unavailable"] as const;
-const UsageSchema = z.object({
+// Tokens are null when no row reported them (or a server still lists usage in `meta.unavailable`). The cost is
+// a plain decimal string (WP-3.1f1): a number would already have lost digits, and "5E-7" is not a price.
+const UsageFields = z.object({
   input_tokens: z.number().int().nullable(),
   output_tokens: z.number().int().nullable(),
-  estimated_cost: z.number().nullable(),
+  estimated_cost: z.string().regex(DECIMAL_STRING).nullable(),
   cost_status: z.enum(COST_STATUSES),
 });
+
+/** The cost must match its status: `unavailable` carries no amount; an estimate (whole or partial) carries
+ * one. Anything else contradicts itself and is a bad response, never a quiet render. */
+function costMatchesStatus(usage: z.infer<typeof UsageFields>, ctx: z.RefinementCtx) {
+  if (usage.cost_status === "unavailable" && usage.estimated_cost !== null)
+    ctx.addIssue({
+      code: "custom",
+      path: ["estimated_cost"],
+      message: "an unavailable cost carries no amount",
+    });
+  if ((usage.cost_status === "estimated" || usage.cost_status === "partial") && usage.estimated_cost === null)
+    ctx.addIssue({
+      code: "custom",
+      path: ["estimated_cost"],
+      message: `a ${usage.cost_status} cost needs an amount`,
+    });
+}
+
+const UsageSchema = UsageFields.superRefine(costMatchesStatus);
 
 /** `TaskSummary` (API_CONTRACTS §11 #2) + `project_name` (conflict #70). */
 export const TaskSummarySchema = z.object({
@@ -58,9 +80,9 @@ export const DashboardSchema = z.object({
   recent_tasks: z.array(TaskSummarySchema),
   failed_queue: z.array(TaskSummarySchema),
   agent_activity: z.array(AgentRunSummarySchema),
-  usage: UsageSchema.extend({
+  usage: UsageFields.extend({
     period: z.object({ start: z.iso.datetime({ offset: true }), end: z.iso.datetime({ offset: true }) }),
-  }),
+  }).superRefine(costMatchesStatus),
 });
 export type Dashboard = z.infer<typeof DashboardSchema>;
 

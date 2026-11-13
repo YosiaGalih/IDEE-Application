@@ -123,5 +123,12 @@ type = "forbidden"
 source_modules = ["app.main", "app.api"]
 forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.services.provider_smoke", "app.worker"]
 
+[[tool.importlinter.contracts]]
+name = "Budget accounting reads the ledger and prices; it never calls a provider (WP-3.1f1)"
+type = "forbidden"
+source_modules = ["app.workflow.budget"]
+forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.llm.scripted_provider",
+                     "app.llm.retry", "app.llm.readiness", "app.tools", "app.agents"]
+
 [tool.ruff.lint.isort]
 known-third-party = ["alembic"]

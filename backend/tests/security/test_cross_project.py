@@ -49,6 +49,8 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("POST", "/api/v1/projects/{id}/git/commit", {"message": "matrix"}),
     ("POST", "/api/v1/projects/{id}/index", None),
     ("GET", "/api/v1/projects/{id}/search?q=x", None),
+    ("GET", "/api/v1/projects/{id}/budget", None),
+    ("PATCH", "/api/v1/projects/{id}/budget", {"max_tokens": 1000}),
     ("DELETE", "/api/v1/projects/{id}", None),  # R3: only asks for a project_delete approval
 ]
 FILE = "README.md"  # exists in every blank project
@@ -65,6 +67,7 @@ WRITES = {
     ("POST", "/api/v1/projects/{id}/git/branch"),
     ("POST", "/api/v1/projects/{id}/git/commit"),
     ("POST", "/api/v1/projects/{id}/index"),
+    ("PATCH", "/api/v1/projects/{id}/budget"),
 }
 
 

@@ -5,6 +5,7 @@ hidden."""
 from __future__ import annotations
 
 import asyncio
+import gc
 import time
 import uuid
 from pathlib import Path
@@ -82,15 +83,24 @@ async def test_git_dir_is_never_searched(
 
 
 async def _loop_gaps(until: asyncio.Future[Any]) -> list[float]:
-    """Gaps between ticks of a 5 ms ticker while ``until`` runs: a blocked event loop shows as a long gap."""
-    gaps: list[float] = []
-    last = time.monotonic()
-    while not until.done():
-        await asyncio.sleep(0.005)
-        now = time.monotonic()
-        gaps.append(now - last)
-        last = now
-    return gaps
+    """Gaps between ticks of a 5 ms ticker while ``until`` runs: a blocked event loop shows as a long gap.
+
+    Objects left by earlier tests are frozen while measuring: a full garbage collection walks the whole heap
+    and holds the GIL, and after a full suite (about 780k live objects) one pause took 0.48-0.58 s on its own,
+    whatever the code under test does. Frozen, a pause covers only what this test allocates."""
+    gc.collect()
+    gc.freeze()
+    try:
+        gaps: list[float] = []
+        last = time.monotonic()
+        while not until.done():
+            await asyncio.sleep(0.005)
+            now = time.monotonic()
+            gaps.append(now - last)
+            last = now
+        return gaps
+    finally:
+        gc.unfreeze()
 
 
 @pytest.mark.parametrize(

@@ -82,3 +82,19 @@ PROVIDERS = ("anthropic",)
 READINESS_STATUSES = ("unknown", "passed", "failed")
 SECRET_STATUSES = ("unknown", "configured", "missing")  # as last seen by the worker (spec 3.1e Keputusan #4)
 LLM_PROVIDER_MODES = ("anthropic", "scripted")
+# Usage ledger (spec WP-3.1f Keputusan Lead #3): one row per attempt. ``app.models`` cannot import
+# ``app.llm``, so these copy ``AttemptRecord.status`` and ``app.llm.base.ErrorKind``;
+# tests/unit/test_pricing_usage.py keeps them equal.
+USAGE_ATTEMPT_STATUSES = ("ok", "error", "cancelled")
+LLM_ERROR_KINDS = (
+    "rate_limited",
+    "overloaded",
+    "transient",
+    "timeout",
+    "refusal",
+    "bad_request",
+    "auth",
+    "malformed",
+    "cancelled",
+    "max_tokens",
+)

@@ -19,6 +19,7 @@ from app.core.db import make_sessionmaker
 from app.core.rbac import RoleGrant
 from app.core.redaction import Redactor
 from app.gitops.adapter import GitAdapter
+from app.llm.base import Usage
 from app.models.projects import Project
 from app.services import projects
 from tests.integration.test_dashboard_api import DASHBOARD, add_project, add_task
@@ -30,6 +31,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     signed_in,
     workspace_root,
 )
+from tests.usage_fakes import record
 
 PASSWORD = "user-long-passphrase"  # make_user's
 
@@ -220,3 +222,36 @@ async def test_recent_projects_are_the_first_page_of_the_project_list(
         listed = (await client.get("/api/v1/projects", params={"page_size": 5})).json()["data"]
         shown = (await client.get(DASHBOARD)).json()["data"]["recent_projects"]
         assert shown == listed
+
+
+async def test_dashboard_usage_counts_only_visible_projects(
+    people: dict[str, Any], engine: AsyncEngine
+) -> None:
+    """WP-3.1f1: the month's usage adds up the same projects as the counts; another user's project, a deleted
+    one, and for a global admin everything it was not granted, never count."""
+    await record(engine, people["projects"]["alice_main"], task_id=people["tasks"]["alice_main"])
+    await record(engine, people["projects"]["alice_side"], usage=Usage(1, 1))
+    await record(
+        engine, people["projects"]["bob_main"], task_id=people["tasks"]["bob_main"], usage=Usage(7, 7)
+    )
+    gone = await add_project(engine, people["ids"]["alice"], "Alice Gone", status="deleted")
+    await record(engine, gone, usage=Usage(1_000, 1_000))
+
+    async def usage_of(name: str) -> dict[str, Any]:
+        response = await (await people["client"](name)).get(DASHBOARD)
+        assert response.status_code == 200, response.text
+        return response.json()["data"]
+
+    alice = await usage_of("alice")
+    assert (alice["usage"]["input_tokens"], alice["usage"]["output_tokens"]) == (101, 21)
+    bob = await usage_of("bob")
+    assert (bob["usage"]["input_tokens"], bob["usage"]["output_tokens"]) == (7, 7)
+    assert bob["failed_queue"][0]["usage"]["input_tokens"] == 7  # its own task, never Alice's
+    carl = await usage_of("carl")  # a global admin (usage:read_all) who owns nothing
+    assert carl["usage"] | {"period": None} == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost": "0",
+        "cost_status": "estimated",
+        "period": None,
+    }
