@@ -2540,3 +2540,56 @@ Ran 112 tests · OK (skipped=1)
   - AG-13 N-1: kegagalan tulis ledger yang di-shield sesudah cancel kedua dicatat `usage_attempt_unrecorded` (atau lewat wrapper `usage_unrecorded`).
 - **3.2:** setiap penulis `tasks.budget_limit` (salinan budget efektif saat task dibuat, usulan `budget_increase`) menulis lewat `dump_budget` dan divalidasi terhadap `BUDGET_MAX_*`, kalau tidak BudgetGuard gagal tertutup (AG-13 L4, `/code-review` Spec); AG-13 N-2: `ProjectOut` hanya mengekspos `SETTINGS_KEYS` dan budget yang sudah di-parse.
 - **PO:** ratifikasi ADR-074; konflik baru di #72 (budget project = default, satu baris per percobaan, `usage:read_all`, smoke di luar ledger, agregasi `cost_status`, presisi, `cache_read`, token `null`, `response_model`, tag postgres di PRD).
+
+### WP-3.1f2a (🔒 AgentRuntime) — kontrak I/O agent, prompt, runtime lewat port, gerbang provider dan kill switch per percobaan, satu jalur panggilan model, `agent_runs.error_code`, `agent.delta` teredaksi, T1/T5 tingkat agent run (FR-129, FR-130, FR-132/133 penegakan runtime, FR-059–062 loop tool; AC-06, AC-15 dan AC-16 sebagian; T1, T4, T5; ADR-075, ADR-072)
+
+Spec: `docs/superpowers/specs/2026-11-11-wp-3.1f-runtime-budget-usage-design.md` bagian "3.1f2 — rancangan" (Keputusan Lead 3.1f #15–#48, Review Focus 3.1f2a). Plan: `docs/superpowers/plans/2026-11-13-wp-3.1f2a-agent-runtime.md` (11 task). ADR-075 (Proposed), dibangun di atas ADR-073 #6 (Proposed) atas arahan PO "lanjutkan hingga selesai". PR #31.
+
+**Syarat WP-3.1f1 yang dicatat di sini [Pasti]:** PR #30 CI 9/9 `success` di head bbbeb3b (sesudah bf798bf hanya commit dokumen/tracker), di-merge PO 13 Nov 2026 (merge commit 5508183). Syarat sign-off AG-13 3.1f1 (CI 9/9 termasuk `security-scan`, perubahan sesudah bf798bf hanya dokumen) terpenuhi.
+
+**Jalannya pekerjaan (fakta):**
+- Task 1–11 plan (770315b..42bcb2e), dokumen kontrak (3e96b1a), putaran perbaikan review 42bcb2e (a99743c..1997a76), pembatalan Lead #36 (073e68d), dokumen (0dbc6a3), putaran perbaikan review delta + `/code-review` (512aa3e..082f104), dokumen dan tracker ini.
+- **Kesalahan Lead yang dibatalkan:** di putaran perbaikan pertama saya memerintahkan kontrak menolak klaim `passed` A07 tanpa bukti (828b962). Itu bertentangan dengan USER_PROXY_ACCEPTANCE §5 V1/UPA-02, yang menaruh downgrade + audit `acceptance.evidence_rejected` di `verify_report`. Dibatalkan di 073e68d (#36). Logika yang sama diterapkan ke ref A07 yang salah format (#45, f5f7dd4).
+- **`security-scan` merah di 0dbc6a3:** gitleaks `private-key` pada PEM sintetis di `backend/tests/security/test_delta_redaction.py:31` (commit b35c3c7), bukan kunci sungguhan. Perbaikan yang diusulkan: literal dibangun lewat konkatenasi dan fingerprint b35c3c7 masuk `.gitleaksignore`, mengikuti pola entri fixture yang sudah ada. Pengklasifikasi izin sesi agent menolak langkah `.gitleaksignore` sebagai "CI Bypass", jadi keputusannya di PO (komentar PR #31). Alternatif: izin force-push untuk menulis ulang b35c3c7.
+
+**Bukti:**
+
+```text
+$ f1-pytest.sh -q          # @ 073e68d, suite backend penuh, sendirian, DB kodekantor_test_f1
+3712 passed in 527.38s
+$ f1-pytest.sh -q          # @ 082f104 (laporan implementer; dijalankan ulang oleh Lead, lihat di bawah)
+3834 passed in 483s
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports   # @ 082f104
+All checks passed! · 327 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
+$ uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml   # exit 0
+```
+
+- Kontrak import baru: "The runtime ends agent runs; it never moves a task" dan larangan `api` mengimpor `app.agents.runtime`/`app.services.agent_runtime`; isolasi `app.agents.runtime` dari `sqlalchemy`, `redis`, `app.models`, `app.core.db`, `app.core.events`, `app.core.audit`, factory provider, `app.llm.readiness`, `app.llm.pricing`, `app.tools.gateway`.
+- Test per bagian: `tests/unit/test_contracts.py`, `test_agent_prompts.py`, `test_agent_runtime.py`, `test_model_call_guard.py` (AST: satu pemanggil `create_with_retry`, kedua hook), `test_agent_run_writer_guard.py`; `tests/integration/test_agent_runtime.py`, `test_agent_run_writer.py`, `test_runtime_locks.py`, `test_builtin_commit.py`; `tests/security/test_runtime_gate.py`, `test_delta_redaction.py`, `test_delta_streams.py`, `test_handler_denials.py`, `test_prompt_injection.py` (T1 tingkat agent run), `test_secret_redaction.py` (T5 tingkat agent run).
+- Mutan satu per run (`scratchpad/mutants_3_1f2a.py`): W1–W71 (86 varian): 83 merah di run pertama, W36a–c bertahan lalu merah sesudah test diperkuat (42bcb2e), W52 semula merah hanya karena timeout (run menggantung) dan kini gagal lewat assertion (42bcb2e); 86/86 merah; X1–X35 (33 varian; X33/X34 dibuang bersama #36) 32/33 merah, X10 bertahan dan dikonfirmasi ekuivalen oleh review delta silent-failure (tidak ada titik suspend antara cek stop terakhir dan `iteration_limit`; cek dipertahankan sebagai pertahanan berlapis); Y1–Y25 (22 varian) 22/22 merah; W/X yang targetnya pindah dijalankan ulang, semuanya merah.
+- **Penyimpangan proses:** bukti merah-dulu ada di laporan implementer per item, tidak terpisah per commit. Kompensasinya mutan di atas.
+
+**Review:**
+
+| Review | Hasil | Penutupan |
+|---|---|---|
+| `kk-backend-reviewer` @ 42bcb2e | **APPROVE** dengan catatan: `interrupted` vs #35, `usage_updated` gagal membunuh run, satu beat gagal = `lease_lost`, `aclose` gagal membuang hasil, `str(exc)` di `error`, `_close` tanpa guard, kebocoran `_projects`, test heartbeat saat tool panjang | 94be138 (`worker_cancelled`, event best-effort, retry beat, `aclose` di-log, teks error tetap, `_projects`), 828b962 (test DB-nyata lease maju selama tool) |
+| `kk-silent-failure-hunter` @ 42bcb2e | 0 CRITICAL, **2 HIGH** (H1 usage "0 / estimated", H2 await port tanpa batas), 5 MEDIUM (M1 lease hilang lalu `succeeded`, M2 stop dilaporkan `iteration_limit`, M3 delta meloloskan JWT/password panjang, M4 restart tanpa reset, M5 `finish` gagal → `running`), 5 LOW, A07 `passed` tanpa bukti | a99743c (H1), 6380a76 (H2, L2), 94be138 (M1, M2, M5, L1, L3), fbad3d3 (M3, M4), 828b962 (L4 `branch_mismatch`, L5). A07: lihat #36 |
+| AG-13 @ 42bcb2e | **SIGNED OFF WITH CONDITIONS 🔒**, 0 CRITICAL/HIGH/MEDIUM; LOW-1 `<agent_input>` dapat ditutup isinya, LOW-2 lock baris task menahan run, LOW-3 percobaan yang mati bersama worker tidak tercatat; INFO-1..5; semua syarat warisan (gerbang + kill switch, wrapper kedua hook, LOW-2 gateway, redaksi `agent_runs`, T1/T5) tertutup kecuali akuntansi crash | LOW-1 828b962, LOW-2 6380a76 (+ 512aa3e ledger), LOW-3 → 3.1f2b, INFO-2/3/4 di SECURITY_MODEL §13, INFO-5 → 3.2 |
+| `kk-silent-failure-hunter` delta @ 073e68d | 0 CRITICAL/HIGH; H1, M1–M5, L1–L5 tertutup, H2 sebagian; baru: **2 MEDIUM** (N1 tulis ledger tanpa batas, PoC 7 dtk; N2 `TimeoutError` asing dibaca `timeout`), 5 LOW (N3–N7); X10 ekuivalen | 512aa3e (N1), 0a016d0 (N2), 10cf748 (N3), aa7d66b (N4, N6). N5 → 3.1f2b recovery; N7 diterima (best-effort, di-log) |
+| AG-13 delta @ 073e68d | **SIGNED OFF WITH CONDITIONS 🔒**; LOW-1 dan LOW-2 **tertutup**, C10 (`aclose` di protocol) OK, suite penuh 3712 passed; baru: **MEDIUM D-M1** (pencarian kandidat delta kuadratik/kubik di event loop: 32 KiB → 14,5 dtk), LOW D-L1 (ejaan umum password berkutip panjang bocor 768 karakter), D-I1..D-I7 | 082f104 (D-M1 cek ekor linear + langkah rilis tumbuh, test performa 64 KiB < 1 dtk; D-L1 kandidat di teks mentah, kunci dari redaktor, ejaan diparametrisasi), 62d5f7d (D-I1), 45c1de8 (D-I4), aa7d66b (D-I5), D-I2/D-I3 di ARCHITECTURE §5.3/§6.1 dan SECURITY_MODEL T4, D-I6 → 3.1f2b, D-I7 diterima (himpunan sama dengan `app/tools/untrusted.py`) |
+| `/code-review` Standards @ 0dbc6a3 | Keras: §4.2 tertinggal, baris log tanpa id, tracker belum ada. Smell: teks `lease_lost` salah (Repeated Switches), kunci secret ganda, `Literal` vs `str`, komentar import-linter keliru, dll. | 45c1de8 (satu kalimat per kode, id di log close, tipe, komentar), dokumen §4.2/§6.1 dan tracker ini. Tidak dikerjakan (penilaian, spec "Tidak dikerjakan"): data clump `BudgetBreach`, nama `_port`, jam injectable, `STEPS`, duplikasi `HANDLER_DENIALS`, helper payload |
+| `/code-review` Spec @ 0dbc6a3 | Tracker/HANDOFF dan butir #72 basi; `hidden_paths_affected` dan langkah rilis tanpa keputusan; tulis ledger tanpa tenggat; cakupan `reset` ≠ API §5.1; pola `EvidenceRef` A07 mengulang #36 untuk V2; teks lease; ADR-011 diukur sebelum escape | #42, #43 (keputusan), 512aa3e, 082f104 (#44), f5f7dd4 (#45), 45c1de8, 83ad404 (#46), butir #72 dan tracker ini |
+| AG-13 delta @ 082f104 | ⏳ berjalan | |
+
+**Status sign-off AG-13 WP-3.1f2a:** ⏳ menunggu delta @ 082f104.
+
+**Syarat yang dibawa:**
+- **3.1f2b (recovery, blocking sebelum pemanggil produksi `build_agent_runtime`):**
+  - recovery `agent_runs`/`tool_calls` (`interrupted`), stale sweep, `RUNTIMES_AVAILABLE`, `agent_activity` dashboard, auth/404 → readiness `unknown`, `pricing_version` di predikat;
+  - AG-13 LOW-3: catat atau tandai percobaan yang mungkin hilang saat worker mati (marker sebelum percobaan → baris `unavailable`), atau keputusan Lead tertulis yang menerimanya;
+  - silent N5 / AG-13 D-I6: baris `running` yatim saat `start` ter-commit tetapi ack-nya hilang;
+  - worker memperlakukan `AgentRunUnfinished` sebagai "hasil akhir tidak diketahui; baris DB adalah kebenaran" (#48).
+- **3.2:** `services/acceptance.verify_report` V1–V10 + test UPA-02 sebelum status A07 dikonsumsi (#36, #45); AG-13 INFO-5 (`worker_id` unik per proses, `TaskWorkspace` dari baris task yang sama, penulis `AgentRunResult.output`/`pending_tool` meredaksi, transkrip resume diredaksi); transisi task dari hasil run, task `running` dengan provider belum siap → `interrupted/provider_not_ready` (#15); resume `tool_r3`; `GET /tasks/{id}/agent-runs`; penulis `tasks.title` meredaksi.
+- **WP yang me-render `agent.delta` (frontend):** wajib menghormati `reset` (API §5.1).
+- **PO:** keputusan temuan gitleaks (di atas); ratifikasi ADR-073 #6, ADR-074, ADR-075; butir 3.1f2 di #72.

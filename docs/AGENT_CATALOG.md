@@ -301,7 +301,7 @@ Bagian bersama (`?` = opsional, default `null`; angka dalam kurung = jumlah item
 | `Finding` | `severity: Severity`, `category: Category`, `title: Line`, `file_path: RepoPath?`, `line_start: int ≥ 1?`, `line_end: int ≥ 1?`, `evidence: Text`, `recommendation: Text`. `line_*` tanpa `file_path` ditolak; `line_end ≥ line_start` |
 | `CriterionView` | `key: CriterionKey`, `requirement_key: RequirementKey`, `criterion: Text`, `verification_method: VerificationMethod`, `mandatory: bool` |
 | `EvidenceItem` | `ref: EvidenceRef`, `label: Line` |
-| `CriterionResult` | `criterion_key: CriterionKey`, `status: passed\|failed\|blocked\|unverified`, `evidence_refs: [EvidenceRef]` (≤ 20), `rationale: Text` |
+| `CriterionResult` | `criterion_key: CriterionKey`, `status: passed\|failed\|blocked\|unverified`, `evidence_refs: [str]` (≤ 20; 1–80 karakter tanpa karakter kontrol, **tanpa** pola ref: `verify_report` yang memeriksa formatnya, USER_PROXY_ACCEPTANCE §5 V2; Keputusan Lead 3.1f #45), `rationale: Text` |
 
 Enam pasang kontrak:
 
