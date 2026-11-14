@@ -980,3 +980,31 @@ def test_fuzz_no_secret_window_in_any_payload() -> None:
         assert secret_windows(events, secrets) == [], case
         checked += len(secrets)
     assert checked > 5 * FUZZ_CASES and restarts > FUZZ_CASES / 2  # the fuzz is not vacuous
+
+
+_INTRO = "intro " * 50
+# (text, readable tail or None): None means a usable secret form, so no 32-char window of VALUE may stream.
+OPEN_AT_FLUSH_CASES = {
+    "unclosed_quote_after_key": (_INTRO + 'password = "' + VALUE, None),
+    "pem_without_end": (_INTRO + "-----BEGIN " + "RSA PRIVATE KEY-----\n" + VALUE, None),
+    "unclosed_header_parameter": (_INTRO + 'Cookie: session="' + VALUE, None),
+    "flag_with_open_quote": (_INTRO + '--password "' + VALUE, None),
+    "argv_flag_with_open_value": (_INTRO + '"--password", "' + VALUE, None),
+    "url_without_userinfo": (_INTRO + "See https://example.com/docs", "https://example.com/docs"),
+    "short_jwt_prefix": (_INTRO + "the prefix is eyJhbGc", "eyJhbGc"),
+}
+
+
+@pytest.mark.parametrize("size", [1, 16, 64])
+@pytest.mark.parametrize("case", list(OPEN_AT_FLUSH_CASES))
+def test_every_candidate_open_at_flush_ends_as_the_redaction(case: str, size: int) -> None:
+    """Spec #12: whatever is open when the call ends, the client view is ``redact(text)``; a usable
+    secret never streams (no 32-character window of it in any payload), a readable tail stays readable."""
+    text, tail = OPEN_AT_FLUSH_CASES[case]
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
+    assert client(events) == REDACTOR.redact(text)
+    if tail is None:
+        joined = "".join(event.text for event in events)
+        assert not any(VALUE[i : i + 32] in joined for i in range(len(VALUE) - 31))
+    else:
+        assert tail in client(events)
