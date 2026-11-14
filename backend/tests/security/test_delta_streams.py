@@ -660,6 +660,53 @@ def test_no_cut_of_a_continued_header_streams_its_value_raw() -> None:
         assert client(events) == redactor.redact(text), text
 
 
+def a_64_kib_attempt_reset_early() -> str:
+    """64 KiB: 600 characters, then a "Z" (a change to what was sent, so a reset at the next release), then a
+    "Z" ending every KiB to the end: each would change what was sent again."""
+    head = "abc " * 150 + "Z"
+    rest = "".join(("abc " * (CALL_KIB // 4))[:-1] + "Z" for _ in range(KIB_64 // CALL_KIB))
+    return (head + rest)[:KIB_64]
+
+
+def test_a_held_64_kib_attempt_streams_in_under_a_second() -> None:
+    """Global constraint (linear, < 1.0 s at 64 KiB) on the held branch of ``feed`` (Lead decision #9; review
+    of 52e0679): an attempt reset early, then fed one character at a time to 64 KiB, costs one append per
+    character until ``flush``, never a redaction."""
+    text = a_64_kib_attempt_reset_early()
+    parts = pieces(text, 1)
+    redactor = DeltaRedactor(changes_with_each_z)
+    started = time.perf_counter()
+    events = stream(redactor, parts)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, elapsed
+    resets = [index for index, event in enumerate(events) if event.reset]
+    assert resets[0] < len(events) - 1  # reset early: the rest was held until flush
+    assert len(resets) == 2 and resets[1] == len(events) - 1  # the flush is the only other reset
+    assert client(events) == changes_with_each_z(text)
+
+
+def test_a_retry_after_a_held_attempt_streams_64_kib_in_under_a_second() -> None:
+    """The same bound when a restart follows the held state (Lead decision #9, builder check 5): the failed
+    attempt is held after its early reset; the retry starts with a clean hold and streams its 64 KiB, one
+    character at a time, at the usual release steps."""
+    held = pieces(a_64_kib_attempt_reset_early(), 1)
+    retry_text = ("abc " * (KIB_64 // 4))[:KIB_64]
+    retry = pieces(retry_text, 1)
+    redactor = DeltaRedactor(changes_with_each_z)
+    started = time.perf_counter()
+    failed = stream(redactor, held, flush=False)
+    restart = redactor.restart()
+    streamed = stream(redactor, retry, flush=False)
+    final = redactor.flush()
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, elapsed
+    assert any(event.reset for event in failed) and restart == Delta("", 1, reset=True)
+    assert streamed and not any(event.reset for event in streamed)  # streamed before flush, never held
+    assert client([*failed, restart, *streamed, *([final] if final else [])]) == changes_with_each_z(
+        retry_text
+    )
+
+
 # --- the AG-13 delta 2 fuzz (poc_fuzz.py), with WP-3.1f2c's candidates and per-call resets (Goal 6) ---
 
 FUZZ_SEED = 20261114

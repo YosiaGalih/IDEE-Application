@@ -1611,6 +1611,22 @@ async def test_a_restart_voids_only_its_call() -> None:
     assert not any("Zq7" in text for text in fakes.events.deltas)
 
 
+async def test_the_last_delta_call_is_the_runs_iterations_across_a_nudge() -> None:
+    """WP-3.1f2c D2-L1 (Lead decision #9; review of 52e0679): ``call`` is the run's iteration. A nudged end
+    turn is a model call of its own, so a run nudged once then submitted streams calls 1 and 2, in order, and
+    the last call is ``RunEnd.iterations``."""
+    submit = Reply(
+        (TextBlock("Done now. " * 30), ToolUseBlock("toolu_submit", SUBMIT_RESULT, VALID_IMPLEMENT)),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(text_turn("Thinking about it. " * 30), submit))
+    assert (await run_b14(fakes)).status == "succeeded"
+    calls = fakes.events.calls
+    assert fakes.provider.requests[1].messages[-1] == Message("user", NUDGE)
+    assert calls == sorted(calls) and set(calls) == {1, 2}
+    assert max(calls) == ended(fakes).iterations == 2
+
+
 class StreamsInPieces:
     """The first request streams ``text`` in pieces of ``size`` before the inner provider answers it."""
 
