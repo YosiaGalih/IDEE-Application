@@ -288,15 +288,18 @@ def _common_prefix(a: str, b: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class Delta:
-    """One ``agent.delta``: ``text`` is appended to what the client shows, or replaces it when ``reset``."""
+    """One ``agent.delta`` of model call ``call`` (a run's first is 1, the run's iteration): ``text`` is
+    appended to that call's text, or replaces that call's text when ``reset`` (Lead decision 3.1f2c #9). A
+    client shows the calls' texts in call order."""
 
     text: str
+    call: int
     reset: bool = False
 
 
 class DeltaRedactor:
     """The streamed text of a run, redacted across deltas (Keputusan Lead #24, #34; Keputusan plan #12;
-    reviews of 42bcb2e: M3, AG-13 INFO-3, M4; of 073e68d: item 11, AG-13 D-M1, D-L1).
+    reviews of 42bcb2e: M3, AG-13 INFO-3, M4; of 073e68d: item 11, AG-13 D-M1, D-L1; WP-3.1f2c D2-L1).
 
     The text of the current model call is redacted whole, never a piece of it, so a secret cut across deltas
     is seen whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
@@ -305,13 +308,18 @@ class DeltaRedactor:
     from a value the header rule ended at a quote its last line may still close (``redact_with_stop``, a
     run's ``Redactor.redact_with_stop``; without it, ``stopped_at_open_quote`` of the redacted text, which
     misses a stop a later rule took: a test's fake redaction only, as ``app`` builds a run's stream with
-    ``delta_redactor``), minus what already went out. ``flush`` ends the call: its final redacted text goes
-    out and is committed, never redacted again. When redacting a longer text changes what already went out, a
-    ``reset`` delta carries the committed text of the calls before, then the current call's stable text: the
-    client replaces, never appends. ``restart`` (a retried attempt) voids the current call's text, held or
-    sent: its reset carries the committed text. The whole text is redacted again every ``release`` raw
-    characters, or every 1/``DELTA_RELEASE_SHARE`` of the text once that is longer, so a stream costs about
-    ``DELTA_RELEASE_SHARE`` redactions of its length, never a quadratic number."""
+    ``delta_redactor``), minus what already went out.
+
+    Every delta names its model call (``Delta.call``, from 1), and a reset replaces that call's text only
+    (Lead decision 3.1f2c #9, which replaces the run-wide reset of WP-3.1f2a #44). When redacting a longer
+    text changes what already went out, a ``reset`` delta carries the call's stable text, and the rest of the
+    attempt is held until ``flush``: at most one reset mid-attempt and one at ``flush``, so the payloads stay
+    linear in the text streamed. ``flush`` ends the call: its ``redact``, appended when it extends what went
+    out, else a reset; the next call is numbered one more. ``restart`` (a retried attempt) voids the call's
+    text, held or sent, with an empty reset, and the retry starts with no hold. The whole text is redacted
+    again every ``release`` raw characters, or every 1/``DELTA_RELEASE_SHARE`` of the text once that is
+    longer, so a stream costs about ``DELTA_RELEASE_SHARE`` redactions of its length, never a quadratic
+    number."""
 
     def __init__(
         self,
@@ -325,12 +333,14 @@ class DeltaRedactor:
         self._redact_with_stop = redact_with_stop
         self._hold = hold
         self._release = max(release, 1)
-        self._committed = ""
+        self._call = 1
         self.reset()
 
     def feed(self, text: str) -> Delta | None:
-        """What is now safe to send; ``None`` when nothing is yet."""
+        """What is now safe to send; ``None`` when nothing is yet, or once the attempt had a reset."""
         self._text += text
+        if self._held:
+            return None
         step = max(self._release, len(self._text) // DELTA_RELEASE_SHARE)
         if len(self._text) - self._redacted_at < step:
             return None
@@ -342,24 +352,24 @@ class DeltaRedactor:
         return self._emit(redacted, final=False, stop=stop)
 
     def flush(self) -> Delta | None:
-        """End of the call: the rest, redacted; the call's text is committed; the next call starts empty."""
-        redacted = self._redact(self._text)
-        out = self._emit(redacted, final=True)
-        self._committed += redacted
+        """End of the call: its ``redact``, the rest appended or a reset; the next call starts empty."""
+        out = self._emit(self._redact(self._text), final=True)
+        self._call += 1
         self.reset()
         return out
 
     def restart(self) -> Delta:
-        """A retried attempt: its text is void; the client goes back to the committed text."""
+        """A retried attempt: its text is void; the client empties the call's text."""
         self.reset()
-        return Delta(self._committed, reset=True)
+        return Delta("", self._call, reset=True)
 
     def reset(self) -> None:
-        """Drops the current call's text, never sending what is held."""
+        """Drops the current call's text, never sending what is held; the next attempt starts with no hold."""
         self._text = ""
         self._sent = ""
         self._redacted_at = 0
         self._before: tuple[int, str] | None = None  # (candidate start, redaction of the raw text before it)
+        self._held = False  # the attempt had a reset: the rest waits for flush (Lead decision 3.1f2c #9)
 
     def _emit(self, redacted: str, *, final: bool, stop: int | None = None) -> Delta | None:
         consistent = redacted.startswith(self._sent)
@@ -374,10 +384,11 @@ class DeltaRedactor:
         stable = redacted[: max(safe, 0)]
         if not consistent:
             self._sent = stable
-            return Delta(self._committed + stable, reset=True)
+            self._held = True
+            return Delta(stable, self._call, reset=True)
         if len(stable) <= len(self._sent):
             return None
-        out = Delta(stable[len(self._sent) :])
+        out = Delta(stable[len(self._sent) :], self._call)
         self._sent = stable
         return out
 
@@ -788,7 +799,7 @@ class RunStore(Protocol):
 
 
 class RunEvents(Protocol):
-    async def delta(self, scope: RunScope, text: str, *, reset: bool = False) -> None: ...
+    async def delta(self, scope: RunScope, text: str, *, call: int, reset: bool = False) -> None: ...
     async def usage_updated(self, scope: RunScope) -> None: ...
 
 
@@ -874,7 +885,7 @@ class _Run:
     input_content: str  # the <agent_input> content: redacted, escaped, within CONTEXT_MAX_BYTES
     deadline: float
     deltas: (
-        DeltaRedactor  # the run's streamed text, one for all its model calls (a reset shows the run's text)
+        DeltaRedactor  # the run's streamed text, one for all its model calls: it numbers them (Delta.call)
     )
     stop: _RunStop = field(default_factory=_RunStop)
     tally: _Tally = field(default_factory=_Tally)
@@ -1256,7 +1267,7 @@ class AgentRuntime:
             await self._delta(run, scope, deltas.feed(text))
 
         async def on_restart(attempt: int) -> None:
-            # M4: the failed attempt's text, held or sent, is void; the client goes back to the calls before.
+            # M4: the failed attempt's text, held or sent, is void; the client empties this call's text only.
             await self._delta(run, scope, deltas.restart())
 
         try:
@@ -1278,7 +1289,9 @@ class AgentRuntime:
     async def _delta(self, run: _Run, scope: RunScope, delta: Delta | None) -> None:
         if delta is not None:
             await self._event(
-                run, "agent.delta", self._ports.events.delta(scope, delta.text, reset=delta.reset)
+                run,
+                "agent.delta",
+                self._ports.events.delta(scope, delta.text, call=delta.call, reset=delta.reset),
             )
 
     async def _usage_changed(self, run: _Run, scope: RunScope, sent_before: int) -> None:

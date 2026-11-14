@@ -4,7 +4,10 @@
 - A long quoted value under a key the redactor treats as secret never streams raw, whatever its spelling:
   candidates are found in the raw text (``_NETRC`` rewrites ``password = "…`` before a candidate could be
   seen in the redacted text) and from the redactor's own key list.
-- A reset carries the run's whole text shown so far: the calls already ended, then the current call.
+- Resets are scoped to one model call (WP-3.1f2c D2-L1, Lead decision #9; replaces #44 of WP-3.1f2a): each
+  delta names its call, a reset replaces that call's text only, a restart empties it, and the client shows
+  the calls' texts in call order. After an attempt's first reset the rest of it waits for ``flush``, so the
+  payloads stay linear in the text streamed, failed attempts included.
 - WP-3.1f2c (D2-L2, D2-I1; Lead decisions #10, #11, Goal 6): a key far from its quote, a key in any spelling
   the redactor knows (camel, a flag, an argv item, one a token ran on into, a string prefix before the value),
   a long URL userinfo and a long configured literal never stream raw: no 32-character window of the secret
@@ -16,6 +19,8 @@
 from __future__ import annotations
 
 import random
+import re
+import string
 import time
 from collections.abc import Iterable
 
@@ -52,10 +57,13 @@ def stream(redactor: DeltaRedactor, parts: Iterable[str], *, flush: bool = True)
     return [d for d in out if d is not None]
 
 
-def client(events: Iterable[Delta], shown: str = "") -> str:
+def client(events: Iterable[Delta]) -> str:
+    """The reference client (Lead decision 3.1f2c #9): one text per model call; a reset replaces its call's
+    text, anything else is appended to it; the run's text is the calls' texts in call order."""
+    calls: dict[int, str] = {}
     for event in events:
-        shown = event.text if event.reset else shown + event.text
-    return shown
+        calls[event.call] = event.text if event.reset else calls.get(event.call, "") + event.text
+    return "".join(calls[call] for call in sorted(calls))
 
 
 @pytest.mark.parametrize("spelling", SPELLINGS)
@@ -156,34 +164,123 @@ def changes_once_z_arrives(text: str) -> str:
     return text.replace("a", "*") if "Z" in text else text
 
 
-def test_a_reset_in_a_later_call_carries_the_text_of_the_calls_before() -> None:
-    """Item 11: the first call's final text is committed; a reset in the second call carries it, then the
-    second call's stable text, so the client shows the run's whole text."""
+def test_a_reset_replaces_only_its_call() -> None:
+    """Lead decision #9 (D2-L1; replaces #44 of WP-3.1f2a, item 11): a reset in the second call carries the
+    second call's stable text only, never the first call's, and the client keeps the first call's text."""
     redactor = DeltaRedactor(changes_once_z_arrives, hold=4, release=1)
-    first = stream(redactor, ["The first call has an answer. "])
+    call_1 = "The first call has an answer. "
+    first = stream(redactor, [call_1])
     second = stream(redactor, ["abc" * 10, "Zmore", "text"])
-    assert any(event.reset for event in second)
-    reset = next(event for event in second if event.reset)
-    assert reset.text.startswith("The first call has an answer. ")
-    expected = changes_once_z_arrives("The first call has an answer. ") + changes_once_z_arrives(
+    assert {event.call for event in first} == {1} and {event.call for event in second} == {2}
+    resets = [event for event in second if event.reset]
+    assert resets == [Delta(changes_once_z_arrives("abc" * 10 + "Zmore")[:-4], 2, reset=True)]
+    assert not any(call_1 in event.text for event in second)
+    assert client(first + second) == changes_once_z_arrives(call_1) + changes_once_z_arrives(
         "abc" * 10 + "Zmoretext"
     )
-    assert client(first + second) == expected
 
 
-def test_a_restart_in_a_later_call_voids_only_that_attempt() -> None:
-    """Item 11, M4: a restart goes back to the calls already ended, never to an empty text; a secret in the
-    failed attempt reaches no payload."""
+def test_a_restart_voids_only_its_call() -> None:
+    """Lead decision #9 (replaces #44's case of item 11, M4): a restart in the second call is an empty reset
+    of that call, never of the first; the client keeps the first call's text, and a secret in the failed
+    attempt reaches no payload."""
     redactor = delta_redactor(REDACTOR)
     call_1 = "Here is what I found in the repository so far. " * 8
     first = stream(redactor, pieces(call_1, 16))
     failed = stream(redactor, pieces("Second call. " * 30 + 'password="' + VALUE[:600], 16), flush=False)
+    assert failed  # the failed attempt showed some of its text
     restart = redactor.restart()
-    assert restart == Delta(REDACTOR.redact(call_1), reset=True)
+    assert restart == Delta("", 2, reset=True)
     retry = stream(redactor, pieces("The retried second call. " * 20, 16))
     events = first + failed + [restart] + retry
+    assert [event.call for event in events] == [1] * len(first) + [2] * (len(failed) + 1 + len(retry))
     assert "Zq7" not in "".join(event.text for event in events)
     assert client(events) == REDACTOR.redact(call_1) + REDACTOR.redact("The retried second call. " * 20)
+
+
+def changes_with_each_z(text: str) -> str:
+    """A fake redaction that reads every "a" differently each time a "Z" arrives: each "Z" changes what was
+    already sent."""
+    return text.replace("a", str(text.count("Z") % 10))
+
+
+def test_one_mid_call_reset_then_hold() -> None:
+    """Lead decision #9: after an attempt's first reset the rest of it waits for ``flush``. Two changes to
+    what was sent in one call give exactly one reset before ``flush`` and no ``feed`` payload after it;
+    ``flush`` sends the call's ``redact``; the next call streams again, numbered 2."""
+    redactor = DeltaRedactor(changes_with_each_z, hold=4, release=1)
+    parts = ["abc" * 10, "Z", "abc" * 10, "Z", "abc" * 10, "tail"]
+    fed = [redactor.feed(part) for part in parts]
+    assert fed[0] == Delta(changes_with_each_z(parts[0])[:-4], 1)
+    assert fed[1] is not None and fed[1].reset and fed[1].call == 1  # the first "Z"
+    assert fed[2:] == [None] * (len(parts) - 2)  # the second "Z" changes what was sent again: held
+    final = redactor.flush()
+    assert final is not None and final.call == 1
+    events = [event for event in [*fed, final] if event is not None]
+    assert client(events) == changes_with_each_z("".join(parts))
+    assert redactor.feed("abc" * 10) == Delta(changes_with_each_z("abc" * 10)[:-4], 2)
+
+
+def test_a_restart_starts_its_attempt_with_a_clean_hold() -> None:
+    """Lead decision #9 (builder check 5): a retried attempt starts with no hold of its own, so it streams
+    before ``flush`` even when the failed attempt had a reset."""
+    redactor = DeltaRedactor(changes_with_each_z, hold=4, release=1)
+    failed = [redactor.feed(part) for part in ["abc" * 10, "Z", "more text"]]
+    assert any(event is not None and event.reset for event in failed)
+    assert redactor.restart() == Delta("", 1, reset=True)
+    retry = [redactor.feed(part) for part in ["The retried attempt ", "streams again."]]
+    assert [event for event in retry if event is not None], "the retry is held as if it had a reset"
+    assert all(event is None or (not event.reset and event.call == 1) for event in retry)
+
+
+def test_a_retry_in_call_2_then_a_reset_in_call_3_keeps_every_call() -> None:
+    """Plan Review Focus 4: a run retried in its second call, then a change to what was sent in the middle of
+    its third: the reference client shows each call's ``redact`` in call order; the first call is never
+    lost."""
+    redactor = DeltaRedactor(changes_once_z_arrives, hold=4, release=1)
+    calls = [
+        "The first call. " * 4,
+        "The second call, retried. " * 4,
+        "abc" * 20 + "Z and the third goes on.",
+    ]
+    events = stream(redactor, pieces(calls[0], 5))
+    events += stream(redactor, pieces("The second call's failed attempt. " * 4, 5), flush=False)
+    events.append(redactor.restart())
+    events += stream(redactor, pieces(calls[1], 5))
+    events += stream(redactor, pieces(calls[2], 5))
+    assert any(event.reset and event.call == 3 and event.text for event in events)  # mid-call, the third
+    assert client(events) == "".join(changes_once_z_arrives(text) for text in calls)
+
+
+CALL_KIB = 1024
+
+
+def a_32_kib_call() -> str:
+    """32 KiB, a "Z" ending each of its last 16 KiB: changes to what was sent from the middle on."""
+    kib = "abc " * (CALL_KIB // 4)
+    return "".join(kib if i < 16 else kib[:-1] + "Z" for i in range(32))
+
+
+def test_payload_bytes_stay_linear() -> None:
+    """D2-L1 (Lead decision #9): 40 model calls of 32 KiB, each with changes to what was sent from its middle
+    on, and calls 2, 10 and 30 restarted once after 24 KiB: the payloads total at most 4 x the raw text
+    streamed, failed attempts included. A run-wide reset carried every call before it (quadratic); a reset at
+    every change carried the call's text again each time."""
+    redactor = DeltaRedactor(changes_with_each_z)
+    text = a_32_kib_call()
+    events: list[Delta] = []
+    total_raw = sent = 0
+    for call in range(1, 41):
+        attempts = [text[: 24 * CALL_KIB], text] if call in (2, 10, 30) else [text]
+        for attempt, raw in enumerate(attempts, start=1):
+            out = stream(redactor, pieces(raw, 64), flush=False)
+            out.append(redactor.restart() if attempt < len(attempts) else redactor.flush())
+            events += [event for event in out if event is not None]
+            total_raw += len(raw)
+            sent += sum(len(event.text) for event in out if event is not None)
+            assert sent <= 4 * total_raw, (call, attempt, sent, total_raw)
+    assert {event.call for event in events} == set(range(1, 41))
+    assert client(events) == changes_with_each_z(text) * 40
 
 
 def test_a_redaction_across_the_candidate_start_never_cuts_into_the_candidate() -> None:
@@ -561,3 +658,130 @@ def test_no_cut_of_a_continued_header_streams_its_value_raw() -> None:
         events = stream(deltas, pieces(text, 4))
         assert leaked(events, FUZZ_VALUE) == [], text
         assert client(events) == redactor.redact(text), text
+
+
+# --- the AG-13 delta 2 fuzz (poc_fuzz.py), with WP-3.1f2c's candidates and per-call resets (Goal 6) ---
+
+FUZZ_SEED = 20261114
+FUZZ_CASES = 2_000
+ALNUM = string.ascii_letters + string.digits
+FUZZ_KEYS = [
+    "password", "db_password", "secret", "secrets", "client_secret", "token", "api_key", "apikey",
+    "access_key", "private_key", "ticket", "credentials", "cookie", "session", "jwt", "bearer", "passphrase",
+    "clientSecret", "accessToken", "SMTPPassword",
+]  # fmt: skip
+FUZZ_SEPS = ["=", ": ", " = ", " : ", "=\n", ":\t"]
+FUZZ_FILLER = [
+    "the", "value", "is", "=", ":", "'", '"', "eyJ", "-----", "BEGIN", "END", "x", "\n", "{", "}", ",",
+    "password", "token", "http://", "@", "-", ".", "\\", "a_b", "Bearer",
+]  # fmt: skip
+# Configured literals of 300, 800 and 1 500 characters: the hold follows the longest (Lead decision #11).
+_LITERAL_RNG = random.Random(FUZZ_SEED + 1)  # noqa: S311 - reproducible test values, not secrets
+FUZZ_LONG_LITERALS = ["".join(_LITERAL_RNG.choices(ALNUM, k=n)) for n in (300, 800, 1_500)]
+FUZZ_REDACTOR = Redactor(FUZZ_LONG_LITERALS)
+_ALNUM_RUN = re.compile(r"[A-Za-z0-9]{32,}")
+
+
+def _value(rng: random.Random, low: int, high: int) -> str:
+    return "".join(rng.choices(ALNUM, k=rng.randint(low, high)))
+
+
+def _gap(rng: random.Random) -> str:
+    """Up to 200 spaces, tabs or line breaks between a key's separator and its quote (Lead decision #10)."""
+    return "".join(rng.choices(" \t\n", k=rng.randint(0, 200)))
+
+
+def _secret_piece(rng: random.Random) -> tuple[str, str]:
+    """A secret in one of the forms the redactor takes, and the secret (alphanumeric, 300 to 1 500)."""
+    kind = rng.randrange(9)
+    value = _value(rng, 300, 1_500)
+    key = rng.choice(FUZZ_KEYS)
+    if kind == 0:  # quoted under a key, JSON-like or not, the quote up to 200 characters after the separator
+        quote = rng.choice(['"', "'"])
+        name = f'"{key}"' if rng.random() < 0.4 else key
+        return f"{name}{rng.choice(FUZZ_SEPS)}{_gap(rng)}{quote}{value}{quote}", value
+    if kind == 1:  # escaped JSON
+        return f'\\"{key}\\": \\"{value}\\"', value
+    if kind == 2:  # a bare value
+        return f"{key}={value}", value
+    if kind == 3:  # a header
+        return rng.choice(["Authorization: Bearer ", "Cookie: ", "x-api-key: "]) + value, value
+    if kind == 4:  # a JWT
+        return f"eyJ{value[:400]}.eyJ{value[400:800] or 'abcdefgh'}.{value[800:] or 'S' * 20}", value[:400]
+    if kind == 5:  # a PEM block
+        return f"-----BEGIN RSA PRIVATE KEY-----\n{value}\n-----END RSA PRIVATE KEY-----", value
+    if kind == 6:  # an Anthropic key
+        return f"sk-ant-api03-{value}", value
+    if kind == 7:  # URL userinfo longer than the hold (no longer left out: Lead decision #11)
+        userinfo = rng.choice([f"user:{value}", value])
+        return f"https://{userinfo}@git.example.com/r.git", value
+    literal = rng.choice(FUZZ_LONG_LITERALS)  # a configured literal longer than DELTA_HOLD_CHARS
+    return literal, literal
+
+
+def _filler(rng: random.Random, words: int) -> str:
+    return " ".join(rng.choice(FUZZ_FILLER) for _ in range(words))
+
+
+def _fuzz_text(rng: random.Random) -> tuple[str, list[str]]:
+    parts, secrets = [_filler(rng, rng.randint(0, 80))], []
+    for _ in range(rng.randint(1, 4)):
+        piece, secret = _secret_piece(rng)
+        parts += [" ", piece, " ", _filler(rng, rng.randint(0, 80))]
+        secrets.append(secret)
+    return "".join(parts), secrets
+
+
+def _fuzz_feed(redactor: DeltaRedactor, text: str, rng: random.Random) -> list[Delta]:
+    out, at = [], 0
+    while at < len(text):
+        size = rng.choice([1, 3, 16, 16, 64, 200])
+        out.append(redactor.feed(text[at : at + size]))
+        at += size
+    return [event for event in out if event is not None]
+
+
+def secret_windows(events: list[Delta], secrets: list[str]) -> list[str]:
+    """The 32-character windows of ``secrets`` (alphanumeric) found in any payload, or across payloads: each
+    lies in an alphanumeric run of 32 or more, so only those runs are read."""
+    texts = [event.text for event in events]
+    found = set()
+    for text in [*texts, "".join(texts)]:
+        for run in _ALNUM_RUN.findall(text):
+            for at in range(len(run) - WINDOW + 1):
+                window = run[at : at + WINDOW]
+                if any(window in secret for secret in secrets):
+                    found.add(window)
+    return sorted(found)
+
+
+def test_fuzz_no_secret_window_in_any_payload() -> None:
+    """Goal 6, AG-13 delta 2's fuzz (poc_fuzz.py), with the keys of R-1, key-to-quote gaps up to 200, long URL
+    userinfo and long configured literals no longer left out: runs of one to three model calls, each call's
+    attempt restarted at a random cut half of the time, streamed through a run's ``delta_redactor``. No
+    32-character window of a secret the redactor takes reaches any payload, resets and restarts included, and
+    the reference client ends with each call's ``redact`` in call order."""
+    rng = random.Random(FUZZ_SEED)  # noqa: S311 - a reproducible fuzz, not a secret
+    checked = restarts = 0
+    for case in range(FUZZ_CASES):
+        redactor = delta_redactor(FUZZ_REDACTOR)
+        events: list[Delta] = []
+        secrets: list[str] = []
+        expected = ""
+        for _ in range(rng.randint(1, 3)):
+            if rng.random() < 0.5:  # a failed attempt that streamed, then its restart
+                failed, failed_secrets = _fuzz_text(rng)
+                events += _fuzz_feed(redactor, failed[: rng.randint(1, len(failed))], rng)
+                events.append(redactor.restart())
+                restarts += 1
+                secrets += [s for s in failed_secrets if s not in FUZZ_REDACTOR.redact(failed)]
+            text, text_secrets = _fuzz_text(rng)
+            events += _fuzz_feed(redactor, text, rng)
+            if (final := redactor.flush()) is not None:
+                events.append(final)
+            expected += FUZZ_REDACTOR.redact(text)
+            secrets += [s for s in text_secrets if s not in FUZZ_REDACTOR.redact(text)]
+        assert client(events) == expected, case
+        assert secret_windows(events, secrets) == [], case
+        checked += len(secrets)
+    assert checked > 5 * FUZZ_CASES and restarts > FUZZ_CASES / 2  # the fuzz is not vacuous

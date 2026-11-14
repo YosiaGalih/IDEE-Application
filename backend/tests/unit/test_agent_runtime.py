@@ -1109,7 +1109,7 @@ async def test_a_second_cancel_during_the_close_still_records_the_end() -> None:
 
 
 class BrokenEvents(FakeEvents):
-    async def delta(self, scope: Any, text: str, *, reset: bool = False) -> None:
+    async def delta(self, scope: Any, text: str, *, call: int, reset: bool = False) -> None:
         raise RuntimeError("redis down")
 
     async def usage_updated(self, scope: Any) -> None:
@@ -1389,8 +1389,8 @@ async def test_an_attempt_stopped_during_its_restart_is_not_counted_as_sent() ->
     holder: dict[str, asyncio.Task[Any]] = {}
 
     class CancelsOnReset(FakeEvents):
-        async def delta(self, scope: Any, text: str, *, reset: bool = False) -> None:
-            await super().delta(scope, text, reset=reset)
+        async def delta(self, scope: Any, text: str, *, call: int, reset: bool = False) -> None:
+            await super().delta(scope, text, call=call, reset=reset)
             if reset:
                 holder["run"].cancel()
                 await asyncio.sleep(5)
@@ -1589,10 +1589,10 @@ class StreamsByPlan:
         return None
 
 
-async def test_a_restart_in_the_second_call_keeps_the_first_calls_text() -> None:
-    """Item 11 (/code-review Spec of 073e68d, API_CONTRACTS §5.1): a reset replaces the run's whole text, so
-    the restart of the second call goes back to the first call's text, not to an empty one, and the client
-    ends with the first call's text and the retried second call's."""
+async def test_a_restart_voids_only_its_call() -> None:
+    """WP-3.1f2c D2-L1 (Lead decision #9; replaces #44 of WP-3.1f2a, item 11): every agent.delta names its
+    model call, the run's iteration. The restart of the second call is an empty reset of that call, never of
+    the first, and the client ends with the first call's text and the retried second call's."""
     secret = 'password="' + "Zq7" * 200
     fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
     plan = [
@@ -1602,12 +1602,12 @@ async def test_a_restart_in_the_second_call_keeps_the_first_calls_text() -> None
     ]
     fakes.providers.provider = StreamsByPlan(fakes.providers.provider, plan)  # type: ignore[assignment]
     assert (await run_b14(fakes)).status == "succeeded"
-    shown = ""
-    for text, reset in zip(fakes.events.deltas, fakes.events.resets, strict=True):
-        shown = text if reset else shown + text
-    assert shown == "First call text. Second, retried."
-    assert fakes.events.resets.count(True) == 1
-    assert fakes.events.deltas[fakes.events.resets.index(True)] == "First call text. "
+    events = list(zip(fakes.events.calls, fakes.events.deltas, fakes.events.resets, strict=True))
+    assert [event for event in events if event[2]] == [(2, "", True)]
+    shown: dict[int, str] = {}
+    for call, text, reset in events:
+        shown[call] = text if reset else shown.get(call, "") + text
+    assert shown == {1: "First call text. ", 2: "Second, retried."}
     assert not any("Zq7" in text for text in fakes.events.deltas)
 
 
