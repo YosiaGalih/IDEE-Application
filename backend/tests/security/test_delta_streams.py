@@ -107,6 +107,10 @@ PATHOLOGICAL = {
     "open header quotes": filled("Cookie: ", 'a="b '),
     "header quoted parts": filled("Cookie: ", 'a="b"; '),
     "header names": filled("", 'Cookie: "'),
+    # A header name, then 64 KiB of line breaks (LF, CRLF) before its value's quote (review M-1 of 50610b5).
+    "header name, line breaks, quote": filled("Cookie:" + "\n" * 65_000, '"'),
+    "header name, CRLF, quote": filled("Cookie:" + "\r\n" * 32_500, '"'),
+    "header name, line breaks, last quote": "Cookie:" + "\n" * (KIB_64 - 8) + '"',
 }
 
 
@@ -367,13 +371,17 @@ def test_a_flag_word_with_no_space_before_the_quote_is_no_candidate(text: str) -
     assert open_candidate(text) is None
 
 
-def test_a_header_line_is_held_only_while_its_quote_is_open() -> None:
-    """A header value never crosses a line: once the line ends, or its quote closes, nothing is held."""
+def test_a_header_value_is_held_while_its_line_is_open() -> None:
+    """A header value is held from its start while its line is the last line, whatever its quotes (review
+    I-1 of 50610b5: the raw text pairs quotes differently from the redactor's); once the line ends, nothing
+    is held."""
     line = "Cookie: it's here"
     assert open_candidate("Some text.\n" + line) == len("Some text.\nCookie: ")
     assert open_candidate("Some text.\n" + line + "\nThe answer goes on.") is None
-    assert open_candidate('Cookie: theme="dark"; lang=en') is None
-    # A value stopped by its own quote on an earlier line is final; a quote on the last line opens nothing.
+    closed = 'Cookie: theme="dark"; lang=en'
+    assert open_candidate(closed) == closed.index("theme")
+    assert open_candidate(closed + "\nThe answer goes on.") is None
+    # A header on an earlier line is final there: a quote on the last line opens nothing for it.
     assert open_candidate("Cookie: it's here\nThe 'answer") is None
     # The name and the colon may sit on earlier lines (YAML): the separator takes line breaks.
     yaml = 'cookie:\n  theme="Zq7'
@@ -388,3 +396,27 @@ def test_a_quoted_flag_in_prose_does_not_hold_the_rest_of_the_answer() -> None:
     redactor = DeltaRedactor(REDACTOR.redact)
     shown = client(e for e in (redactor.feed(piece) for piece in pieces(text, 16)) if e is not None)
     assert len(shown) >= len(REDACTOR.redact(text)) - DELTA_HOLD_CHARS - DELTA_RELEASE
+
+
+# Review I-1 of 50610b5: a URL credential or a configured literal in a header line may hold a quote or a
+# backslash. The redactor reads the line with them replaced, so it pairs the line's quotes differently from
+# the raw text: the delta holds the header's value while its line is open, pairing no quote.
+HEADER_LINES: dict[str, tuple[str, list[str]]] = {
+    "URL credentials with a quote": ('Cookie: a=https://u:p"q@h/x; b="{}"', []),
+    "URL credentials with a backslash": ('Cookie: a=https://u:p\\q@h/x; b="{}"', []),
+    "literal with a quote": ('Cookie: sid=Pa55"word9; theme="{}"', ['Pa55"word9']),
+    "literal with a backslash": ('Cookie: sid=Pa55\\word9; theme="{}"', ["Pa55\\word9"]),
+}
+
+
+@pytest.mark.parametrize("line", list(HEADER_LINES))
+@pytest.mark.parametrize("size", [1, 7, 16, 64, 255, 257])
+def test_a_header_value_never_streams_raw_whatever_the_redactor_replaces(line: str, size: int) -> None:
+    template, literals = HEADER_LINES[line]
+    redactor = Redactor(literals)
+    text = INTRO + template.format(VALUE) + TAIL
+    assert not any(window in redactor.redact(text) for window in windows(VALUE))  # the redactor takes it
+    assert held_from(text, VALUE) == text.index("Cookie: ") + len("Cookie: ")
+    events = stream(DeltaRedactor(redactor.redact, hold=delta_hold(redactor)), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == redactor.redact(text)

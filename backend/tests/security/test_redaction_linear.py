@@ -75,6 +75,15 @@ CASES = [
     # The fix round's KEY_HINT: every character a lead of its words, and words cut one letter short.
     ("key_hint_leads", "pcksujb[PCKSUJB\u017f" * 4_096),
     ("key_hint_near_words", "toke tick auh pas secre sessio cooki credentia beare jw [redacte " * 1_024),
+    # Review of 50610b5: a header parameter's quote never closed, many of them, many on their own lines; a
+    # header name before 64 KiB of line breaks (LF, CRLF); the #7 swallow after a glued string prefix.
+    ("header_parameter_never_closed", 'Cookie: a="' + "b" * KIB_64),
+    ("header_parameter_quotes", "Cookie: " + 'a="b ' * 13_107),
+    ("header_parameter_quote_lines", "Cookie: " + 'a="\n' * 16_384),
+    ("header_name_line_breaks", "Cookie:" + "\n" * KIB_64 + '"'),
+    ("header_name_crlf", "Cookie:" + "\r\n" * (KIB_64 // 2) + '"'),
+    ("bare_swallow_prefix_letters", "password=a:" + "b" * KIB_64),
+    ("bare_swallow_prefix_quotes", "password=a:b" + '"' * KIB_64),
 ]
 
 

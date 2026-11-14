@@ -11,13 +11,16 @@ import pytest
 from app.core.redaction import (
     _AFTER_REDACTED,
     _ARGV_VALUE,
+    _CASE_FOLDS,
     _FLAG_VALUE,
     _KEY_VALUE,
     _NAMED_PATTERNS,
     _NETRC,
+    _NETRC_KEY,
     _PATTERNS,
     _URL_CREDENTIALS,
     CREDENTIAL_HEADER,
+    CREDENTIAL_HEADER_NAMES,
     KEY_HINT,
     KNOWN_SECRET_NAMES,
     REDACTED,
@@ -650,6 +653,17 @@ def test_a_value_after_a_token_is_redacted_once(redactor: Redactor) -> None:
     assert redactor.redact(f'{{"a": "{token}", "b": "kept"}}') == f'{{"a": "{REDACTED}", "b": "kept"}}'
 
 
+@pytest.mark.parametrize(
+    "text",
+    ['password=abc:b"VVVVVVVVVV"', "token=x=rb'VVVVVVVVVV'", 'password=abc:B"VV VV"', "secret=a:u'VV'"],
+)
+def test_a_bare_value_ending_in_a_separator_takes_a_prefixed_string(redactor: Redactor, text: str) -> None:
+    """Review of 50610b5 (#7): the string after a bare value that ends in ":" or "=" is swallowed also when a
+    string prefix (b"…", rb'…') is glued to the separator."""
+    out = redactor.redact(text)
+    assert "V" not in out, out
+
+
 def test_a_stray_apostrophe_after_a_key_redacts_one_word() -> None:
     out = Redactor().redact("the token: it's here")
     assert "'s here" in out
@@ -881,8 +895,45 @@ def test_a_quoted_header_value_ends_at_its_closing_quote(redactor: Redactor) -> 
 
 
 def test_a_header_value_stays_on_its_line(redactor: Redactor) -> None:
-    out = redactor.redact('Cookie: a="b\nnext line "kept"')
-    assert "next line" in out, out
+    """Outside a parameter's quoted value a header value keeps to its line (a parameter's quote, after "=",
+    may close on a later line: test_a_header_parameter_quote_closes_later_or_never)."""
+    out = redactor.redact('Cookie: a b"c\nnext line "kept"')
+    assert "next line" in out and "kept" in out, out
+    assert "next line" in redactor.redact("Cookie: abc\nnext line")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'Cookie: session="VVVVVVVVVV',
+        'Authorization: Token token="VVVVVVVVVV',
+        'Cookie: session="VV\nVV"',
+        "Proxy-Authorization: Digest response='VV\nVV' qop=auth",
+        'x-api-key: a=1; password="VVVVVVVVVV',
+    ],
+)
+def test_a_header_parameter_quote_closes_later_or_never(redactor: Redactor, text: str) -> None:
+    """Review of 50610b5 (D2-I2, #12): a quote that opens a header parameter's value is read as #6 reads a
+    key's quoted value. One never closed takes the rest of the text, so a header value cut by max_tokens never
+    goes out raw at flush; one closed on a later line is taken whole."""
+    out = redactor.redact(text)
+    assert "V" not in out, out
+    assert out.startswith(text.split(":", 1)[0] + ": "), out
+
+
+def test_a_header_parameter_quote_closed_on_a_later_line_ends_the_value_there(redactor: Redactor) -> None:
+    """As #6 for a key's quoted value: the value ends with its line after the closing quote, and the next line
+    stays readable."""
+    out = redactor.redact('Cookie: session="VV\nVV"; theme=dark\nnext line')
+    assert "V" not in out and out.endswith("\nnext line"), out
+
+
+def test_a_quote_that_closes_a_shell_word_keeps_what_follows(redactor: Redactor) -> None:
+    """The quote after a header value in curl -H "..." closes the shell word, not a parameter: it is not
+    taken to the end of the text, so the URL stays."""
+    out = redactor.redact('curl -H "Authorization: Bearer V" https://api.example.com/x')
+    assert "V" not in out.replace("Authorization", ""), out
+    assert out.endswith('" https://api.example.com/x'), out
 
 
 _PGP = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nV\n-----END PGP PRIVATE KEY BLOCK-----"
@@ -926,10 +977,16 @@ def _tail_words() -> list[str]:
     return words
 
 
-HINTED_WORDS = [
-    *_tail_words(), *sorted(KNOWN_SECRET_NAMES),
-    "proxy-authorization", "authorization", "set-cookie", "cookie", "x-api-key", REDACTED,
-]  # fmt: skip
+# The same sources KEY_HINT is built from (review M-2 of 50610b5): one header list, the netrc key, the marker.
+HINTED_WORDS = [*_tail_words(), *sorted(KNOWN_SECRET_NAMES), *CREDENTIAL_HEADER_NAMES, _NETRC_KEY, REDACTED]
+
+
+def test_the_case_folds_are_every_character_a_case_insensitive_letter_takes() -> None:
+    """KEY_HINT's lead class adds these to each letter's two cases: Python's re takes exactly these for an
+    ASCII letter under IGNORECASE, over all of Unicode."""
+    for letter in "abcdefghijklmnopqrstuvwxyz":
+        expected = {letter, letter.upper(), *_CASE_FOLDS.get(letter, "")}
+        assert set(_case_variants(letter)) == expected, letter
 
 
 @pytest.mark.parametrize("word", HINTED_WORDS)

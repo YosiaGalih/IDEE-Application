@@ -37,7 +37,14 @@ from app.agents.prompt_book import Prompt, PromptBook
 from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.cancel import CancelToken
 from app.core.logging import get_logger
-from app.core.redaction import CREDENTIAL_HEADER, KEY_HINT, SECRET_KEY_PATTERN, URL_SCHEME_PATTERN, Redactor
+from app.core.redaction import (
+    CREDENTIAL_HEADER_NAMES,
+    CREDENTIAL_HEADER_START,
+    KEY_HINT,
+    SECRET_KEY_PATTERN,
+    URL_SCHEME_PATTERN,
+    Redactor,
+)
 from app.llm.base import (
     ContentBlock,
     LLMError,
@@ -180,6 +187,7 @@ _KEY_BEFORE_QUOTE: Final = re.compile(
     """
 )
 _KEY_WINDOW: Final = 128  # how far before the last character before the gap the key is looked for
+_LONGEST_HEADER_NAME: Final = max(map(len, CREDENTIAL_HEADER_NAMES))
 
 
 def open_candidate(text: str) -> int | None:
@@ -189,7 +197,7 @@ def open_candidate(text: str) -> int | None:
     - a ``scheme://`` with no "@", "/" or space after it yet: userinfo that may still grow (``_open_url``);
     - an opening quote with no closing one after it, after a key the redactor treats as secret
       (``_key_before``);
-    - a header value whose line holds a quote with no closing one after it (``_open_header``)."""
+    - the value of a header whose line is the last line (``_open_header``)."""
     found: list[int] = []
     run = text.find("eyJ", len(text.rstrip(_TOKEN_CHARS)))
     if run != -1:
@@ -234,27 +242,28 @@ def _key_before(text: str, quote: int) -> int | None:
 
 
 def _open_header(text: str) -> int | None:
-    """Where a header value that may still grow starts (Lead ruling, WP-3.1f2c fix round). Without an
-    opening quote after its colon a header value is the rest of its line, quoted parts included
-    (CREDENTIAL_HEADER), so it stops at a quote of its line that nothing closes yet and takes the quoted part
-    once it closes: until then the value is held from its start. Only the last line can still grow: a value
-    never crosses a line, and a quote nothing closes on an earlier line never will be. The header's name may
-    sit on an earlier line, before blank lines and the colon its separator takes, so the scan starts on the
-    name's line. One scan from the end to the last line break, then a ":" and KEY_HINT before the quote (every
-    header holds both) and one pass of CREDENTIAL_HEADER over the last lines: linear."""
+    """Where the value of a header whose line is still open starts, or None (Lead rulings, WP-3.1f2c fix
+    rounds). Without an opening quote after its colon a header value is the rest of its line, and a quote
+    that opens a parameter may take later lines or the rest of the text (CREDENTIAL_HEADER): while the
+    header's line is the last line of the text, its value is held from its start. No quote is paired here:
+    the redactor reads the text with tokens, URL credentials and literals replaced, and a replaced span may
+    hold a quote or a backslash, so the raw text pairs its quotes differently (review I-1 of 50610b5).
+
+    A value starts on the last line when its header's name is on that line, or when only the separator comes
+    between the name and that line (line breaks, the colon, a JSON key's closing quote and backslash): the
+    search starts that far back, less the longest name, and no earlier than the first KEY_HINT word allows.
+    Scans from the end, then ":" and KEY_HINT, then one search of CREDENTIAL_HEADER_START: linear."""
     line = max(text.rfind("\n"), text.rfind("\r")) + 1
-    quote = max(text.rfind('"'), text.rfind("'"))
-    if quote < line:
-        return None  # no quote on the last line
     head = text[:line].rstrip()
     head = head[:-1].rstrip() if head.endswith(":") else head
-    start = max(head.rfind("\n"), head.rfind("\r")) + 1
-    if text.find(":", start, quote) == -1 or KEY_HINT.search(text, start, quote) is None:
-        return None  # no separator, or no header name, before the quote
-    for header in CREDENTIAL_HEADER.finditer(text, start):
-        stop = header.end()
-        if header["open"] is None and stop >= line and stop < len(text) and text[stop] in "\"'":
-            return header.start("value")
+    head = head[:-1] if head.endswith(('"', "'")) else head
+    head = head[:-1] if head.endswith("\\") else head
+    start = max(len(head) - _LONGEST_HEADER_NAME, 0)
+    if text.find(":", start) == -1 or (hint := KEY_HINT.search(text, start)) is None:
+        return None  # no separator, or no header name
+    for header in CREDENTIAL_HEADER_START.finditer(text, max(start, hint.start() - _LONGEST_HEADER_NAME)):
+        if header.end() >= line:
+            return header.end()
     return None
 
 
