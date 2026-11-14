@@ -139,8 +139,13 @@ def test_the_key_predicate_is_linear() -> None:
 
 @pytest.mark.parametrize(
     "items",
-    [["--token"] * 8_192, ["--token", "x"] * 4_096, ["--no-password", "--token"] * 4_096],
-    ids=["flags", "flag_value_pairs", "secret_flags"],
+    [
+        ["--token"] * 8_192,
+        ["--token", "x"] * 4_096,
+        ["--no-password", "--token"] * 4_096,
+        ["--token", ["x"], "--password=", 1] * 2_048,  # any value after a flag, and a flag ending in "="
+    ],
+    ids=["flags", "flag_value_pairs", "secret_flags", "nested_values"],
 )
 def test_an_argv_list_is_linear(items: list[str]) -> None:
     redactor = Redactor()

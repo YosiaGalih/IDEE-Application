@@ -839,6 +839,38 @@ def test_redact_obj_drops_the_item_after_a_secret_flag() -> None:
     assert redactor.redact_obj(["the", "token", "was", "used"]) == ["the", "token", "was", "used"]
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["mysql", "--password", 123456], ["mysql", "--password", REDACTED]),
+        (["--password", [V]], ["--password", REDACTED]),
+        (("--token", (V,)), ("--token", REDACTED)),
+        (["--password", {"value": V}], ["--password", REDACTED]),
+        (["--password", b"hunter2hunter2"], ["--password", REDACTED]),
+        # A flag that ends in "=" with nothing after it: its value is the next item.
+        (["--password=", V], ["--password=", REDACTED]),
+        # None is no value; neither is what follows it.
+        (["--password", None, "next"], ["--password", None, "next"]),
+        ([f"--password={V}", "next"], [f"--password={REDACTED}", "next"]),
+    ],
+    ids=["int", "list", "tuple", "dict", "bytes", "flag=", "none", "flag=value"],
+)
+def test_redact_obj_drops_any_value_after_a_secret_flag(argv: object, expected: object) -> None:
+    """Silent-failure review MEDIUM-1 (final review of 74bf8d4): after a secret flag any item but None is
+    dropped whole, a nested container too, also with ``stringify=False``. ToolGateway refuses an R3 input that
+    ``redact_obj`` changes (``secret_in_input``)."""
+    assert Redactor().redact_obj(argv) == expected
+
+
+def test_redact_obj_reads_a_bytes_key() -> None:
+    """Silent-failure review LOW-1: a bytes key is read as text (UTF-8, errors replaced) for the check; the
+    key itself is kept as it is."""
+    redactor = Redactor()
+    assert redactor.redact_obj({b"password": V, b"note": "kept"}) == {b"password": REDACTED, b"note": "kept"}
+    assert redactor.redact_obj({b"\xffpassword": V}) == {b"\xffpassword": V}  # U+FFFD is part of the name
+    assert redactor.redact_obj({b"api_key": None, 7: V}) == {b"api_key": None, 7: V}
+
+
 def test_a_secret_flag_as_a_value_takes_the_word_after_it(redactor: Redactor) -> None:
     # "--no-password" takes the next word (Lead ruling #15). When that word is itself a secret flag, its own
     # value follows it: both go (Lead ruling on the Task 2 review, Important 1).

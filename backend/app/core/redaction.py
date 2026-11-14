@@ -3,8 +3,8 @@
 Two layers:
 - text patterns (token prefixes, PEM, URL credentials, headers, ``key=value``, command-line flags), plus
   configured literals;
-- structure: a value stored under a sensitive key name is dropped whole, whatever it looks like; so is the
-  string after a secret flag in a list or tuple (an argv list).
+- structure: a value stored under a sensitive key name (a str or bytes key) is dropped whole, whatever it
+  looks like; so is the item after a secret flag in a list or tuple (an argv list).
 
 Order matters: the labelled Anthropic admin-key pattern runs before the generic ``sk-ant-`` pattern so it
 stays covered even if the generic pattern is narrowed later. A token pattern can run on into the key after it
@@ -453,9 +453,18 @@ def stopped_at_open_quote(redacted: str) -> int | None:
 
 
 def _is_secret_flag(item: object) -> bool:
-    """A command-line flag whose value is a secret: ``--password``, ``-api-key``. ``--password=V`` is not (its
-    value is in the same string, which the text patterns redact); neither is ``--password-file``."""
-    return isinstance(item, str) and item.startswith("-") and is_sensitive_key(item)
+    """A command-line flag whose value is a secret: ``--password``, ``-api-key``, and ``--password=`` with its
+    value left to the next item (silent-failure review MEDIUM-1). ``--password=V`` is not (its value is in the
+    same string, which the text patterns redact); neither is ``--password-file``."""
+    return isinstance(item, str) and item.startswith("-") and is_sensitive_key(item.removesuffix("="))
+
+
+def _key_name(key: object) -> str | None:
+    """A dict key as ``is_sensitive_key`` reads it: a str, or bytes as UTF-8 with errors replaced
+    (silent-failure review LOW-1: ``{b"password": V}``); None for any other key."""
+    if isinstance(key, str):
+        return key
+    return key.decode("utf-8", errors="replace") if isinstance(key, bytes) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,7 +589,7 @@ class Redactor:
         if isinstance(obj, dict):
             return {
                 (self.redact(key) if isinstance(key, str) else key): REDACTED
-                if isinstance(key, str) and is_sensitive_key(key) and value is not None
+                if value is not None and (name := _key_name(key)) is not None and is_sensitive_key(name)
                 else self.redact_obj(value, stringify=stringify)
                 for key, value in obj.items()
             }
@@ -597,13 +606,14 @@ class Redactor:
         return obj
 
     def _redact_items(self, items: Iterable[Any], *, stringify: bool) -> list[Any]:
-        """A list or tuple, read as a command line too: the string after a secret flag is dropped whole, like
-        a value under a sensitive key (``["mysql", "--password", "V"]``). A dropped string that is itself a
-        secret flag drops the string after it too (``["--no-password", "--token", "V"]``)."""
+        """A list or tuple, read as a command line too: the item after a secret flag is dropped whole, like a
+        value under a sensitive key (``["mysql", "--password", "V"]``), whatever it is but None: a number,
+        bytes or a nested container too (silent-failure review MEDIUM-1). A dropped string that is itself a
+        secret flag drops the item after it too (``["--no-password", "--token", "V"]``)."""
         out: list[Any] = []
         after_flag = False
         for item in items:
-            take = after_flag and isinstance(item, str)
+            take = after_flag and item is not None
             out.append(REDACTED if take else self.redact_obj(item, stringify=stringify))
             after_flag = _is_secret_flag(item)
         return out
