@@ -170,10 +170,11 @@ _QUOTED = r"""
         )
 """
 
-# An unquoted value: one word. A word that ends in ":" or "=" right before a quoted string takes the string
-# too: a key was taken as the value of the key before it (password : password: "V"; Lead decision #7).
+# An unquoted value: one word. A word that ends in ":" or "=" immediately followed, on the same line, by a
+# quoted string takes the string too: a key was taken as the value of the key before it (password : password:
+# "V"; Lead decision #7). Not across a line: "password=None):" then a docstring on the next line.
 _BARE = rf"""
-        [^\s"'&;,\\]++(?:(?<=[:=])\s*+(?:{_QUOTED}))?
+        [^\s"'&;,\\]++(?:(?<=[:=])[\ \t]*+(?:{_QUOTED}))?
 """
 
 # The value after a sensitive key and its separator (_KEY_VALUE, _AFTER_REDACTED): quoted or one word, after
@@ -183,15 +184,28 @@ _VALUE = rf"""
         (?:(?:bearer|basic|token)[\ \t]++)?(?:{_QUOTED}|{_BARE})
 """
 
-# A secret flag is never the value of the flag or netrc "password" before it, quoted or not: in
-# "--no-password --token V" the token's own value would be left raw after it.
-_NOT_A_SECRET_FLAG = rf"(?!\\?[\"']?(?=-)(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))"
+# A secret flag as one argv word: bare (it ends at a space or the end of the text) or quoted, also as escaped
+# JSON. Atomic, so a word the key pattern matches in two ways (--Password: snake and Pascal) is tried once.
+_SECRET_FLAG_WORD = rf"(?>\\?[\"']?(?=-)(?:{SECRET_KEY_PATTERN})(?:\\?[\"']|(?=\s|\Z)))"
+_SECRET_FLAG_ITEM = rf"(?>\\?[\"'](?=-)(?:{SECRET_KEY_PATTERN})\\?[\"'])"  # a quoted list item only
 
-# The value of a command-line flag after spaces or a comma (_FLAG_VALUE, _ARGV_VALUE): one argv word, so no
-# scheme word ("--token TOKEN    The API token" keeps its help text). Never a separator: --api-key = V is
-# _KEY_VALUE's.
+# The value of a command-line flag after spaces (_FLAG_VALUE, _ARGV_VALUE): one argv word, so no scheme word
+# ("--token TOKEN    The API token" keeps its help text). Never a separator: --api-key = V is _KEY_VALUE's.
+# A value that is itself a secret flag is redacted and takes the word after it too: in
+# "--no-password --token V" the token's own value goes with it, and "--password -MyPassword" (a secret that
+# reads as a flag) is redacted, never skipped.
 _ARG = rf"""
-        (?![:=]){_NOT_A_SECRET_FLAG}(?:{_QUOTED}|{_BARE})
+        (?![:=])
+        (?:{_SECRET_FLAG_WORD}(?:[\ \t]++{_SECRET_FLAG_WORD})*+(?:[\ \t]++(?:{_QUOTED}|{_BARE}))?
+          | {_QUOTED}
+          | {_BARE})
+"""
+
+# An argv list item after a comma: a quoted string only. A bare word there is code that defines the flag, not
+# its value: add_argument("--token", help=...), ["--api-key", api_key]. A secret flag item takes the next one.
+_ITEM = rf"""
+        (?:{_SECRET_FLAG_ITEM}(?:\s*+,\s*+{_SECRET_FLAG_ITEM})*+(?:\s*+,\s*+(?:{_QUOTED}))?
+          | {_QUOTED})
 """
 
 # key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value / --key=value, compound names.
@@ -226,19 +240,25 @@ _FLAG_VALUE = re.compile(
     """
 )
 
-# A quoted flag and its value after a comma or spaces: an argv list (["mysql", "--password", "V"], also as
-# escaped JSON) or a quoted shell word ("--password" "V", '--password' V). The opening quote anchors it.
+# A quoted flag and its value: after a comma, an argv list item (["mysql", "--password", "V"], also as escaped
+# JSON), a quoted string only; after spaces, a quoted shell word ("--password" "V", '--password' V), quoted or
+# bare. The opening quote anchors it.
 _ARGV_VALUE = re.compile(
     rf"""(?ix)
     (?P<key>(?P<quote>["'])(?=-)(?:{SECRET_KEY_PATTERN})\\?(?P=quote))
-    (?P<sep>\s*+,\s*+|[\ \t]++)
-    (?P<value>{_ARG})
+    (?P<sep>(?P<comma>\s*+,\s*+)|[\ \t]++)
+    (?P<value>(?(comma){_ITEM}|{_ARG}))
     """
 )
 
-# .netrc: "... password <value>", on one line. Never a separator: password = "V" is _KEY_VALUE's (#6).
+# .netrc: "... password <value>", on one line. Never a separator: password = "V" is _KEY_VALUE's (#6). A value
+# that reads as a secret flag takes the word after it, as in _ARG.
 _NETRC = re.compile(
-    rf"(?i)(?<![A-Za-z0-9_])(?P<key>password)(?P<sep>[ \t]++)(?P<value>(?![:=]){_NOT_A_SECRET_FLAG}\S+)"
+    rf"""(?ix)
+    (?<![A-Za-z0-9_])(?P<key>password)
+    (?P<sep>[\ \t]++)
+    (?P<value>(?![:=])(?:{_SECRET_FLAG_WORD}(?:[\ \t]++{_SECRET_FLAG_WORD})*+(?:[\ \t]++\S+)?|\S+))
+    """
 )
 
 _MIN_LITERAL_LENGTH = 8
@@ -369,18 +389,14 @@ class Redactor:
 
     def _redact_items(self, items: Iterable[Any], *, stringify: bool) -> list[Any]:
         """A list or tuple, read as a command line too: the string after a secret flag is dropped whole, like
-        a value under a sensitive key (``["mysql", "--password", "V"]``). A secret flag is never that value
-        (``["--no-password", "--token", "V"]``): it stays, and the string after it goes."""
+        a value under a sensitive key (``["mysql", "--password", "V"]``). A dropped string that is itself a
+        secret flag drops the string after it too (``["--no-password", "--token", "V"]``)."""
         out: list[Any] = []
         after_flag = False
         for item in items:
-            flag = _is_secret_flag(item)
-            if after_flag and isinstance(item, str) and not flag:
-                out.append(REDACTED)
-                after_flag = False
-            else:
-                out.append(self.redact_obj(item, stringify=stringify))
-                after_flag = flag
+            take = after_flag and isinstance(item, str)
+            out.append(REDACTED if take else self.redact_obj(item, stringify=stringify))
+            after_flag = _is_secret_flag(item)
         return out
 
 

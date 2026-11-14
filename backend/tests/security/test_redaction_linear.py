@@ -57,6 +57,17 @@ CASES = [
     ("token_before_spaces", "ghp_" + "a" * 36 + ":" + " " * KIB_64),
     ("string_prefix_run", "password=" + "rb" * (KIB_64 // 2)),
     ("string_prefix_before_quotes", "password=b" + "'" * KIB_64),
+    # A secret flag taken as a value takes the word after it (Task 2 review, Important 1): long runs of secret
+    # flags, bare (also a word the key pattern matches two ways), quoted, before trailing spaces, as argv list
+    # items and after a netrc "password". A quoted flag in shell words, and a #7 swallow kept on one line.
+    ("secret_flag_chain", "--password " + "--token " * 8_190),
+    ("secret_flag_chain_pascal", "--password " + "--Password " * 5_956),
+    ("secret_flag_chain_before_spaces", "--password " + "--token " * 4_096 + " " * (KIB_64 // 2)),
+    ("quoted_secret_flag_chain", "--password " + '"--token" ' * 6_552),
+    ("argv_secret_item_chain", '"--password", ' + '"--token", ' * 5_956),
+    ("quoted_flag_shell_run", '"--password" ' * 5_041),
+    ("netrc_secret_flag_chain", "password " + "-abcSecret " * 5_956),
+    ("bare_swallow_before_tabs_and_a_line", "password=a:" + "\t" * KIB_64 + '\n"x"'),
 ]
 
 

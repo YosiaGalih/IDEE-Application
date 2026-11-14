@@ -688,19 +688,82 @@ def test_redact_obj_drops_the_item_after_a_secret_flag() -> None:
     assert redactor.redact_obj(["the", "token", "was", "used"]) == ["the", "token", "was", "used"]
 
 
-def test_a_secret_flag_is_never_another_secret_flags_value(redactor: Redactor) -> None:
-    # "--no-password" takes the next word (Lead ruling #15), but never a secret flag: that flag's own value
-    # would be left raw after it.
-    assert redactor.redact(f"mysql --no-password --password {V}") == (
-        f"mysql --no-password --password {REDACTED}"
+def test_a_secret_flag_as_a_value_takes_the_word_after_it(redactor: Redactor) -> None:
+    # "--no-password" takes the next word (Lead ruling #15). When that word is itself a secret flag, its own
+    # value follows it: both go (Lead ruling on the Task 2 review, Important 1).
+    assert redactor.redact(f"mysql --no-password --password {V}") == f"mysql --no-password {REDACTED}"
+    assert redactor.redact(f"tool --skip-password --token {V} --verbose") == (
+        f"tool --skip-password {REDACTED} --verbose"
     )
     assert V not in redactor.redact(f'["--no-password", "--token", "{V}"]')
-    assert redactor.redact_obj(["--no-password", "--password", V]) == [
+    assert V not in redactor.redact(f'"--no-password" "--token" "{V}"')
+    assert redactor.redact_obj(["--no-password", "--password", V]) == ["--no-password", REDACTED, REDACTED]
+    assert redactor.redact_obj(["--no-password", "--password", V, "-v"]) == [
         "--no-password",
-        "--password",
         REDACTED,
+        REDACTED,
+        "-v",
     ]
-    assert redactor.redact_obj(["--token", "--token"]) == ["--token", "--token"]
+    assert redactor.redact_obj(["--token", "--token"]) == ["--token", REDACTED]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("mysql --password -MyPassword", f"mysql --password {REDACTED}"),  # redacted at 70f88a1
+        ("password -abcSecret", f"password {REDACTED}"),  # netrc; redacted at ad6303b
+        ("machine h login u password -abcSecret extra", f"machine h login u password {REDACTED}"),
+        ('["mysql", "--password", "-MyPassword"]', f'["mysql", "--password", {REDACTED}]'),
+        ("'--password' -MyPassword", f"'--password' {REDACTED}"),
+    ],
+)
+def test_a_secret_that_looks_like_a_secret_flag_is_still_redacted(
+    redactor: Redactor, text: str, expected: str
+) -> None:
+    # A password that starts with "-" and ends in a tail word reads as a secret flag. Taken as a value, it is
+    # redacted, never skipped (Task 2 review, Important 1).
+    assert redactor.redact(text) == expected
+    assert redactor.redact_obj(["mysql", "--password", "-MyPassword"]) == ["mysql", "--password", REDACTED]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'parser.add_argument("--token", help="The API token")',
+        'parser.add_argument("--password", required=True)',
+        '@click.option("--password", prompt=True, hide_input=True)',
+        'cmd = ["--api-key", api_key]',
+        'cmd = ["--api-key", api_key, "--verbose"]',
+    ],
+)
+def test_code_that_defines_a_secret_flag_stays_readable(redactor: Redactor, text: str) -> None:
+    # After a comma an argv value is a quoted string; a bare word there is code (Task 2 review, Important 2).
+    assert redactor.redact(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f'["mysql", "--password", "{V}"]', f'["mysql", "--password", {REDACTED}]'),
+        (f'"--password" {V}', f'"--password" {REDACTED}'),
+        (f"'--password' {V} --verbose", f"'--password' {REDACTED} --verbose"),
+        (f'"--password" "{V}"', f'"--password" {REDACTED}'),
+    ],
+)
+def test_a_quoted_flag_takes_a_quoted_item_or_a_shell_word(
+    redactor: Redactor, text: str, expected: str
+) -> None:
+    assert redactor.redact(text) == expected
+
+
+def test_a_docstring_after_a_secret_parameter_stays_readable(redactor: Redactor) -> None:
+    # The #7 swallow takes a quoted string that immediately follows, on the same line (Task 2 review,
+    # Important 3).
+    text = 'def connect(host, password=None):\n    """Open a connection to the database."""\n'
+    out = redactor.redact(text)
+    assert '"""Open a connection to the database."""' in out, out
+    assert V not in redactor.redact(f'password : password:\t"{V}"')
+    assert V not in redactor.redact(f'password : password:  "{V}"')
 
 
 def test_a_flag_value_is_one_word_on_its_line(redactor: Redactor) -> None:
