@@ -751,6 +751,17 @@ def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, te
         (f"credential:{V}_secret: Q", f"credential:{REDACTED}"),
         (f"apikey:{V}-cookie= o", f"apikey:{REDACTED}"),
         (f"token: x-apikey: {V}", f"token: {REDACTED}"),
+        # The word stops at a quote or a backslash before the key's separator: the value lies past it.
+        (f'bPASSword:session":{V}', f'bPASSword:session":{REDACTED}'),
+        (f"dPASSWORDs:PASSWORD'={V}", f"dPASSWORDs:PASSWORD'={REDACTED}"),
+        # The spaced value a compound key takes is read as a bare value: "key=" and a quoted string.
+        (f'PASSWORD=s-apikey: passwd="{V}', f"PASSWORD={REDACTED}"),
+        (f'password:HCookie: session="{V}"', f"password:{REDACTED}"),
+        # A word that ends with a key glued to its separator, after any other character, takes the value too.
+        (f"bPASSword:[session: {V}", f"bPASSword:{REDACTED}"),
+        (f"password=x.token: {V}", f"password={REDACTED}"),
+        (f'bPASSword:[session":{V}', f"bPASSword:{REDACTED}"),  # a JSON key's closing quote
+        (f"password=x.token : {V}", f"password={REDACTED}"),  # spaces before the separator
         ("xoxb-" + f"GJj206odyX=B_PASSWORD: {V}", f"{REDACTED}={REDACTED}"),  # after a token (#7)
         # netrc's key after dashes is netrc's key too (_NETRC reads a "-" before it).
         (f"_password=-Password {V}", f"_password=-Password {REDACTED}"),
@@ -775,6 +786,14 @@ def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, te
         "secret-before-a-snake-tail",
         "secret-before-a-kebab-tail",
         "compound-key-takes-its-value",
+        "quote-before-the-separator",
+        "escaped-quote-before-the-separator",
+        "compound-key-value-ending-in-a-separator",
+        "compound-camel-key-value-ending-in-a-separator",
+        "word-ending-in-a-key-after-a-bracket",
+        "word-ending-in-a-key-after-a-dot",
+        "word-ending-in-a-json-key",
+        "word-ending-in-a-key-before-spaces",
         "compound-upper-key-takes-its-value",
         "netrc-after-a-dash",
     ],

@@ -325,40 +325,54 @@ _QUOTED = r"""
         )
 """
 
-# A word that is itself a key whose value lies past it: a secret key's tail alone, spaces before or after
-# its separator, and the first character of a value (password: in "token: password: V", secret in
+# Where a key starts: after no letter, digit, "_" or "-" (_KEY_VALUE, _FLAG_VALUE; netrc reads "-" before its
+# key too), or right after an escaped line break or tab. ToolGateway json-dumps a dict output before redacting
+# it, and logging's stringify uses repr: there a line break before a key is "\n", glued to it (AG-13 F-8).
+_AFTER_ESCAPE = r"(?<=\\[nrt])"
+_KEY_START = rf"(?:(?<![A-Za-z0-9_-])|{_AFTER_ESCAPE})"
+
+# A word that is itself a key whose value lies past it: a secret key's tail alone, then a separator the word
+# stops before (spaces, or a quote or backslash before it: session": V, PASSWORD'= V) or one followed by
+# spaces, and the first character of a value (password: in "token: password: V", secret in
 # "self._password = secret = V"), or netrc's key, after any dashes, and a word after it (password in
 # "api-key: password V"). No unquoted value takes one (_BARE, netrc's word): the key gets its own match, so
 # its own value is redacted (AG-13 F-2). Otherwise the word stays the value, taken whole, so nothing in it
 # stays raw: a key glued to its separator and value is one word with them; one with no value after it gets
 # no match of its own; one with words before its tail may be a secret glued to a tail word
 # ("<secret>Cookie: x", "<secret>-cookie= o"), which a match of its own would keep. A lookahead from where
-# the value starts: one key, the spaces around its separator, one character.
+# the value starts: one key, its separator and the spaces around it, one character.
 _NOT_A_KEY = (
-    rf"(?!(?:{_SECRET_TAIL_PATTERN})(?![A-Za-z0-9_-])(?:\s++[:=]|[:=]\s)\s*+(?:[^\s&;,\\]|\\[\"'])"
+    rf"(?!(?:{_SECRET_TAIL_PATTERN})(?![A-Za-z0-9_-])"
+    r"(?:(?:\\?[\"']\s*+|\s++)[:=]|[:=]\s)\s*+(?:[^\s&;,\\]|\\[\"'])"
     rf"|-*+{_NETRC_KEY}[\ \t]++(?![:=])\S)"
 )
 
-# A word that is a secret key with words before its tail, glued to its separator, then spaces and a value on
-# the same line ("x-apikey: V", and "<secret>-cookie= o", a secret glued to a tail word): the word takes the
-# value too. _NOT_A_KEY leaves the word to the value it is in, so the key gets no match of its own; taken
-# with it, its value is not left raw (AG-13 F-2 follow-up).
-_KEY_WORD_VALUE = (
-    rf"(?=(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-])[:=][\ \t])"
-    rf"[^\s\"'&;,\\]++[\ \t]++(?:{_QUOTED}|[^\s\"'&;,\\]++)"
-)
-
-# An unquoted value: one word, never a key with its own value (_NOT_A_KEY). A word that ends in ":" or "="
-# immediately followed, on the same line, by a quoted string takes the string too: a key was taken as the
-# value of the key before it (password : password: "V"; Lead decision #7); a key glued to its separator takes
-# an unquoted value after spaces too (_KEY_WORD_VALUE). Not across a line: "password=None):" then a docstring
-# on the next line.
-_BARE = rf"""
-        {_NOT_A_KEY}
-        (?:{_KEY_WORD_VALUE}|
+# One word, and a quoted string glued to it after a ":" or "=" that ends it, on the same line: a key was taken
+# as the value of the key before it (password : password: "V"; Lead decision #7). Not across a line:
+# "password=None):" then a docstring on the next line.
+_WORD = rf"""
         [^\s"'&;,\\]++(?:(?<=[:=])[\ \t]*+(?:{_QUOTED})
                        |(?:(?<=[:=][bBfFrRuU])|(?<=[:=][bBfFrRuU][bBfFrRuU]))(?=["'])(?:{_QUOTED}))?
-        )
+"""
+
+# A word that ends with a secret key whose value lies past the word, on the same line: the key glued to its
+# separator then spaces ("x-apikey: V"), a quote or spaces between the key and its separator ('[session": V',
+# "x.token : V"). The key may have words before its tail ("<secret>-cookie= o", a secret glued to a tail
+# word), or follow any other character ("[session", "x.token"). The word takes the separator and the value
+# too, a quoted string or a word as _BARE reads one: _NOT_A_KEY leaves such a word to the value it is in, so
+# the key gets no match of its own, and its value is not left raw (AG-13 F-2 follow-up). The lookahead reads
+# the word once: a key is tried only where one may start (_KEY_START), and ends only before its separator.
+_KEY_WORD_VALUE = rf"""
+        (?=[^\s"'&;,\\]*?{_KEY_START}(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-])
+           (?:[:=][\ \t]|\\?["'][\ \t]*+[:=]|[\ \t]++[:=]))
+        [^\s"'&;,\\]++(?:(?<=[:=])|\\?["']?[\ \t]*+[:=])[\ \t]*+(?:{_QUOTED}|{_NOT_A_KEY}{_WORD})
+"""
+
+# An unquoted value: one word (_WORD), never a key with its own value (_NOT_A_KEY); a key glued to its
+# separator takes the value after its spaces too (_KEY_WORD_VALUE).
+_BARE = rf"""
+        {_NOT_A_KEY}
+        (?:{_KEY_WORD_VALUE}|{_WORD})
 """
 
 # The value after a sensitive key and its separator (_KEY_VALUE, _AFTER_REDACTED): quoted or one word, after
@@ -391,12 +405,6 @@ _ITEM = rf"""
         (?:{_SECRET_FLAG_ITEM}(?:\s*+,\s*+{_SECRET_FLAG_ITEM})*+(?:\s*+,\s*+(?:{_QUOTED}))?
           | {_QUOTED})
 """
-
-# Where a key starts: after no letter, digit, "_" or "-" (_KEY_VALUE, _FLAG_VALUE; netrc reads "-" before its
-# key too), or right after an escaped line break or tab. ToolGateway json-dumps a dict output before redacting
-# it, and logging's stringify uses repr: there a line break before a key is "\n", glued to it (AG-13 F-8).
-_AFTER_ESCAPE = r"(?<=\\[nrt])"
-_KEY_START = rf"(?:(?<![A-Za-z0-9_-])|{_AFTER_ESCAPE})"
 
 # key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value / --key=value, compound names.
 _KEY_VALUE = re.compile(

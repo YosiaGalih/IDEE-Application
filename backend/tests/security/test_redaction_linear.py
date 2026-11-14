@@ -113,6 +113,11 @@ CASES = [
     # 64 KiB compound key made of short words.
     ("compound_key_values", "token: " + "x-apikey: v " * (KIB_64 // 12)),
     ("long_compound_key_value", "password=" + "a-" * (KIB_64 // 2) + "cookie: v"),
+    # A word that ends with a key and its separator is read once for it: key starts all along a word, words
+    # joined by "_" before a key, and keys after dots, each word ending in ": v".
+    ("key_starts_along_a_word", "password=" + ".passwor" * (KIB_64 // 8) + ": v"),
+    ("words_before_a_key_in_a_word", "password=" + "a_" * (KIB_64 // 2) + "token: v"),
+    ("dotted_keys_in_a_word", "password=" + ".token" * (KIB_64 // 6) + ": v"),
     # AG-13 F-3: after a hump a tail word is any upper-case run then lower case. Runs that never end a tail,
     # mixed tails one after another (one 64 KiB name), and two-word tails mixed after a hump.
     ("upper_runs_that_never_end_a_tail", "aPASSWOR" * (KIB_64 // 8)),
