@@ -23,7 +23,8 @@ dev = [
 # Same age rule as the backend (PRD v2.2 §8), with the same recorded security exception:
 # certifi 2026.10.19 fixes PYSEC-2026-4320 (IMPLEMENTATION_TRACKER §12).
 exclude-newer = "2026-10-10T00:00:00Z"
-exclude-newer-package = { certifi = "2026-10-24T00:00:00Z" }
+# opentelemetry-api 1.45.2 fixes CVE-2026-126360 (same exception as backend/pyproject.toml, 14 Nov 2026).
+exclude-newer-package = { certifi = "2026-10-24T00:00:00Z", opentelemetry-api = "2026-10-30T00:00:00Z" }
 package = false
 
 [tool.ruff]

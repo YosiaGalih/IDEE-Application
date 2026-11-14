@@ -35,7 +35,8 @@ dev = [
 exclude-newer = "2026-10-10T00:00:00Z"
 # Security fixes override the age rule, per package, recorded in IMPLEMENTATION_TRACKER §12:
 # certifi 2026.10.19 fixes PYSEC-2026-4320 (found by pip-audit, 24 Oct 2026).
-exclude-newer-package = { certifi = "2026-10-24T00:00:00Z" }
+# opentelemetry-api 1.45.2 (29 Oct 2026) fixes CVE-2026-126360 (found by pip-audit on main, 14 Nov 2026).
+exclude-newer-package = { certifi = "2026-10-24T00:00:00Z", opentelemetry-api = "2026-10-30T00:00:00Z" }
 package = false
 
 [tool.ruff]
