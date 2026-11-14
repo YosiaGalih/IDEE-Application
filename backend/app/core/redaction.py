@@ -119,11 +119,13 @@ _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     ("password_hash", re.compile(r"\$argon2(?:id|i|d)\$[A-Za-z0-9+/=,$]+")),  # PHC string
-    # PEM blocks, including a truncated block with no END marker.
+    # PEM and PGP blocks ("-----BEGIN PGP PRIVATE KEY BLOCK-----"), including a truncated block with no END
+    # marker (Lead decision 3.1f2c #5).
     (
         "private_key",
         re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\Z)",
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"
+            r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|.*\Z)",
             re.DOTALL,
         ),
     ),
@@ -139,11 +141,17 @@ _URL_CREDENTIALS = re.compile(
 )
 
 # Header-like pairs anywhere in a line, also inside JSON/repr: Authorization: Bearer x / "x-api-key": "y".
+# Without an opening quote after the colon the value is the rest of the line, quoted parts included
+# (Authorization: Token token="V", Cookie: session="V"; theme=dark): a header value is a list of
+# parameters, and a quote in it opens one. After an opening quote (JSON: "Authorization": "Bearer V", ...)
+# the value ends at the next quote. A quoted part never crosses a line, and an unclosed quote ends the value
+# there: the alternatives start on different characters, and the repeat is possessive, so a run of quotes is
+# read once (Lead decision 3.1f2c #4).
 _HEADERS = re.compile(
     r"""(?ix)
     (?P<name>(?<![A-Za-z0-9_-])(?:proxy-authorization|authorization|set-cookie|cookie|x-api-key))
-    (?P<sep>\\?["']?\s*:\s*\\?["']?)
-    (?P<value>[^"'\\\r\n]+)
+    (?P<sep>\\?["']?\s*:\s*(?P<open>\\?["'])?)
+    (?P<value>(?(open)[^"'\\\r\n]+|(?:[^"'\\\r\n]|"[^"\r\n]*"|'[^'\r\n]*')++))
     """
 )
 

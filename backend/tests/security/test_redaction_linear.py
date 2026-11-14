@@ -68,6 +68,10 @@ CASES = [
     ("quoted_flag_shell_run", '"--password" ' * 5_041),
     ("netrc_secret_flag_chain", "password " + "-abcSecret " * 5_956),
     ("bare_swallow_before_tabs_and_a_line", "password=a:" + "\t" * KIB_64 + '\n"x"'),
+    # A header value reads quoted parts (R-2): quotes never closed in a cookie; PGP blocks with no END (R-3).
+    ("header_quote_run", "Cookie: " + '"a' * 32_768),
+    ("header_closed_quote_run", "Cookie: " + '"a"' * 21_845),
+    ("pgp_begin_run", "-----BEGIN PGP PRIVATE KEY BLOCK-----" * 1_771),
 ]
 
 

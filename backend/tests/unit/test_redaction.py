@@ -831,3 +831,51 @@ def test_known_secret_names_are_exact_names_in_both_layers() -> None:
 )
 def test_a_string_prefix_is_part_of_the_quoted_value(redactor: Redactor, text: str) -> None:
     assert V not in redactor.redact(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'Authorization: Token token="V"',
+        'Cookie: session="V"; theme=dark',
+        'x-api-key: password="V"',
+        "Authorization: Token token='V'",
+        'Proxy-Authorization: Digest username="u", response="V"',
+    ],
+)
+def test_a_header_value_keeps_its_quoted_parts(redactor: Redactor, text: str) -> None:
+    out = redactor.redact(text)
+    assert "V" not in out, out
+    assert out.split(":", 1)[0] == text.split(":", 1)[0]
+
+
+def test_a_quoted_header_value_ends_at_its_closing_quote(redactor: Redactor) -> None:
+    out = redactor.redact('{"Authorization": "Bearer V", "next": "kept"}')
+    assert "V" not in out, out
+    assert '"next": "kept"' in out, out
+    escaped = redactor.redact(r"{\"Authorization\": \"Bearer V\", \"next\": \"kept\"}")
+    assert "Bearer V" not in escaped and "kept" in escaped, escaped
+
+
+def test_a_header_value_stays_on_its_line(redactor: Redactor) -> None:
+    out = redactor.redact('Cookie: a="b\nnext line "kept"')
+    assert "next line" in out, out
+
+
+_PGP = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nV\n-----END PGP PRIVATE KEY BLOCK-----"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _PGP,
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----\nV",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nV\n-----END OPENSSH PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----\nV\n-----END ENCRYPTED PRIVATE KEY-----",
+        "-----BEGIN EC2 PRIVATE KEY-----\nV",
+    ],
+)
+def test_every_private_key_block_is_redacted(redactor: Redactor, text: str) -> None:
+    out = redactor.redact(f"before\n{text}")
+    assert out.startswith("before\n") and "V" not in out.removeprefix("before\n"), out
+    assert [finding.rule for finding in redactor.find(text)] == ["private_key"]
