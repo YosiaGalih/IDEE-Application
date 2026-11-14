@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import random
 import re
 
@@ -925,6 +926,26 @@ def test_a_flag_value_is_one_word_on_its_line(redactor: Redactor) -> None:
     assert redactor.redact("tool --token bearer\n--verbose") == f"tool --token {REDACTED}\n--verbose"
     # A scheme word and its credential share a line in key=value too.
     assert redactor.redact("token: Bearer\nnext_line") == f"token: {REDACTED}\nnext_line"
+
+
+# AG-13 F-8 (final review of 74bf8d4): ToolGateway._content_text json-dumps a dict output before redacting it,
+# and logging's stringify uses repr: a line break or tab before a key is then "\n", "\r" or "\t", glued to it.
+ESCAPED_BREAK_OUTPUTS = {
+    "key=value": {"stdout": f"connecting\npassword={V}\n"},
+    "flag": {"stdout": f"x\n--token {V}\n"},
+    "camel key, quoted": {"stdout": f'x\nclientSecret: "{V}"\n'},
+    "tab before a key": {"content": f"[db]\n\tsecret = '{V}'\n"},
+    "netrc after CRLF": {"stdout": f"machine h login u\r\npassword {V}\r\n"},
+}
+
+
+@pytest.mark.parametrize("output", list(ESCAPED_BREAK_OUTPUTS))
+def test_a_key_after_an_escaped_line_break_is_redacted(redactor: Redactor, output: str) -> None:
+    value = ESCAPED_BREAK_OUTPUTS[output]
+    for text in (json.dumps(value), repr(value)):
+        out = redactor.redact(text)
+        assert V not in out, out
+        assert "credential_assignment" in {finding.rule for finding in redactor.find(text)}
 
 
 @pytest.mark.parametrize(

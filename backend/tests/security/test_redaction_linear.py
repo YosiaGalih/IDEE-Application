@@ -30,6 +30,9 @@ CASES = [
     # name, dashes alternating with letters, and many flags in a row.
     ("dashes_before_tail", "-" * KIB_64 + "password=V"),
     ("dashes_before_plain_name", "-" * KIB_64 + "x y"),
+    # The same with a key word later in the text: the KEY_HINT prefilter skips the flag rule on a text with
+    # none, so the case above no longer reaches _FLAG_VALUE (final fix wave: mutant Z3j survived it).
+    ("dashes_before_plain_name_then_a_key_word", "-" * KIB_64 + "x y token"),
     ("dash_letter_run", "--a" * 21_845),
     ("flag_run", "--token " * 8_192),
     # Value forms (R-4..R-6): quotes never closed, backslashes inside a string (plain and escaped JSON), the
@@ -104,6 +107,12 @@ CASES = [
     ("upper_runs_that_never_end_a_tail", "aPASSWOR" * (KIB_64 // 8)),
     ("mixed_tail_run", "dbPASSword" * (KIB_64 // 10) + "=V"),
     ("mixed_two_word_tail_run", "aSecretKEy" * (KIB_64 // 10) + "=V"),
+    # AG-13 F-8: a key may start after an escaped line break or tab. Escaped breaks before keys, flags and
+    # netrc's key one after another, and before words that are no key.
+    ("escaped_breaks_before_keys", "\\npassword=x" * (KIB_64 // 12)),
+    ("escaped_breaks_before_flags", "\\t--token x" * (KIB_64 // 12)),
+    ("escaped_breaks_before_netrc", "\\rpassword x" * (KIB_64 // 12)),
+    ("escaped_breaks_before_words", "\\nxyz" * (KIB_64 // 5)),
 ]
 
 

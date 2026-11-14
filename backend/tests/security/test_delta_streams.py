@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import string
@@ -620,6 +621,30 @@ BACKSLASH_BEFORE_A_CLOSE = {
 @pytest.mark.parametrize("size", SIZES)
 def test_a_value_after_a_backslash_before_a_close_never_streams_raw(form: str, size: int) -> None:
     text = INTRO + BACKSLASH_BEFORE_A_CLOSE[form].format(VALUE) + TAIL
+    assert not any(window in REDACTOR.redact(text) for window in windows(VALUE))  # the redactor takes it
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == REDACTOR.redact(text)
+
+
+# AG-13 F-8 (final review of 74bf8d4): a key after an escaped line break or tab in a JSON-dumped tool output
+# (ToolGateway._content_text). The redactor reads the key; the stream holds its quoted value from it: the
+# delta's key check has no left boundary, so the "n" or "t" of the escape before the key changes nothing.
+ESCAPED_BREAK_OUTPUTS = {
+    "quoted value": ('x\npassword="{}"', "password"),
+    "camel key": ('x\nclientSecret: "{}"', "clientSecret"),
+    "tab, single quotes": ("[db]\n\tsecret = '{}'", "secret"),
+    "bare value": ("x\npassword={}", None),
+}
+
+
+@pytest.mark.parametrize("output", list(ESCAPED_BREAK_OUTPUTS))
+@pytest.mark.parametrize("size", SIZES)
+def test_a_key_after_an_escaped_line_break_never_streams_raw(output: str, size: int) -> None:
+    template, key = ESCAPED_BREAK_OUTPUTS[output]
+    text = json.dumps({"stdout": INTRO + template.format(VALUE) + TAIL})
+    if key is not None:  # held from the key (or from the escape's letter glued to it)
+        assert held_from(text, VALUE) in (text.index(key), text.index(key) - 1)
     assert not any(window in REDACTOR.redact(text) for window in windows(VALUE))  # the redactor takes it
     events = stream(delta_redactor(REDACTOR), pieces(text, size))
     assert leaked(events, VALUE) == []

@@ -345,10 +345,16 @@ _ITEM = rf"""
           | {_QUOTED})
 """
 
+# Where a key starts: after no letter, digit, "_" or "-" (_KEY_VALUE, _FLAG_VALUE; netrc reads "-" before its
+# key too), or right after an escaped line break or tab. ToolGateway json-dumps a dict output before redacting
+# it, and logging's stringify uses repr: there a line break before a key is "\n", glued to it (AG-13 F-8).
+_AFTER_ESCAPE = r"(?<=\\[nrt])"
+_KEY_START = rf"(?:(?<![A-Za-z0-9_-])|{_AFTER_ESCAPE})"
+
 # key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value / --key=value, compound names.
 _KEY_VALUE = re.compile(
     rf"""(?ix)
-    (?P<key>(?<![A-Za-z0-9_-])(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<key>{_KEY_START}(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
     (?P<sep>\\?["']?\s*+[:=]\s*+)
     (?P<value>{_VALUE})
     """
@@ -371,7 +377,7 @@ _AFTER_REDACTED = re.compile(
 # flag at the end of a line does not take the next line.
 _FLAG_VALUE = re.compile(
     rf"""(?ix)
-    (?P<key>(?<![A-Za-z0-9_-])(?=-)(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<key>{_KEY_START}(?=-)(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
     (?P<sep>[\ \t]++)
     (?P<value>{_ARG})
     """
@@ -393,7 +399,7 @@ _ARGV_VALUE = re.compile(
 # (_NOT_A_KEY), as a bare value.
 _NETRC = re.compile(
     rf"""(?ix)
-    (?<![A-Za-z0-9_])(?P<key>{_NETRC_KEY})
+    (?:(?<![A-Za-z0-9_])|{_AFTER_ESCAPE})(?P<key>{_NETRC_KEY})
     (?P<sep>[\ \t]++)
     (?P<value>(?![:=])(?:{_SECRET_FLAG_WORD}(?:[\ \t]++{_SECRET_FLAG_WORD})*+(?:[\ \t]++{_NOT_A_KEY}\S+)?
                         |{_NOT_A_KEY}\S+))
