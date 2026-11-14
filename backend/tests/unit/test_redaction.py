@@ -622,6 +622,33 @@ def test_a_quoted_value_ends_at_its_own_closing_quote(redactor: Redactor, text: 
     assert redactor.redact(text) == expected
 
 
+# AG-13 F-1 (final review of 74bf8d4): single-quoted shell, YAML, INI and PowerShell strings read no "\" as an
+# escape. A value whose escape-aware close is on a later line ends at a plain close on its own line.
+BACKSLASH_BEFORE_A_CLOSE = {
+    "shell single quotes": (
+        f"export DB_PASSWORD='aB3\\'\nexport GITHUB_TOKEN='{V}'\n",
+        f"export DB_PASSWORD={REDACTED}\nexport GITHUB_TOKEN={REDACTED}\n",
+    ),
+    "yaml single quotes": (
+        f"db:\n  password: 'p4ss\\'\n  api_key: '{V}'\n",
+        f"db:\n  password: {REDACTED}\n  api_key: {REDACTED}\n",
+    ),
+    "double quotes": (f'PASSWORD="ab\\"\nTOKEN="{V}"\n', f"PASSWORD={REDACTED}\nTOKEN={REDACTED}\n"),
+    "windows path in ini": (
+        f"[db]\npassword = 'C:\\keys\\'\nsecret = '{V}'\n",
+        f"[db]\npassword = {REDACTED}\nsecret = {REDACTED}\n",
+    ),
+    # The escape-aware close on the value's own line still wins (R-6, #8).
+    "escaped quote closed on its line": (f'{{"password": "ab\\"{V}"}}', f'{{"password": {REDACTED}}}'),
+}
+
+
+@pytest.mark.parametrize("form", list(BACKSLASH_BEFORE_A_CLOSE))
+def test_a_backslash_before_a_close_on_its_line_ends_the_value_there(redactor: Redactor, form: str) -> None:
+    text, expected = BACKSLASH_BEFORE_A_CLOSE[form]
+    assert redactor.redact(text) == expected
+
+
 def test_an_escaped_backslash_closes_the_string(redactor: Redactor) -> None:
     # 'secret: "a\\" ' + V: the double backslash is one escaped backslash, so the quote after it closes the
     # string before the space and V. Escapes are not over-read.

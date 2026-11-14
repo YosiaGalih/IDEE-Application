@@ -244,15 +244,25 @@ CREDENTIAL_HEADER_START = re.compile(rf"(?i){_HEADER_NAME_SEP}")
 # in this order (Lead decisions 3.1f2c #6, #8):
 # - triple quoted, one value across lines; never closed: to the end of the text;
 # - \"escaped JSON\": in the JSON-encoded text, \\ followed by \" or \\ is one escape of the inner string;
-# - "double" or 'single' quoted, across lines, with backslash escapes ("ab\"c" is one string);
+# - "double" or 'single' quoted with backslash escapes ("ab\"c" is one string), closed on its own line;
+# - else closed on its own line by the first quote of its kind, a backslash before it or not: single-quoted
+#   shell, YAML, INI and PowerShell strings read no escapes ('C:\keys\'), and a value that read one there
+#   would take the next value's opening quote, on a later line, as its close (AG-13 F-1);
+# - else across lines, with backslash escapes;
 # - a quote never closed: to the end of the text, like a PEM block without its END line. The rest of the
 #   text holds no closing quote of that kind, so what is over-redacted is bounded.
+# Each of the three line-bound tries reads at most the rest of the value's line; one that fails leaves no
+# unescaped quote of its kind on that line for a later value to open with, so a line is read so at most twice.
 _QUOTED = r"""
         (?:[bBfFrRuU]{1,2}(?=["']))?
         (?:
         "{3}(?s:.*?)(?:"{3}|\Z)
       | '{3}(?s:.*?)(?:'{3}|\Z)
       | \\"(?:[^\\]|\\[^"\\]|\\\\(?:[^\\]|\\[\s\S]))*+\\"
+      | "(?:[^"\\\r\n]|\\[^\r\n])*+"
+      | '(?:[^'\\\r\n]|\\[^\r\n])*+'
+      | "[^"\r\n]*+"
+      | '[^'\r\n]*+'
       | "(?:[^"\\]|\\[\s\S])*+"
       | '(?:[^'\\]|\\[\s\S])*+'
       | (?:\\"|["'])(?s:.*)

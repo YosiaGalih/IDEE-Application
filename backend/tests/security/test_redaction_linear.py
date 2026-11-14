@@ -86,6 +86,12 @@ CASES = [
     ("bare_swallow_prefix_quotes", "password=a:b" + '"' * KIB_64),
     # Review of 0733969: base64 padding before a quote that closes a shell word, many times on one line.
     ("header_padding_quotes", "Cookie: " + 'a==" ' * 13_107),
+    # AG-13 F-1 (final review of 74bf8d4): a quoted value closed on its own line by a plain close, its
+    # escape-aware close on no line: escaped quotes to the end of one long line, the same with single quotes,
+    # and many lines that each end such a value.
+    ("escaped_quotes_on_one_line", 'password="' + '\\"' * (KIB_64 // 2)),
+    ("escaped_apostrophes_on_one_line", "password='" + "\\'" * (KIB_64 // 2)),
+    ("backslash_closes_on_many_lines", "password='a\\'\n" * (KIB_64 // 14)),
 ]
 
 

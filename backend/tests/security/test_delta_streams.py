@@ -602,6 +602,26 @@ def test_a_header_stop_a_later_rule_rewrites_never_streams_raw(form: str, size: 
     assert client(events) == REDACTOR.redact(text)
 
 
+# AG-13 F-1 (final review of 74bf8d4): a value ending in a backslash before its quote, then the next key's
+# quoted value on the next line. The redactor closes the first value on its own line, so the second is its own
+# match, and the stream holds it from its key.
+BACKSLASH_BEFORE_A_CLOSE = {
+    "shell single quotes": "export DB_PASSWORD='aB3\\'\nexport GITHUB_TOKEN='{}'\n",
+    "yaml single quotes": "db:\n  password: 'p4ss\\'\n  api_key: '{}'\n",
+    "double quotes": 'PASSWORD="ab\\"\nTOKEN="{}"\n',
+}
+
+
+@pytest.mark.parametrize("form", list(BACKSLASH_BEFORE_A_CLOSE))
+@pytest.mark.parametrize("size", SIZES)
+def test_a_value_after_a_backslash_before_a_close_never_streams_raw(form: str, size: int) -> None:
+    text = INTRO + BACKSLASH_BEFORE_A_CLOSE[form].format(VALUE) + TAIL
+    assert not any(window in REDACTOR.redact(text) for window in windows(VALUE))  # the redactor takes it
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == REDACTOR.redact(text)
+
+
 # The reviewer's per-prefix fuzz (sfuzz2.py) in short: a header value carried onto a later line by a
 # parameter's quote, among the later rules' atoms (keys, flags, argv items, netrc, the #7 swallow, markers,
 # literals with a quote or a backslash, URL credentials). Every release is a redaction (release 1), so every
