@@ -363,6 +363,9 @@ SECRET_KEYS = [
     # a command-line flag: leading dashes are not part of the name either (Lead ruling, flags);
     # "--no-password" is no_password, a password key by the predicate (no special case)
     "--password", "-password", "--api-key", "-api-key", "--client-secret", "--clientSecret", "--no-password",
+    # mixed spellings main's split (a hump only after a lower-case letter or digit) reads as a tail: either
+    # split makes a key sensitive (AG-13 F-3, final review of 74bf8d4)
+    "APIkey", "PASSword", "PASSWORDs", "SECRETs", "COOKIEs", "dbPASSword", "SECretKey", "dbSecretKEy",
 ]  # fmt: skip
 # The tail is not the last word: these stay readable (Goal 3).
 PLAIN_KEYS = [
@@ -448,6 +451,51 @@ def test_the_secret_key_pattern_is_the_predicate_whatever_the_enclosing_flags() 
 def test_acronym_keys_are_sensitive(redactor: Redactor, key: str) -> None:
     assert is_sensitive_key(key)
     assert redactor.redact_obj({key: "v"}) == {key: REDACTED}
+
+
+# AG-13 F-3 (final review of 74bf8d4): main's is_sensitive_key split a name at a hump after a lower-case
+# letter or digit only, so a mixed spelling of a tail (APIkey, PASSword, dbPASSword, PASSWORDs) was one
+# sensitive word.
+_MAIN_SENSITIVE_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAIL})$")
+
+
+def _main_is_sensitive(name: str) -> bool:
+    """main's (8251c84) is_sensitive_key, as it was."""
+    return bool(_MAIN_SENSITIVE_NAME.match(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).replace("-", "_")))
+
+
+def _mixed_spellings() -> list[str]:
+    """AG-13's key corpus (poc_predicate.py, 2 645 keys): each tail in mixed spellings, after common
+    prefixes."""
+    prefixes = ["", "db", "DB", "my", "API", "x", "X", "SMTP", "user", "Aws", "aws_", "x-", "_", "--", "HTTP"]
+    keys: set[str] = set()
+    for tail in SENSITIVE_KEY_TAIL.replace("s?", "").split("|"):
+        word = tail.replace("_", "")
+        half = len(word) // 2
+        variants = {
+            tail, tail.upper(), tail.title().replace("_", ""), word, word.upper(), word.capitalize(),
+            tail + "s", (tail + "s").upper(), word[:half].upper() + word[half:], word[:3].upper() + word[3:],
+            word.upper()[:-1] + word[-1:], word.upper() + "s",
+        }  # fmt: skip
+        for variant in variants:
+            for prefix in prefixes:
+                keys.add(prefix + variant)
+                if prefix and prefix[-1].isalpha():
+                    keys.add(prefix + variant[0].upper() + variant[1:])
+    return sorted(keys)
+
+
+def test_no_key_main_called_sensitive_is_readable(redactor: Redactor) -> None:
+    corpus = _mixed_spellings()
+    assert len(corpus) == 2_645
+    lost = [key for key in corpus if _main_is_sensitive(key) and not is_sensitive_key(key)]
+    assert not lost, lost
+    for flags in (0, re.IGNORECASE):  # free text agrees, as for every other key
+        wrong = [k for k in corpus if bool(re.fullmatch(SECRET_KEY_PATTERN, k, flags)) != is_sensitive_key(k)]
+        assert not wrong, (flags, wrong)
+    for key in ["APIkey", "PASSword", "PASSWORDs", "SECRETs", "COOKIEs", "dbPASSword"]:
+        assert redactor.redact_obj({key: SECRET_VALUE}) == {key: REDACTED}, key
+        assert SECRET_VALUE not in redactor.redact(f"{key}={SECRET_VALUE}"), key
 
 
 @pytest.mark.parametrize(

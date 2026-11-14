@@ -44,16 +44,42 @@ def _capitalised(word: str) -> str:
     return word[0].upper() + word[1:]  # "secrets?" -> "Secrets?": a tail word is letters and an optional "s?"
 
 
+def _upper_run(word: str, *, after_lower: str, after_upper: str) -> str:
+    """``word`` as an upper-case run of one letter or more, then lower case: Secret, SECret, SECRET (and the
+    plural's s in either case), the spellings one of ``is_sensitive_key``'s splits reads as one word after a
+    lower-case letter or digit. ``after_lower`` follows a spelling that ends in lower case, ``after_upper``
+    one that ends in upper case. At each letter the run goes on (upper case) or ends (lower case): the two
+    alternatives start on different characters, so the word is read once."""
+    letters = word.removesuffix("s?")
+    plural = letters != word
+
+    def from_letter(at: int) -> str:  # letters[at:], the run still going at ``at``
+        if at == len(letters):
+            return f"(?:S{after_upper}|s{after_lower}|{after_upper})" if plural else after_upper
+        rest = letters[at:] + ("s?" if plural else "") + after_lower
+        return f"(?:{letters[at].upper()}{from_letter(at + 1)}|{rest})"
+
+    return letters[0].upper() + from_letter(1)
+
+
 def _camel_rest(words: list[str], *, after_lower: bool) -> str:
     """The tail words after the first, joined as ``is_sensitive_key`` splits them: by "_" or "-" (the rest is
-    then snake, any case), or by a hump. A Capitalised word starts a word after any letter; an UPPER word only
-    after a lower-case letter (secretKEY splits, SECRETKEY does not)."""
+    then snake, any case), or by a hump. After a lower-case letter a word is any upper-case run then lower
+    case (secretKey, secretKEY, secretKEy); after an upper-case one only a Capitalised word, which the acronym
+    split reads (SECRETKey splits, SECRETKEY and SECRETKEy do not)."""
     if not words:
         return ""
     word, *more = words
-    joints = [rf"[_-](?i:{'[_-]'.join(words)})", _capitalised(word) + _camel_rest(more, after_lower=True)]
-    if after_lower:
-        joints.append(word.upper() + _camel_rest(more, after_lower=False))
+    hump = (
+        _upper_run(
+            word,
+            after_lower=_camel_rest(more, after_lower=True),
+            after_upper=_camel_rest(more, after_lower=False),
+        )
+        if after_lower
+        else _capitalised(word) + _camel_rest(more, after_lower=True)
+    )
+    joints = [rf"[_-](?i:{'[_-]'.join(words)})", hump]
     return "(?:" + "|".join(joints) + ")"
 
 
@@ -63,14 +89,15 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
 
     ``is_sensitive_key`` drops leading underscores and dashes (a private name, a command-line flag), then
     takes a well-known secret name whole, in any case (``names``: ``PGPASSWORD``). Otherwise it splits the
-    rest into words at "_", "-" and humps (``_CAMEL_BOUNDARY``) and asks whether the last words spell a
-    tail. The same name in free text, after any leading "_" or "-" (``self._password``, ``--api-key``):
+    rest into words at "_", "-" and humps, in two ways (``_WORD_BOUNDARIES``: with and without the acronym
+    split), and asks whether the last words spell a tail. The same name in free text, after any leading "_"
+    or "-" (``self._password``, ``--api-key``):
     - snake, kebab or UPPER: the tail starts the name or follows "_"/"-", its words joined by "_" or "-",
       in any case (``db_password``, ``x-api-key``, ``SECRET_KEY``);
     - camel and Pascal: the tail starts where a hump starts a word. A Capitalised tail follows any letter
-      or digit (``clientSecret``, ``DBPassword``); an UPPER tail only a lower-case letter or digit
-      (``dbPASSWORD``; ``DBPASSWORD`` has no hump); a lower-case tail only the start of a word
-      (``secretKey``).
+      or digit (``clientSecret``, ``DBPassword``); an upper-case run then lower case, UPPER included, only a
+      lower-case letter or digit (``dbPASSWORD``, ``dbPASSword``; ``DBPASSWORD`` has no hump); a lower-case
+      tail only the start of a word (``secretKey``).
 
     The camel part is case-sensitive whatever the flags of the pattern it is embedded in: a hump is a case
     change. The snake part is case-insensitive, so it also takes a mixed-case word (``PassWord``) that
@@ -82,15 +109,16 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
     """
     snake: list[str] = []
     lower: list[str] = []
-    upper: list[str] = []
+    upper: list[str] = []  # an upper-case run, then lower case
     capital: list[str] = []
     for tail in tails:
         first, *more = tail.split("_")
         snake.append("[_-]".join([first, *more]))
         if more:  # a lower-case word alone is snake; it needs a hump inside the tail (secretKey)
             lower.append(first + _camel_rest(more, after_lower=True))
-        upper.append(first.upper() + _camel_rest(more, after_lower=False))
-        capital.append(_capitalised(first) + _camel_rest(more, after_lower=True))
+        rest_after_lower, rest_after_upper = (_camel_rest(more, after_lower=case) for case in (True, False))
+        upper.append(_upper_run(first, after_lower=rest_after_lower, after_upper=rest_after_upper))
+        capital.append(_capitalised(first) + rest_after_lower)
     return (
         # Leading "_" (self._password) and "-" (--password), possessive: every alternative after it starts
         # with a letter or digit, so a "_" or "-" given back could never match, and a long run of dashes is
@@ -379,15 +407,24 @@ _PRIMITIVES = (str, int, float, bool, type(None))
 # Where a hump starts a word: after a lower-case letter or digit (clientSecret), and at the last capital of an
 # acronym before a word (SMTPPassword -> SMTP_Password; Lead decision 3.1f2c #14).
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+# The hump alone, main's split (8251c84): it reads a mixed spelling as one word (APIkey, PASSword, dbPASSword:
+# db_PASSword, PASSWORDs), where the acronym split cuts it (AP_Ikey, PAS_Sword, PASSWOR_Ds).
+_HUMP = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# A name is sensitive when either split makes it so: neither drops a key the other keeps (AG-13 F-3, final
+# review of 74bf8d4).
+_WORD_BOUNDARIES = (_CAMEL_BOUNDARY, _HUMP)
 
 
 def is_sensitive_key(name: str) -> bool:
-    """``accessToken``, ``x-api-key``, ``SMTPPassword``, ``_password``, ``--password`` and ``CLIENT_SECRET``
-    all normalise to a sensitive snake_case tail. Leading underscores and dashes are not part of the name
-    (``self._password``, ``mysql --password``). A well-known secret name with no tail (``PGPASSWORD``) is
-    sensitive as a whole name. Free text matches the same names with ``SECRET_KEY_PATTERN``."""
-    normalised = _CAMEL_BOUNDARY.sub("_", name.lstrip("_-")).replace("-", "_")
-    return bool(_SENSITIVE_KEY_NAME.match(normalised)) or name.lstrip("_-").lower() in KNOWN_SECRET_NAMES
+    """``accessToken``, ``x-api-key``, ``SMTPPassword``, ``_password``, ``--password``, ``CLIENT_SECRET`` and
+    ``APIkey`` all normalise to a sensitive snake_case tail, by one of two splits (``_WORD_BOUNDARIES``).
+    Leading underscores and dashes are not part of the name (``self._password``, ``mysql --password``). A
+    well-known secret name with no tail (``PGPASSWORD``) is sensitive as a whole name. Free text matches the
+    same names with ``SECRET_KEY_PATTERN``."""
+    bare = name.lstrip("_-")
+    return bare.lower() in KNOWN_SECRET_NAMES or any(
+        _SENSITIVE_KEY_NAME.match(boundary.sub("_", bare).replace("-", "_")) for boundary in _WORD_BOUNDARIES
+    )
 
 
 def _drop_value(match: re.Match[str]) -> str:

@@ -99,6 +99,11 @@ CASES = [
     ("netrc_value_key_run", "password password " * (KIB_64 // 18)),
     ("bare_value_key_before_spaces", "password=token" + " " * KIB_64 + "x"),
     ("bare_value_long_word", "password=" + "aB" * (KIB_64 // 2) + "="),
+    # AG-13 F-3: after a hump a tail word is any upper-case run then lower case. Runs that never end a tail,
+    # mixed tails one after another (one 64 KiB name), and two-word tails mixed after a hump.
+    ("upper_runs_that_never_end_a_tail", "aPASSWOR" * (KIB_64 // 8)),
+    ("mixed_tail_run", "dbPASSword" * (KIB_64 // 10) + "=V"),
+    ("mixed_two_word_tail_run", "aSecretKEy" * (KIB_64 // 10) + "=V"),
 ]
 
 

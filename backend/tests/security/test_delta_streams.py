@@ -106,6 +106,8 @@ PATHOLOGICAL = {
     "far key": filled("password =" + " " * 32_768 + '"', "w"),
     "spaces before a quote": filled(" " * 32_768 + '"', "w"),
     "camel humps": filled("aB" * 16_384 + ' = "', "w"),
+    # AG-13 F-3 (final review of 74bf8d4): upper-case runs after a hump that never end a tail, before a quote.
+    "upper runs before a quote": filled("aPASSWOR" * 4_096 + ' = "', "w"),
     "dashes": filled("-" * 32_768 + ' "', "w"),
     "dash flags": filled("--password " * 3_000 + '"', "w"),
     "argv item": filled('"--password", ' * 10 + '"', "w"),
