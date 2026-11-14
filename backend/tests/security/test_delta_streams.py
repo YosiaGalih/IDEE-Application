@@ -613,9 +613,7 @@ LATER_RULES = {
     "a key's quoted value": 'password: "Cookie: a="x\ny" z"{}" w"',
     "a key's single-quoted value": "token = 'Cookie: a=\"x\ny\" z'{}' w'",
     "an argv item": '"--password", "Cookie: a="x\ny" z"{}" w"',
-    # netrc's word is never a bare key with its own value (AG-13 F-2): a quoted header name keeps it netrc's.
-    "netrc's word": 'password "Cookie":a="x\ny" z" {}" w',
-    "netrc's key before a header": 'password Cookie:a="x\ny" z" {}" w',
+    "netrc's word": 'password Cookie:a="x\ny" z" {}" w',
     "the #7 swallow": 'password=q=" Cookie: a="x\ny" z"{}" w"',
 }
 

@@ -86,7 +86,7 @@ def _camel_rest(words: list[str], *, after_lower: bool) -> str:
     return "(?:" + "|".join(joints) + ")"
 
 
-def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
+def _secret_key_pattern(tails: Iterable[str], names: Iterable[str], *, words_before: bool = True) -> str:
     """One sensitive key name, generated from the tails so a non-secret name never matches (Lead decision
     3.1f2c #2): a pattern for any identifier would swallow ``note="password=v"`` whole, secret and all.
 
@@ -108,7 +108,10 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
     caller anchors the name (``_KEY_VALUE``, the delta stream's key check). Every alternative is a fixed
     word after a run of ``[A-Za-z0-9]``, so a match tried from one start is linear in the name, and the
     leading run of "_" and "-" is possessive, so it is read once. Two lookaheads only fail early what could
-    not match (tests/unit/test_redaction.py compares the pattern with and without them).
+    not match (tests/unit/test_redaction_internals.py compares the pattern with and without them).
+
+    With ``words_before=False``, the tail alone: no word or hump before it (``secret``, ``secretKey``,
+    ``PASSWORD``; not ``db_password`` or ``clientSecret``).
     """
     snake: list[str] = []
     lower: list[str] = []
@@ -122,6 +125,9 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
         rest_after_lower, rest_after_upper = (_camel_rest(more, after_lower=case) for case in (True, False))
         upper.append(_upper_run(first, after_lower=rest_after_lower, after_upper=rest_after_upper))
         capital.append(_capitalised(first) + rest_after_lower)
+    words = r"(?:[A-Za-z0-9]+[_-])*" if words_before else ""  # the words before the tail's own segment
+    hump_after_lower = r"(?:[A-Za-z0-9]*[a-z0-9])?" if words_before else ""
+    hump_after_any = r"[A-Za-z0-9]*" if words_before else ""
     return (
         # Leading "_" (self._password) and "-" (--password), possessive: every alternative after it starts
         # with a letter or digit, so a "_" or "-" given back could never match, and a long run of dashes is
@@ -131,14 +137,14 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
         # at any other position the pattern fails at once instead of trying every alternative.
         r"(?=(?i:[A-Za-z0-9]))"
         rf"(?:(?i:{'|'.join(sorted(names))})|"  # a well-known secret name, whole
-        r"(?:[A-Za-z0-9]+[_-])*"  # the words before the tail's own segment
+        rf"{words}"
         rf"(?:(?i:{'|'.join(snake)})"
         # A camel or Pascal form holds a capital before any character other than a lower-case letter or
         # digit (one with none, secret_key, is a snake form on the same span, tried first), so a lower-case
         # word does not try every hump of every tail.
         rf"|(?-i:(?=[a-z0-9]*[A-Z])(?:(?:{'|'.join(lower)})"
-        rf"|(?:[A-Za-z0-9]*[a-z0-9])?(?:{'|'.join(upper)})"
-        rf"|[A-Za-z0-9]*(?:{'|'.join(capital)}))))"
+        rf"|{hump_after_lower}(?:{'|'.join(upper)})"
+        rf"|{hump_after_any}(?:{'|'.join(capital)}))))"
         r")"
     )
 
@@ -146,6 +152,11 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
 # One sensitive key name, the free-text form of ``is_sensitive_key``: ``_KEY_VALUE`` here, the delta stream's
 # key check in app.agents.runtime. A regex source with no boundary lookaround; the caller adds the boundaries.
 SECRET_KEY_PATTERN = _secret_key_pattern(SENSITIVE_KEY_TAIL.split("|"), _KNOWN_SECRET_NAMES)
+# The tail alone, no words before it (_NOT_A_KEY): a key whose words before the tail stay readable may hold a
+# secret glued to a tail word ("<secret>Cookie: x").
+_SECRET_TAIL_PATTERN = _secret_key_pattern(
+    SENSITIVE_KEY_TAIL.split("|"), _KNOWN_SECRET_NAMES, words_before=False
+)
 
 # The characters a case-insensitive pattern takes for an ASCII letter besides its two cases (Python's re;
 # tests/unit/test_redaction.py checks all of Unicode for every letter).
@@ -310,12 +321,19 @@ _QUOTED = r"""
         )
 """
 
-# A word that is itself a key with a value of its own: a secret key and its separator (password: in
-# "token: password: V", secret in "self._password = secret = V"), or netrc's key and a word after it
-# (password in "api-key: password V"). No unquoted value takes one (_BARE, netrc's word): the key gets its own
-# match, so its own value is redacted (AG-13 F-2). A lookahead from where the value starts: one key, the
-# spaces after it, one character.
-_NOT_A_KEY = rf"(?!(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-])\s*+[:=]|{_NETRC_KEY}[\ \t]++(?![:=])\S)"
+# A word that is itself a key whose value lies past it: a secret key's tail alone, spaces before or after
+# its separator, and the first character of a value (password: in "token: password: V", secret in
+# "self._password = secret = V"), or netrc's key, after any dashes, and a word after it (password in
+# "api-key: password V"). No unquoted value takes one (_BARE, netrc's word): the key gets its own match, so
+# its own value is redacted (AG-13 F-2). Otherwise the word stays the value, taken whole, so nothing in it
+# stays raw: a key glued to its separator and value is one word with them; one with no value after it gets
+# no match of its own; one with words before its tail may be a secret glued to a tail word
+# ("<secret>Cookie: x", "<secret>-cookie= o"), which a match of its own would keep. A lookahead from where
+# the value starts: one key, the spaces around its separator, one character.
+_NOT_A_KEY = (
+    rf"(?!(?:{_SECRET_TAIL_PATTERN})(?![A-Za-z0-9_-])(?:\s++[:=]|[:=]\s)\s*+(?:[^\s&;,\\]|\\[\"'])"
+    rf"|-*+{_NETRC_KEY}[\ \t]++(?![:=])\S)"
+)
 
 # An unquoted value: one word, never a key with its own value (_NOT_A_KEY). A word that ends in ":" or "="
 # immediately followed, on the same line, by a quoted string takes the string too: a key was taken as the

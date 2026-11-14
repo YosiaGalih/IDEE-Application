@@ -718,7 +718,7 @@ def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, te
         (f"api-key: password {V}", f"api-key: password {REDACTED}"),
         # Raw on main too.
         (f"password: token: {V}", f"password: token: {REDACTED}"),
-        (f"password=token={V}", f"password=token={REDACTED}"),
+        (f"password=token= {V}", f"password=token= {REDACTED}"),
         # A flag's bare value and netrc's.
         (f"tool --token password {V}", f"tool --token password {REDACTED}"),
         (f"machine h password password {V}", f"machine h password password {REDACTED}"),
@@ -726,6 +726,21 @@ def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, te
         (f"password=hunter2 {V}", f"password={REDACTED} {V}"),
         ("--password password", f"--password {REDACTED}"),
         ("token: password", f"token: {REDACTED}"),
+        # A word that reads as a key and its separator, with no value of its own after it (a secret glued to
+        # "-cookie=" at the end of the text), or with its value glued to it in the same word: the word is the
+        # value, taken whole, so nothing of it stays.
+        (f"apikey:{V}-cookie=", f"apikey:{REDACTED}"),
+        (f"token: {V}-secret: ;", f"token: {REDACTED} ;"),
+        ("password: token: ;", f"password: {REDACTED} ;"),
+        (f"apikey:{V}-cookie=o", f"apikey:{REDACTED}"),
+        (f"password=token={V}", f"password={REDACTED}"),
+        # Only a tail alone is refused: a key with words before its tail may be a secret glued to a tail word,
+        # which a match of its own would keep (the AG-13 grammar fuzz against main, seed 1).
+        (f"password {V}Cookie: s", f"password {REDACTED} {REDACTED}"),  # the camel key takes "s" first
+        (f"credential:{V}_secret: Q", f"credential:{REDACTED} Q"),
+        (f"apikey:{V}-cookie= o", f"apikey:{REDACTED} o"),
+        # netrc's key after dashes is netrc's key too (_NETRC reads a "-" before it).
+        (f"_password=-Password {V}", f"_password=-Password {REDACTED}"),
     ],
     ids=[
         "private-name",
@@ -738,6 +753,15 @@ def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, te
         "no-key",
         "flag-word",
         "key-alone",
+        "key-without-a-value-at-the-end",
+        "key-without-a-value",
+        "tail-without-a-value",
+        "key-and-value-in-one-word",
+        "glued-key-equals",
+        "secret-before-a-camel-tail",
+        "secret-before-a-snake-tail",
+        "secret-before-a-kebab-tail",
+        "netrc-after-a-dash",
     ],
 )
 def test_a_value_never_takes_a_key_with_its_own_value(redactor: Redactor, text: str, expected: str) -> None:
@@ -1167,10 +1191,7 @@ def test_redact_with_stop_changes_no_output() -> None:
         ('Cookie: a b"q', len("Cookie: ")),  # nothing after the header rule changed it: the marker itself
         ('x: 1\nCookie: a="x\ny" z"q', len("x: 1\nCookie: ")),  # carried onto a later line by a parameter
         ('password: "Cookie: a="x\ny" z"q', 0),  # a key's quoted value paired the stop: its last line
-        # netrc took the marker: its last line. A quoted header name: netrc's word is never a bare key with
-        # its own value (AG-13 F-2), so after an unquoted Cookie: the header rule keeps its stop.
-        ('note\npassword "Cookie":a="x\ny" z" q', len("note\n")),
-        ('note\npassword Cookie:a="x\ny" z" q', len("note\npassword Cookie:")),
+        ('note\npassword Cookie:a="x\ny" z" q', len("note\n")),  # netrc took the marker: its last line
         ('Cookie: a b"q\nnext line', None),  # the line ended: the value is final
         ('token = "abc', None),  # no header
         ("Cookie: a b c", None),  # the value runs to the end of its line

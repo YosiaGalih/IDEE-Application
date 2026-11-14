@@ -101,6 +101,10 @@ CASES = [
     ("netrc_value_key_run", "password password " * (KIB_64 // 18)),
     ("bare_value_key_before_spaces", "password=token" + " " * KIB_64 + "x"),
     ("bare_value_long_word", "password=" + "aB" * (KIB_64 // 2) + "="),
+    # A2 follow-up: only a tail alone, with spaces around its separator, is refused. Spaced keys as values one
+    # after another, and a 64 KiB word before a tail (no tail alone).
+    ("bare_value_spaced_key_run", "password= token= " * (KIB_64 // 17)),
+    ("bare_value_word_before_a_tail", "password=" + "a" * KIB_64 + "Cookie: x"),
     # AG-13 F-3: after a hump a tail word is any upper-case run then lower case. Runs that never end a tail,
     # mixed tails one after another (one 64 KiB name), and two-word tails mixed after a hump.
     ("upper_runs_that_never_end_a_tail", "aPASSWOR" * (KIB_64 // 8)),
