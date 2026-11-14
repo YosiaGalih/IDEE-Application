@@ -269,10 +269,19 @@ _QUOTED = r"""
         )
 """
 
-# An unquoted value: one word. A word that ends in ":" or "=" immediately followed, on the same line, by a
-# quoted string takes the string too: a key was taken as the value of the key before it (password : password:
-# "V"; Lead decision #7). Not across a line: "password=None):" then a docstring on the next line.
+# A word that is itself a key with a value of its own: a secret key and its separator (password: in
+# "token: password: V", secret in "self._password = secret = V"), or netrc's key and a word after it
+# (password in "api-key: password V"). No unquoted value takes one (_BARE, netrc's word): the key gets its own
+# match, so its own value is redacted (AG-13 F-2). A lookahead from where the value starts: one key, the
+# spaces after it, one character.
+_NOT_A_KEY = rf"(?!(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-])\s*+[:=]|{_NETRC_KEY}[\ \t]++(?![:=])\S)"
+
+# An unquoted value: one word, never a key with its own value (_NOT_A_KEY). A word that ends in ":" or "="
+# immediately followed, on the same line, by a quoted string takes the string too: a key was taken as the
+# value of the key before it (password : password: "V"; Lead decision #7). Not across a line:
+# "password=None):" then a docstring on the next line.
 _BARE = rf"""
+        {_NOT_A_KEY}
         [^\s"'&;,\\]++(?:(?<=[:=])[\ \t]*+(?:{_QUOTED})
                        |(?:(?<=[:=][bBfFrRuU])|(?<=[:=][bBfFrRuU][bBfFrRuU]))(?=["'])(?:{_QUOTED}))?
 """
@@ -352,12 +361,14 @@ _ARGV_VALUE = re.compile(
 )
 
 # .netrc: "... password <value>", on one line. Never a separator: password = "V" is _KEY_VALUE's (#6). A value
-# that reads as a secret flag takes the word after it, as in _ARG.
+# that reads as a secret flag takes the word after it, as in _ARG. Its word is never a key with its own value
+# (_NOT_A_KEY), as a bare value.
 _NETRC = re.compile(
     rf"""(?ix)
     (?<![A-Za-z0-9_])(?P<key>{_NETRC_KEY})
     (?P<sep>[\ \t]++)
-    (?P<value>(?![:=])(?:{_SECRET_FLAG_WORD}(?:[\ \t]++{_SECRET_FLAG_WORD})*+(?:[\ \t]++\S+)?|\S+))
+    (?P<value>(?![:=])(?:{_SECRET_FLAG_WORD}(?:[\ \t]++{_SECRET_FLAG_WORD})*+(?:[\ \t]++{_NOT_A_KEY}\S+)?
+                        |{_NOT_A_KEY}\S+))
     """
 )
 

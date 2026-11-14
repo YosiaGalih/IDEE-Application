@@ -92,6 +92,13 @@ CASES = [
     ("escaped_quotes_on_one_line", 'password="' + '\\"' * (KIB_64 // 2)),
     ("escaped_apostrophes_on_one_line", "password='" + "\\'" * (KIB_64 // 2)),
     ("backslash_closes_on_many_lines", "password='a\\'\n" * (KIB_64 // 14)),
+    # AG-13 F-2: a bare value is never a key with its own value. Keys as values one after another, netrc's
+    # key as a value, a key before 64 KiB of spaces, and one 64 KiB word read as a key.
+    ("bare_value_key_run", "password=token=" * (KIB_64 // 15)),
+    ("bare_value_netrc_key_run", "token: password " * (KIB_64 // 16)),
+    ("netrc_value_key_run", "password password " * (KIB_64 // 18)),
+    ("bare_value_key_before_spaces", "password=token" + " " * KIB_64 + "x"),
+    ("bare_value_long_word", "password=" + "aB" * (KIB_64 // 2) + "="),
 ]
 
 

@@ -672,6 +672,44 @@ def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, te
     assert V not in redactor.redact(text)
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A key the new key forms recognise used to take the next key as its bare value (redacted on main).
+        (f'self._password = secret = "{V}"', f"self._password = secret = {REDACTED}"),
+        (f"clientSecret = password = '{V}'", f"clientSecret = password = {REDACTED}"),
+        (f"api-key: password {V}", f"api-key: password {REDACTED}"),
+        # Raw on main too.
+        (f"password: token: {V}", f"password: token: {REDACTED}"),
+        (f"password=token={V}", f"password=token={REDACTED}"),
+        # A flag's bare value and netrc's.
+        (f"tool --token password {V}", f"tool --token password {REDACTED}"),
+        (f"machine h password password {V}", f"machine h password password {REDACTED}"),
+        # A word that is no key, or a key with no value of its own, is still the value.
+        (f"password=hunter2 {V}", f"password={REDACTED} {V}"),
+        ("--password password", f"--password {REDACTED}"),
+        ("token: password", f"token: {REDACTED}"),
+    ],
+    ids=[
+        "private-name",
+        "camel",
+        "kebab-netrc",
+        "key-colon",
+        "key-equals",
+        "flag",
+        "netrc",
+        "no-key",
+        "flag-word",
+        "key-alone",
+    ],
+)
+def test_a_value_never_takes_a_key_with_its_own_value(redactor: Redactor, text: str, expected: str) -> None:
+    """AG-13 F-2 (final review of 74bf8d4): a bare value (also a flag's and netrc's) never takes a word that
+    is itself a secret key followed by its separator, or netrc's key followed by a word: that key gets its
+    own match, so its value is redacted."""
+    assert redactor.redact(text) == expected
+
+
 def test_a_value_after_a_token_is_redacted_once(redactor: Redactor) -> None:
     assert redactor.redact("ghp_" + "A1b2C3d4E5" * 4 + f'password="{V}"') == f"{REDACTED}={REDACTED}"
     # A token in a list or a JSON value is followed by no assignment: nothing more is removed.
@@ -1145,7 +1183,10 @@ def test_redact_with_stop_changes_no_output() -> None:
         ('Cookie: a b"q', len("Cookie: ")),  # nothing after the header rule changed it: the marker itself
         ('x: 1\nCookie: a="x\ny" z"q', len("x: 1\nCookie: ")),  # carried onto a later line by a parameter
         ('password: "Cookie: a="x\ny" z"q', 0),  # a key's quoted value paired the stop: its last line
-        ('note\npassword Cookie:a="x\ny" z" q', len("note\n")),  # netrc took the marker: its last line
+        # netrc took the marker: its last line. A quoted header name: netrc's word is never a bare key with
+        # its own value (AG-13 F-2), so after an unquoted Cookie: the header rule keeps its stop.
+        ('note\npassword "Cookie":a="x\ny" z" q', len("note\n")),
+        ('note\npassword Cookie:a="x\ny" z" q', len("note\npassword Cookie:")),
         ('Cookie: a b"q\nnext line', None),  # the line ended: the value is final
         ('token = "abc', None),  # no header
         ("Cookie: a b c", None),  # the value runs to the end of its line
