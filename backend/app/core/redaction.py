@@ -525,10 +525,15 @@ def stopped_at_open_quote(redacted: str) -> int | None:
 
 
 def _is_secret_flag(item: object) -> bool:
-    """A command-line flag whose value is a secret: ``--password``, ``-api-key``, and ``--password=`` with its
-    value left to the next item (silent-failure review MEDIUM-1). ``--password=V`` is not (its value is in the
-    same string, which the text patterns redact); neither is ``--password-file``."""
-    return isinstance(item, str) and item.startswith("-") and is_sensitive_key(item.removesuffix("="))
+    """A command-line flag whose value is a secret: ``--password``, ``-api-key``, and ``--password=`` or
+    ``--password:`` with its value left to the next item (silent-failure review MEDIUM-1; AG-13 L-2, delta
+    review of 2ac73c3). A bytes item is read as UTF-8 with errors replaced, as a bytes key is (``_key_name``):
+    ``[b"--password", b"V"]``. ``--password=V`` is not (its value is in the same string, which the text
+    patterns redact); neither is ``--password-file``."""
+    flag = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else item
+    if not isinstance(flag, str) or not flag.startswith("-"):
+        return False
+    return is_sensitive_key(flag[:-1] if flag.endswith(("=", ":")) else flag)
 
 
 def _key_name(key: object) -> str | None:

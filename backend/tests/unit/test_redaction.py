@@ -942,6 +942,27 @@ def test_redact_obj_reads_a_bytes_key() -> None:
     assert redactor.redact_obj({b"api_key": None, 7: V}) == {b"api_key": None, 7: V}
 
 
+def test_redact_obj_reads_a_flag_ending_in_a_colon() -> None:
+    """AG-13 L-2 (delta review of 2ac73c3): a flag that ends in ":" with nothing after it is a secret flag, as
+    one that ends in "=": its value is the next item."""
+    redactor = Redactor()
+    assert redactor.redact_obj(["--password:", V]) == ["--password:", REDACTED]
+    assert redactor.redact_obj(("-api-key:", V, "next")) == ("-api-key:", REDACTED, "next")
+    assert redactor.redact_obj(["--password:", None, "next"]) == ["--password:", None, "next"]
+    assert redactor.redact_obj(["--note:", "kept"]) == ["--note:", "kept"]  # no secret flag
+
+
+def test_redact_obj_reads_a_bytes_flag() -> None:
+    """AG-13 L-2: a bytes item is read as text (UTF-8, errors replaced) for the secret-flag check, as a
+    bytes key is, so the item after it is dropped. The flag itself is kept, or rendered with stringify."""
+    redactor = Redactor()
+    assert redactor.redact_obj([b"--password", b"V"]) == [b"--password", REDACTED]
+    assert redactor.redact_obj((b"--token", V)) == (b"--token", REDACTED)
+    assert redactor.redact_obj([b"--password=", V]) == [b"--password=", REDACTED]
+    assert redactor.redact_obj([b"--password", b"V"], stringify=True) == ["--password", REDACTED]
+    assert redactor.redact_obj([b"--pass\xffword", "kept"]) == [b"--pass\xffword", "kept"]  # U+FFFD splits it
+
+
 def test_a_secret_flag_as_a_value_takes_the_word_after_it(redactor: Redactor) -> None:
     # "--no-password" takes the next word (Lead ruling #15). When that word is itself a secret flag, its own
     # value follows it: both go (Lead ruling on the Task 2 review, Important 1).
