@@ -1,8 +1,12 @@
-"""Redaction patterns — SECURITY_MODEL §6.2, ADR-030, appendix T12, M.2 (AC-15)."""
+"""Redaction patterns — SECURITY_MODEL §6.2, ADR-030, appendix T12, M.2 (AC-15).
+
+Black-box: through ``Redactor`` (``redact``, ``redact_with_stop``, ``find``, ``redact_obj``),
+``is_sensitive_key`` and ``SECRET_KEY_PATTERN`` only. Tests that read the module's private patterns are in
+``tests/unit/test_redaction_internals.py``.
+"""
 
 from __future__ import annotations
 
-import functools
 import json
 import random
 import re
@@ -10,25 +14,10 @@ import re
 import pytest
 
 from app.core.redaction import (
-    _AFTER_REDACTED,
-    _ARGV_VALUE,
-    _CASE_FOLDS,
-    _FLAG_VALUE,
-    _KEY_VALUE,
-    _NAMED_PATTERNS,
-    _NETRC,
-    _NETRC_KEY,
-    _PATTERNS,
-    _URL_CREDENTIALS,
-    CREDENTIAL_HEADER,
-    CREDENTIAL_HEADER_NAMES,
-    KEY_HINT,
-    KNOWN_SECRET_NAMES,
     REDACTED,
     SECRET_KEY_PATTERN,
     SENSITIVE_KEY_TAIL,
     Redactor,
-    _drop_value,
     is_sensitive_key,
 )
 
@@ -1011,12 +1000,13 @@ def test_names_near_a_known_secret_name_stay_readable(redactor: Redactor, text: 
     assert redactor.redact(text) == text
 
 
-def test_known_secret_names_are_exact_names_in_both_layers() -> None:
-    from app.core.redaction import KNOWN_SECRET_NAMES
+KNOWN_NAMES = ["pgpassword", "mysql_pwd", "rediscli_auth"]  # tests/unit/test_redaction_internals.py pins them
 
-    assert KNOWN_SECRET_NAMES == frozenset({"pgpassword", "mysql_pwd", "rediscli_auth"})
+
+def test_known_secret_names_are_exact_names_in_both_layers() -> None:
     near = ["PGPASSWORD", "--pgpassword", "_MYSQL_PWD", "pgpasswords", "MYSQL_PWD_FILE", "x_pgpassword"]
-    keys = [*KNOWN_SECRET_NAMES, *(name.upper() for name in KNOWN_SECRET_NAMES), *near, "mysql-pwd", "pwd"]
+    keys = [*KNOWN_NAMES, *(name.upper() for name in KNOWN_NAMES), *near, "mysql-pwd", "pwd"]
+    assert all(is_sensitive_key(name) for name in KNOWN_NAMES)
     for flags in (0, re.IGNORECASE):
         wrong = [k for k in keys if bool(re.fullmatch(SECRET_KEY_PATTERN, k, flags)) != is_sensitive_key(k)]
         assert not wrong, (flags, wrong)
@@ -1141,60 +1131,7 @@ def test_every_private_key_block_is_redacted(redactor: Redactor, text: str) -> N
     assert [finding.rule for finding in redactor.find(text)] == ["private_key"]
 
 
-# --- The fix round's speed-ups change no output (WP-3.1f2c, Lead ruling on the delta's time budget) ---
-# Redactor.redact skips a rule on a text that cannot hold a match of it (KEY_HINT and one character per
-# rule), the jwt pattern leads with its literal, and SECRET_KEY_PATTERN fails early where it could not match.
-# Each must leave every output as it was: these tests compare with the rules run in full and with the
-# patterns' former forms.
-
-_ALL_CHARACTERS = "".join(map(chr, [*range(0xD800), *range(0xE000, 0x110000)]))
-
-
-@functools.cache
-def _case_variants(letter: str) -> str:
-    """Every character a case-insensitive pattern takes for ``letter``, from all of Unicode."""
-    return "".join(match[0] for match in re.finditer(f"(?i){re.escape(letter)}", _ALL_CHARACTERS))
-
-
-def _tail_words() -> list[str]:
-    words: list[str] = []
-    for tail in SENSITIVE_KEY_TAIL.split("|"):
-        words += [tail.replace("s?", ""), tail.replace("s?", "s")] if tail.endswith("s?") else [tail]
-    return words
-
-
-# The same sources KEY_HINT is built from (review M-2 of 50610b5): one header list, the netrc key, the marker.
-HINTED_WORDS = [*_tail_words(), *sorted(KNOWN_SECRET_NAMES), *CREDENTIAL_HEADER_NAMES, _NETRC_KEY, REDACTED]
-
-
-def test_the_case_folds_are_every_character_a_case_insensitive_letter_takes() -> None:
-    """KEY_HINT's lead class adds these to each letter's two cases: Python's re takes exactly these for an
-    ASCII letter under IGNORECASE, over all of Unicode."""
-    for letter in "abcdefghijklmnopqrstuvwxyz":
-        expected = {letter, letter.upper(), *_CASE_FOLDS.get(letter, "")}
-        assert set(_case_variants(letter)) == expected, letter
-
-
-@pytest.mark.parametrize("word", HINTED_WORDS)
-def test_key_hint_finds_every_word_the_rules_read_in_every_case(word: str) -> None:
-    """Every key, header name and marker the six skippable rules read holds a word of KEY_HINT, in every
-    character a case-insensitive pattern takes for each of its letters (the long s for s, the Kelvin sign for
-    k)."""
-    assert KEY_HINT.search(word) and KEY_HINT.search(word.upper()) and KEY_HINT.search(word.title())
-    for at, letter in enumerate(word):
-        for variant in _case_variants(letter) if letter.isalpha() else letter:
-            assert KEY_HINT.search(word[:at] + variant + word[at + 1 :]), (word, at, hex(ord(variant)))
-
-
-def _every_rule(text: str) -> str:
-    """``Redactor().redact`` with no rule skipped: the reference for the skips."""
-    for pattern in _PATTERNS:
-        text = pattern.sub(REDACTED, text)
-    text = _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)
-    for rule in (_AFTER_REDACTED, CREDENTIAL_HEADER, _KEY_VALUE, _FLAG_VALUE, _ARGV_VALUE, _NETRC):
-        text = rule.sub(_drop_value, text)
-    return text
-
+# --- redact_with_stop: the delta stream's redaction (reviews of 45c2ec7 and 08fa05e) ---
 
 # Characters a case-insensitive pattern folds onto ASCII letters: long s, Kelvin sign, dotless i, dotted I.
 LONG_S, KELVIN, DOTLESS_I, DOTTED_I = "\u017f", "\u212a", "\u0131", "\u0130"
@@ -1212,59 +1149,6 @@ FUZZ_PIECES = [
     "-eyJabcde.eyJfghij.klmnopqrstuv", "https://user:pw@host/x", "ftp://" + "Pq9" * 4 + "@h", "://",
     "-----BEGIN RSA PRIVATE KEY-----\nMII", KELVIN, DOTLESS_I, DOTTED_I, "\u00e9",
 ]  # fmt: skip
-
-
-def test_the_rules_redact_skips_could_not_have_matched() -> None:
-    rnd = random.Random(31)  # noqa: S311 - a reproducible fuzz, not a secret
-    redactor = Redactor()
-    for _ in range(4_000):
-        text = "".join(rnd.choice(FUZZ_PIECES) for _ in range(rnd.randint(1, 16)))
-        assert redactor.redact(text) == _every_rule(text), text
-
-
-# The jwt pattern as it was before the fix round: the start checked before the literal.
-_JWT_BEFORE = re.compile(
-    r"(?:(?<![A-Za-z0-9_-])|(?<=^-)|(?<=[^A-Za-z0-9_-]-))"
-    r"eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
-)
-
-
-def test_the_jwt_pattern_matches_what_its_former_form_did() -> None:
-    jwt = dict(_NAMED_PATTERNS)["jwt"]
-    pieces = ["eyJ", "-", "a", ".", " ", "\n", "_", "x", "eyJhbGci", ".eyJzdWIi", "AbCdEfGhIjK", "Z", "é"]
-    rnd = random.Random(7)  # noqa: S311 - a reproducible fuzz, not a secret
-    for _ in range(20_000):
-        text = "".join(rnd.choice(pieces) for _ in range(rnd.randint(0, 25)))
-        assert [m.span() for m in jwt.finditer(text)] == [m.span() for m in _JWT_BEFORE.finditer(text)], text
-
-
-def test_the_key_pattern_matches_what_it_did_without_its_lookaheads() -> None:
-    """The two lookaheads only fail early where no alternative could match: with and without them the
-    pattern matches the same spans, inside a case-insensitive pattern (as _KEY_VALUE embeds it) and outside
-    one."""
-    lookaheads = ["(?=(?i:[A-Za-z0-9]))", "(?=[a-z0-9]*[A-Z])"]
-    assert all(lookahead in SECRET_KEY_PATTERN for lookahead in lookaheads)
-    without = SECRET_KEY_PATTERN
-    for lookahead in lookaheads:
-        without = without.replace(lookahead, "")
-    pieces = [
-        "pass", "Pass", "PASS", "word", "Word", "WORD", "wd", "secret", "Secret", "SECRET", "Key", "key",
-        "KEY", "api", "Api", "API", "access", "Access", "private", "Private", "token", "Token", "TOKEN",
-        "session", "Session", "cookie", "Cookie", "set", "Set", "jwt", "JWT", "bearer", "ticket",
-        "credential", "s", "Id",
-        "db", "DB", "x", "X", "2", "3", "_", "-", LONG_S, KELVIN, DOTLESS_I, DOTTED_I, "\u00e9", "pgpassword",
-        "mysql_pwd", "aB", "ecret", "ession",
-    ]  # fmt: skip
-    boundaries = r"(?ix)(?<![A-Za-z0-9_-])(?:{})(?![A-Za-z0-9_-])"
-    compiled = [
-        (re.compile(boundaries.format(SECRET_KEY_PATTERN)), re.compile(boundaries.format(without))),
-        (re.compile(SECRET_KEY_PATTERN), re.compile(without)),
-    ]
-    rnd = random.Random(11)  # noqa: S311 - a reproducible fuzz, not a secret
-    for _ in range(20_000):
-        text = "".join(rnd.choice(pieces) for _ in range(rnd.randint(1, 8)))
-        for fast, slow in compiled:
-            assert [m.span() for m in fast.finditer(text)] == [m.span() for m in slow.finditer(text)], text
 
 
 def test_redact_with_stop_changes_no_output() -> None:
