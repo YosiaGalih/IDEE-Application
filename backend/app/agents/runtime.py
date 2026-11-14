@@ -41,6 +41,7 @@ from app.core.redaction import (
     CREDENTIAL_HEADER_NAMES,
     CREDENTIAL_HEADER_START,
     KEY_HINT,
+    REDACTED,
     SECRET_KEY_PATTERN,
     URL_SCHEME_PATTERN,
     Redactor,
@@ -267,6 +268,23 @@ def _open_header(text: str) -> int | None:
     return None
 
 
+# A value the redactor ended at a quote: its marker, then the quote (CREDENTIAL_HEADER, review of 0733969).
+_STOPPED_AT_QUOTE: Final = (REDACTED + '"', REDACTED + "'")
+
+
+def stopped_at_open_quote(redacted: str) -> int | None:
+    """Where, in the REDACTED text, a value ends at a quote on its last line, or None (review round 2 of
+    0733969). The redactor ends a header value at a quote its line has not closed (CREDENTIAL_HEADER); the
+    line may still close it, and the value then takes the quoted part, so until the line ends the value's
+    marker and all after it are held. A parameter's quote may carry the value onto later lines: the marker
+    then stands on the line where the value now ends, which this finds wherever the header's name is. It reads
+    the redactor's own output, where the redactor paired the quotes with tokens, URL credentials and literals
+    already replaced, so no quote of the raw text is paired here. Two searches from the last line break:
+    linear."""
+    line = max(redacted.rfind("\n"), redacted.rfind("\r")) + 1
+    return min((at for end in _STOPPED_AT_QUOTE if (at := redacted.find(end, line)) != -1), default=None)
+
+
 def delta_hold(redactor: Redactor) -> int:
     """The ``hold`` of a run's delta stream (Lead decision 3.1f2c #11): DELTA_HOLD_CHARS, or the longest
     configured literal less one when that is more. A literal is redacted only once it is whole, so a part of
@@ -300,8 +318,9 @@ class DeltaRedactor:
     The text of the current model call is redacted whole, never a piece of it, so a secret cut across deltas
     is seen whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
     characters (a run's is ``delta_hold``: never less than its longest configured literal less one), and
-    nothing from the start of a candidate still open at the end of the raw text
-    (``open_candidate``), minus what already went out. ``flush`` ends the call: its final redacted text goes
+    nothing from the start of a candidate still open at the end of the raw text (``open_candidate``), nor
+    from a value the redactor ended at a quote its last line may still close (``stopped_at_open_quote``),
+    minus what already went out. ``flush`` ends the call: its final redacted text goes
     out and is committed, never redacted again. When redacting a longer text changes what already went out, a
     ``reset`` delta carries the committed text of the calls before, then the current call's stable text: the
     client replaces, never appends. ``restart`` (a retried attempt) voids the current call's text, held or
@@ -359,6 +378,8 @@ class DeltaRedactor:
             start = open_candidate(self._text)
             if start is not None:
                 safe = min(safe, self._redacted_before(start, redacted))
+            if (stopped := stopped_at_open_quote(redacted)) is not None:
+                safe = min(safe, stopped)
         stable = redacted[: max(safe, 0)]
         if not consistent:
             self._sent = stable

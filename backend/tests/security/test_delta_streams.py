@@ -20,7 +20,14 @@ from collections.abc import Iterable
 
 import pytest
 
-from app.agents.runtime import DELTA_HOLD_CHARS, Delta, DeltaRedactor, delta_hold, open_candidate
+from app.agents.runtime import (
+    DELTA_HOLD_CHARS,
+    Delta,
+    DeltaRedactor,
+    delta_hold,
+    open_candidate,
+    stopped_at_open_quote,
+)
 from app.agents.runtime import DELTA_RELEASE_CHARS as DELTA_RELEASE
 from app.core.redaction import Redactor
 
@@ -420,3 +427,38 @@ def test_a_header_value_never_streams_raw_whatever_the_redactor_replaces(line: s
     events = stream(DeltaRedactor(redactor.redact, hold=delta_hold(redactor)), pieces(text, size))
     assert leaked(events, VALUE) == []
     assert client(events) == redactor.redact(text)
+
+
+# Review round 2 of 0733969: a parameter's quote carries a header value onto later lines, where a quote that
+# is not a parameter's may stop it while its line is open. The delta holds from the value's marker in the
+# redacted text, wherever the header's name is, and pairs no quote of the raw text.
+HEADER_CONTINUATIONS: dict[str, tuple[str, list[str]]] = {
+    "a quote after the parameter's line": ('Cookie: a="x\ny" z"{}" w', []),
+    "a quoted part after the parameter": ('Cookie: a="x\ny"; "{}"', []),
+    "digest parameters": ('Authorization: Digest realm="a\n b", "{}"', []),
+    "a literal with a quote on the continuation": ('Cookie: a="x\ny" Pa55"word9 z"{}" w', ['Pa55"word9']),
+    "single quotes": ("Cookie: a='x\ny' z'{}' w", []),
+}
+
+
+@pytest.mark.parametrize("line", list(HEADER_CONTINUATIONS))
+@pytest.mark.parametrize("size", [1, 7, 16, 64, 255, 257])
+def test_a_header_value_carried_onto_later_lines_never_streams_raw(line: str, size: int) -> None:
+    template, literals = HEADER_CONTINUATIONS[line]
+    redactor = Redactor(literals)
+    text = INTRO + template.format(VALUE) + TAIL
+    assert not any(window in redactor.redact(text) for window in windows(VALUE))  # the redactor takes it
+    events = stream(DeltaRedactor(redactor.redact, hold=delta_hold(redactor)), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == redactor.redact(text)
+
+
+def test_a_value_stopped_at_a_quote_is_held_only_while_its_line_is_open() -> None:
+    assert stopped_at_open_quote('Cookie: [REDACTED]"abc') == len("Cookie: ")
+    assert stopped_at_open_quote("x-api-key: [REDACTED]'a") == len("x-api-key: ")
+    assert stopped_at_open_quote('Cookie: [REDACTED]"abc\nThe answer goes on.') is None
+    assert stopped_at_open_quote("Cookie: [REDACTED] done") is None
+    text = 'Cookie: a b"q\n' + "The answer goes on after it. " * 60
+    redactor = DeltaRedactor(REDACTOR.redact)
+    shown = client(e for e in (redactor.feed(piece) for piece in pieces(text, 16)) if e is not None)
+    assert len(shown) >= len(REDACTOR.redact(text)) - DELTA_HOLD_CHARS - DELTA_RELEASE

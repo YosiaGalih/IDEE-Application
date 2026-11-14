@@ -84,6 +84,8 @@ CASES = [
     ("header_name_crlf", "Cookie:" + "\r\n" * (KIB_64 // 2) + '"'),
     ("bare_swallow_prefix_letters", "password=a:" + "b" * KIB_64),
     ("bare_swallow_prefix_quotes", "password=a:b" + '"' * KIB_64),
+    # Review of 0733969: base64 padding before a quote that closes a shell word, many times on one line.
+    ("header_padding_quotes", "Cookie: " + 'a==" ' * 13_107),
 ]
 
 

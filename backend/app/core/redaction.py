@@ -207,11 +207,13 @@ _URL_CREDENTIALS = re.compile(rf"(?P<scheme>{URL_SCHEME_PATTERN}://)(?:[^/\s:@]*
 # (Authorization: Token token="V", Cookie: session="V"; theme=dark): a header value is a list of
 # parameters, and a quote in it opens one. After an opening quote (JSON: "Authorization": "Bearer V", ...)
 # the value ends at the next quote (Lead decision 3.1f2c #4).
-# - A quote that opens a parameter's value (right after "=") is read as #6 reads a key's quoted value: it may
-#   close on a later line, and one never closed takes the rest of the text, so a value cut by the end of the
-#   text (max_tokens) never stays raw (D2-I2, #12; review of 50610b5).
+# - A quote that opens a parameter's value (right after "=", and followed by neither a space nor a quote) is
+#   read as #6 reads a key's quoted value: it may close on a later line, and one never closed takes the rest
+#   of the text, so a value cut by the end of the text (max_tokens) never stays raw (D2-I2, #12; reviews of
+#   50610b5 and 0733969).
 # - Any other quote keeps to its line, and one its line never closes ends the value: in
-#   curl -H "Authorization: Bearer V" https://api.example.com/x it closes the shell word, so the URL stays.
+#   curl -H "Authorization: Bearer V" https://api.example.com/x, and after base64 padding
+#   (curl -H "Cookie: sid=abc==" https://...), it closes the shell word, so the URL stays.
 # - The value otherwise stays on its line. The alternatives start on different characters, each quoted part
 #   is read once, and the repeat is possessive: linear. No space is given back before the colon (it cannot
 #   be one): a name before 64 KiB of line breaks is read once.
@@ -225,8 +227,8 @@ _HEADER_NAME_SEP = (
 CREDENTIAL_HEADER = re.compile(
     rf"""(?ix)
     (?<![A-Za-z0-9_-]){_HEADER_NAME_SEP}
-    (?P<value>(?(open)[^"'\\\r\n]+|(?:[^"'\\\r\n]|(?<==)"[^"]*+"|(?<==)'[^']*+'|(?<==)["'](?s:.*)
-                                  |"[^"\r\n]*+"|'[^'\r\n]*+')++))
+    (?P<value>(?(open)[^"'\\\r\n]+|(?:[^"'\\\r\n]|(?<==)"(?=[^\s"])[^"]*+"|(?<==)'(?=[^\s'])[^']*+'
+                                  |(?<==)(?:"(?=[^\s"])|'(?=[^\s']))(?s:.*)|"[^"\r\n]*+"|'[^'\r\n]*+')++))
     """
 )
 # Where a header's value starts, read from the raw text by the agent runtime's delta stream: the name and

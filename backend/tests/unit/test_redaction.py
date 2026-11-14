@@ -921,6 +921,26 @@ def test_a_header_parameter_quote_closes_later_or_never(redactor: Redactor, text
     assert out.startswith(text.split(":", 1)[0] + ": "), out
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        'curl -H "Authorization: Basic dXNlcjpwYXNz=" https://api.example.com/x\nThen run "make test" now.',
+        'curl -H "Cookie: sid=abc==" https://api.example.com/x\nThen run "make test".',
+    ],
+)
+def test_a_quote_after_base64_padding_closes_the_shell_word(redactor: Redactor, text: str) -> None:
+    """Lead correction (review of 0733969): "=" then a quote opens a parameter's value only when a character
+    that is neither a space nor a quote follows; after base64 padding the quote closes the shell word."""
+    out = redactor.redact(text)
+    assert 'https://api.example.com/x\nThen run "make test"' in out, out
+    assert "dXNlcjpwYXNz" not in out and "abc" not in out, out
+
+
+def test_an_empty_header_parameter_takes_nothing_after_it(redactor: Redactor) -> None:
+    out = redactor.redact('Cookie: token=""\nnext "line" kept')
+    assert out.endswith('\nnext "line" kept'), out
+
+
 def test_a_header_parameter_quote_closed_on_a_later_line_ends_the_value_there(redactor: Redactor) -> None:
     """As #6 for a key's quoted value: the value ends with its line after the closing quote, and the next line
     stays readable."""
