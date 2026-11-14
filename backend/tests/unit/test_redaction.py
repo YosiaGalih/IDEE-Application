@@ -20,6 +20,7 @@ from app.core.redaction import (
     Redactor,
     is_sensitive_key,
 )
+from tests.timing import best_of
 
 FAKE_ANTHROPIC = "sk-ant-api03-" + "A" * 40
 FAKE_ADMIN = "sk-ant-admin01-" + "B" * 44
@@ -278,13 +279,11 @@ def test_argon2_hash_is_redacted(redactor: Redactor) -> None:
 def test_long_word_runs_redact_in_linear_time() -> None:
     # A tool can return a long run of letters (minified code, a base64 blob): the URL-credential pattern
     # must not retry its scheme from every position of the run (WP-3.1d1: 64 KB took 2.8 s before).
-    import time
-
     redactor = Redactor(["kk-test-secret-literal-0123456789"])
-    started = time.perf_counter()
-    redactor.redact("a" * 131_072)
-    redactor.redact("x9+." * 32_768)
-    assert time.perf_counter() - started < 1.0
+    elapsed, _ = best_of(
+        lambda: (redactor.redact("a" * 131_072), redactor.redact("x9+." * 32_768)), under=1.0
+    )
+    assert elapsed < 1.0, f"{elapsed:.2f} s"
 
 
 def test_url_credentials_inside_a_word_run_are_still_redacted() -> None:

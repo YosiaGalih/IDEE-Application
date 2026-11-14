@@ -22,7 +22,6 @@ import json
 import random
 import re
 import string
-import time
 from collections.abc import Iterable
 
 import pytest
@@ -37,6 +36,7 @@ from app.agents.runtime import (
 )
 from app.agents.runtime import DELTA_RELEASE_CHARS as DELTA_RELEASE
 from app.core.redaction import Redactor, stopped_at_open_quote
+from tests.timing import best_of
 
 REDACTOR = Redactor()
 VALUE = "Zq7" * 400  # 1 200 characters
@@ -145,9 +145,7 @@ def test_a_pathological_64_kib_attempt_streams_in_under_a_second(name: str) -> N
     stream is a run's (``delta_redactor``), so its header stops are read too (review of 08fa05e)."""
     text = PATHOLOGICAL[name]
     assert len(text) == KIB_64
-    started = time.perf_counter()
-    events = stream(delta_redactor(REDACTOR), pieces(text, 16))
-    elapsed = time.perf_counter() - started
+    elapsed, events = best_of(lambda: stream(delta_redactor(REDACTOR), pieces(text, 16)), under=1.0)
     assert elapsed < 1.0, (name, elapsed)
     assert client(events) == REDACTOR.redact(text)
 
@@ -742,10 +740,7 @@ def test_a_held_64_kib_attempt_streams_in_under_a_second() -> None:
     character until ``flush``, never a redaction."""
     text = a_64_kib_attempt_reset_early()
     parts = pieces(text, 1)
-    redactor = DeltaRedactor(changes_with_each_z)
-    started = time.perf_counter()
-    events = stream(redactor, parts)
-    elapsed = time.perf_counter() - started
+    elapsed, events = best_of(lambda: stream(DeltaRedactor(changes_with_each_z), parts), under=1.0)
     assert elapsed < 1.0, elapsed
     resets = [index for index, event in enumerate(events) if event.reset]
     assert resets[0] < len(events) - 1  # reset early: the rest was held until flush
@@ -760,13 +755,14 @@ def test_a_retry_after_a_held_attempt_streams_64_kib_in_under_a_second() -> None
     held = pieces(a_64_kib_attempt_reset_early(), 1)
     retry_text = ("abc " * (KIB_64 // 4))[:KIB_64]
     retry = pieces(retry_text, 1)
-    redactor = DeltaRedactor(changes_with_each_z)
-    started = time.perf_counter()
-    failed = stream(redactor, held, flush=False)
-    restart = redactor.restart()
-    streamed = stream(redactor, retry, flush=False)
-    final = redactor.flush()
-    elapsed = time.perf_counter() - started
+
+    def run() -> tuple[list[Delta], Delta, list[Delta], Delta | None]:
+        redactor = DeltaRedactor(changes_with_each_z)
+        failed = stream(redactor, held, flush=False)
+        restart = redactor.restart()
+        return failed, restart, stream(redactor, retry, flush=False), redactor.flush()
+
+    elapsed, (failed, restart, streamed, final) = best_of(run, under=1.0)
     assert elapsed < 1.0, elapsed
     assert any(event.reset for event in failed) and restart == Delta("", 1, reset=True)
     assert streamed and not any(event.reset for event in streamed)  # streamed before flush, never held

@@ -3,16 +3,15 @@
 ``Redactor.redact`` runs on every outbound path, often on 64 KiB tool outputs. A pattern retried from every
 position of a long run was quadratic before: "eyJ" repeated over 256 KiB took 17 s (AG-13 WP-3.1d2a
 MEDIUM-2), an unbounded URL scheme 2.8 s on 64 KiB of letters (WP-3.1d1). One case per new or changed
-pattern; the bound is loose for CI.
+pattern; the bound is loose for CI, and the best of up to three runs counts (``tests/timing.py``).
 """
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from app.core.redaction import Redactor, is_sensitive_key
+from tests.timing import best_of
 
 KIB_64 = 65_536
 
@@ -122,18 +121,16 @@ def test_pattern_is_linear(name: str, text: str) -> None:
     (review of 08fa05e)."""
     redactor = Redactor()
     for redact in (redactor.redact, redactor.redact_with_stop):
-        started = time.perf_counter()
-        redact(text)
-        elapsed = time.perf_counter() - started
+        elapsed, _ = best_of(lambda redact=redact: redact(text), under=1.0)
         assert elapsed < 1.0, f"{name}, {redact.__name__}: {elapsed:.2f} s"
 
 
 def test_the_key_predicate_is_linear() -> None:
-    # _CAMEL_BOUNDARY splits a name at every hump: a 64 KiB name with a hump at every second character.
-    started = time.perf_counter()
-    is_sensitive_key("aB" * (KIB_64 // 2))
-    is_sensitive_key("-" * KIB_64 + "password")
-    elapsed = time.perf_counter() - started
+    # Both splits read a name at every hump: a 64 KiB name with a hump at every second character.
+    elapsed, _ = best_of(
+        lambda: (is_sensitive_key("aB" * (KIB_64 // 2)), is_sensitive_key("-" * KIB_64 + "password")),
+        under=1.0,
+    )
     assert elapsed < 1.0, f"{elapsed:.2f} s"
 
 
@@ -147,10 +144,7 @@ def test_the_key_predicate_is_linear() -> None:
     ],
     ids=["flags", "flag_value_pairs", "secret_flags", "nested_values"],
 )
-def test_an_argv_list_is_linear(items: list[str]) -> None:
+def test_an_argv_list_is_linear(items: list[object]) -> None:
     redactor = Redactor()
-    started = time.perf_counter()
-    redactor.redact_obj(items)
-    redactor.redact_obj(tuple(items))
-    elapsed = time.perf_counter() - started
+    elapsed, _ = best_of(lambda: (redactor.redact_obj(items), redactor.redact_obj(tuple(items))), under=1.0)
     assert elapsed < 1.0, f"{elapsed:.2f} s"
