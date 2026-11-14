@@ -72,7 +72,8 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
     ``is_sensitive_key`` splits: free text redacts more there, never less. No boundary lookaround: the
     caller anchors the name (``_KEY_VALUE``, the delta stream's key check). Every alternative is a fixed
     word after a run of ``[A-Za-z0-9]``, so a match tried from one start is linear in the name, and the
-    leading run of "_" and "-" is possessive, so it is read once.
+    leading run of "_" and "-" is possessive, so it is read once. Two lookaheads only fail early what could
+    not match (tests/unit/test_redaction.py compares the pattern with and without them).
     """
     snake: list[str] = []
     lower: list[str] = []
@@ -90,12 +91,18 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
         # with a letter or digit, so a "_" or "-" given back could never match, and a long run of dashes is
         # read once (backtracking it through the alternatives cost 18 ms per 64 KiB per pattern).
         r"[_-]*+"
+        # Every alternative starts with a letter or digit (any case (?i) reads, whatever the enclosing flags):
+        # at any other position the pattern fails at once instead of trying every alternative.
+        r"(?=(?i:[A-Za-z0-9]))"
         rf"(?:(?i:{'|'.join(sorted(names))})|"  # a well-known secret name, whole
         r"(?:[A-Za-z0-9]+[_-])*"  # the words before the tail's own segment
         rf"(?:(?i:{'|'.join(snake)})"
-        rf"|(?-i:(?:{'|'.join(lower)})"
+        # A camel or Pascal form holds a capital before any character other than a lower-case letter or
+        # digit (one with none, secret_key, is a snake form on the same span, tried first), so a lower-case
+        # word does not try every hump of every tail.
+        rf"|(?-i:(?=[a-z0-9]*[A-Z])(?:(?:{'|'.join(lower)})"
         rf"|(?:[A-Za-z0-9]*[a-z0-9])?(?:{'|'.join(upper)})"
-        rf"|[A-Za-z0-9]*(?:{'|'.join(capital)})))"
+        rf"|[A-Za-z0-9]*(?:{'|'.join(capital)}))))"
         r")"
     )
 
@@ -103,6 +110,23 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
 # One sensitive key name, the free-text form of ``is_sensitive_key``: ``_KEY_VALUE`` here, the delta stream's
 # key check in app.agents.runtime. A regex source with no boundary lookaround; the caller adds the boundaries.
 SECRET_KEY_PATTERN = _secret_key_pattern(SENSITIVE_KEY_TAIL.split("|"), KNOWN_SECRET_NAMES)
+
+# A word that every key the key-value rules read holds (SECRET_KEY_PATTERN in _KEY_VALUE, _FLAG_VALUE and
+# _ARGV_VALUE; "password" in _NETRC), as does every header name (CREDENTIAL_HEADER) and the marker
+# _AFTER_REDACTED reads, in the case-insensitive sense those rules use. A text with none of them is left as
+# it is by all six rules, so ``Redactor.redact`` skips them: they cost 15 ms per 64 KiB of plain text, and
+# the delta stream redacts a call's whole text up to about 100 times. Each word is found at one of its rarer
+# letters (the lead), the rest checked behind and after it. A case-sensitive class of the leads, with every
+# character (?i) takes for one of them (the long s U+017F for s, the Kelvin sign U+212A for k;
+# tests/unit/test_redaction.py checks every code point), leads the pattern, so the search skips every other
+# character at C speed: a (?i) alternation would be tried at every position. Public: the delta stream's
+# header check reads it too.
+KEY_HINT = re.compile(
+    "[\\[BCJKPSUbcjkpsu\u017f\u212a]"
+    r"(?:(?<=\[)(?i:redacted\])"
+    r"|(?i:(?<=p)(?:ass|wd)|(?<=s)(?:ecret|ession)|(?<=c)(?:redential|ookie)"
+    r"|(?<=tok)en|(?<=tick)et|(?<=k)ey|(?<=au)th|(?<=j)wt|(?<=b)earer))"
+)
 
 # Named so ``Redactor.find`` (security.scan_secrets) reports which rule matched, from the very same patterns.
 _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -114,12 +138,14 @@ _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
     # Starts only where a token starts: a match tried from every "eyJ" of a long run was quadratic (256 KiB of
     # "eyJ" took 17 s; AG-13 WP-3.1d2a MEDIUM-2). One "-" that itself follows no token character also counts
-    # as a start: git.diff prints a removed line as "-" + text (/code-review WP-3.1d2a spec HIGH).
+    # as a start: git.diff prints a removed line as "-" + text (/code-review WP-3.1d2a spec HIGH). The literal
+    # "eyJ" leads and the start is checked behind it (the same spans), so the search skips to each "eyJ" at C
+    # speed instead of trying the lookbehinds at every position (2 ms per 64 KiB; WP-3.1f2c fix round).
     (
         "jwt",
         re.compile(
-            r"(?:(?<![A-Za-z0-9_-])|(?<=^-)|(?<=[^A-Za-z0-9_-]-))"
-            r"eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
+            r"eyJ(?:(?<![A-Za-z0-9_-]eyJ)|(?<=^-eyJ)|(?<=[^A-Za-z0-9_-]-eyJ))"
+            r"[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
         ),
     ),
     ("password_hash", re.compile(r"\$argon2(?:id|i|d)\$[A-Za-z0-9+/=,$]+")),  # PHC string
@@ -150,8 +176,9 @@ _URL_CREDENTIALS = re.compile(rf"(?P<scheme>{URL_SCHEME_PATTERN}://)(?:[^/\s:@]*
 # parameters, and a quote in it opens one. After an opening quote (JSON: "Authorization": "Bearer V", ...)
 # the value ends at the next quote. A quoted part never crosses a line, and an unclosed quote ends the value
 # there: the alternatives start on different characters, and the repeat is possessive, so a run of quotes is
-# read once (Lead decision 3.1f2c #4).
-_HEADERS = re.compile(
+# read once (Lead decision 3.1f2c #4). Public: while a quote on a header's line is open, the agent runtime's
+# delta stream holds the value from its start, since the value takes the quoted part once it closes.
+CREDENTIAL_HEADER = re.compile(
     r"""(?ix)
     (?P<name>(?<![A-Za-z0-9_-])(?:proxy-authorization|authorization|set-cookie|cookie|x-api-key))
     (?P<sep>\\?["']?\s*:\s*(?P<open>\\?["'])?)
@@ -328,12 +355,22 @@ class Redactor:
         return len(self._literals[0]) if self._literals else 0
 
     def redact(self, text: str) -> str:
+        """Each rule runs only on a text that holds what every match of it holds (WP-3.1f2c fix round: the
+        delta stream redacts a call's whole text up to about 100 times): a word of KEY_HINT for all of them,
+        and a character each needs (its separator, the marker's "[", a flag's "-"). Skipping a rule that
+        cannot match leaves the text as running it would."""
         text = self._without_tokens(text)
-        text = _AFTER_REDACTED.sub(_drop_value, text)
-        text = _HEADERS.sub(_drop_value, text)
-        text = _KEY_VALUE.sub(_drop_value, text)
-        text = _FLAG_VALUE.sub(_drop_value, text)
-        text = _ARGV_VALUE.sub(_drop_value, text)
+        if KEY_HINT.search(text) is None:
+            return text  # no key, header name or marker: none of the rules below can match
+        if "[" in text:
+            text = _AFTER_REDACTED.sub(_drop_value, text)
+        if ":" in text:
+            text = CREDENTIAL_HEADER.sub(_drop_value, text)
+        if ":" in text or "=" in text:
+            text = _KEY_VALUE.sub(_drop_value, text)
+        if "-" in text:
+            text = _FLAG_VALUE.sub(_drop_value, text)
+            text = _ARGV_VALUE.sub(_drop_value, text)
         return _NETRC.sub(_drop_value, text)
 
     def _without_tokens(self, text: str, *, keep_lines: bool = False) -> str:
@@ -351,6 +388,8 @@ class Redactor:
             text = text.replace(literal, marker(literal))
         for pattern in _PATTERNS:
             text = pattern.sub(replace, text)
+        if "://" not in text:
+            return text
         return _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)  # userinfo holds no line break
 
     def find(self, text: str) -> list[Finding]:
@@ -360,7 +399,7 @@ class Redactor:
             *((f"literal_{index}", re.compile(re.escape(lit))) for index, lit in enumerate(self._literals)),
             *_NAMED_PATTERNS,
             ("url_credentials", _URL_CREDENTIALS),
-            ("credential_header", _HEADERS),
+            ("credential_header", CREDENTIAL_HEADER),
             ("credential_assignment", _KEY_VALUE),
             ("credential_assignment", _FLAG_VALUE),
             ("credential_assignment", _ARGV_VALUE),

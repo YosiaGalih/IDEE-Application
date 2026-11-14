@@ -37,7 +37,7 @@ from app.agents.prompt_book import Prompt, PromptBook
 from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.cancel import CancelToken
 from app.core.logging import get_logger
-from app.core.redaction import SECRET_KEY_PATTERN, URL_SCHEME_PATTERN, Redactor
+from app.core.redaction import CREDENTIAL_HEADER, KEY_HINT, SECRET_KEY_PATTERN, URL_SCHEME_PATTERN, Redactor
 from app.llm.base import (
     ContentBlock,
     LLMError,
@@ -188,7 +188,8 @@ def open_candidate(text: str) -> int | None:
     - a ``-----BEGIN`` with no ``-----END`` after it;
     - a ``scheme://`` with no "@", "/" or space after it yet: userinfo that may still grow (``_open_url``);
     - an opening quote with no closing one after it, after a key the redactor treats as secret
-      (``_key_before``)."""
+      (``_key_before``);
+    - a header value whose line holds a quote with no closing one after it (``_open_header``)."""
     found: list[int] = []
     run = text.find("eyJ", len(text.rstrip(_TOKEN_CHARS)))
     if run != -1:
@@ -203,6 +204,8 @@ def open_candidate(text: str) -> int | None:
         at = text.rfind(quote)  # the last one: no quote of its kind closes it
         if at != -1 and (key := _key_before(text, at)) is not None:
             found.append(key)
+    if (header := _open_header(text)) is not None:
+        found.append(header)
     return min(found, default=None)
 
 
@@ -228,6 +231,31 @@ def _key_before(text: str, quote: int) -> int | None:
     if key is None or (key["word"] is not None and stop == head):
         return None
     return key.start()
+
+
+def _open_header(text: str) -> int | None:
+    """Where a header value that may still grow starts (Lead ruling, WP-3.1f2c fix round). Without an
+    opening quote after its colon a header value is the rest of its line, quoted parts included
+    (CREDENTIAL_HEADER), so it stops at a quote of its line that nothing closes yet and takes the quoted part
+    once it closes: until then the value is held from its start. Only the last line can still grow: a value
+    never crosses a line, and a quote nothing closes on an earlier line never will be. The header's name may
+    sit on an earlier line, before blank lines and the colon its separator takes, so the scan starts on the
+    name's line. One scan from the end to the last line break, then a ":" and KEY_HINT before the quote (every
+    header holds both) and one pass of CREDENTIAL_HEADER over the last lines: linear."""
+    line = max(text.rfind("\n"), text.rfind("\r")) + 1
+    quote = max(text.rfind('"'), text.rfind("'"))
+    if quote < line:
+        return None  # no quote on the last line
+    head = text[:line].rstrip()
+    head = head[:-1].rstrip() if head.endswith(":") else head
+    start = max(head.rfind("\n"), head.rfind("\r")) + 1
+    if text.find(":", start, quote) == -1 or KEY_HINT.search(text, start, quote) is None:
+        return None  # no separator, or no header name, before the quote
+    for header in CREDENTIAL_HEADER.finditer(text, start):
+        stop = header.end()
+        if header["open"] is None and stop >= line and stop < len(text) and text[stop] in "\"'":
+            return header.start("value")
+    return None
 
 
 def delta_hold(redactor: Redactor) -> int:

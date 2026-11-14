@@ -72,6 +72,9 @@ CASES = [
     ("header_quote_run", "Cookie: " + '"a' * 32_768),
     ("header_closed_quote_run", "Cookie: " + '"a"' * 21_845),
     ("pgp_begin_run", "-----BEGIN PGP PRIVATE KEY BLOCK-----" * 1_771),
+    # The fix round's KEY_HINT: every character a lead of its words, and words cut one letter short.
+    ("key_hint_leads", "pcksujb[PCKSUJB\u017f" * 4_096),
+    ("key_hint_near_words", "toke tick auh pas secre sessio cooki credentia beare jw [redacte " * 1_024),
 ]
 
 

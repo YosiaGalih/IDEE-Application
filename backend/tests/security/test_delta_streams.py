@@ -97,6 +97,16 @@ PATHOLOGICAL = {
     "keys after tokens": filled((GITHUB_TOKEN + 'password="a" ') * 1_000 + GITHUB_TOKEN + 'password="', "w"),
     "string prefixes": filled('password = rb"a" ' * 3_000 + 'password = b"', "w"),
     "prefix letters": filled("password = " + "b" * 32_768 + '"', "w"),
+    # Dense text where a new candidate opens at every release (Lead ruling on the 3.1f2c fix round: every
+    # input stays under the bound): URLs, argv items and quoted shell words one after another, quoted dashes.
+    "dense URLs": filled("", "ab+.-://"),
+    "dense argv items": filled("", '"--password", '),
+    "dense quoted shell words": filled("", '"--password" '),
+    "quoted dashes": filled('"-' * 16_384 + ', "', "w"),
+    # A header line with an open quote: a 64 KiB line, its quoted parts never closed, then closed ones.
+    "open header quotes": filled("Cookie: ", 'a="b '),
+    "header quoted parts": filled("Cookie: ", 'a="b"; '),
+    "header names": filled("", 'Cookie: "'),
 }
 
 
@@ -315,6 +325,13 @@ QUOTE_FORMS: dict[str, tuple[str, str | None]] = {
     "raw prefix": ('SECRET_KEY = r"{}"', "SECRET_KEY"),
     "two-letter prefix": ("token: rb'{}'", "token"),
     "prefix after a flag": ("--token b'{}'", "--token"),
+    # A header value without an opening quote is the rest of its line, quoted parts included (Task 3, R-2):
+    # the delta holds it from the value's start while a quote on that line is open (Lead ruling, fix round).
+    "cookie parameter": ('Cookie: theme="{}"', "theme"),
+    "set-cookie after other parameters": ('Set-Cookie: a=1; sid="{}"', "a=1"),
+    "authorization token parameter": ('Authorization: Token token="{}"', "Token"),
+    "x-api-key parameter": ('x-api-key: password="{}"', "password"),
+    "proxy-authorization, single quotes": ("Proxy-Authorization: Digest response='{}'", "Digest"),
 }
 
 
@@ -348,6 +365,22 @@ def test_a_flag_word_with_no_space_before_the_quote_is_no_candidate(text: str) -
     ``_ARGV_VALUE``): the closing quote of "--password" in prose opens nothing, so the rest of the answer is
     not held until the stream ends."""
     assert open_candidate(text) is None
+
+
+def test_a_header_line_is_held_only_while_its_quote_is_open() -> None:
+    """A header value never crosses a line: once the line ends, or its quote closes, nothing is held."""
+    line = "Cookie: it's here"
+    assert open_candidate("Some text.\n" + line) == len("Some text.\nCookie: ")
+    assert open_candidate("Some text.\n" + line + "\nThe answer goes on.") is None
+    assert open_candidate('Cookie: theme="dark"; lang=en') is None
+    # A value stopped by its own quote on an earlier line is final; a quote on the last line opens nothing.
+    assert open_candidate("Cookie: it's here\nThe 'answer") is None
+    # The name and the colon may sit on earlier lines (YAML): the separator takes line breaks.
+    yaml = 'cookie:\n  theme="Zq7'
+    assert open_candidate(yaml) == yaml.index("theme")
+    spread = 'Cookie\n\n:\n theme="Zq7'
+    assert open_candidate(spread) == spread.index("theme")
+    assert open_candidate('"Authorization": "Bearer abc') == 1  # the JSON form: the key candidate, as before
 
 
 def test_a_quoted_flag_in_prose_does_not_hold_the_rest_of_the_answer() -> None:
