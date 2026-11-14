@@ -236,6 +236,25 @@ def test_a_restart_starts_its_attempt_with_a_clean_hold() -> None:
     assert all(event is None or (not event.reset and event.call == 1) for event in retry)
 
 
+def test_a_lost_delta_marks_its_call_until_flush_or_a_restart() -> None:
+    """Silent-failure review MEDIUM-2 (final review of 74bf8d4): a call marked lost ends with its whole
+    ``redact`` as a reset; a mark for a call that has already ended changes nothing; a restart clears the
+    mark (its own empty reset, if delivered, voids what the client had)."""
+    redactor = DeltaRedactor(REDACTOR.redact, hold=4, release=1)
+    first = stream(redactor, ["The first call. " * 4])
+    assert not first[-1].reset
+    redactor.mark_lost(1)  # call 1 has ended: its flush delta cannot be resent
+    second = "The second call streams. " * 4
+    assert redactor.feed(second) is not None
+    redactor.mark_lost(2)
+    assert redactor.flush() == Delta(REDACTOR.redact(second), 2, reset=True)
+    assert redactor.feed("The third call. " * 4) is not None
+    redactor.mark_lost(3)
+    assert redactor.restart() == Delta("", 3, reset=True)
+    retry = stream(redactor, ["The retried third call. " * 4])
+    assert retry and not any(event.reset for event in retry)  # the restart cleared the mark
+
+
 def test_a_retry_in_call_2_then_a_reset_in_call_3_keeps_every_call() -> None:
     """Plan Review Focus 4: a run retried in its second call, then a change to what was sent in the middle of
     its third: the reference client shows each call's ``redact`` in call order; the first call is never

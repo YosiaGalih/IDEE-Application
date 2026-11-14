@@ -1611,6 +1611,63 @@ async def test_a_restart_voids_only_its_call() -> None:
     assert not any("Zq7" in text for text in fakes.events.deltas)
 
 
+class LosesOneDelta(FakeEvents):
+    """The ``lose``-th agent.delta publish fails (a Redis blip); every other one is delivered."""
+
+    def __init__(self, lose: int) -> None:
+        super().__init__()
+        self.lose = lose
+        self.published = 0
+
+    async def delta(self, scope: Any, text: str, *, call: int, reset: bool = False) -> None:
+        self.published += 1
+        if self.published == self.lose:
+            raise RuntimeError("redis down")
+        await super().delta(scope, text, call=call, reset=reset)
+
+
+def delivered(events: FakeEvents) -> dict[int, str]:
+    """The reference client (Lead decision 3.1f2c #9) over the deltas that reached it."""
+    shown: dict[int, str] = {}
+    for call, text, reset in zip(events.calls, events.deltas, events.resets, strict=True):
+        shown[call] = text if reset else shown.get(call, "") + text
+    return shown
+
+
+async def test_a_lost_delta_is_repaired_by_a_reset_at_flush() -> None:
+    """Silent-failure review MEDIUM-2 (final review of 74bf8d4): an agent.delta whose publish fails leaves
+    the client's text holed. The failure is logged with its call and whether it was a reset, and the call's
+    flush sends the call's whole redacted text as a reset, so the client ends with ``redact`` of the call."""
+    from structlog.testing import capture_logs
+
+    text = 'The answer streams for a while, password="Zq7Zq7Zq7Zq7Zq7Zq7" then goes on. ' * 30
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = StreamsInPieces(fakes.providers.provider, text, 16)  # type: ignore[assignment]
+    fakes.events = LosesOneDelta(lose=2)
+    with capture_logs() as logs:
+        assert (await run_b14(fakes)).status == "succeeded"
+    failed = [log for log in logs if log["event"] == "agent_run_event_failed"]
+    assert [(log["event_type"], log["call"], log["reset"]) for log in failed] == [("agent.delta", 1, False)]
+    assert fakes.events.resets[-1] and fakes.events.calls[-1] == 1
+    assert fakes.events.deltas[-1] == Redactor().redact(text)
+    assert delivered(fakes.events) == {1: Redactor().redact(text)}
+
+
+async def test_a_lost_reset_is_repaired_by_a_reset_at_flush() -> None:
+    """The same when the lost delta is a restart's empty reset: the client still shows the failed attempt's
+    text until the call's flush replaces it with the retried attempt's ``redact``."""
+    failed_attempt = "The first attempt streams this much before it fails. " * 12
+    retried = "The retried attempt answers instead. " * 12
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    plan = [(failed_attempt, True), (retried, False)]
+    fakes.providers.provider = StreamsByPlan(fakes.providers.provider, plan)  # type: ignore[assignment]
+    fakes.events = LosesOneDelta(lose=2)  # the first attempt's append, then the restart's reset
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert fakes.events.resets[0] is False and failed_attempt[:64] in fakes.events.deltas[0]
+    assert fakes.events.resets[-1] and fakes.events.deltas[-1] == Redactor().redact(retried)
+    assert delivered(fakes.events) == {1: Redactor().redact(retried)}
+
+
 async def test_the_last_delta_call_is_the_runs_iterations_across_a_nudge() -> None:
     """WP-3.1f2c D2-L1 (Lead decision #9; review of 52e0679): ``call`` is the run's iteration. A nudged end
     turn is a model call of its own, so a run nudged once then submitted streams calls 1 and 2, in order, and

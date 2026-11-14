@@ -352,11 +352,24 @@ class DeltaRedactor:
         return self._emit(redacted, final=False, stop=stop)
 
     def flush(self) -> Delta | None:
-        """End of the call: its ``redact``, the rest appended or a reset; the next call starts empty."""
+        """End of the call: its ``redact``, the rest appended or a reset, or the whole of it as a reset when a
+        delta of the call was lost (``mark_lost``); the next call starts empty."""
         out = self._emit(self._redact(self._text), final=True)
+        if self._lost:  # what went out was not all received: the call's whole text replaces the client's
+            out = Delta(self._sent, self._call, reset=True)
         self._call += 1
         self.reset()
         return out
+
+    def mark_lost(self, call: int) -> None:
+        """A delta of model call ``call`` did not reach the client: its publish failed, so the client's text
+        of the call has a hole or misses a reset (silent-failure review MEDIUM-2, final review of 74bf8d4).
+        When it is the current call, its ``flush`` sends the call's whole redacted text as a reset.
+        ``restart`` clears the mark: its empty reset voids the attempt (and marks the call again if it is lost
+        too). A lost ``flush`` delta belongs to a call that has ended: nothing repairs it; the runtime logs
+        it."""
+        if call == self._call:
+            self._lost = True
 
     def restart(self) -> Delta:
         """A retried attempt: its text is void; the client empties the call's text."""
@@ -370,6 +383,7 @@ class DeltaRedactor:
         self._redacted_at = 0
         self._before: tuple[int, str] | None = None  # (candidate start, redaction of the raw text before it)
         self._held = False  # the attempt had a reset: the rest waits for flush (Lead decision 3.1f2c #9)
+        self._lost = False  # a delta of the call never reached the client: flush resends it whole
 
     def _emit(self, redacted: str, *, final: bool, stop: int | None = None) -> Delta | None:
         consistent = redacted.startswith(self._sent)
@@ -1287,27 +1301,42 @@ class AgentRuntime:
         return response
 
     async def _delta(self, run: _Run, scope: RunScope, delta: Delta | None) -> None:
-        if delta is not None:
-            await self._event(
-                run,
-                "agent.delta",
-                self._ports.events.delta(scope, delta.text, call=delta.call, reset=delta.reset),
-            )
+        """Publishes ``delta``; one that fails is logged with its call and reset, and the call's ``flush``
+        resends the call whole (``DeltaRedactor.mark_lost``)."""
+        if delta is None:
+            return
+        published = await self._event(
+            run,
+            "agent.delta",
+            self._ports.events.delta(scope, delta.text, call=delta.call, reset=delta.reset),
+            call=delta.call,
+            reset=delta.reset,
+        )
+        if not published:
+            run.deltas.mark_lost(delta.call)
 
     async def _usage_changed(self, run: _Run, scope: RunScope, sent_before: int) -> None:
         """``usage.updated`` only when an attempt of this call reached the provider (review L3)."""
         if run.tally.sent > sent_before:
             await self._event(run, "usage.updated", self._ports.events.usage_updated(scope))
 
-    async def _event(self, run: _Run, event_type: str, awaitable: Awaitable[None]) -> None:
-        """Events are best effort (review L3): the ledger is the truth; a failed event is logged (ids and
-        type) and the run goes on."""
+    async def _event(
+        self, run: _Run, event_type: str, awaitable: Awaitable[None], **fields: int | bool
+    ) -> bool:
+        """Events are best effort (review L3): the ledger is the truth; a failed event is logged (ids, type
+        and ``fields``) and the run goes on. Whether the event was published."""
         try:
             await self._port(run, awaitable)
         except Exception as error:
             _log.warning(
-                "agent_run_event_failed", **_ctx(run), event_type=event_type, error_type=type(error).__name__
+                "agent_run_event_failed",
+                **_ctx(run),
+                event_type=event_type,
+                error_type=type(error).__name__,
+                **fields,
             )
+            return False
+        return True
 
     # --- how it ends ----------------------------------------------------------------------------------------
 
