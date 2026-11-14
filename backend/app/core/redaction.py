@@ -297,14 +297,18 @@ CREDENTIAL_HEADER_START = re.compile(rf"(?i){_HEADER_NAME_SEP}")
 # - triple quoted, one value across lines; never closed: to the end of the text;
 # - \"escaped JSON\": in the JSON-encoded text, \\ followed by \" or \\ is one escape of the inner string;
 # - "double" or 'single' quoted with backslash escapes ("ab\"c" is one string), closed on its own line;
-# - else closed on its own line by the first quote of its kind, a backslash before it or not: single-quoted
-#   shell, YAML, INI and PowerShell strings read no escapes ('C:\keys\'), and a value that read one there
-#   would take the next value's opening quote, on a later line, as its close (AG-13 F-1);
+# - else, when the escape-aware close is on a later line, closed on its own line by the first quote of its
+#   kind, a backslash before it or not, if no letter, digit or "_" follows it: single-quoted shell, YAML, INI
+#   and PowerShell strings read no escapes ('C:\keys\'), and a value that read one there would take the next
+#   value's opening quote, on a later line, as its close (AG-13 F-1). A quote glued to a word ends no value
+#   ("\"V…": V is inside the string);
 # - else across lines, with backslash escapes;
-# - a quote never closed: to the end of the text, like a PEM block without its END line. The rest of the
-#   text holds no closing quote of that kind, so what is over-redacted is bounded.
-# Each of the three line-bound tries reads at most the rest of the value's line; one that fails leaves no
-# unescaped quote of its kind on that line for a later value to open with, so a line is read so at most twice.
+# - a quote never closed (with escapes): to the end of the text, like a PEM block without its END line. The
+#   rest of the text holds no closing quote of that kind, so what is over-redacted is bounded.
+# Each line-bound try reads at most the rest of the value's line; one that fails leaves no unescaped quote of
+# its kind on that line for a later value to open with, so a line is read so at most twice. The lookahead
+# before the plain close reads, as the try across lines does, up to the next unescaped quote of its kind: the
+# opening quote of any later value, so each stretch of text is read so a bounded number of times.
 _QUOTED = r"""
         (?:[bBfFrRuU]{1,2}(?=["']))?
         (?:
@@ -313,8 +317,8 @@ _QUOTED = r"""
       | \\"(?:[^\\]|\\[^"\\]|\\\\(?:[^\\]|\\[\s\S]))*+\\"
       | "(?:[^"\\\r\n]|\\[^\r\n])*+"
       | '(?:[^'\\\r\n]|\\[^\r\n])*+'
-      | "[^"\r\n]*+"
-      | '[^'\r\n]*+'
+      | (?="(?:[^"\\]|\\[\s\S])*+")"[^"\r\n]*+"(?![A-Za-z0-9_])
+      | (?='(?:[^'\\]|\\[\s\S])*+')'[^'\r\n]*+'(?![A-Za-z0-9_])
       | "(?:[^"\\]|\\[\s\S])*+"
       | '(?:[^'\\]|\\[\s\S])*+'
       | (?:\\"|["'])(?s:.*)
@@ -335,14 +339,26 @@ _NOT_A_KEY = (
     rf"|-*+{_NETRC_KEY}[\ \t]++(?![:=])\S)"
 )
 
+# A word that is a secret key with words before its tail, glued to its separator, then spaces and a value on
+# the same line ("x-apikey: V", and "<secret>-cookie= o", a secret glued to a tail word): the word takes the
+# value too. _NOT_A_KEY leaves the word to the value it is in, so the key gets no match of its own; taken
+# with it, its value is not left raw (AG-13 F-2 follow-up).
+_KEY_WORD_VALUE = (
+    rf"(?=(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-])[:=][\ \t])"
+    rf"[^\s\"'&;,\\]++[\ \t]++(?:{_QUOTED}|[^\s\"'&;,\\]++)"
+)
+
 # An unquoted value: one word, never a key with its own value (_NOT_A_KEY). A word that ends in ":" or "="
 # immediately followed, on the same line, by a quoted string takes the string too: a key was taken as the
-# value of the key before it (password : password: "V"; Lead decision #7). Not across a line:
-# "password=None):" then a docstring on the next line.
+# value of the key before it (password : password: "V"; Lead decision #7); a key glued to its separator takes
+# an unquoted value after spaces too (_KEY_WORD_VALUE). Not across a line: "password=None):" then a docstring
+# on the next line.
 _BARE = rf"""
         {_NOT_A_KEY}
+        (?:{_KEY_WORD_VALUE}|
         [^\s"'&;,\\]++(?:(?<=[:=])[\ \t]*+(?:{_QUOTED})
                        |(?:(?<=[:=][bBfFrRuU])|(?<=[:=][bBfFrRuU][bBfFrRuU]))(?=["'])(?:{_QUOTED}))?
+        )
 """
 
 # The value after a sensitive key and its separator (_KEY_VALUE, _AFTER_REDACTED): quoted or one word, after

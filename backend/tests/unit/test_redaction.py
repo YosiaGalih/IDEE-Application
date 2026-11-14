@@ -677,6 +677,16 @@ BACKSLASH_BEFORE_A_CLOSE = {
     ),
     # The escape-aware close on the value's own line still wins (R-6, #8).
     "escaped quote closed on its line": (f'{{"password": "ab\\"{V}"}}', f'{{"password": {REDACTED}}}'),
+    "escaped quote and a space, closed on its line": (
+        f'{{"password": "ab\\" {V}"}}',
+        f'{{"password": {REDACTED}}}',
+    ),
+    # No escape-aware close anywhere: the quote is never closed, the value runs to the end of the text (#6).
+    "never closed after an escaped quote": (f'password="\\"{V}', f"password={REDACTED}"),
+    "never closed, single quotes": (f"token='\\'{V}\nmore", f"token={REDACTED}"),
+    "never closed, a space after the escaped quote": (f'password="\\" {V}', f"password={REDACTED}"),
+    # A plain close glued to a word is no end of a value: the escape-aware close on a later line is taken.
+    "plain close glued to a word": (f'Bearer="\\"{V}\n" next', f"Bearer={REDACTED} next"),
 }
 
 
@@ -735,10 +745,13 @@ def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, te
         (f"apikey:{V}-cookie=o", f"apikey:{REDACTED}"),
         (f"password=token={V}", f"password={REDACTED}"),
         # Only a tail alone is refused: a key with words before its tail may be a secret glued to a tail word,
-        # which a match of its own would keep (the AG-13 grammar fuzz against main, seed 1).
+        # which a match of its own would keep (the AG-13 grammar fuzz against main, seed 1). Glued to its
+        # separator, such a key takes the value after the spaces with it, so neither stays raw.
         (f"password {V}Cookie: s", f"password {REDACTED} {REDACTED}"),  # the camel key takes "s" first
-        (f"credential:{V}_secret: Q", f"credential:{REDACTED} Q"),
-        (f"apikey:{V}-cookie= o", f"apikey:{REDACTED} o"),
+        (f"credential:{V}_secret: Q", f"credential:{REDACTED}"),
+        (f"apikey:{V}-cookie= o", f"apikey:{REDACTED}"),
+        (f"token: x-apikey: {V}", f"token: {REDACTED}"),
+        ("xoxb-" + f"GJj206odyX=B_PASSWORD: {V}", f"{REDACTED}={REDACTED}"),  # after a token (#7)
         # netrc's key after dashes is netrc's key too (_NETRC reads a "-" before it).
         (f"_password=-Password {V}", f"_password=-Password {REDACTED}"),
     ],
@@ -761,6 +774,8 @@ def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, te
         "secret-before-a-camel-tail",
         "secret-before-a-snake-tail",
         "secret-before-a-kebab-tail",
+        "compound-key-takes-its-value",
+        "compound-upper-key-takes-its-value",
         "netrc-after-a-dash",
     ],
 )

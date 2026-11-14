@@ -94,6 +94,10 @@ CASES = [
     ("escaped_quotes_on_one_line", 'password="' + '\\"' * (KIB_64 // 2)),
     ("escaped_apostrophes_on_one_line", "password='" + "\\'" * (KIB_64 // 2)),
     ("backslash_closes_on_many_lines", "password='a\\'\n" * (KIB_64 // 14)),
+    # The plain close is taken only when an escape-aware close comes on a later line: one far away, and
+    # single-quoted values on every line under a double-quoted one closed at the very end.
+    ("escape_aware_close_far_away", 'password="a\\"\n' + "x" * KIB_64 + '"'),
+    ("single_quoted_lines_under_a_double_quote", 'password="x\\"\n' + "token='y\\'\n" * (KIB_64 // 12) + '"'),
     # AG-13 F-2: a bare value is never a key with its own value. Keys as values one after another, netrc's
     # key as a value, a key before 64 KiB of spaces, and one 64 KiB word read as a key.
     ("bare_value_key_run", "password=token=" * (KIB_64 // 15)),
@@ -105,6 +109,10 @@ CASES = [
     # after another, and a 64 KiB word before a tail (no tail alone).
     ("bare_value_spaced_key_run", "password= token= " * (KIB_64 // 17)),
     ("bare_value_word_before_a_tail", "password=" + "a" * KIB_64 + "Cookie: x"),
+    # A compound key glued to its separator takes its spaced value with it: many of them as values, and one
+    # 64 KiB compound key made of short words.
+    ("compound_key_values", "token: " + "x-apikey: v " * (KIB_64 // 12)),
+    ("long_compound_key_value", "password=" + "a-" * (KIB_64 // 2) + "cookie: v"),
     # AG-13 F-3: after a hump a tail word is any upper-case run then lower case. Runs that never end a tail,
     # mixed tails one after another (one 64 KiB name), and two-word tails mixed after a hump.
     ("upper_runs_that_never_end_a_tail", "aPASSWOR" * (KIB_64 // 8)),
