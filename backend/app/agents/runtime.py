@@ -304,8 +304,9 @@ class DeltaRedactor:
     The text of the current model call is redacted whole, never a piece of it, so a secret cut across deltas
     is seen whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
     characters (a run's is ``delta_hold``: never less than its longest configured literal less one), and
-    nothing from the start of a candidate still open at the end of the raw text (``open_candidate``), nor
-    from a value the header rule ended at a quote its last line may still close (``redact_with_stop``, a
+    nothing from the start of a candidate still open at the end of the raw text (``open_candidate``; from
+    where the text the release before read ended, when the candidate starts past it: ``_redacted_before``),
+    nor from a value the header rule ended at a quote its last line may still close (``redact_with_stop``, a
     run's ``Redactor.redact_with_stop``; without it, ``stopped_at_open_quote`` of the redacted text, which
     misses a stop a later rule took: a test's fake redaction only, as ``app`` builds a run's stream with
     ``delta_redactor``), minus what already went out.
@@ -347,9 +348,12 @@ class DeltaRedactor:
         self._redacted_at = len(self._text)
         if self._redact_with_stop is None:
             redacted = self._redact(self._text)
-            return self._emit(redacted, final=False, stop=stopped_at_open_quote(redacted))
-        redacted, stop = self._redact_with_stop(self._text)
-        return self._emit(redacted, final=False, stop=stop)
+            stop = stopped_at_open_quote(redacted)
+        else:
+            redacted, stop = self._redact_with_stop(self._text)
+        out = self._emit(redacted, final=False, stop=stop)
+        self._last = (len(self._text), redacted)
+        return out
 
     def flush(self) -> Delta | None:
         """End of the call: its ``redact``, the rest appended or a reset, or the whole of it as a reset when a
@@ -382,6 +386,7 @@ class DeltaRedactor:
         self._sent = ""
         self._redacted_at = 0
         self._before: tuple[int, str] | None = None  # (candidate start, redaction of the raw text before it)
+        self._last: tuple[int, str] | None = None  # (length, redaction) of the raw text the last release read
         self._held = False  # the attempt had a reset: the rest waits for flush (Lead decision 3.1f2c #9)
         self._lost = False  # a delta of the call never reached the client: flush resends it whole
 
@@ -408,9 +413,18 @@ class DeltaRedactor:
 
     def _redacted_before(self, start: int, redacted: str) -> int:
         """How much of ``redacted`` comes from the raw text before ``start`` alone: its common prefix with the
-        redaction of that text (kept while the same candidate stays open)."""
+        redaction of that text, or of a shorter prefix of it (kept while the same candidate stays open).
+
+        A candidate that starts past all the raw text the last release read takes that release's redaction as
+        the shorter prefix's, so it costs no redaction of its own: a header on every line opens a candidate on
+        the last line at every release, and redacting the text before each one was half of a 64 KiB stream's
+        time (AG-13 M-2, delta review of 2ac73c3). Like the text before ``start``, a shorter prefix holds
+        nothing of the candidate, so what its redaction agrees with is safe to send; what lies between it and
+        ``start``, at most the text one release added, waits for a later release or ``flush``."""
         if self._before is None or self._before[0] != start:
-            self._before = (start, self._redact(self._text[:start]))
+            last = self._last
+            prefix = last[1] if last is not None and last[0] <= start else self._redact(self._text[:start])
+            self._before = (start, prefix)
         before = self._before[1]
         return len(before) if redacted.startswith(before) else _common_prefix(before, redacted)
 

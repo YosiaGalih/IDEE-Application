@@ -29,6 +29,7 @@ import pytest
 
 from app.agents.runtime import (
     DELTA_HOLD_CHARS,
+    DELTA_RELEASE_SHARE,
     Delta,
     DeltaRedactor,
     delta_hold,
@@ -142,6 +143,17 @@ PATHOLOGICAL = {
     "key words around URLs": filled("a", "passwordsecret://passwd", "cookie: "),
     "URLs before key words": filled("aeyJb", "://credentialpassword", '"""\\"'),
     "key words, dashes and URLs": filled("Authorization:b\n", "credential-----://", "://ticket;"),
+    # AG-13 M-2 (delta review of 2ac73c3): a header on every short line, so the header candidate moves to each
+    # new line, and its value redacted to a marker the key rule reads again; a scheme word as a key after an
+    # escaped line break or before an escaped tab (A4's key start), and as a JSON key before dashes (1.43 s at
+    # most at 2ac73c3).
+    "header lines with an open apostrophe": filled("", "\ncookie: '"),
+    "header lines after a key word": filled("tokenA", '\ncookie: "'),
+    "API key header lines after a key": filled("password=", "\nx-api-key: '"),
+    "header lines with a quote and a backslash": filled("://", '\ncookie: "\\'),
+    "scheme words after escaped line breaks": filled("://", "\\nBearer="),
+    "scheme words before escaped tabs": filled("://", "Bearer:\\t"),
+    "scheme words as JSON keys before dashes": filled("a", 'Bearer": -'),
 }
 
 
@@ -154,6 +166,27 @@ def test_a_pathological_64_kib_attempt_streams_in_under_a_second(name: str) -> N
     elapsed, events = best_of(lambda: stream(delta_redactor(REDACTOR), pieces(text, 16)), under=1.0)
     assert elapsed < 1.0, (name, elapsed)
     assert client(events) == REDACTOR.redact(text)
+
+
+def test_a_candidate_past_the_last_redaction_redacts_no_prefix_again() -> None:
+    """AG-13 M-2 (delta review of 2ac73c3): with a header on every line, a candidate opens on the last line at
+    every release, past all the text the release before redacted. That redaction stands in for the text before
+    the candidate, so no prefix is redacted again (one per release was half of a 64 KiB stream's time), and
+    before ``flush`` the client still shows the text up to two release steps before its end."""
+    prefixes: list[int] = []
+
+    def redact(text: str) -> str:  # the prefix (and flush) redaction; a release redacts with redact_with_stop
+        prefixes.append(len(text))
+        return REDACTOR.redact(text)
+
+    text = PATHOLOGICAL["header lines with an open apostrophe"][:16_384]
+    redactor = DeltaRedactor(redact, hold=delta_hold(REDACTOR), redact_with_stop=REDACTOR.redact_with_stop)
+    events = stream(redactor, pieces(text, 16), flush=False)
+    assert len(prefixes) == 1  # at the first release, which no redaction came before
+    step = len(text) // DELTA_RELEASE_SHARE
+    assert len(client(events)) >= len(REDACTOR.redact(text[: len(text) - 2 * step]))
+    final = redactor.flush()
+    assert final is not None and client([*events, final]) == REDACTOR.redact(text)
 
 
 STOP_INPUTS = ["header markers and quotes", "header lines stopped at quotes", "keys pairing header stops"]
@@ -649,6 +682,28 @@ BACKSLASH_BEFORE_A_CLOSE = {
 @pytest.mark.parametrize("size", SIZES)
 def test_a_value_after_a_backslash_before_a_close_never_streams_raw(form: str, size: int) -> None:
     text = INTRO + BACKSLASH_BEFORE_A_CLOSE[form].format(VALUE) + TAIL
+    assert not any(window in REDACTOR.redact(text) for window in windows(VALUE))  # the redactor takes it
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == REDACTOR.redact(text)
+
+
+@pytest.mark.parametrize("size", SIZES)
+def test_a_candidate_inside_the_text_the_last_release_read_never_takes_its_redaction(size: int) -> None:
+    """AG-13 M-2: the last release's redaction stands in only for a candidate that starts past all the text
+    it read. Here a BEGIN marker, the first candidate, ends (its END arrives) while a URL that started inside
+    that text is still open: the URL's userinfo is raw in the last release's redaction, so the text before the
+    URL is redacted again, and the userinfo never goes out before its "@" arrives."""
+    text = (
+        INTRO
+        + "-----BEGIN NOTE-----\nhttps://"
+        + "user:"
+        + VALUE
+        + "-----END"
+        + VALUE
+        + "@git.example.test/x"
+        + TAIL
+    )
     assert not any(window in REDACTOR.redact(text) for window in windows(VALUE))  # the redactor takes it
     events = stream(delta_redactor(REDACTOR), pieces(text, size))
     assert leaked(events, VALUE) == []

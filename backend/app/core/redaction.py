@@ -363,9 +363,14 @@ _WORD = rf"""
 # "x.token : V"). The key may have words before its tail ("<secret>-cookie= o", a secret glued to a tail
 # word), or follow any other character ("[session", "x.token"). The word takes the separator and the value
 # too, a quoted string or a word as _BARE reads one: _NOT_A_KEY leaves such a word to the value it is in, so
-# the key gets no match of its own, and its value is not left raw (AG-13 F-2 follow-up). The lookahead reads
-# the word once: a key is tried only where one may start (_KEY_START), and ends only before its separator.
+# the key gets no match of its own, and its value is not left raw (AG-13 F-2 follow-up). The second lookahead
+# reads the word once: a key is tried only where one may start (_KEY_START), and ends only before its
+# separator. The first reads the word to its end for that separator (a key ends the word, or the word ends
+# with the separator), so a word with none is not tried for a key at all: a value the header rule made a
+# marker, read again by the key rule on every line of 64 KiB of header lines, took half of that rule's time
+# (AG-13 M-2, delta review of 2ac73c3).
 _KEY_WORD_VALUE = rf"""
+        (?=[^\s"'&;,\\]*+(?:(?<=[:=])[\ \t]|\\?["'][\ \t]*+[:=]|[\ \t]++[:=]))
         (?=[^\s"'&;,\\]*?{_KEY_START}(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-])
            (?:[:=][\ \t]|\\?["'][\ \t]*+[:=]|[\ \t]++[:=]))
         [^\s"'&;,\\]++(?:(?<=[:=])|\\?["']?[\ \t]*+[:=])[\ \t]*+(?:{_QUOTED}|{_NOT_A_KEY}{_WORD})
@@ -409,10 +414,17 @@ _ITEM = rf"""
           | {_QUOTED})
 """
 
+# One secret key name to the end of its word, in a rule's key (_KEY_VALUE, _FLAG_VALUE). Atomic: the key
+# pattern reads only word characters and none may follow, so every way it reads a name ends at the same place,
+# and a value that fails after it is tried once, not once per way ("Bearer" is snake and Pascal; after an
+# escaped line break, "\nBearer=" at every 9 characters of 64 KiB tried each value two or three times: AG-13
+# M-2, delta review of 2ac73c3).
+_WHOLE_KEY = rf"(?>(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))"
+
 # key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value / --key=value, compound names.
 _KEY_VALUE = re.compile(
     rf"""(?ix)
-    (?P<key>{_KEY_START}(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<key>{_KEY_START}{_WHOLE_KEY})
     (?P<sep>\\?["']?\s*+[:=]\s*+)
     (?P<value>{_VALUE})
     """
@@ -431,11 +443,12 @@ _AFTER_REDACTED = re.compile(
 
 # A command-line flag and its value after spaces or tabs: --password V, -api-key "V" (_KEY_VALUE covers
 # --key=V). Only a flag: a bare "token V" is prose. The dash is a lookahead, not "-+": "-+" before the
-# pattern's own "[_-]*" would split a long run of dashes in every way (quadratic). Spaces and tabs only: a
-# flag at the end of a line does not take the next line.
+# pattern's own "[_-]*" would split a long run of dashes in every way (quadratic), and it comes first: it
+# fails at once where no flag starts, before the key start's two lookbehinds (AG-13 M-2). Spaces and tabs
+# only: a flag at the end of a line does not take the next line.
 _FLAG_VALUE = re.compile(
     rf"""(?ix)
-    (?P<key>{_KEY_START}(?=-)(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<key>(?=-){_KEY_START}{_WHOLE_KEY})
     (?P<sep>[\ \t]++)
     (?P<value>{_ARG})
     """
@@ -454,10 +467,11 @@ _ARGV_VALUE = re.compile(
 
 # .netrc: "... password <value>", on one line. Never a separator: password = "V" is _KEY_VALUE's (#6). A value
 # that reads as a secret flag takes the word after it, as in _ARG. Its word is never a key with its own value
-# (_NOT_A_KEY), as a bare value.
+# (_NOT_A_KEY), as a bare value. The key's first letter is looked for first: it fails at once where no key
+# starts, before the two lookbehinds of its start (AG-13 M-2).
 _NETRC = re.compile(
     rf"""(?ix)
-    (?:(?<![A-Za-z0-9_])|{_AFTER_ESCAPE})(?P<key>{_NETRC_KEY})
+    (?={_NETRC_KEY[0]})(?:(?<![A-Za-z0-9_])|{_AFTER_ESCAPE})(?P<key>{_NETRC_KEY})
     (?P<sep>[\ \t]++)
     (?P<value>(?![:=])(?:{_SECRET_FLAG_WORD}(?:[\ \t]++{_SECRET_FLAG_WORD})*+(?:[\ \t]++{_NOT_A_KEY}\S+)?
                         |{_NOT_A_KEY}\S+))
