@@ -2,10 +2,11 @@
 
 ``tests/unit/test_redaction.py`` checks behaviour through the public API only. These tests check what that
 API cannot show without a reference to compare with: a speed-up (the KEY_HINT prefilter, the literal-first
-jwt pattern, the lookaheads in SECRET_KEY_PATTERN) leaves every output as the rules run in full, or the
-patterns' former forms, would give; the prefilter's tables cover every word the rules read; the black-box
-tests read no private name. Each is coupled to the module's internals on purpose: a refactor that renames a
-pattern updates these tests, never the black-box ones (backend review M1, final review of 74bf8d4).
+jwt pattern, the lookaheads in SECRET_KEY_PATTERN, the literal-first URL rule) leaves every output as the
+rules run in full, or the patterns' former forms, would give; the prefilter's tables cover every word the
+rules read; the black-box tests read no private name. Each is coupled to the module's internals on
+purpose: a refactor that renames a pattern updates these tests, never the black-box ones (backend review M1,
+final review of 74bf8d4).
 """
 
 from __future__ import annotations
@@ -91,7 +92,7 @@ def _every_rule(text: str) -> str:
     """``Redactor().redact`` with no rule skipped: the reference for the skips."""
     for pattern in _PATTERNS:
         text = pattern.sub(REDACTED, text)
-    text = _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)
+    text = _URL_CREDENTIALS.sub(f"://{REDACTED}@", text)
     for rule in (_AFTER_REDACTED, _CREDENTIAL_HEADER, _KEY_VALUE, _FLAG_VALUE, _ARGV_VALUE, _NETRC):
         text = rule.sub(_drop_value, text)
     return text
@@ -119,6 +120,28 @@ def test_the_jwt_pattern_matches_what_its_former_form_did() -> None:
     for _ in range(20_000):
         text = "".join(rnd.choice(pieces) for _ in range(rnd.randint(0, 25)))
         assert [m.span() for m in jwt.finditer(text)] == [m.span() for m in _JWT_BEFORE.finditer(text)], text
+
+
+# The URL rule as it was before the final fix wave: the scheme first, retried from every letter.
+_URL_CREDENTIALS_BEFORE = re.compile(
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]{0,31}://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{8,})@"
+)
+
+
+def test_the_url_rule_redacts_what_its_former_form_did() -> None:
+    """AG-13 F-4 (final review of 74bf8d4): the literal-first URL rule replaces the same userinfo, and its
+    matches end where the former form's did (they start at "://", after the scheme the former form took)."""
+    pieces = [
+        "://", ":", "/", "@", "a", "Z", "1", "+", ".", "-", " ", "\n", "user", "pw", "x" * 8, "https", "h",
+        "ab", "\u00e9", "a" * 31, "1" * 31, REDACTED, "git+ssh", "Pq9" * 4,
+    ]  # fmt: skip
+    rnd = random.Random(17)  # noqa: S311 - a reproducible fuzz, not a secret
+    for _ in range(30_000):
+        text = "".join(rnd.choice(pieces) for _ in range(rnd.randint(1, 14)))
+        before = _URL_CREDENTIALS_BEFORE.sub(rf"\g<scheme>{REDACTED}@", text)
+        assert _URL_CREDENTIALS.sub(f"://{REDACTED}@", text) == before, text
+        ends = [m.end() for m in _URL_CREDENTIALS_BEFORE.finditer(text)]
+        assert [m.end() for m in _URL_CREDENTIALS.finditer(text)] == ends, text
 
 
 def test_the_key_pattern_matches_what_it_did_without_its_lookaheads() -> None:

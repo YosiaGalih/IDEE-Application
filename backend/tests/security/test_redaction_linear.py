@@ -112,6 +112,11 @@ CASES = [
     ("escaped_breaks_before_flags", "\\t--token x" * (KIB_64 // 12)),
     ("escaped_breaks_before_netrc", "\\rpassword x" * (KIB_64 // 12)),
     ("escaped_breaks_before_words", "\\nxyz" * (KIB_64 // 5)),
+    # AG-13 F-4: the URL rule leads with "://" and checks the scheme behind it. URLs among key words, the
+    # longest scheme of digits after a letter (every width tried), and digits that make no scheme.
+    ("urls_among_key_words", "a" + "passwordsecret://passwd" * (KIB_64 // 23)),
+    ("url_schemes_of_digits", ("a" + "1" * 31 + "://u:p ") * (KIB_64 // 39)),
+    ("url_without_a_scheme", ("1" * 33 + "://u:p ") * (KIB_64 // 40)),
 ]
 
 

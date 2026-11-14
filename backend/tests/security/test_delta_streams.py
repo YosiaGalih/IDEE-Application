@@ -82,9 +82,9 @@ def test_a_long_quoted_secret_never_streams_raw_whatever_its_spelling(spelling: 
 KIB_64 = 64 * 1024
 
 
-def filled(head: str, filler: str) -> str:
-    """``head``, then ``filler`` up to 64 KiB."""
-    return (head + filler * KIB_64)[:KIB_64]
+def filled(head: str, filler: str, tail: str = "") -> str:
+    """``head``, then ``filler`` up to 64 KiB, the last characters ``tail``."""
+    return (head + filler * KIB_64)[: KIB_64 - len(tail)] + tail
 
 
 # Built, not written: test values a token pattern matches, followed by a key it runs on into.
@@ -137,6 +137,11 @@ PATHOLOGICAL = {
     "header markers and quotes": filled("Cookie: ", '[REDACTED]"'),
     "header lines stopped at quotes": filled("", 'Cookie: a b"x [REDACTED]"\n'),
     "keys pairing header stops": filled("", 'password: "Cookie: a b"x '),
+    # AG-13 F-4 (final review of 74bf8d4): key words dense around "://", so a URL candidate opens at every
+    # release and the text is keyword-dense for every rule (1.06 to 1.42 s at 74bf8d4).
+    "key words around URLs": filled("a", "passwordsecret://passwd", "cookie: "),
+    "URLs before key words": filled("aeyJb", "://credentialpassword", '"""\\"'),
+    "key words, dashes and URLs": filled("Authorization:b\n", "credential-----://", "://ticket;"),
 }
 
 

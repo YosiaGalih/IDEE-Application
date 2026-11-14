@@ -227,11 +227,21 @@ _PATTERNS: tuple[re.Pattern[str], ...] = tuple(pattern for _, pattern in _NAMED_
 
 # scheme://user:pass@host and scheme://<token-like userinfo>@host → scheme://[REDACTED]@host
 # The scheme is at most 32 characters: an unbounded one was retried from every position of a long run of
-# letters (64 KB of "a" took 2.8 s; WP-3.1d1, tool outputs). No lookbehind: a URL right after "+", "-", ".",
-# a digit or other letters (a diff line, a list) must still be redacted (AG-13, WP-3.1d1). The scheme is
-# public: the agent runtime's delta stream holds a URL from its scheme while its userinfo may still grow.
-URL_SCHEME_PATTERN = r"[A-Za-z][A-Za-z0-9+.\-]{0,31}"
-_URL_CREDENTIALS = re.compile(rf"(?P<scheme>{URL_SCHEME_PATTERN}://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{{8,}})@")
+# letters (64 KB of "a" took 2.8 s; WP-3.1d1, tool outputs). No boundary before it: a URL right after "+",
+# "-", ".", a digit or other letters (a diff line, a list) must still be redacted (AG-13, WP-3.1d1). The
+# scheme is public: the agent runtime's delta stream holds a URL from its scheme while its userinfo may still
+# grow.
+_SCHEME_FIRST, _SCHEME_REST, _SCHEME_LONGEST = r"[A-Za-z]", r"[A-Za-z0-9+.\-]", 32
+URL_SCHEME_PATTERN = rf"{_SCHEME_FIRST}{_SCHEME_REST}{{0,{_SCHEME_LONGEST - 1}}}"
+# The literal "://" leads and the scheme is checked behind it, one fixed width per length, in an atomic
+# group: the search skips to each "://" at C speed and reads its userinfo once. A scheme tried from every
+# letter read the userinfo again from each start (17 ms per 64 KiB of URL-dense text, and the delta stream
+# redacts a call about 100 times: AG-13 F-4, final review of 74bf8d4). The same URLs as the scheme-first form
+# (tests/unit/test_redaction_internals.py); a match starts at "://", on the scheme's line.
+_URL_SCHEME_BEHIND = "|".join(
+    rf"(?<={_SCHEME_FIRST}{_SCHEME_REST}{{{n}}}://)" for n in range(_SCHEME_LONGEST)
+)
+_URL_CREDENTIALS = re.compile(rf"://(?>{_URL_SCHEME_BEHIND})(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{{8,}})@")
 
 # Header-like pairs anywhere in a line, also inside JSON/repr: Authorization: Bearer x / "x-api-key": "y".
 # Without an opening quote after the colon the value is the rest of the line, quoted parts included
@@ -553,7 +563,7 @@ class Redactor:
             text = pattern.sub(replace, text)
         if "://" not in text:
             return text
-        return _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)  # userinfo holds no line break
+        return _URL_CREDENTIALS.sub(f"://{REDACTED}@", text)  # userinfo holds no line break
 
     def find(self, text: str) -> list[Finding]:
         """What ``redact`` would remove, as (line, rule), in text order; one finding per rule and line. The
