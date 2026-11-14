@@ -37,7 +37,15 @@ from app.agents.prompt_book import Prompt, PromptBook
 from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.cancel import CancelToken
 from app.core.logging import get_logger
-from app.core.redaction import SENSITIVE_KEY_TAIL, Redactor
+from app.core.redaction import (
+    CREDENTIAL_HEADER_NAMES,
+    CREDENTIAL_HEADER_START,
+    KEY_HINT,
+    SECRET_KEY_PATTERN,
+    URL_SCHEME_PATTERN,
+    Redactor,
+    stopped_at_open_quote,
+)
 from app.llm.base import (
     ContentBlock,
     LLMError,
@@ -147,22 +155,50 @@ _log = get_logger(__name__)
 
 
 # Where a secret may still be growing at the end of the RAW text: nothing goes out from the start of one until
-# it closes or the call's stream ends (reviews of 42bcb2e: M3, AG-13 INFO-3; of 073e68d: AG-13 D-M1, D-L1).
-# Each check is a scan from the end at C speed, linear in the text: a `\Z`-anchored search tried from every
-# start was quadratic (a 64 KiB attempt took 90 s). The raw text, not the redacted one: _NETRC rewrites
-# `password = "…` to `password [REDACTED] "…` before the quote could be seen.
+# it closes or the call's stream ends (reviews of 42bcb2e: M3, AG-13 INFO-3; of 073e68d: AG-13 D-M1, D-L1;
+# WP-3.1f2c D2-L2, D2-I1). Each check is a scan from the end at C speed, or a search in a short window that
+# ends there, linear in the text: a `\Z`-anchored search tried from every start was quadratic (a 64 KiB
+# attempt took 90 s). The raw text, not the redacted one: a rule can take the key before its value's quote is
+# closed (`Cookie: session="…` reads `Cookie: [REDACTED]"…` until the quote closes).
 _TOKEN_CHARS: Final = string.ascii_letters + string.digits + "_.-"
 _PEM_BEGIN: Final = "-----BEGIN"
 _PEM_END: Final = "-----END"
-# A key the redactor treats as secret (one list: SENSITIVE_KEY_TAIL) and its separator, right before a quote.
-_KEY_BEFORE_QUOTE: Final = re.compile(rf"(?i)(?:{SENSITIVE_KEY_TAIL})" r"\\?[\"']?\s*[:=]\s*\\?\Z")
-_KEY_WINDOW: Final = 128  # how far before the quote the key and its separator are looked for
+# A URL's userinfo grows until "@"; a "/" or a space ends the URL before any (Lead decision 3.1f2c #11).
+_URL_CLOSED: Final = re.compile(r"[@/\s]")
+_URL_SCHEME: Final = re.compile(rf"(?:{URL_SCHEME_PATTERN})\Z")  # the redactor's own scheme, leftmost
+_SCHEME_WINDOW: Final = 64  # longer than any scheme URL_SCHEME_PATTERN takes (32)
+# What opens a quoted value before its quote: a string prefix (b"…, rb'…, as the redactor reads one) or the
+# backslash of an escaped JSON quote (\"…). Spaces before it are the gap, not part of the key's separator.
+_VALUE_OPENER: Final = re.compile(r"(?:(?<![A-Za-z0-9_])[bBfFrRuU]{1,2}|\\)\Z")
+# What precedes a quoted value the redactor redacts, up to the last character before the gap, in the forms its
+# rules read (Lead decision 3.1f2c #10; the Lead's Task 2 carry):
+# - a key and its assignment, as _KEY_VALUE reads them: password=, "password": , \"password\": , --token=
+# - an argv item and its comma, as _ARGV_VALUE reads them: "--password",
+# - a flag word, as _FLAG_VALUE and _ARGV_VALUE read it: --password, "--password". A word opens a value only
+#   after a gap of spaces (the "word" group): the closing quote of "--password" in prose opens none.
+# The key is SECRET_KEY_PATTERN, the redactor's own key names (Goal 2), with no left boundary: a token pattern
+# that ran on into the key (ghp_…password="V", which the redactor reads as [REDACTED]="V") leaves the key in
+# the raw text.
+_KEY_BEFORE_QUOTE: Final = re.compile(
+    rf"""(?ix)
+    (?: (?:{SECRET_KEY_PATTERN}) \\?["']? \s*[:=]
+      | ["'](?=-)(?:{SECRET_KEY_PATTERN}) \\?["'] \s*,
+      | (?P<word> (?=-)(?:{SECRET_KEY_PATTERN}) | ["'](?=-)(?:{SECRET_KEY_PATTERN}) \\?["'] )
+    )\Z
+    """
+)
+_KEY_WINDOW: Final = 128  # how far before the last character before the gap the key is looked for
+_LONGEST_HEADER_NAME: Final = max(map(len, CREDENTIAL_HEADER_NAMES))
 
 
 def open_candidate(text: str) -> int | None:
-    """Where the first candidate still open at the end of ``text`` starts, or None: an ``eyJ`` token run that
-    has not ended, a ``-----BEGIN`` with no ``-----END`` after it, an opening quote with no closing one after
-    it, right after a secret-like key."""
+    """Where the first candidate still open at the end of ``text`` starts, or None:
+    - an ``eyJ`` token run that has not ended;
+    - a ``-----BEGIN`` with no ``-----END`` after it;
+    - a ``scheme://`` with no "@", "/" or space after it yet: userinfo that may still grow (``_open_url``);
+    - an opening quote with no closing one after it, after a key the redactor treats as secret
+      (``_key_before``);
+    - the value of a header whose line is the last line (``_open_header``)."""
     found: list[int] = []
     run = text.find("eyJ", len(text.rstrip(_TOKEN_CHARS)))
     if run != -1:
@@ -171,11 +207,72 @@ def open_candidate(text: str) -> int | None:
     begin = text.find(_PEM_BEGIN, 0 if last_end == -1 else last_end + 1)
     if begin != -1:
         found.append(begin)
+    if (url := _open_url(text)) is not None:
+        found.append(url)
     for quote in "\"'":
         at = text.rfind(quote)  # the last one: no quote of its kind closes it
-        if at != -1 and (key := _KEY_BEFORE_QUOTE.search(text, max(at - _KEY_WINDOW, 0), at)):
-            found.append(key.start())
+        if at != -1 and (key := _key_before(text, at)) is not None:
+            found.append(key)
+    if (header := _open_header(text)) is not None:
+        found.append(header)
     return min(found, default=None)
+
+
+def _open_url(text: str) -> int | None:
+    """Where a URL whose userinfo may still grow starts: the last ``://`` (an earlier one has the "//" of
+    this one after it), with no "@", "/" or space after it, from its scheme (Lead decision 3.1f2c #11). A URL
+    longer than the hold is then redacted whole once its "@" arrives, never streamed in part before."""
+    at = text.rfind("://")
+    if at == -1 or _URL_CLOSED.search(text, at + 3) is not None:
+        return None
+    scheme = _URL_SCHEME.search(text, max(at - _SCHEME_WINDOW, 0), at)
+    return None if scheme is None else scheme.start()
+
+
+def _key_before(text: str, quote: int) -> int | None:
+    """Where the key starts whose value the quote at ``quote`` opens, or None (Lead decision 3.1f2c #10). The
+    key and its separator end at the last non-space character before the value's opening and are looked for
+    within ``_KEY_WINDOW`` characters of it, however many spaces or line breaks come between."""
+    opener = _VALUE_OPENER.search(text, max(quote - 2, 0), quote)
+    head = quote if opener is None else opener.start()
+    stop = len(text[:head].rstrip())  # one scan from the end at C speed
+    key = _KEY_BEFORE_QUOTE.search(text, max(stop - _KEY_WINDOW, 0), stop)
+    if key is None or (key["word"] is not None and stop == head):
+        return None
+    return key.start()
+
+
+def _open_header(text: str) -> int | None:
+    """Where the value of a header whose line is still open starts, or None (Lead rulings, WP-3.1f2c fix
+    rounds). Without an opening quote after its colon a header value is the rest of its line, and a quote
+    that opens a parameter may take later lines or the rest of the text (the redactor's header rule): while
+    the header's line is the last line of the text, its value is held from its start. No quote is paired here:
+    the redactor reads the text with tokens, URL credentials and literals replaced, and a replaced span may
+    hold a quote or a backslash, so the raw text pairs its quotes differently (review I-1 of 50610b5).
+
+    A value starts on the last line when its header's name is on that line, or when only the separator comes
+    between the name and that line (line breaks, the colon, a JSON key's closing quote and backslash): the
+    search starts that far back, less the longest name, and no earlier than the first KEY_HINT word allows.
+    Scans from the end, then ":" and KEY_HINT, then one search of CREDENTIAL_HEADER_START: linear."""
+    line = max(text.rfind("\n"), text.rfind("\r")) + 1
+    head = text[:line].rstrip()
+    head = head[:-1].rstrip() if head.endswith(":") else head
+    head = head[:-1] if head.endswith(('"', "'")) else head
+    head = head[:-1] if head.endswith("\\") else head
+    start = max(len(head) - _LONGEST_HEADER_NAME, 0)
+    if text.find(":", start) == -1 or (hint := KEY_HINT.search(text, start)) is None:
+        return None  # no separator, or no header name
+    for header in CREDENTIAL_HEADER_START.finditer(text, max(start, hint.start() - _LONGEST_HEADER_NAME)):
+        if header.end() >= line:
+            return header.end()
+    return None
+
+
+def delta_hold(redactor: Redactor) -> int:
+    """The ``hold`` of a run's delta stream (Lead decision 3.1f2c #11): DELTA_HOLD_CHARS, or the longest
+    configured literal less one when that is more. A literal is redacted only once it is whole, so a part of
+    one cut at the end of the text, at most that long, stays in the held tail."""
+    return max(DELTA_HOLD_CHARS, redactor.longest_literal - 1)
 
 
 def _common_prefix(a: str, b: str) -> int:
@@ -191,26 +288,38 @@ def _common_prefix(a: str, b: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class Delta:
-    """One ``agent.delta``: ``text`` is appended to what the client shows, or replaces it when ``reset``."""
+    """One ``agent.delta`` of model call ``call`` (a run's first is 1, the run's iteration): ``text`` is
+    appended to that call's text, or replaces that call's text when ``reset`` (Lead decision 3.1f2c #9). A
+    client shows the calls' texts in call order."""
 
     text: str
+    call: int
     reset: bool = False
 
 
 class DeltaRedactor:
     """The streamed text of a run, redacted across deltas (Keputusan Lead #24, #34; Keputusan plan #12;
-    reviews of 42bcb2e: M3, AG-13 INFO-3, M4; of 073e68d: item 11, AG-13 D-M1, D-L1).
+    reviews of 42bcb2e: M3, AG-13 INFO-3, M4; of 073e68d: item 11, AG-13 D-M1, D-L1; WP-3.1f2c D2-L1).
 
     The text of the current model call is redacted whole, never a piece of it, so a secret cut across deltas
     is seen whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
-    characters, and nothing from the start of a candidate still open at the end of the raw text
-    (``open_candidate``), minus what already went out. ``flush`` ends the call: its final redacted text goes
-    out and is committed, never redacted again. When redacting a longer text changes what already went out, a
-    ``reset`` delta carries the committed text of the calls before, then the current call's stable text: the
-    client replaces, never appends. ``restart`` (a retried attempt) voids the current call's text, held or
-    sent: its reset carries the committed text. The whole text is redacted again every ``release`` raw
-    characters, or every 1/``DELTA_RELEASE_SHARE`` of the text once that is longer, so a stream costs about
-    ``DELTA_RELEASE_SHARE`` redactions of its length, never a quadratic number."""
+    characters (a run's is ``delta_hold``: never less than its longest configured literal less one), and
+    nothing from the start of a candidate still open at the end of the raw text (``open_candidate``), nor
+    from a value the header rule ended at a quote its last line may still close (``redact_with_stop``, a
+    run's ``Redactor.redact_with_stop``; without it, ``stopped_at_open_quote`` of the redacted text, which
+    misses a stop a later rule took: a test's fake redaction only, as ``app`` builds a run's stream with
+    ``delta_redactor``), minus what already went out.
+
+    Every delta names its model call (``Delta.call``, from 1), and a reset replaces that call's text only
+    (Lead decision 3.1f2c #9, which replaces the run-wide reset of WP-3.1f2a #44). When redacting a longer
+    text changes what already went out, a ``reset`` delta carries the call's stable text, and the rest of the
+    attempt is held until ``flush``: at most one reset mid-attempt and one at ``flush``, so the payloads stay
+    linear in the text streamed. ``flush`` ends the call: its ``redact``, appended when it extends what went
+    out, else a reset; the next call is numbered one more. ``restart`` (a retried attempt) voids the call's
+    text, held or sent, with an empty reset, and the retry starts with no hold. The whole text is redacted
+    again every ``release`` raw characters, or every 1/``DELTA_RELEASE_SHARE`` of the text once that is
+    longer, so a stream costs about ``DELTA_RELEASE_SHARE`` redactions of its length, never a quadratic
+    number."""
 
     def __init__(
         self,
@@ -218,43 +327,65 @@ class DeltaRedactor:
         *,
         hold: int = DELTA_HOLD_CHARS,
         release: int = DELTA_RELEASE_CHARS,
+        redact_with_stop: Callable[[str], tuple[str, int | None]] | None = None,
     ) -> None:
         self._redact = redact
+        self._redact_with_stop = redact_with_stop
         self._hold = hold
         self._release = max(release, 1)
-        self._committed = ""
+        self._call = 1
         self.reset()
 
     def feed(self, text: str) -> Delta | None:
-        """What is now safe to send; ``None`` when nothing is yet."""
+        """What is now safe to send; ``None`` when nothing is yet, or once the attempt had a reset."""
         self._text += text
+        if self._held:
+            return None
         step = max(self._release, len(self._text) // DELTA_RELEASE_SHARE)
         if len(self._text) - self._redacted_at < step:
             return None
         self._redacted_at = len(self._text)
-        return self._emit(self._redact(self._text), final=False)
+        if self._redact_with_stop is None:
+            redacted = self._redact(self._text)
+            return self._emit(redacted, final=False, stop=stopped_at_open_quote(redacted))
+        redacted, stop = self._redact_with_stop(self._text)
+        return self._emit(redacted, final=False, stop=stop)
 
     def flush(self) -> Delta | None:
-        """End of the call: the rest, redacted; the call's text is committed; the next call starts empty."""
-        redacted = self._redact(self._text)
-        out = self._emit(redacted, final=True)
-        self._committed += redacted
+        """End of the call: its ``redact``, the rest appended or a reset, or the whole of it as a reset when a
+        delta of the call was lost (``mark_lost``); the next call starts empty."""
+        out = self._emit(self._redact(self._text), final=True)
+        if self._lost:  # what went out was not all received: the call's whole text replaces the client's
+            out = Delta(self._sent, self._call, reset=True)
+        self._call += 1
         self.reset()
         return out
 
+    def mark_lost(self, call: int) -> None:
+        """A delta of model call ``call`` did not reach the client: its publish failed, so the client's text
+        of the call has a hole or misses a reset (silent-failure review MEDIUM-2, final review of 74bf8d4).
+        When it is the current call, its ``flush`` sends the call's whole redacted text as a reset.
+        ``restart`` clears the mark: its empty reset voids the attempt (and marks the call again if it is lost
+        too). A lost ``flush`` delta belongs to a call that has ended: nothing repairs it; the runtime logs
+        it."""
+        if call == self._call:
+            self._lost = True
+
     def restart(self) -> Delta:
-        """A retried attempt: its text is void; the client goes back to the committed text."""
+        """A retried attempt: its text is void; the client empties the call's text."""
         self.reset()
-        return Delta(self._committed, reset=True)
+        return Delta("", self._call, reset=True)
 
     def reset(self) -> None:
-        """Drops the current call's text, never sending what is held."""
+        """Drops the current call's text, never sending what is held; the next attempt starts with no hold."""
         self._text = ""
         self._sent = ""
         self._redacted_at = 0
         self._before: tuple[int, str] | None = None  # (candidate start, redaction of the raw text before it)
+        self._held = False  # the attempt had a reset: the rest waits for flush (Lead decision 3.1f2c #9)
+        self._lost = False  # a delta of the call never reached the client: flush resends it whole
 
-    def _emit(self, redacted: str, *, final: bool) -> Delta | None:
+    def _emit(self, redacted: str, *, final: bool, stop: int | None = None) -> Delta | None:
         consistent = redacted.startswith(self._sent)
         safe = len(redacted)
         if not final:
@@ -262,13 +393,16 @@ class DeltaRedactor:
             start = open_candidate(self._text)
             if start is not None:
                 safe = min(safe, self._redacted_before(start, redacted))
+            if stop is not None:
+                safe = min(safe, stop)
         stable = redacted[: max(safe, 0)]
         if not consistent:
             self._sent = stable
-            return Delta(self._committed + stable, reset=True)
+            self._held = True
+            return Delta(stable, self._call, reset=True)
         if len(stable) <= len(self._sent):
             return None
-        out = Delta(stable[len(self._sent) :])
+        out = Delta(stable[len(self._sent) :], self._call)
         self._sent = stable
         return out
 
@@ -279,6 +413,20 @@ class DeltaRedactor:
             self._before = (start, self._redact(self._text[:start]))
         before = self._before[1]
         return len(before) if redacted.startswith(before) else _common_prefix(before, redacted)
+
+
+def delta_redactor(redactor: Redactor, *, release: int = DELTA_RELEASE_CHARS) -> DeltaRedactor:
+    """A run's delta stream (WP-3.1f2c): the redactor's redaction, its hold (``delta_hold``) and its header
+    stops (``Redactor.redact_with_stop``). It is the one place in ``app`` that builds a ``DeltaRedactor``
+    (``tests/unit/test_delta_redactor_guard.py``): one built without ``redact_with_stop`` reads the stop on
+    the redacted text, where a rule after the header rule may have taken it (review of 45c2ec7). A run keeps
+    the default ``release``; a test that checks every cut passes 1."""
+    return DeltaRedactor(
+        redactor.redact,
+        hold=delta_hold(redactor),
+        release=release,
+        redact_with_stop=redactor.redact_with_stop,
+    )
 
 
 class AgentInputInvalid(ValueError):
@@ -665,7 +813,7 @@ class RunStore(Protocol):
 
 
 class RunEvents(Protocol):
-    async def delta(self, scope: RunScope, text: str, *, reset: bool = False) -> None: ...
+    async def delta(self, scope: RunScope, text: str, *, call: int, reset: bool = False) -> None: ...
     async def usage_updated(self, scope: RunScope) -> None: ...
 
 
@@ -751,7 +899,7 @@ class _Run:
     input_content: str  # the <agent_input> content: redacted, escaped, within CONTEXT_MAX_BYTES
     deadline: float
     deltas: (
-        DeltaRedactor  # the run's streamed text, one for all its model calls (a reset shows the run's text)
+        DeltaRedactor  # the run's streamed text, one for all its model calls: it numbers them (Delta.call)
     )
     stop: _RunStop = field(default_factory=_RunStop)
     tally: _Tally = field(default_factory=_Tally)
@@ -889,7 +1037,7 @@ class AgentRuntime:
             runtime_id=runtime_id,
             output_contract=output_contract,
             input_content=content,
-            deltas=DeltaRedactor(self._redactor.redact),
+            deltas=delta_redactor(self._redactor),
             deadline=self._clock() + spec.limits.timeout_seconds,
         )
 
@@ -1133,7 +1281,7 @@ class AgentRuntime:
             await self._delta(run, scope, deltas.feed(text))
 
         async def on_restart(attempt: int) -> None:
-            # M4: the failed attempt's text, held or sent, is void; the client goes back to the calls before.
+            # M4: the failed attempt's text, held or sent, is void; the client empties this call's text only.
             await self._delta(run, scope, deltas.restart())
 
         try:
@@ -1153,25 +1301,42 @@ class AgentRuntime:
         return response
 
     async def _delta(self, run: _Run, scope: RunScope, delta: Delta | None) -> None:
-        if delta is not None:
-            await self._event(
-                run, "agent.delta", self._ports.events.delta(scope, delta.text, reset=delta.reset)
-            )
+        """Publishes ``delta``; one that fails is logged with its call and reset, and the call's ``flush``
+        resends the call whole (``DeltaRedactor.mark_lost``)."""
+        if delta is None:
+            return
+        published = await self._event(
+            run,
+            "agent.delta",
+            self._ports.events.delta(scope, delta.text, call=delta.call, reset=delta.reset),
+            call=delta.call,
+            reset=delta.reset,
+        )
+        if not published:
+            run.deltas.mark_lost(delta.call)
 
     async def _usage_changed(self, run: _Run, scope: RunScope, sent_before: int) -> None:
         """``usage.updated`` only when an attempt of this call reached the provider (review L3)."""
         if run.tally.sent > sent_before:
             await self._event(run, "usage.updated", self._ports.events.usage_updated(scope))
 
-    async def _event(self, run: _Run, event_type: str, awaitable: Awaitable[None]) -> None:
-        """Events are best effort (review L3): the ledger is the truth; a failed event is logged (ids and
-        type) and the run goes on."""
+    async def _event(
+        self, run: _Run, event_type: str, awaitable: Awaitable[None], **fields: int | bool
+    ) -> bool:
+        """Events are best effort (review L3): the ledger is the truth; a failed event is logged (ids, type
+        and ``fields``) and the run goes on. Whether the event was published."""
         try:
             await self._port(run, awaitable)
         except Exception as error:
             _log.warning(
-                "agent_run_event_failed", **_ctx(run), event_type=event_type, error_type=type(error).__name__
+                "agent_run_event_failed",
+                **_ctx(run),
+                event_type=event_type,
+                error_type=type(error).__name__,
+                **fields,
             )
+            return False
+        return True
 
     # --- how it ends ----------------------------------------------------------------------------------------
 

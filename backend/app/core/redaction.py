@@ -1,31 +1,206 @@
 """Secret redaction for every outbound path (SECURITY_MODEL §6.2, ADR-030, T12, M.2).
 
 Two layers:
-- text patterns (token prefixes, PEM, URL credentials, headers, ``key=value``), plus configured literals;
-- structure: a value stored under a sensitive key name is dropped whole, whatever it looks like.
+- text patterns (token prefixes, PEM, URL credentials, headers, ``key=value``, command-line flags), plus
+  configured literals;
+- structure: a value stored under a sensitive key name (a str or bytes key) is dropped whole, whatever it
+  looks like; so is the item after a secret flag in a list or tuple (an argv list).
 
 Order matters: the labelled Anthropic admin-key pattern runs before the generic ``sk-ant-`` pattern so it
-stays covered even if the generic pattern is narrowed later.
+stays covered even if the generic pattern is narrowed later. A token pattern can run on into the key after it
+(``ghp_…password="V"``): the rule for a value after a redacted token (``_AFTER_REDACTED``) runs next.
 """
 
 from __future__ import annotations
 
 import bisect
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
 REDACTED = "[REDACTED]"
 
 # A key is sensitive when its *last* segment(s) name a secret: GITHUB_TOKEN, client_secret, api-key. Public:
-# the agent runtime's delta stream holds a quoted value back after the same keys (app.agents.runtime).
+# SECRET_KEY_PATTERN, which the agent runtime's delta stream reads, is generated from it, and tests read it as
+# the list of tails.
 # "token_count", "max_tokens", "secret_santa" and "password_policy" stay readable.
 SENSITIVE_KEY_TAIL = (
     r"passwords?|passwd|passphrase|secrets?|secret_key|token|api_key|apikey|access_key|private_key"
     r"|ticket|credentials?|authorization|cookies?|set_cookie|session|jwt|bearer"
 )
 _SENSITIVE_KEY_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAIL})$")
+
+# Well-known secret environment variables whose name ends in no tail. Exact names in any case, not tails:
+# "pwd" alone is the working directory in code and shells, and PGPASSFILE names a file (Lead ruling, 3.1f2c).
+# Private, as _CREDENTIAL_HEADER: only this module reads them (backend review M4, final review of 74bf8d4).
+_KNOWN_SECRET_NAMES = frozenset({"pgpassword", "mysql_pwd", "rediscli_auth"})
+
+# The headers whose value is a credential, in the order _CREDENTIAL_HEADER tries them. One list: it builds
+# _CREDENTIAL_HEADER, CREDENTIAL_HEADER_START and KEY_HINT. Public: the agent runtime's delta stream reads it,
+# as tests/unit/test_redaction_internals.py does.
+CREDENTIAL_HEADER_NAMES = ("proxy-authorization", "authorization", "set-cookie", "cookie", "x-api-key")
+_NETRC_KEY = "password"  # the one key _NETRC reads (KEY_HINT reads it too)
+
+
+def _capitalised(word: str) -> str:
+    return word[0].upper() + word[1:]  # "secrets?" -> "Secrets?": a tail word is letters and an optional "s?"
+
+
+def _upper_run(word: str, *, after_lower: str, after_upper: str) -> str:
+    """``word`` as an upper-case run of one letter or more, then lower case: Secret, SECret, SECRET (and the
+    plural's s in either case), the spellings one of ``is_sensitive_key``'s splits reads as one word after a
+    lower-case letter or digit. ``after_lower`` follows a spelling that ends in lower case, ``after_upper``
+    one that ends in upper case. At each letter the run goes on (upper case) or ends (lower case): the two
+    alternatives start on different characters, so the word is read once."""
+    letters = word.removesuffix("s?")
+    plural = letters != word
+
+    def from_letter(at: int) -> str:  # letters[at:], the run still going at ``at``
+        if at == len(letters):
+            return f"(?:S{after_upper}|s{after_lower}|{after_upper})" if plural else after_upper
+        rest = letters[at:] + ("s?" if plural else "") + after_lower
+        return f"(?:{letters[at].upper()}{from_letter(at + 1)}|{rest})"
+
+    return letters[0].upper() + from_letter(1)
+
+
+def _camel_rest(words: list[str], *, after_lower: bool) -> str:
+    """The tail words after the first, joined as ``is_sensitive_key`` splits them: by "_" or "-" (the rest is
+    then snake, any case), or by a hump. After a lower-case letter a word is any upper-case run then lower
+    case (secretKey, secretKEY, secretKEy); after an upper-case one only a Capitalised word, which the acronym
+    split reads (SECRETKey splits, SECRETKEY and SECRETKEy do not)."""
+    if not words:
+        return ""
+    word, *more = words
+    hump = (
+        _upper_run(
+            word,
+            after_lower=_camel_rest(more, after_lower=True),
+            after_upper=_camel_rest(more, after_lower=False),
+        )
+        if after_lower
+        else _capitalised(word) + _camel_rest(more, after_lower=True)
+    )
+    joints = [rf"[_-](?i:{'[_-]'.join(words)})", hump]
+    return "(?:" + "|".join(joints) + ")"
+
+
+def _secret_key_pattern(tails: Iterable[str], names: Iterable[str], *, words_before: bool = True) -> str:
+    """One sensitive key name, generated from the tails so a non-secret name never matches (Lead decision
+    3.1f2c #2): a pattern for any identifier would swallow ``note="password=v"`` whole, secret and all.
+
+    ``is_sensitive_key`` drops leading underscores and dashes (a private name, a command-line flag), then
+    takes a well-known secret name whole, in any case (``names``: ``PGPASSWORD``). Otherwise it splits the
+    rest into words at "_", "-" and humps, in two ways (``_WORD_BOUNDARIES``: with and without the acronym
+    split), and asks whether the last words spell a tail. The same name in free text, after any leading "_"
+    or "-" (``self._password``, ``--api-key``):
+    - snake, kebab or UPPER: the tail starts the name or follows "_"/"-", its words joined by "_" or "-",
+      in any case (``db_password``, ``x-api-key``, ``SECRET_KEY``);
+    - camel and Pascal: the tail starts where a hump starts a word. A Capitalised tail follows any letter
+      or digit (``clientSecret``, ``DBPassword``); an upper-case run then lower case, UPPER included, only a
+      lower-case letter or digit (``dbPASSWORD``, ``dbPASSword``; ``DBPASSWORD`` has no hump); a lower-case
+      tail only the start of a word (``secretKey``).
+
+    The camel part is case-sensitive whatever the flags of the pattern it is embedded in: a hump is a case
+    change. The snake part is case-insensitive, so it also takes a mixed-case word (``PassWord``) that
+    ``is_sensitive_key`` splits: free text redacts more there, never less. No boundary lookaround: the
+    caller anchors the name (``_KEY_VALUE``, the delta stream's key check). Every alternative is a fixed
+    word after a run of ``[A-Za-z0-9]``, so a match tried from one start is linear in the name, and the
+    leading run of "_" and "-" is possessive, so it is read once. Two lookaheads only fail early what could
+    not match (tests/unit/test_redaction_internals.py compares the pattern with and without them).
+
+    With ``words_before=False``, the tail alone: no word or hump before it (``secret``, ``secretKey``,
+    ``PASSWORD``; not ``db_password`` or ``clientSecret``).
+    """
+    snake: list[str] = []
+    lower: list[str] = []
+    upper: list[str] = []  # an upper-case run, then lower case
+    capital: list[str] = []
+    for tail in tails:
+        first, *more = tail.split("_")
+        snake.append("[_-]".join([first, *more]))
+        if more:  # a lower-case word alone is snake; it needs a hump inside the tail (secretKey)
+            lower.append(first + _camel_rest(more, after_lower=True))
+        rest_after_lower, rest_after_upper = (_camel_rest(more, after_lower=case) for case in (True, False))
+        upper.append(_upper_run(first, after_lower=rest_after_lower, after_upper=rest_after_upper))
+        capital.append(_capitalised(first) + rest_after_lower)
+    words = r"(?:[A-Za-z0-9]+[_-])*" if words_before else ""  # the words before the tail's own segment
+    hump_after_lower = r"(?:[A-Za-z0-9]*[a-z0-9])?" if words_before else ""
+    hump_after_any = r"[A-Za-z0-9]*" if words_before else ""
+    return (
+        # Leading "_" (self._password) and "-" (--password), possessive: every alternative after it starts
+        # with a letter or digit, so a "_" or "-" given back could never match, and a long run of dashes is
+        # read once (backtracking it through the alternatives cost 18 ms per 64 KiB per pattern).
+        r"[_-]*+"
+        # Every alternative starts with a letter or digit (any case (?i) reads, whatever the enclosing flags):
+        # at any other position the pattern fails at once instead of trying every alternative.
+        r"(?=(?i:[A-Za-z0-9]))"
+        rf"(?:(?i:{'|'.join(sorted(names))})|"  # a well-known secret name, whole
+        rf"{words}"
+        rf"(?:(?i:{'|'.join(snake)})"
+        # A camel or Pascal form holds a capital before any character other than a lower-case letter or
+        # digit (one with none, secret_key, is a snake form on the same span, tried first), so a lower-case
+        # word does not try every hump of every tail.
+        rf"|(?-i:(?=[a-z0-9]*[A-Z])(?:(?:{'|'.join(lower)})"
+        rf"|{hump_after_lower}(?:{'|'.join(upper)})"
+        rf"|{hump_after_any}(?:{'|'.join(capital)}))))"
+        r")"
+    )
+
+
+# One sensitive key name, the free-text form of ``is_sensitive_key``: ``_KEY_VALUE`` here, the delta stream's
+# key check in app.agents.runtime. A regex source with no boundary lookaround; the caller adds the boundaries.
+SECRET_KEY_PATTERN = _secret_key_pattern(SENSITIVE_KEY_TAIL.split("|"), _KNOWN_SECRET_NAMES)
+# The tail alone, no words before it (_NOT_A_KEY): a key whose words before the tail stay readable may hold a
+# secret glued to a tail word ("<secret>Cookie: x").
+_SECRET_TAIL_PATTERN = _secret_key_pattern(
+    SENSITIVE_KEY_TAIL.split("|"), _KNOWN_SECRET_NAMES, words_before=False
+)
+
+# The characters a case-insensitive pattern takes for an ASCII letter besides its two cases (Python's re;
+# tests/unit/test_redaction.py checks all of Unicode for every letter).
+_CASE_FOLDS = {"i": "\u0130\u0131", "k": "\u212a", "s": "\u017f"}
+# ASCII letters from the rarest in English text to the most common.
+_RARE_FIRST = "zqxjkvbpygfwmucldrhsnioate"
+
+
+def _hint_words() -> list[str]:
+    """A word every match of the six skippable rules holds: the last word of each tail (any spelling of a
+    tail holds it: secret_key, secretKey and SECRETKEY all hold "key"), the known secret names, the header
+    names, the netrc key and the redaction marker. A word that holds another is left out: the other is
+    found wherever it is."""
+    words = {tail.split("_")[-1].removesuffix("s?") for tail in SENSITIVE_KEY_TAIL.split("|")}
+    words |= {*_KNOWN_SECRET_NAMES, *CREDENTIAL_HEADER_NAMES, _NETRC_KEY, "[redacted]"}
+    return sorted(word for word in words if not any(other != word and other in word for other in words))
+
+
+def _key_hint(words: Iterable[str]) -> re.Pattern[str]:
+    """A search for any of ``words`` in the case-insensitive sense, led by a case-sensitive class so that the
+    search skips every other character at C speed: a (?i) alternation is tried at every position (sre drops
+    its first-character set for cased literals under IGNORECASE). Each word is found at its rarest letter
+    (the lead), the rest checked behind and after it; the class holds every lead in every character (?i)
+    takes for it."""
+    leads: set[str] = set()
+    by_lead: dict[str, list[str]] = {}
+    for word in words:
+        at = min(range(len(word)), key=lambda i: _RARE_FIRST.find(word[i]) % (len(_RARE_FIRST) + 1))
+        lead = word[at]
+        leads |= {lead, lead.upper(), *_CASE_FOLDS.get(lead, "")}
+        before = f"(?<={re.escape(word[: at + 1])})" if at else ""
+        by_lead.setdefault(lead, []).append(before + re.escape(word[at + 1 :]))
+    # One lookbehind per lead letter, then only that letter's words.
+    branches = [f"(?<={re.escape(lead)})(?:{'|'.join(alts)})" for lead, alts in sorted(by_lead.items())]
+    return re.compile(f"[{''.join(map(re.escape, sorted(leads)))}](?i:{'|'.join(branches)})")
+
+
+# A word every key the key-value rules read holds (SECRET_KEY_PATTERN in _KEY_VALUE, _FLAG_VALUE and
+# _ARGV_VALUE; _NETRC_KEY in _NETRC), as do every header name (_CREDENTIAL_HEADER) and the marker
+# _AFTER_REDACTED reads, in the case-insensitive sense those rules use. A text with none of them is left as
+# it is by all six rules, so ``Redactor.redact`` skips them: they cost 15 ms per 64 KiB of plain text, and
+# the delta stream redacts a call's whole text up to about 100 times. Public: the delta stream's header
+# check reads it too.
+KEY_HINT = _key_hint(_hint_words())
 
 # Named so ``Redactor.find`` (security.scan_secrets) reports which rule matched, from the very same patterns.
 _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -37,20 +212,24 @@ _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
     # Starts only where a token starts: a match tried from every "eyJ" of a long run was quadratic (256 KiB of
     # "eyJ" took 17 s; AG-13 WP-3.1d2a MEDIUM-2). One "-" that itself follows no token character also counts
-    # as a start: git.diff prints a removed line as "-" + text (/code-review WP-3.1d2a spec HIGH).
+    # as a start: git.diff prints a removed line as "-" + text (/code-review WP-3.1d2a spec HIGH). The literal
+    # "eyJ" leads and the start is checked behind it (the same spans), so the search skips to each "eyJ" at C
+    # speed instead of trying the lookbehinds at every position (2 ms per 64 KiB; WP-3.1f2c fix round).
     (
         "jwt",
         re.compile(
-            r"(?:(?<![A-Za-z0-9_-])|(?<=^-)|(?<=[^A-Za-z0-9_-]-))"
-            r"eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
+            r"eyJ(?:(?<![A-Za-z0-9_-]eyJ)|(?<=^-eyJ)|(?<=[^A-Za-z0-9_-]-eyJ))"
+            r"[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
         ),
     ),
     ("password_hash", re.compile(r"\$argon2(?:id|i|d)\$[A-Za-z0-9+/=,$]+")),  # PHC string
-    # PEM blocks, including a truncated block with no END marker.
+    # PEM and PGP blocks ("-----BEGIN PGP PRIVATE KEY BLOCK-----"), including a truncated block with no END
+    # marker (Lead decision 3.1f2c #5).
     (
         "private_key",
         re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\Z)",
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"
+            r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|.*\Z)",
             re.DOTALL,
         ),
     ),
@@ -59,49 +238,288 @@ _PATTERNS: tuple[re.Pattern[str], ...] = tuple(pattern for _, pattern in _NAMED_
 
 # scheme://user:pass@host and scheme://<token-like userinfo>@host → scheme://[REDACTED]@host
 # The scheme is at most 32 characters: an unbounded one was retried from every position of a long run of
-# letters (64 KB of "a" took 2.8 s; WP-3.1d1, tool outputs). No lookbehind: a URL right after "+", "-", ".",
-# a digit or other letters (a diff line, a list) must still be redacted (AG-13, WP-3.1d1).
-_URL_CREDENTIALS = re.compile(
-    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]{0,31}://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{8,})@"
+# letters (64 KB of "a" took 2.8 s; WP-3.1d1, tool outputs). No boundary before it: a URL right after "+",
+# "-", ".", a digit or other letters (a diff line, a list) must still be redacted (AG-13, WP-3.1d1). The
+# scheme is public: the agent runtime's delta stream holds a URL from its scheme while its userinfo may still
+# grow.
+_SCHEME_FIRST, _SCHEME_REST, _SCHEME_LONGEST = r"[A-Za-z]", r"[A-Za-z0-9+.\-]", 32
+URL_SCHEME_PATTERN = rf"{_SCHEME_FIRST}{_SCHEME_REST}{{0,{_SCHEME_LONGEST - 1}}}"
+# The literal "://" leads and the scheme is checked behind it, one fixed width per length, in an atomic
+# group: the search skips to each "://" at C speed and reads its userinfo once. A scheme tried from every
+# letter read the userinfo again from each start (17 ms per 64 KiB of URL-dense text, and the delta stream
+# redacts a call about 100 times: AG-13 F-4, final review of 74bf8d4). The same URLs as the scheme-first form
+# (tests/unit/test_redaction_internals.py); a match starts at "://", on the scheme's line.
+_URL_SCHEME_BEHIND = "|".join(
+    rf"(?<={_SCHEME_FIRST}{_SCHEME_REST}{{{n}}}://)" for n in range(_SCHEME_LONGEST)
 )
+_URL_CREDENTIALS = re.compile(rf"://(?>{_URL_SCHEME_BEHIND})(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{{8,}})@")
 
 # Header-like pairs anywhere in a line, also inside JSON/repr: Authorization: Bearer x / "x-api-key": "y".
-_HEADERS = re.compile(
-    r"""(?ix)
-    (?P<name>(?<![A-Za-z0-9_-])(?:proxy-authorization|authorization|set-cookie|cookie|x-api-key))
-    (?P<sep>\\?["']?\s*:\s*\\?["']?)
-    (?P<value>[^"'\\\r\n]+)
+# Without an opening quote after the colon the value is the rest of the line, quoted parts included
+# (Authorization: Token token="V", Cookie: session="V"; theme=dark): a header value is a list of
+# parameters, and a quote in it opens one. After an opening quote (JSON: "Authorization": "Bearer V", ...)
+# the value ends at the next quote (Lead decision 3.1f2c #4).
+# - A quote that opens a parameter's value (right after "=", and followed by neither a space nor a quote) is
+#   read as #6 reads a key's quoted value: it may close on a later line, and one never closed takes the rest
+#   of the text, so a value cut by the end of the text (max_tokens) never stays raw (D2-I2, #12; reviews of
+#   50610b5 and 0733969).
+# - Any other quote keeps to its line, and one its line never closes ends the value: in
+#   curl -H "Authorization: Bearer V" https://api.example.com/x, and after base64 padding
+#   (curl -H "Cookie: sid=abc==" https://...), it closes the shell word, so the URL stays.
+# - The value otherwise stays on its line. The alternatives start on different characters, each quoted part
+#   is read once, and the repeat is possessive: linear. No space is given back before the colon (it cannot
+#   be one): a name before 64 KiB of line breaks is read once.
+# After the colon the spaces are taken whole when a value or its opening quote can follow; otherwise they are
+# given back only down to a space or tab (a value can start with one, never with a line break): the positions
+# a plain \s* would try, in the same order, without trying every alternative at each of 64 KiB of line breaks.
+_HEADER_NAME_SEP = (
+    rf"(?P<name>(?:{'|'.join(map(re.escape, CREDENTIAL_HEADER_NAMES))}))"
+    r"""(?P<sep>\\?["']?\s*+:(?:\s*+(?=[^\s\\]|\\["'])|\s*(?=[^\S\r\n]))?(?P<open>\\?["'])?)"""
+)
+_CREDENTIAL_HEADER = re.compile(
+    rf"""(?ix)
+    (?<![A-Za-z0-9_-]){_HEADER_NAME_SEP}
+    (?P<value>(?(open)[^"'\\\r\n]+|(?:[^"'\\\r\n]|(?<==)"(?=[^\s"])[^"]*+"|(?<==)'(?=[^\s'])[^']*+'
+                                  |(?<==)(?:"(?=[^\s"])|'(?=[^\s']))(?s:.*)|"[^"\r\n]*+"|'[^'\r\n]*+')++))
     """
 )
+# Where a header's value starts, read from the raw text by the agent runtime's delta stream: the name and
+# separator alone, with no left boundary (a superset of _CREDENTIAL_HEADER's starts, whatever the redactor
+# replaced before them), and no quote paired.
+CREDENTIAL_HEADER_START = re.compile(rf"(?i){_HEADER_NAME_SEP}")
 
-# key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value, compound names included.
+# The value forms below are fragments of the verbose patterns after them. Each alternative starts at a fixed
+# point that a key, a flag or a redaction marker has anchored, and reads forward once: the strings are
+# unambiguous (one way to split them) and possessive, so a string never closed costs one pass, never a retry.
+
+# A quoted value, after a string prefix if any (r"…", b'…', rb"…": a bytes field in a repr), the alternatives
+# in this order (Lead decisions 3.1f2c #6, #8):
+# - triple quoted, one value across lines; never closed: to the end of the text;
+# - \"escaped JSON\": in the JSON-encoded text, \\ followed by \" or \\ is one escape of the inner string;
+# - "double" or 'single' quoted with backslash escapes ("ab\"c" is one string), closed on its own line;
+# - else, when the escape-aware close is on a later line, closed on its own line by the first quote of its
+#   kind, a backslash before it or not, if no letter, digit or "_" follows it: single-quoted shell, YAML, INI
+#   and PowerShell strings read no escapes ('C:\keys\'), and a value that read one there would take the next
+#   value's opening quote, on a later line, as its close (AG-13 F-1). A quote glued to a word ends no value
+#   ("\"V…": V is inside the string);
+# - else across lines, with backslash escapes;
+# - a quote never closed (with escapes): to the end of the text, like a PEM block without its END line. The
+#   rest of the text holds no closing quote of that kind, so what is over-redacted is bounded.
+# Each line-bound try reads at most the rest of the value's line; one that fails leaves no unescaped quote of
+# its kind on that line for a later value to open with, so a line is read so at most twice. The lookahead
+# before the plain close reads, as the try across lines does, up to the next unescaped quote of its kind: the
+# opening quote of any later value, so each stretch of text is read so a bounded number of times.
+_QUOTED = r"""
+        (?:[bBfFrRuU]{1,2}(?=["']))?
+        (?:
+        "{3}(?s:.*?)(?:"{3}|\Z)
+      | '{3}(?s:.*?)(?:'{3}|\Z)
+      | \\"(?:[^\\]|\\[^"\\]|\\\\(?:[^\\]|\\[\s\S]))*+\\"
+      | "(?:[^"\\\r\n]|\\[^\r\n])*+"
+      | '(?:[^'\\\r\n]|\\[^\r\n])*+'
+      | (?="(?:[^"\\]|\\[\s\S])*+")"[^"\r\n]*+"(?![A-Za-z0-9_])
+      | (?='(?:[^'\\]|\\[\s\S])*+')'[^'\r\n]*+'(?![A-Za-z0-9_])
+      | "(?:[^"\\]|\\[\s\S])*+"
+      | '(?:[^'\\]|\\[\s\S])*+'
+      | (?:\\"|["'])(?s:.*)
+        )
+"""
+
+# Where a key starts: after no letter, digit, "_" or "-" (_KEY_VALUE, _FLAG_VALUE; netrc reads "-" before its
+# key too), or right after an escaped line break or tab. ToolGateway json-dumps a dict output before redacting
+# it, and logging's stringify uses repr: there a line break before a key is "\n", glued to it (AG-13 F-8).
+_AFTER_ESCAPE = r"(?<=\\[nrt])"
+_KEY_START = rf"(?:(?<![A-Za-z0-9_-])|{_AFTER_ESCAPE})"
+
+# A word that is itself a key whose value lies past it: a secret key's tail alone, then a separator the word
+# stops before (spaces, or a quote or backslash before it: session": V, PASSWORD'= V) or one followed by
+# spaces, and the first character of a value (password: in "token: password: V", secret in
+# "self._password = secret = V"), or netrc's key, after any dashes, and a word after it (password in
+# "api-key: password V"). No unquoted value takes one (_BARE, netrc's word): the key gets its own match, so
+# its own value is redacted (AG-13 F-2). Otherwise the word stays the value, taken whole, so nothing in it
+# stays raw: a key glued to its separator and value is one word with them; one with no value after it gets
+# no match of its own; one with words before its tail may be a secret glued to a tail word
+# ("<secret>Cookie: x", "<secret>-cookie= o"), which a match of its own would keep. A lookahead from where
+# the value starts: one key, its separator and the spaces around it, one character.
+_NOT_A_KEY = (
+    rf"(?!(?:{_SECRET_TAIL_PATTERN})(?![A-Za-z0-9_-])"
+    r"(?:(?:\\?[\"']\s*+|\s++)[:=]|[:=]\s)\s*+(?:[^\s&;,\\]|\\[\"'])"
+    rf"|-*+{_NETRC_KEY}[\ \t]++(?![:=])\S)"
+)
+
+# One word, and a quoted string glued to it after a ":" or "=" that ends it, on the same line: a key was taken
+# as the value of the key before it (password : password: "V"; Lead decision #7). Not across a line:
+# "password=None):" then a docstring on the next line.
+_WORD = rf"""
+        [^\s"'&;,\\]++(?:(?<=[:=])[\ \t]*+(?:{_QUOTED})
+                       |(?:(?<=[:=][bBfFrRuU])|(?<=[:=][bBfFrRuU][bBfFrRuU]))(?=["'])(?:{_QUOTED}))?
+"""
+
+# A word that ends with a secret key whose value lies past the word, on the same line: the key glued to its
+# separator then spaces ("x-apikey: V"), a quote or spaces between the key and its separator ('[session": V',
+# "x.token : V"). The key may have words before its tail ("<secret>-cookie= o", a secret glued to a tail
+# word), or follow any other character ("[session", "x.token"). The word takes the separator and the value
+# too, a quoted string or a word as _BARE reads one: _NOT_A_KEY leaves such a word to the value it is in, so
+# the key gets no match of its own, and its value is not left raw (AG-13 F-2 follow-up). The lookahead reads
+# the word once: a key is tried only where one may start (_KEY_START), and ends only before its separator.
+_KEY_WORD_VALUE = rf"""
+        (?=[^\s"'&;,\\]*?{_KEY_START}(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-])
+           (?:[:=][\ \t]|\\?["'][\ \t]*+[:=]|[\ \t]++[:=]))
+        [^\s"'&;,\\]++(?:(?<=[:=])|\\?["']?[\ \t]*+[:=])[\ \t]*+(?:{_QUOTED}|{_NOT_A_KEY}{_WORD})
+"""
+
+# An unquoted value: one word (_WORD), never a key with its own value (_NOT_A_KEY); a key glued to its
+# separator takes the value after its spaces too (_KEY_WORD_VALUE).
+_BARE = rf"""
+        {_NOT_A_KEY}
+        (?:{_KEY_WORD_VALUE}|{_WORD})
+"""
+
+# The value after a sensitive key and its separator (_KEY_VALUE, _AFTER_REDACTED): quoted or one word, after
+# an auth scheme word (token: Bearer V). The scheme word and its credential share a line: "token: bearer" at
+# the end of a line does not take the next line.
+_VALUE = rf"""
+        (?:(?:bearer|basic|token)[\ \t]++)?(?:{_QUOTED}|{_BARE})
+"""
+
+# A secret flag as one argv word: bare (it ends at a space or the end of the text) or quoted, also as escaped
+# JSON. Atomic, so a word the key pattern matches in two ways (--Password: snake and Pascal) is tried once.
+_SECRET_FLAG_WORD = rf"(?>\\?[\"']?(?=-)(?:{SECRET_KEY_PATTERN})(?:\\?[\"']|(?=\s|\Z)))"
+_SECRET_FLAG_ITEM = rf"(?>\\?[\"'](?=-)(?:{SECRET_KEY_PATTERN})\\?[\"'])"  # a quoted list item only
+
+# The value of a command-line flag after spaces (_FLAG_VALUE, _ARGV_VALUE): one argv word, so no scheme word
+# ("--token TOKEN    The API token" keeps its help text). Never a separator: --api-key = V is _KEY_VALUE's.
+# A value that is itself a secret flag is redacted and takes the word after it too: in
+# "--no-password --token V" the token's own value goes with it, and "--password -MyPassword" (a secret that
+# reads as a flag) is redacted, never skipped.
+_ARG = rf"""
+        (?![:=])
+        (?:{_SECRET_FLAG_WORD}(?:[\ \t]++{_SECRET_FLAG_WORD})*+(?:[\ \t]++(?:{_QUOTED}|{_BARE}))?
+          | {_QUOTED}
+          | {_BARE})
+"""
+
+# An argv list item after a comma: a quoted string only. A bare word there is code that defines the flag, not
+# its value: add_argument("--token", help=...), ["--api-key", api_key]. A secret flag item takes the next one.
+_ITEM = rf"""
+        (?:{_SECRET_FLAG_ITEM}(?:\s*+,\s*+{_SECRET_FLAG_ITEM})*+(?:\s*+,\s*+(?:{_QUOTED}))?
+          | {_QUOTED})
+"""
+
+# key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value / --key=value, compound names.
 _KEY_VALUE = re.compile(
     rf"""(?ix)
-    (?P<key>(?<![A-Za-z0-9_-])(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAIL})(?![A-Za-z0-9_-]))
-    (?P<sep>\\?["']?\s*[:=]\s*)
-    (?P<value>
-        \\"[^"\\]*\\"            # \"escaped json\"
-      | "[^"]*"                  # "double quoted"
-      | '[^']*'                  # 'single quoted'
-      | (?:(?:bearer|basic|token)\s+)?[^\s"'&;,\\]+
-    )
+    (?P<key>{_KEY_START}(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<sep>\\?["']?\s*+[:=]\s*+)
+    (?P<value>{_VALUE})
     """
 )
 
-# .netrc: "... password <value>"
-_NETRC = re.compile(r"(?i)(?<![A-Za-z0-9_])(?P<key>password)(?P<sep>\s+)(?P<value>\S+)")
+# A value right after a redacted token: a key the token pattern ran on into (ghp_…password="V",
+# sk-ant-…password=V; Lead decision #7). It reads the text with the literals, token patterns and URL
+# credentials already replaced (Redactor._without_tokens).
+_AFTER_REDACTED = re.compile(
+    rf"""(?ix)
+    {re.escape(REDACTED)}
+    (?P<sep>\\?["']?\s*+[:=]\s*+)
+    (?P<value>{_VALUE})
+    """
+)
+
+# A command-line flag and its value after spaces or tabs: --password V, -api-key "V" (_KEY_VALUE covers
+# --key=V). Only a flag: a bare "token V" is prose. The dash is a lookahead, not "-+": "-+" before the
+# pattern's own "[_-]*" would split a long run of dashes in every way (quadratic). Spaces and tabs only: a
+# flag at the end of a line does not take the next line.
+_FLAG_VALUE = re.compile(
+    rf"""(?ix)
+    (?P<key>{_KEY_START}(?=-)(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<sep>[\ \t]++)
+    (?P<value>{_ARG})
+    """
+)
+
+# A quoted flag and its value: after a comma, an argv list item (["mysql", "--password", "V"], also as escaped
+# JSON), a quoted string only; after spaces, a quoted shell word ("--password" "V", '--password' V), quoted or
+# bare. The opening quote anchors it.
+_ARGV_VALUE = re.compile(
+    rf"""(?ix)
+    (?P<key>(?P<quote>["'])(?=-)(?:{SECRET_KEY_PATTERN})\\?(?P=quote))
+    (?P<sep>(?P<comma>\s*+,\s*+)|[\ \t]++)
+    (?P<value>(?(comma){_ITEM}|{_ARG}))
+    """
+)
+
+# .netrc: "... password <value>", on one line. Never a separator: password = "V" is _KEY_VALUE's (#6). A value
+# that reads as a secret flag takes the word after it, as in _ARG. Its word is never a key with its own value
+# (_NOT_A_KEY), as a bare value.
+_NETRC = re.compile(
+    rf"""(?ix)
+    (?:(?<![A-Za-z0-9_])|{_AFTER_ESCAPE})(?P<key>{_NETRC_KEY})
+    (?P<sep>[\ \t]++)
+    (?P<value>(?![:=])(?:{_SECRET_FLAG_WORD}(?:[\ \t]++{_SECRET_FLAG_WORD})*+(?:[\ \t]++{_NOT_A_KEY}\S+)?
+                        |{_NOT_A_KEY}\S+))
+    """
+)
 
 _MIN_LITERAL_LENGTH = 8
 _PRIMITIVES = (str, int, float, bool, type(None))
 
 
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# Where a hump starts a word: after a lower-case letter or digit (clientSecret), and at the last capital of an
+# acronym before a word (SMTPPassword -> SMTP_Password; Lead decision 3.1f2c #14).
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+# The hump alone, main's split (8251c84): it reads a mixed spelling as one word (APIkey, PASSword, dbPASSword:
+# db_PASSword, PASSWORDs), where the acronym split cuts it (AP_Ikey, PAS_Sword, PASSWOR_Ds).
+_HUMP = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# A name is sensitive when either split makes it so: neither drops a key the other keeps (AG-13 F-3, final
+# review of 74bf8d4).
+_WORD_BOUNDARIES = (_CAMEL_BOUNDARY, _HUMP)
 
 
 def is_sensitive_key(name: str) -> bool:
-    """``accessToken``, ``x-api-key`` and ``CLIENT_SECRET`` all normalise to a sensitive snake_case tail."""
-    normalised = _CAMEL_BOUNDARY.sub("_", name).replace("-", "_")
-    return bool(_SENSITIVE_KEY_NAME.match(normalised))
+    """``accessToken``, ``x-api-key``, ``SMTPPassword``, ``_password``, ``--password``, ``CLIENT_SECRET`` and
+    ``APIkey`` all normalise to a sensitive snake_case tail, by one of two splits (``_WORD_BOUNDARIES``).
+    Leading underscores and dashes are not part of the name (``self._password``, ``mysql --password``). A
+    well-known secret name with no tail (``PGPASSWORD``) is sensitive as a whole name. Free text matches the
+    same names with ``SECRET_KEY_PATTERN``."""
+    bare = name.lstrip("_-")
+    return bare.lower() in _KNOWN_SECRET_NAMES or any(
+        _SENSITIVE_KEY_NAME.match(boundary.sub("_", bare).replace("-", "_")) for boundary in _WORD_BOUNDARIES
+    )
+
+
+def _drop_value(match: re.Match[str]) -> str:
+    """A match with its ``value`` group replaced: the key (or marker) and the separator before it stay. A
+    function, not a ``\\g<key>`` template: ``sub`` looks a template up in a cache keyed by the pattern, and
+    for these long patterns that lookup cost more than scanning a short text (a log field)."""
+    return match.string[match.start() : match.start("value")] + REDACTED
+
+
+# A value a rule ended at a quote: its marker, then the quote.
+_STOPPED_AT_QUOTE = (REDACTED + '"', REDACTED + "'")
+
+
+def stopped_at_open_quote(redacted: str) -> int | None:
+    """Where, on the last line of ``redacted``, a value ends at a quote, or None: the marker of the value,
+    directly followed by the quote. The header rule ends a value at a quote its line has not closed, and the
+    line may still close it (``Redactor.redact_with_stop``). Two searches from the last line break: linear."""
+    line = max(redacted.rfind("\n"), redacted.rfind("\r")) + 1
+    return min((at for end in _STOPPED_AT_QUOTE if (at := redacted.find(end, line)) != -1), default=None)
+
+
+def _is_secret_flag(item: object) -> bool:
+    """A command-line flag whose value is a secret: ``--password``, ``-api-key``, and ``--password=`` with its
+    value left to the next item (silent-failure review MEDIUM-1). ``--password=V`` is not (its value is in the
+    same string, which the text patterns redact); neither is ``--password-file``."""
+    return isinstance(item, str) and item.startswith("-") and is_sensitive_key(item.removesuffix("="))
+
+
+def _key_name(key: object) -> str | None:
+    """A dict key as ``is_sensitive_key`` reads it: a str, or bytes as UTF-8 with errors replaced
+    (silent-failure review LOW-1: ``{b"password": V}``); None for any other key."""
+    if isinstance(key, str):
+        return key
+    return key.decode("utf-8", errors="replace") if isinstance(key, bytes) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,33 +538,99 @@ class Redactor:
         # Longest first so a secret that contains another secret is removed whole.
         self._literals = sorted(unique, key=len, reverse=True)
 
+    @property
+    def longest_literal(self) -> int:
+        """The length of the longest configured literal it redacts, or 0. A stream of text redacted as it
+        grows holds back this many characters less one, so a literal cut at its end is never sent in part
+        (the agent runtime's delta stream; Lead decision 3.1f2c #11)."""
+        return len(self._literals[0]) if self._literals else 0
+
     def redact(self, text: str) -> str:
+        """``text`` with every secret it finds replaced by REDACTED: the configured literals, token patterns
+        and URL credentials first, then the value after a redacted token, a credential header, a secret key,
+        a secret flag (also as an argv item) and netrc's ``password``, in that order (``_redact``). Linear in
+        the length of ``text`` (``tests/security/test_redaction_linear.py``)."""
+        return self._redact(text, stop=False)[0]
+
+    def redact_with_stop(self, text: str) -> tuple[str, int | None]:
+        """``redact(text)``, and where in it a stream of the text, cut at its end, holds back from: the agent
+        runtime's delta stream (reviews of 0733969 and 45c2ec7). The header rule ends a value at a quote its
+        line may still close (_CREDENTIAL_HEADER), and the value takes the quoted part once it closes. The
+        rules after it may pair that quote or take the marker before it, so the stop is read on the text as
+        the header rule leaves it (``stopped_at_open_quote``), then placed in the redacted text: at the same
+        place when no later rule changed anything up to it, else at the start of the redacted text's last line
+        (a later rule only replaces a value with the marker, never adds a line break, so that line holds all
+        that came after the stop). None when the header rule left no such stop."""
+        return self._redact(text, stop=True)
+
+    def _redact(self, text: str, *, stop: bool) -> tuple[str, int | None]:
+        """The rules in their one order. Each runs only on a text that holds what every match of it holds
+        (WP-3.1f2c fix round: the delta stream redacts a call's whole text up to about 100 times): a word of
+        KEY_HINT for all of them, and a character each needs (its separator, the marker's "[", a flag's "-").
+        Skipping a rule that cannot match leaves the text as running it would."""
+        text = self._without_tokens(text)
+        if KEY_HINT.search(text) is None:
+            return text, None  # no key, header name or marker: none of the rules below can match
+        if "[" in text:
+            text = _AFTER_REDACTED.sub(_drop_value, text)
+        at: int | None = None
+        if ":" in text:
+            text = _CREDENTIAL_HEADER.sub(_drop_value, text)
+            at = stopped_at_open_quote(text) if stop else None
+        headed = text
+        if ":" in text or "=" in text:
+            text = _KEY_VALUE.sub(_drop_value, text)
+        if "-" in text:
+            text = _FLAG_VALUE.sub(_drop_value, text)
+            text = _ARGV_VALUE.sub(_drop_value, text)
+        text = _NETRC.sub(_drop_value, text)
+        if at is not None and not text.startswith(headed[: at + len(REDACTED) + 1]):
+            at = max(text.rfind("\n"), text.rfind("\r")) + 1
+        return text, at
+
+    def _without_tokens(self, text: str, *, keep_lines: bool = False) -> str:
+        """The text with configured literals, token patterns and URL credentials replaced: what
+        ``_AFTER_REDACTED`` reads. With ``keep_lines`` (``find``), each marker comes after the line breaks of
+        what it replaced, so the marker and the text after it stay on their original line."""
+
+        def marker(removed: str) -> str:
+            return "\n" * removed.count("\n") + REDACTED if keep_lines else REDACTED
+
+        replace: Callable[[re.Match[str]], str] | str = (
+            (lambda match: marker(match[0])) if keep_lines else REDACTED
+        )
         for literal in self._literals:
-            text = text.replace(literal, REDACTED)
+            text = text.replace(literal, marker(literal))
         for pattern in _PATTERNS:
-            text = pattern.sub(REDACTED, text)
-        text = _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)
-        text = _HEADERS.sub(rf"\g<name>\g<sep>{REDACTED}", text)
-        text = _KEY_VALUE.sub(rf"\g<key>\g<sep>{REDACTED}", text)
-        return _NETRC.sub(rf"\g<key>\g<sep>{REDACTED}", text)
+            text = pattern.sub(replace, text)
+        if "://" not in text:
+            return text
+        return _URL_CREDENTIALS.sub(f"://{REDACTED}@", text)  # userinfo holds no line break
 
     def find(self, text: str) -> list[Finding]:
         """What ``redact`` would remove, as (line, rule), in text order; one finding per rule and line. The
         value itself is never returned (security.scan_secrets, SECURITY_MODEL T5)."""
-        starts = [0, *(m.end() for m in re.finditer("\n", text))]
         rules: list[tuple[str, re.Pattern[str]]] = [
             *((f"literal_{index}", re.compile(re.escape(lit))) for index, lit in enumerate(self._literals)),
             *_NAMED_PATTERNS,
             ("url_credentials", _URL_CREDENTIALS),
-            ("credential_header", _HEADERS),
+            ("credential_header", _CREDENTIAL_HEADER),
             ("credential_assignment", _KEY_VALUE),
+            ("credential_assignment", _FLAG_VALUE),
+            ("credential_assignment", _ARGV_VALUE),
             ("credential_assignment", _NETRC),
         ]
         seen: set[tuple[int, str]] = set()
+        starts = _line_starts(text)
         for rule, pattern in rules:
-            for match in pattern.finditer(text):
-                name = "configured_secret" if rule.startswith("literal_") else rule
-                seen.add((bisect.bisect_right(starts, match.start()), name))
+            name = "configured_secret" if rule.startswith("literal_") else rule
+            seen.update((_line(starts, match), name) for match in pattern.finditer(text))
+        # A value after a redacted token is only there once the tokens are replaced, as in redact.
+        replaced = self._without_tokens(text, keep_lines=True)
+        starts = _line_starts(replaced)
+        seen.update(
+            (_line(starts, match), "credential_assignment") for match in _AFTER_REDACTED.finditer(replaced)
+        )
         return [Finding(line, rule) for line, rule in sorted(seen)]
 
     def redact_obj(self, obj: Any, *, stringify: bool = False) -> Any:
@@ -160,14 +644,14 @@ class Redactor:
         if isinstance(obj, dict):
             return {
                 (self.redact(key) if isinstance(key, str) else key): REDACTED
-                if isinstance(key, str) and is_sensitive_key(key) and value is not None
+                if value is not None and (name := _key_name(key)) is not None and is_sensitive_key(name)
                 else self.redact_obj(value, stringify=stringify)
                 for key, value in obj.items()
             }
         if isinstance(obj, list):
-            return [self.redact_obj(value, stringify=stringify) for value in obj]
+            return self._redact_items(obj, stringify=stringify)
         if isinstance(obj, tuple):
-            return tuple(self.redact_obj(value, stringify=stringify) for value in obj)
+            return tuple(self._redact_items(obj, stringify=stringify))
         if isinstance(obj, set | frozenset):
             return type(obj)(self.redact_obj(value, stringify=stringify) for value in obj)
         if stringify and not isinstance(obj, _PRIMITIVES):
@@ -175,3 +659,25 @@ class Redactor:
                 return self.redact(bytes(obj).decode("utf-8", errors="replace"))
             return self.redact(repr(obj))
         return obj
+
+    def _redact_items(self, items: Iterable[Any], *, stringify: bool) -> list[Any]:
+        """A list or tuple, read as a command line too: the item after a secret flag is dropped whole, like a
+        value under a sensitive key (``["mysql", "--password", "V"]``), whatever it is but None: a number,
+        bytes or a nested container too (silent-failure review MEDIUM-1). A dropped string that is itself a
+        secret flag drops the item after it too (``["--no-password", "--token", "V"]``)."""
+        out: list[Any] = []
+        after_flag = False
+        for item in items:
+            take = after_flag and item is not None
+            out.append(REDACTED if take else self.redact_obj(item, stringify=stringify))
+            after_flag = _is_secret_flag(item)
+        return out
+
+
+def _line_starts(text: str) -> list[int]:
+    return [0, *(m.end() for m in re.finditer("\n", text))]
+
+
+def _line(starts: list[int], match: re.Match[str]) -> int:
+    """The 1-based line a match starts on, given ``_line_starts`` of the text it is in."""
+    return bisect.bisect_right(starts, match.start())

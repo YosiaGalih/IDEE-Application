@@ -127,6 +127,18 @@ Tambahan *(turunan)*: approval memiliki `expires_at` (default 24 jam untuk `appl
 ### 6.2 Redaksi (`app/core/redaction.py`, dipakai di semua jalur keluar)
 
 - **Pola:** `sk-ant-[A-Za-z0-9_-]{10,}`, header `Authorization`/`Cookie`/`Set-Cookie`, `password=`/`token=`/`secret=` pada key-value, private key PEM (`-----BEGIN … PRIVATE KEY-----`), pola umum (AWS `AKIA…`, GitHub `ghp_…`, `xox[baprs]-…`), URL dengan kredensial (`scheme://user:pass@`), serta **nilai literal** semua secret yang dikonfigurasi (dibaca dari settings saat startup, dicocokkan persis).
+- **Predikat kunci tunggal (WP-3.1f2c, Keputusan Lead 3.1f2c #2, #14, #15):** kunci-nilai di teks bebas, lapisan struktur (`redact_obj`), dan kandidat `agent.delta` memakai satu predikat (`is_sensitive_key` / `SECRET_KEY_PATTERN`). Kunci dianggap sensitif bila **ekornya** adalah kata rahasia (`SENSITIVE_KEY_TAIL`: `password`, `secret`, `token`, `api_key`, `access_key`, `private_key`, `ticket`, `credentials`, `authorization`, `cookie`, `session`, `jwt`, `bearer`, dst.), dalam bentuk snake, kebab, UPPER, camel (`clientSecret`), Pascal (`ClientSecret`), atau akronim (`SMTPPassword`, `APIToken`). Awalan `_`/`-` diabaikan (`self._password`, `--password`). Nama env yang dikenal tanpa ekor rahasia ada di daftar tetap `KNOWN_SECRET_NAMES` (`PGPASSWORD`, `MYSQL_PWD`, `REDISCLI_AUTH`). Kunci yang ekornya bukan kata rahasia tetap terbaca (`token_count`, `max_tokens`, `password_policy`, `sessionId`, `--password-file`).
+- **Bentuk nilai (WP-3.1f2c #6–#8, #15):**
+  - `key=v`, `key: "v"`, `"key": "v"`, `\"key\": \"v\"`, `?key=v`;
+  - flag `--key=v` / `--key v`;
+  - argv berkutip (`"--password", "v"`, `"--password" v`) dan list/tuple argv di `redact_obj`;
+  - awalan string `b'v'`/`r"v"`;
+  - kutip ter-escape dan triple-quote; kutip yang ditutup di baris lain tetap utuh; kutip yang tidak pernah ditutup diredaksi sampai akhir teks;
+  - nilai sesudah `[REDACTED]` + pemisah (kunci yang tertelan token);
+  - nilai header mencakup bagian berkutipnya sampai akhir baris, dan kutip parameter (`="` diikuti karakter bukan spasi/kutip) boleh menyambung ke baris berikutnya;
+  - blok `-----BEGIN … PRIVATE KEY[ BLOCK]-----` termasuk PGP.
+  - Semua pola linear; masukan patologis 64 KiB < 1 dtk (`tests/security/test_redaction_linear.py`).
+  - Prefilter melewati aturan yang tidak mungkin cocok tanpa mengubah output (diuji diferensial).
 - **Jalur yang wajib melewati redaksi:** structlog processor (semua log), `emit_task_event` payload, `tool_calls.sanitized_input`/`output_summary`, artefak log/test report sebelum ditulis, `messages.content`, input/output `agent_runs`, isi context package & tool_result sebelum dikirim ke Claude API, `project_memory.content`, respons error API (tanpa stack trace/path absolut — PRD §9.1).
 - **Env sandbox:** allowlist eksplisit tanpa secret; test memastikan `env` di container tidak memuat nilai secret apa pun.
 - **Secret scanning:** `security.scan_secrets` (D23) atas worktree task di S7; temuan menjadi `findings(reviewer_type=security)` dan, bila `critical`, memblokir gate S9.

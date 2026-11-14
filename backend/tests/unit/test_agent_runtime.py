@@ -1109,7 +1109,7 @@ async def test_a_second_cancel_during_the_close_still_records_the_end() -> None:
 
 
 class BrokenEvents(FakeEvents):
-    async def delta(self, scope: Any, text: str, *, reset: bool = False) -> None:
+    async def delta(self, scope: Any, text: str, *, call: int, reset: bool = False) -> None:
         raise RuntimeError("redis down")
 
     async def usage_updated(self, scope: Any) -> None:
@@ -1389,8 +1389,8 @@ async def test_an_attempt_stopped_during_its_restart_is_not_counted_as_sent() ->
     holder: dict[str, asyncio.Task[Any]] = {}
 
     class CancelsOnReset(FakeEvents):
-        async def delta(self, scope: Any, text: str, *, reset: bool = False) -> None:
-            await super().delta(scope, text, reset=reset)
+        async def delta(self, scope: Any, text: str, *, call: int, reset: bool = False) -> None:
+            await super().delta(scope, text, call=call, reset=reset)
             if reset:
                 holder["run"].cancel()
                 await asyncio.sleep(5)
@@ -1589,10 +1589,10 @@ class StreamsByPlan:
         return None
 
 
-async def test_a_restart_in_the_second_call_keeps_the_first_calls_text() -> None:
-    """Item 11 (/code-review Spec of 073e68d, API_CONTRACTS §5.1): a reset replaces the run's whole text, so
-    the restart of the second call goes back to the first call's text, not to an empty one, and the client
-    ends with the first call's text and the retried second call's."""
+async def test_a_restart_voids_only_its_call() -> None:
+    """WP-3.1f2c D2-L1 (Lead decision #9; replaces #44 of WP-3.1f2a, item 11): every agent.delta names its
+    model call, the run's iteration. The restart of the second call is an empty reset of that call, never of
+    the first, and the client ends with the first call's text and the retried second call's."""
     secret = 'password="' + "Zq7" * 200
     fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
     plan = [
@@ -1602,10 +1602,127 @@ async def test_a_restart_in_the_second_call_keeps_the_first_calls_text() -> None
     ]
     fakes.providers.provider = StreamsByPlan(fakes.providers.provider, plan)  # type: ignore[assignment]
     assert (await run_b14(fakes)).status == "succeeded"
-    shown = ""
-    for text, reset in zip(fakes.events.deltas, fakes.events.resets, strict=True):
-        shown = text if reset else shown + text
-    assert shown == "First call text. Second, retried."
-    assert fakes.events.resets.count(True) == 1
-    assert fakes.events.deltas[fakes.events.resets.index(True)] == "First call text. "
+    events = list(zip(fakes.events.calls, fakes.events.deltas, fakes.events.resets, strict=True))
+    assert [event for event in events if event[2]] == [(2, "", True)]
+    shown: dict[int, str] = {}
+    for call, text, reset in events:
+        shown[call] = text if reset else shown.get(call, "") + text
+    assert shown == {1: "First call text. ", 2: "Second, retried."}
     assert not any("Zq7" in text for text in fakes.events.deltas)
+
+
+class LosesOneDelta(FakeEvents):
+    """The ``lose``-th agent.delta publish fails (a Redis blip); every other one is delivered."""
+
+    def __init__(self, lose: int) -> None:
+        super().__init__()
+        self.lose = lose
+        self.published = 0
+
+    async def delta(self, scope: Any, text: str, *, call: int, reset: bool = False) -> None:
+        self.published += 1
+        if self.published == self.lose:
+            raise RuntimeError("redis down")
+        await super().delta(scope, text, call=call, reset=reset)
+
+
+def delivered(events: FakeEvents) -> dict[int, str]:
+    """The reference client (Lead decision 3.1f2c #9) over the deltas that reached it."""
+    shown: dict[int, str] = {}
+    for call, text, reset in zip(events.calls, events.deltas, events.resets, strict=True):
+        shown[call] = text if reset else shown.get(call, "") + text
+    return shown
+
+
+async def test_a_lost_delta_is_repaired_by_a_reset_at_flush() -> None:
+    """Silent-failure review MEDIUM-2 (final review of 74bf8d4): an agent.delta whose publish fails leaves
+    the client's text holed. The failure is logged with its call and whether it was a reset, and the call's
+    flush sends the call's whole redacted text as a reset, so the client ends with ``redact`` of the call."""
+    from structlog.testing import capture_logs
+
+    text = 'The answer streams for a while, password="Zq7Zq7Zq7Zq7Zq7Zq7" then goes on. ' * 30
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = StreamsInPieces(fakes.providers.provider, text, 16)  # type: ignore[assignment]
+    fakes.events = LosesOneDelta(lose=2)
+    with capture_logs() as logs:
+        assert (await run_b14(fakes)).status == "succeeded"
+    failed = [log for log in logs if log["event"] == "agent_run_event_failed"]
+    assert [(log["event_type"], log["call"], log["reset"]) for log in failed] == [("agent.delta", 1, False)]
+    assert fakes.events.resets[-1] and fakes.events.calls[-1] == 1
+    assert fakes.events.deltas[-1] == Redactor().redact(text)
+    assert delivered(fakes.events) == {1: Redactor().redact(text)}
+
+
+async def test_a_lost_reset_is_repaired_by_a_reset_at_flush() -> None:
+    """The same when the lost delta is a restart's empty reset: the client still shows the failed attempt's
+    text until the call's flush replaces it with the retried attempt's ``redact``."""
+    failed_attempt = "The first attempt streams this much before it fails. " * 12
+    retried = "The retried attempt answers instead. " * 12
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    plan = [(failed_attempt, True), (retried, False)]
+    fakes.providers.provider = StreamsByPlan(fakes.providers.provider, plan)  # type: ignore[assignment]
+    fakes.events = LosesOneDelta(lose=2)  # the first attempt's append, then the restart's reset
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert fakes.events.resets[0] is False and failed_attempt[:64] in fakes.events.deltas[0]
+    assert fakes.events.resets[-1] and fakes.events.deltas[-1] == Redactor().redact(retried)
+    assert delivered(fakes.events) == {1: Redactor().redact(retried)}
+
+
+async def test_the_last_delta_call_is_the_runs_iterations_across_a_nudge() -> None:
+    """WP-3.1f2c D2-L1 (Lead decision #9; review of 52e0679): ``call`` is the run's iteration. A nudged end
+    turn is a model call of its own, so a run nudged once then submitted streams calls 1 and 2, in order, and
+    the last call is ``RunEnd.iterations``."""
+    submit = Reply(
+        (TextBlock("Done now. " * 30), ToolUseBlock("toolu_submit", SUBMIT_RESULT, VALID_IMPLEMENT)),
+        stop_reason="tool_use",
+    )
+    fakes = Fakes(scripted(text_turn("Thinking about it. " * 30), submit))
+    assert (await run_b14(fakes)).status == "succeeded"
+    calls = fakes.events.calls
+    assert fakes.provider.requests[1].messages[-1] == Message("user", NUDGE)
+    assert calls == sorted(calls) and set(calls) == {1, 2}
+    assert max(calls) == ended(fakes).iterations == 2
+
+
+class StreamsInPieces:
+    """The first request streams ``text`` in pieces of ``size`` before the inner provider answers it."""
+
+    def __init__(self, inner: Any, text: str, size: int) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.pieces = [text[i : i + size] for i in range(0, len(text), size)]
+
+    async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+        assert on_text_delta is not None
+        for piece in self.pieces:
+            await on_text_delta(piece)
+        self.pieces = []
+        return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_the_run_holds_back_its_longest_configured_literal() -> None:
+    """WP-3.1f2c D2-I1 (Lead decision #11): the run's delta stream holds back ``delta_hold`` of its redactor,
+    so a configured literal longer than DELTA_HOLD_CHARS is never streamed in part."""
+    literal = "Lit" * 400
+    text = "The answer quotes the value: " + literal + " and then goes on." * 20
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = StreamsInPieces(fakes.providers.provider, text, 16)  # type: ignore[assignment]
+    assert (await run_b14(fakes, redactor=Redactor([literal]))).status == "succeeded"
+    assert fakes.events.deltas
+    assert not any(literal[i : i + 32] in sent for i in range(3) for sent in fakes.events.deltas)
+
+
+async def test_the_run_holds_a_header_value_a_later_rule_rewrites() -> None:
+    """Review round 3 of 45c2ec7: the run's delta stream reads the header rule's stop with
+    Redactor.redact_with_stop, so a key's quoted value that pairs the header's stopping quote streams nothing
+    raw."""
+    value = "Zq7" * 400
+    text = 'Set password: "Cookie: a="x\ny" z"' + value + '" w" and then goes on.' + " More." * 40
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = StreamsInPieces(fakes.providers.provider, text, 16)  # type: ignore[assignment]
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert fakes.events.deltas
+    assert not any(value[i : i + 32] in sent for i in range(3) for sent in fakes.events.deltas)

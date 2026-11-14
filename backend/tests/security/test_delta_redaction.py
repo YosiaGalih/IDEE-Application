@@ -16,7 +16,13 @@ from collections.abc import Callable, Iterable
 
 import pytest
 
-from app.agents.runtime import DELTA_HOLD_CHARS, DELTA_RELEASE_CHARS, Delta, DeltaRedactor
+from app.agents.runtime import (
+    DELTA_HOLD_CHARS,
+    DELTA_RELEASE_CHARS,
+    Delta,
+    DeltaRedactor,
+    delta_redactor,
+)
 from app.core.redaction import Redactor
 
 LITERAL = "kk-literal-" + "configured-" + "q" * 24  # built, not written: a test value
@@ -57,11 +63,12 @@ def stream(pieces: Iterable[str], redactor: DeltaRedactor) -> list[Delta]:
 
 
 def client(events: Iterable[Delta]) -> str:
-    """What a client shows: a reset replaces the text, anything else is appended."""
-    shown = ""
+    """What a client shows (Lead decision 3.1f2c #9): one text per model call; a reset replaces its call's
+    text, anything else is appended to it; the run's text is the calls' texts in call order."""
+    calls: dict[int, str] = {}
     for event in events:
-        shown = event.text if event.reset else shown + event.text
-    return shown
+        calls[event.call] = event.text if event.reset else calls.get(event.call, "") + event.text
+    return "".join(calls[call] for call in sorted(calls))
 
 
 def raw_pieces(secret: str, width: int = 20) -> list[str]:
@@ -86,7 +93,7 @@ def test_a_secret_split_across_deltas_never_goes_out(name: str) -> None:
     assert secret not in REDACTOR.redact(text)  # the pattern knows it
     for size in (1, 3, 16):
         for offset in range(size):
-            events = stream(deltas(text, size, offset), DeltaRedactor(REDACTOR.redact))
+            events = stream(deltas(text, size, offset), delta_redactor(REDACTOR))
             sent = everything_sent(events)
             assert secret not in sent and secret[4:-4] not in sent, (size, offset)
             assert client(events) == REDACTOR.redact(text)  # nothing lost either
@@ -104,7 +111,7 @@ def test_a_long_secret_never_leaks_while_it_streams(secret: str) -> None:
         (64, DELTA_RELEASE_CHARS),
         (16, 1),
     ):
-        events = stream(deltas(text, size, 0), DeltaRedactor(REDACTOR.redact, release=release))
+        events = stream(deltas(text, size, 0), delta_redactor(REDACTOR, release=release))
         assert leaks(events, secret) == [], (size, release)
         assert client(events) == REDACTOR.redact(text)
 
@@ -117,7 +124,7 @@ def test_a_value_cut_after_its_key_is_still_redacted() -> None:
 
 
 def test_an_unfinished_pem_block_never_leaks_its_body() -> None:
-    redactor = DeltaRedactor(REDACTOR.redact)
+    redactor = delta_redactor(REDACTOR)
     events = [redactor.feed(BEFORE + "-----BEGIN PRIVATE KEY-----\n")]
     body = [f"BODYLINE{i:02d}AbCdEfGh" for i in range(40)]
     events += [redactor.feed(line) for line in body]
@@ -140,14 +147,14 @@ def test_a_begin_marker_is_held_until_its_end_marker() -> None:
 def test_plain_text_comes_out_whole_and_in_order() -> None:
     text = BEFORE + AFTER * 3
     for size in (1, 7, 64):
-        events = stream(deltas(text, size, 0), DeltaRedactor(REDACTOR.redact))
+        events = stream(deltas(text, size, 0), delta_redactor(REDACTOR))
         assert not any(e.reset for e in events)
         assert "".join(e.text for e in events) == text
 
 
 def test_at_most_hold_and_one_release_step_wait() -> None:
     text = BEFORE + SECRETS["password"] + AFTER * 4
-    redactor = DeltaRedactor(REDACTOR.redact)
+    redactor = delta_redactor(REDACTOR)
     shown, fed = "", ""
     for piece in deltas(text, 16, 0):
         fed += piece
@@ -162,25 +169,25 @@ def test_at_most_hold_and_one_release_step_wait() -> None:
 
 
 def test_the_last_window_is_never_sent_before_the_end() -> None:
-    redactor = DeltaRedactor(REDACTOR.redact, release=1)
+    redactor = delta_redactor(REDACTOR, release=1)
     text = BEFORE + AFTER
     shown = client(e for e in (redactor.feed(piece) for piece in deltas(text, 5, 0)) if e is not None)
     assert len(REDACTOR.redact(text)) - len(shown) >= DELTA_HOLD_CHARS
 
 
 def test_a_restart_drops_the_held_text() -> None:
-    redactor = DeltaRedactor(REDACTOR.redact, release=1)
+    redactor = delta_redactor(REDACTOR, release=1)
     first = redactor.feed("A" * 300)
-    assert first == Delta("A" * (300 - DELTA_HOLD_CHARS))
+    assert first == Delta("A" * (300 - DELTA_HOLD_CHARS), 1)
     redactor.reset()
     rest = [redactor.feed("B" * 10), redactor.flush()]
-    assert [e for e in rest if e is not None] == [Delta("B" * 10)]  # the 256 held A's were never sent
+    assert [e for e in rest if e is not None] == [Delta("B" * 10, 1)]  # the 256 held A's were never sent
 
 
 def test_flush_resets_for_the_next_attempt() -> None:
-    redactor = DeltaRedactor(REDACTOR.redact)
-    assert redactor.feed("one") is None and redactor.flush() == Delta("one")
-    assert redactor.feed("two") is None and redactor.flush() == Delta("two")
+    redactor = delta_redactor(REDACTOR)
+    assert redactor.feed("one") is None and redactor.flush() == Delta("one", 1)
+    assert redactor.feed("two") is None and redactor.flush() == Delta("two", 2)
 
 
 def test_a_change_to_what_was_sent_is_a_reset_with_the_whole_text() -> None:
@@ -191,7 +198,7 @@ def test_a_change_to_what_was_sent_is_a_reset_with_the_whole_text() -> None:
 
     redactor = DeltaRedactor(redact, hold=4, release=1)
     first = redactor.feed("abc" * 10)
-    assert first == Delta(("abc" * 10)[:-4])
+    assert first == Delta(("abc" * 10)[:-4], 1)
     changed = redactor.feed("Zmore")
     assert changed is not None and changed.reset
     assert changed.text == redact("abc" * 10 + "Zmore")[:-4]
@@ -209,6 +216,6 @@ def test_redacting_a_long_stream_stays_fast() -> None:
     text = ("The quick brown fox jumps over the lazy dog. " * 800)[:32_000]
 
     def run() -> None:
-        assert client(stream(deltas(text, 16, 0), DeltaRedactor(REDACTOR.redact))) == text
+        assert client(stream(deltas(text, 16, 0), delta_redactor(REDACTOR))) == text
 
     assert _timed(run) < 2.0
