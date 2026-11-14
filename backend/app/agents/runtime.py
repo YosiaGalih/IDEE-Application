@@ -37,7 +37,7 @@ from app.agents.prompt_book import Prompt, PromptBook
 from app.agents.registry import AgentRegistry, AgentSpec
 from app.core.cancel import CancelToken
 from app.core.logging import get_logger
-from app.core.redaction import SENSITIVE_KEY_TAIL, Redactor
+from app.core.redaction import SECRET_KEY_PATTERN, URL_SCHEME_PATTERN, Redactor
 from app.llm.base import (
     ContentBlock,
     LLMError,
@@ -147,22 +147,48 @@ _log = get_logger(__name__)
 
 
 # Where a secret may still be growing at the end of the RAW text: nothing goes out from the start of one until
-# it closes or the call's stream ends (reviews of 42bcb2e: M3, AG-13 INFO-3; of 073e68d: AG-13 D-M1, D-L1).
-# Each check is a scan from the end at C speed, linear in the text: a `\Z`-anchored search tried from every
-# start was quadratic (a 64 KiB attempt took 90 s). The raw text, not the redacted one: _NETRC rewrites
-# `password = "…` to `password [REDACTED] "…` before the quote could be seen.
+# it closes or the call's stream ends (reviews of 42bcb2e: M3, AG-13 INFO-3; of 073e68d: AG-13 D-M1, D-L1;
+# WP-3.1f2c D2-L2, D2-I1). Each check is a scan from the end at C speed, or a search in a short window that
+# ends there, linear in the text: a `\Z`-anchored search tried from every start was quadratic (a 64 KiB
+# attempt took 90 s). The raw text, not the redacted one: a rule can take the key before its value's quote is
+# closed (`Cookie: session="…` reads `Cookie: [REDACTED]"…` until the quote closes).
 _TOKEN_CHARS: Final = string.ascii_letters + string.digits + "_.-"
 _PEM_BEGIN: Final = "-----BEGIN"
 _PEM_END: Final = "-----END"
-# A key the redactor treats as secret (one list: SENSITIVE_KEY_TAIL) and its separator, right before a quote.
-_KEY_BEFORE_QUOTE: Final = re.compile(rf"(?i)(?:{SENSITIVE_KEY_TAIL})" r"\\?[\"']?\s*[:=]\s*\\?\Z")
-_KEY_WINDOW: Final = 128  # how far before the quote the key and its separator are looked for
+# A URL's userinfo grows until "@"; a "/" or a space ends the URL before any (Lead decision 3.1f2c #11).
+_URL_CLOSED: Final = re.compile(r"[@/\s]")
+_URL_SCHEME: Final = re.compile(rf"(?:{URL_SCHEME_PATTERN})\Z")  # the redactor's own scheme, leftmost
+_SCHEME_WINDOW: Final = 64  # longer than any scheme URL_SCHEME_PATTERN takes (32)
+# What opens a quoted value before its quote: a string prefix (b"…, rb'…, as the redactor reads one) or the
+# backslash of an escaped JSON quote (\"…). Spaces before it are the gap, not part of the key's separator.
+_VALUE_OPENER: Final = re.compile(r"(?:(?<![A-Za-z0-9_])[bBfFrRuU]{1,2}|\\)\Z")
+# What precedes a quoted value the redactor redacts, up to the last character before the gap, in the forms its
+# rules read (Lead decision 3.1f2c #10; the Lead's Task 2 carry):
+# - a key and its assignment, as _KEY_VALUE reads them: password=, "password": , \"password\": , --token=
+# - an argv item and its comma, as _ARGV_VALUE reads them: "--password",
+# - a flag word, as _FLAG_VALUE and _ARGV_VALUE read it: --password, "--password". A word opens a value only
+#   after a gap of spaces (the "word" group): the closing quote of "--password" in prose opens none.
+# The key is SECRET_KEY_PATTERN, the redactor's own key names (Goal 2), with no left boundary: a token pattern
+# that ran on into the key (ghp_…password="V", which the redactor reads as [REDACTED]="V") leaves the key in
+# the raw text.
+_KEY_BEFORE_QUOTE: Final = re.compile(
+    rf"""(?ix)
+    (?: (?:{SECRET_KEY_PATTERN}) \\?["']? \s*[:=]
+      | ["'](?=-)(?:{SECRET_KEY_PATTERN}) \\?["'] \s*,
+      | (?P<word> (?=-)(?:{SECRET_KEY_PATTERN}) | ["'](?=-)(?:{SECRET_KEY_PATTERN}) \\?["'] )
+    )\Z
+    """
+)
+_KEY_WINDOW: Final = 128  # how far before the last character before the gap the key is looked for
 
 
 def open_candidate(text: str) -> int | None:
-    """Where the first candidate still open at the end of ``text`` starts, or None: an ``eyJ`` token run that
-    has not ended, a ``-----BEGIN`` with no ``-----END`` after it, an opening quote with no closing one after
-    it, right after a secret-like key."""
+    """Where the first candidate still open at the end of ``text`` starts, or None:
+    - an ``eyJ`` token run that has not ended;
+    - a ``-----BEGIN`` with no ``-----END`` after it;
+    - a ``scheme://`` with no "@", "/" or space after it yet: userinfo that may still grow (``_open_url``);
+    - an opening quote with no closing one after it, after a key the redactor treats as secret
+      (``_key_before``)."""
     found: list[int] = []
     run = text.find("eyJ", len(text.rstrip(_TOKEN_CHARS)))
     if run != -1:
@@ -171,11 +197,44 @@ def open_candidate(text: str) -> int | None:
     begin = text.find(_PEM_BEGIN, 0 if last_end == -1 else last_end + 1)
     if begin != -1:
         found.append(begin)
+    if (url := _open_url(text)) is not None:
+        found.append(url)
     for quote in "\"'":
         at = text.rfind(quote)  # the last one: no quote of its kind closes it
-        if at != -1 and (key := _KEY_BEFORE_QUOTE.search(text, max(at - _KEY_WINDOW, 0), at)):
-            found.append(key.start())
+        if at != -1 and (key := _key_before(text, at)) is not None:
+            found.append(key)
     return min(found, default=None)
+
+
+def _open_url(text: str) -> int | None:
+    """Where a URL whose userinfo may still grow starts: the last ``://`` (an earlier one has the "//" of
+    this one after it), with no "@", "/" or space after it, from its scheme (Lead decision 3.1f2c #11). A URL
+    longer than the hold is then redacted whole once its "@" arrives, never streamed in part before."""
+    at = text.rfind("://")
+    if at == -1 or _URL_CLOSED.search(text, at + 3) is not None:
+        return None
+    scheme = _URL_SCHEME.search(text, max(at - _SCHEME_WINDOW, 0), at)
+    return None if scheme is None else scheme.start()
+
+
+def _key_before(text: str, quote: int) -> int | None:
+    """Where the key starts whose value the quote at ``quote`` opens, or None (Lead decision 3.1f2c #10). The
+    key and its separator end at the last non-space character before the value's opening and are looked for
+    within ``_KEY_WINDOW`` characters of it, however many spaces or line breaks come between."""
+    opener = _VALUE_OPENER.search(text, max(quote - 2, 0), quote)
+    head = quote if opener is None else opener.start()
+    stop = len(text[:head].rstrip())  # one scan from the end at C speed
+    key = _KEY_BEFORE_QUOTE.search(text, max(stop - _KEY_WINDOW, 0), stop)
+    if key is None or (key["word"] is not None and stop == head):
+        return None
+    return key.start()
+
+
+def delta_hold(redactor: Redactor) -> int:
+    """The ``hold`` of a run's delta stream (Lead decision 3.1f2c #11): DELTA_HOLD_CHARS, or the longest
+    configured literal less one when that is more. A literal is redacted only once it is whole, so a part of
+    one cut at the end of the text, at most that long, stays in the held tail."""
+    return max(DELTA_HOLD_CHARS, redactor.longest_literal - 1)
 
 
 def _common_prefix(a: str, b: str) -> int:
@@ -203,7 +262,8 @@ class DeltaRedactor:
 
     The text of the current model call is redacted whole, never a piece of it, so a secret cut across deltas
     is seen whole. What goes out is the stable part of that redacted text: everything but its last ``hold``
-    characters, and nothing from the start of a candidate still open at the end of the raw text
+    characters (a run's is ``delta_hold``: never less than its longest configured literal less one), and
+    nothing from the start of a candidate still open at the end of the raw text
     (``open_candidate``), minus what already went out. ``flush`` ends the call: its final redacted text goes
     out and is committed, never redacted again. When redacting a longer text changes what already went out, a
     ``reset`` delta carries the committed text of the calls before, then the current call's stable text: the
@@ -889,7 +949,7 @@ class AgentRuntime:
             runtime_id=runtime_id,
             output_contract=output_contract,
             input_content=content,
-            deltas=DeltaRedactor(self._redactor.redact),
+            deltas=DeltaRedactor(self._redactor.redact, hold=delta_hold(self._redactor)),
             deadline=self._clock() + spec.limits.timeout_seconds,
         )
 

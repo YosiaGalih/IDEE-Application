@@ -1609,3 +1609,34 @@ async def test_a_restart_in_the_second_call_keeps_the_first_calls_text() -> None
     assert fakes.events.resets.count(True) == 1
     assert fakes.events.deltas[fakes.events.resets.index(True)] == "First call text. "
     assert not any("Zq7" in text for text in fakes.events.deltas)
+
+
+class StreamsInPieces:
+    """The first request streams ``text`` in pieces of ``size`` before the inner provider answers it."""
+
+    def __init__(self, inner: Any, text: str, size: int) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.pieces = [text[i : i + size] for i in range(0, len(text), size)]
+
+    async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+        assert on_text_delta is not None
+        for piece in self.pieces:
+            await on_text_delta(piece)
+        self.pieces = []
+        return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_the_run_holds_back_its_longest_configured_literal() -> None:
+    """WP-3.1f2c D2-I1 (Lead decision #11): the run's delta stream holds back ``delta_hold`` of its redactor,
+    so a configured literal longer than DELTA_HOLD_CHARS is never streamed in part."""
+    literal = "Lit" * 400
+    text = "The answer quotes the value: " + literal + " and then goes on." * 20
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = StreamsInPieces(fakes.providers.provider, text, 16)  # type: ignore[assignment]
+    assert (await run_b14(fakes, redactor=Redactor([literal]))).status == "succeeded"
+    assert fakes.events.deltas
+    assert not any(literal[i : i + 32] in sent for i in range(3) for sent in fakes.events.deltas)

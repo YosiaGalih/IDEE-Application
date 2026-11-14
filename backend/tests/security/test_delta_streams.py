@@ -5,6 +5,10 @@
   candidates are found in the raw text (``_NETRC`` rewrites ``password = "…`` before a candidate could be
   seen in the redacted text) and from the redactor's own key list.
 - A reset carries the run's whole text shown so far: the calls already ended, then the current call.
+- WP-3.1f2c (D2-L2, D2-I1; Lead decisions #10, #11, Goal 6): a key far from its quote, a key in any spelling
+  the redactor knows (camel, a flag, an argv item, one a token ran on into, a string prefix before the value),
+  a long URL userinfo and a long configured literal never stream raw: no 32-character window of the secret
+  reaches any payload.
 
 ``tests/security/test_delta_redaction.py`` holds the single-attempt cases.
 """
@@ -16,8 +20,8 @@ from collections.abc import Iterable
 
 import pytest
 
+from app.agents.runtime import DELTA_HOLD_CHARS, Delta, DeltaRedactor, delta_hold, open_candidate
 from app.agents.runtime import DELTA_RELEASE_CHARS as DELTA_RELEASE
-from app.agents.runtime import Delta, DeltaRedactor
 from app.core.redaction import Redactor
 
 REDACTOR = Redactor()
@@ -65,6 +69,10 @@ def filled(head: str, filler: str) -> str:
     return (head + filler * KIB_64)[:KIB_64]
 
 
+# Built, not written: test values a token pattern matches, followed by a key it runs on into.
+GITHUB_TOKEN = "ghp_" + "a1B2" * 9
+ANTHROPIC_KEY = "sk-ant-" + "api03-" + "A1b2C3d4" * 2
+
 PATHOLOGICAL = {
     # An open quote pins the origin while ended eyJ runs follow: each release used to rescan every run.
     "eyJ runs": filled('password="' + "eyJ" * 10_000 + " ", "w"),
@@ -74,6 +82,21 @@ PATHOLOGICAL = {
     "open token": filled("eyJ", "A"),
     "open BEGIN": filled("-----BEGIN PRIVATE KEY-----\n", "MIIE"),
     "plain": filled("", "The quick brown fox jumps over the lazy dog. "),
+    # WP-3.1f2c (Lead decisions #10, #11): each new candidate path. A URL never closed; a key 32 KiB of
+    # spaces before its quote, and spaces with no key; the window before a quote full of camel humps or dashes
+    # that never make a key; flags, keys a token ran on into and string prefixes one after another; an argv
+    # item and a quoted shell word held open; a long run of prefix letters.
+    "open URL": filled("https://", "a"),
+    "far key": filled("password =" + " " * 32_768 + '"', "w"),
+    "spaces before a quote": filled(" " * 32_768 + '"', "w"),
+    "camel humps": filled("aB" * 16_384 + ' = "', "w"),
+    "dashes": filled("-" * 32_768 + ' "', "w"),
+    "dash flags": filled("--password " * 3_000 + '"', "w"),
+    "argv item": filled('"--password", ' * 10 + '"', "w"),
+    "quoted shell word": filled('"--password" ' * 10 + '"', "w"),
+    "keys after tokens": filled((GITHUB_TOKEN + 'password="a" ') * 1_000 + GITHUB_TOKEN + 'password="', "w"),
+    "string prefixes": filled('password = rb"a" ' * 3_000 + 'password = b"', "w"),
+    "prefix letters": filled("password = " + "b" * 32_768 + '"', "w"),
 }
 
 
@@ -162,3 +185,173 @@ def test_the_last_window_holds_a_token_cut_at_a_release(name: str, cut: int) -> 
     events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, 1))
     assert token[4:cut] not in "".join(event.text for event in events)
     assert client(events) == REDACTOR.redact(text)
+
+
+# --- WP-3.1f2c: candidates for far keys, every key spelling, long userinfo, long literals (D2-L2, D2-I1) ---
+
+WINDOW = 32
+SIZES = [1, 16, 64]
+INTRO = "intro " * 40
+TAIL = " tail" * 80
+
+
+def windows(secret: str) -> set[str]:
+    return {secret[i : i + WINDOW] for i in range(len(secret) - WINDOW + 1)}
+
+
+def leaked(events: list[Delta], secret: str) -> list[str]:
+    """The 32-character windows of ``secret`` found in any payload, or across payloads (Goal 6)."""
+    texts = [event.text for event in events]
+    return sorted({w for w in windows(secret) for text in [*texts, "".join(texts)] if w in text})
+
+
+def held_from(text: str, value: str) -> int | None:
+    """Where the open candidate starts while ``value`` is half streamed."""
+    return open_candidate(text[: text.index(value) + len(value) // 2])
+
+
+GAPS = {"140 spaces": " " * 140, "140 line breaks": "\n" * 140, "127 spaces": " " * 127}
+
+
+@pytest.mark.parametrize("gap", list(GAPS))
+@pytest.mark.parametrize("size", SIZES)
+def test_a_key_far_from_its_quote_still_holds(gap: str, size: int) -> None:
+    """D2-L2 (Lead decision #10): the key and its separator are looked for within 128 characters of the last
+    non-space character before the quote, so spaces or line breaks of any length between them keep the value
+    held from its key."""
+    text = INTRO + "password =" + GAPS[gap] + '"' + VALUE + '"' + TAIL
+    assert held_from(text, VALUE) == text.index("password")
+    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == REDACTOR.redact(text)
+
+
+USERINFO = "Pq9" * 200
+URLS = {
+    "user and password": "https://user:" + USERINFO + "@git.example.com/r.git",
+    "token as the user": "https://" + USERINFO + "@git.example.com/r.git",
+}
+
+
+@pytest.mark.parametrize("url", list(URLS))
+@pytest.mark.parametrize("size", SIZES)
+def test_a_long_userinfo_never_streams_raw(url: str, size: int) -> None:
+    """D2-I1 (Lead decision #11): a ``scheme://`` not yet followed by "@", "/" or a space is held from its
+    scheme, so userinfo longer than the hold is redacted whole once its "@" arrives."""
+    text = INTRO + URLS[url] + TAIL
+    assert held_from(text, USERINFO) == text.index("https://")
+    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    assert leaked(events, USERINFO) == []
+    assert client(events) == REDACTOR.redact(text)
+
+
+LONG_LITERAL = "Lit" * 400  # 1 200 characters
+SHORT_LITERAL = "Sh0rt-8c"  # 8 characters: the shortest literal the redactor takes
+
+
+def test_the_hold_covers_the_longest_literal_and_never_drops_below_the_default() -> None:
+    assert delta_hold(Redactor()) == DELTA_HOLD_CHARS
+    assert delta_hold(Redactor([SHORT_LITERAL, "x" * DELTA_HOLD_CHARS])) == DELTA_HOLD_CHARS
+    assert delta_hold(Redactor(["x" * (DELTA_HOLD_CHARS + 2)])) == DELTA_HOLD_CHARS + 1
+    assert delta_hold(Redactor([SHORT_LITERAL, LONG_LITERAL])) == len(LONG_LITERAL) - 1
+
+
+@pytest.mark.parametrize("size", SIZES)
+def test_a_long_configured_literal_never_streams_raw(size: int) -> None:
+    """D2-I1 (Lead decision #11; plan Review Focus 5): with a short and a long literal in one run the hold
+    follows the longest, so neither is ever sent in part."""
+    redactor = Redactor([SHORT_LITERAL, LONG_LITERAL])
+    text = INTRO + "first " + SHORT_LITERAL + " then " + LONG_LITERAL + TAIL
+    events = stream(DeltaRedactor(redactor.redact, hold=delta_hold(redactor)), pieces(text, size))
+    assert leaked(events, LONG_LITERAL) == []
+    assert not any(SHORT_LITERAL in event.text for event in events)
+    assert client(events) == redactor.redact(text)
+
+
+# Camel, Pascal and acronym keys: the first is AG-13's, the others a check on SENSITIVE_KEY_TAIL alone missed.
+CAMEL_KEYS = ["clientSecret", "secretKey", "privateKey", "accessKey", "awsSecretAccessKey", "SMTPPassword"]
+
+
+@pytest.mark.parametrize("key", CAMEL_KEYS)
+@pytest.mark.parametrize("size", SIZES)
+def test_a_camel_key_quote_holds(key: str, size: int) -> None:
+    """Goal 6: the delta's key check is SECRET_KEY_PATTERN, the redactor's own key names."""
+    text = INTRO + key + ' = "' + VALUE + '"' + TAIL
+    assert held_from(text, VALUE) == text.index(key)
+    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == REDACTOR.redact(text)
+
+
+def test_a_plain_link_at_the_end_is_kept() -> None:
+    """Lead decision #12: a URL with no "@" carries no credential. It is held while it may still grow, and the
+    final payload at ``flush`` shows it as ``redact`` does."""
+    text = INTRO + "See https://example.com"
+    assert open_candidate(text) == text.index("https://")
+    for size in SIZES:
+        events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+        assert client(events) == REDACTOR.redact(text) == text
+        assert "https://example.com" in client(events)
+
+
+# The value forms the redactor takes after a key it knows (WP-3.1f2c Task 2), each with where the candidate
+# starts: a flag and its value after spaces, an argv list item after its flag, a quoted shell word, a key a
+# token pattern ran on into (the redactor sees "[REDACTED]=" there), and a string prefix before the quote.
+# A token followed by a separator alone has no key in the raw text: the redactor hides that value to the end
+# of the text while its quote is open, so it is checked end to end only.
+QUOTE_FORMS: dict[str, tuple[str, str | None]] = {
+    "dash flag": ('mysql --password "{}"', "--password"),
+    "dash flag, single quotes": ("curl -api-key '{}'", "-api-key"),
+    "argv item": ('["mysql", "--password", "{}"]', '"--password"'),
+    "argv item, single quotes": ("['--token', '{}']", "'--token'"),
+    "argv item, escaped JSON": ('[\\"--password\\", \\"{}\\"]', '"--password'),
+    "quoted shell word": ('mysql "--password" "{}"', '"--password"'),
+    "quoted shell word, single quotes": ("mysql '--api-key' '{}'", "'--api-key'"),
+    "key after a GitHub token": (GITHUB_TOKEN + 'password="{}"', "password"),
+    "key after an Anthropic key": (ANTHROPIC_KEY + 'password="{}"', "password"),
+    "camel key after a GitHub token": (GITHUB_TOKEN + "secretKey='{}'", "secretKey"),
+    "separator after a token": (GITHUB_TOKEN + '="{}"', None),
+    "bytes prefix": ('password = b"{}"', "password"),
+    "raw prefix": ('SECRET_KEY = r"{}"', "SECRET_KEY"),
+    "two-letter prefix": ("token: rb'{}'", "token"),
+    "prefix after a flag": ("--token b'{}'", "--token"),
+}
+
+
+@pytest.mark.parametrize("form", list(QUOTE_FORMS))
+@pytest.mark.parametrize("size", SIZES)
+def test_a_quoted_value_after_any_key_form_never_streams_raw(form: str, size: int) -> None:
+    """Goal 6 and the Lead's Task 2 carry: the delta holds a quote-opened value in every key form the
+    redactor redacts, from the key, and the client ends with exactly what ``redact`` gives."""
+    template, key = QUOTE_FORMS[form]
+    text = INTRO + template.format(VALUE) + TAIL
+    assert not any(window in REDACTOR.redact(text) for window in windows(VALUE))  # the redactor takes it
+    if key is not None:
+        assert held_from(text, VALUE) == text.index(key)
+    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == REDACTOR.redact(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'Run it with "--password" and type the password when asked.',
+        "Pass '--token' first.",
+        'The --password" flag',
+        "The secret's length",
+        'mysql "--password""',
+    ],
+)
+def test_a_flag_word_with_no_space_before_the_quote_is_no_candidate(text: str) -> None:
+    """A flag (or a quoted flag) opens a value only after spaces, as in the redactor (``_FLAG_VALUE``,
+    ``_ARGV_VALUE``): the closing quote of "--password" in prose opens nothing, so the rest of the answer is
+    not held until the stream ends."""
+    assert open_candidate(text) is None
+
+
+def test_a_quoted_flag_in_prose_does_not_hold_the_rest_of_the_answer() -> None:
+    text = 'Run it with "--password" and type the password when asked.' + " Then it carries on." * 40
+    redactor = DeltaRedactor(REDACTOR.redact)
+    shown = client(e for e in (redactor.feed(piece) for piece in pieces(text, 16)) if e is not None)
+    assert len(shown) >= len(REDACTOR.redact(text)) - DELTA_HOLD_CHARS - DELTA_RELEASE

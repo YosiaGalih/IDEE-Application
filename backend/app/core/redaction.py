@@ -71,7 +71,8 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
     change. The snake part is case-insensitive, so it also takes a mixed-case word (``PassWord``) that
     ``is_sensitive_key`` splits: free text redacts more there, never less. No boundary lookaround: the
     caller anchors the name (``_KEY_VALUE``, the delta stream's key check). Every alternative is a fixed
-    word after a run of ``[A-Za-z0-9]``, so a match tried from one start is linear in the name.
+    word after a run of ``[A-Za-z0-9]``, so a match tried from one start is linear in the name, and the
+    leading run of "_" and "-" is possessive, so it is read once.
     """
     snake: list[str] = []
     lower: list[str] = []
@@ -85,7 +86,10 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
         upper.append(first.upper() + _camel_rest(more, after_lower=False))
         capital.append(_capitalised(first) + _camel_rest(more, after_lower=True))
     return (
-        r"[_-]*"  # leading "_" (self._password) and "-" (--password); a word starts with a letter or digit
+        # Leading "_" (self._password) and "-" (--password), possessive: every alternative after it starts
+        # with a letter or digit, so a "_" or "-" given back could never match, and a long run of dashes is
+        # read once (backtracking it through the alternatives cost 18 ms per 64 KiB per pattern).
+        r"[_-]*+"
         rf"(?:(?i:{'|'.join(sorted(names))})|"  # a well-known secret name, whole
         r"(?:[A-Za-z0-9]+[_-])*"  # the words before the tail's own segment
         rf"(?:(?i:{'|'.join(snake)})"
@@ -135,10 +139,10 @@ _PATTERNS: tuple[re.Pattern[str], ...] = tuple(pattern for _, pattern in _NAMED_
 # scheme://user:pass@host and scheme://<token-like userinfo>@host → scheme://[REDACTED]@host
 # The scheme is at most 32 characters: an unbounded one was retried from every position of a long run of
 # letters (64 KB of "a" took 2.8 s; WP-3.1d1, tool outputs). No lookbehind: a URL right after "+", "-", ".",
-# a digit or other letters (a diff line, a list) must still be redacted (AG-13, WP-3.1d1).
-_URL_CREDENTIALS = re.compile(
-    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]{0,31}://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{8,})@"
-)
+# a digit or other letters (a diff line, a list) must still be redacted (AG-13, WP-3.1d1). The scheme is
+# public: the agent runtime's delta stream holds a URL from its scheme while its userinfo may still grow.
+URL_SCHEME_PATTERN = r"[A-Za-z][A-Za-z0-9+.\-]{0,31}"
+_URL_CREDENTIALS = re.compile(rf"(?P<scheme>{URL_SCHEME_PATTERN}://)(?:[^/\s:@]*:[^/\s@]+|[^/\s:@]{{8,}})@")
 
 # Header-like pairs anywhere in a line, also inside JSON/repr: Authorization: Bearer x / "x-api-key": "y".
 # Without an opening quote after the colon the value is the rest of the line, quoted parts included
