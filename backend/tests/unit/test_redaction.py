@@ -1099,3 +1099,35 @@ def test_the_key_pattern_matches_what_it_did_without_its_lookaheads() -> None:
         text = "".join(rnd.choice(pieces) for _ in range(rnd.randint(1, 8)))
         for fast, slow in compiled:
             assert [m.span() for m in fast.finditer(text)] == [m.span() for m in slow.finditer(text)], text
+
+
+def test_redact_with_stop_changes_no_output() -> None:
+    """Review round 3 of 45c2ec7: the delta stream's redaction is redact's: the same rules, in one order."""
+    rnd = random.Random(53)  # noqa: S311 - a reproducible fuzz, not a secret
+    pieces = [*FUZZ_PIECES, 'Cookie: a="x', 'z"', "password Cookie:", "password=q=", '"--password", ']
+    for literals in ([], ['Pa55"word9']):
+        redactor = Redactor(literals)
+        for _ in range(3_000):
+            text = "".join(rnd.choice(pieces) for _ in range(rnd.randint(1, 16)))
+            assert redactor.redact_with_stop(text)[0] == redactor.redact(text), text
+
+
+@pytest.mark.parametrize(
+    ("text", "stop"),
+    [
+        ('Cookie: a b"q', len("Cookie: ")),  # nothing after the header rule changed it: the marker itself
+        ('x: 1\nCookie: a="x\ny" z"q', len("x: 1\nCookie: ")),  # carried onto a later line by a parameter
+        ('password: "Cookie: a="x\ny" z"q', 0),  # a key's quoted value paired the stop: its last line
+        ('note\npassword Cookie:a="x\ny" z" q', len("note\n")),  # netrc took the marker: its last line
+        ('Cookie: a b"q\nnext line', None),  # the line ended: the value is final
+        ('token = "abc', None),  # no header
+        ("Cookie: a b c", None),  # the value runs to the end of its line
+    ],
+)
+def test_redact_with_stop_finds_where_a_header_value_stopped(
+    redactor: Redactor, text: str, stop: int | None
+) -> None:
+    redacted, at = redactor.redact_with_stop(text)
+    assert at == stop, (redacted, at)
+    if at is not None:
+        assert "q" not in redacted[:at], redacted

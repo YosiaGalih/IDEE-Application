@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Iterable
 
@@ -25,11 +26,11 @@ from app.agents.runtime import (
     Delta,
     DeltaRedactor,
     delta_hold,
+    delta_redactor,
     open_candidate,
-    stopped_at_open_quote,
 )
 from app.agents.runtime import DELTA_RELEASE_CHARS as DELTA_RELEASE
-from app.core.redaction import Redactor
+from app.core.redaction import Redactor, stopped_at_open_quote
 
 REDACTOR = Redactor()
 VALUE = "Zq7" * 400  # 1 200 characters
@@ -118,6 +119,12 @@ PATHOLOGICAL = {
     "header name, line breaks, quote": filled("Cookie:" + "\n" * 65_000, '"'),
     "header name, CRLF, quote": filled("Cookie:" + "\r\n" * 32_500, '"'),
     "header name, line breaks, last quote": "Cookie:" + "\n" * (KIB_64 - 8) + '"',
+    # The header stop read after the header rule (review of 45c2ec7): a line of markers and quotes, a JSON
+    # line of header values stopped at quotes among markers, and key values that pair a header's stopping
+    # quote.
+    "markers and quotes": filled("", '[REDACTED]"'),
+    "JSON of header stops": filled("{", '"h": "Cookie: a b\\"x", "k": "[REDACTED]\\"", '),
+    "keys pairing header stops": filled("", 'password: "Cookie: a b"x '),
 }
 
 
@@ -424,7 +431,7 @@ def test_a_header_value_never_streams_raw_whatever_the_redactor_replaces(line: s
     text = INTRO + template.format(VALUE) + TAIL
     assert not any(window in redactor.redact(text) for window in windows(VALUE))  # the redactor takes it
     assert held_from(text, VALUE) == text.index("Cookie: ") + len("Cookie: ")
-    events = stream(DeltaRedactor(redactor.redact, hold=delta_hold(redactor)), pieces(text, size))
+    events = stream(delta_redactor(redactor), pieces(text, size))
     assert leaked(events, VALUE) == []
     assert client(events) == redactor.redact(text)
 
@@ -448,7 +455,7 @@ def test_a_header_value_carried_onto_later_lines_never_streams_raw(line: str, si
     redactor = Redactor(literals)
     text = INTRO + template.format(VALUE) + TAIL
     assert not any(window in redactor.redact(text) for window in windows(VALUE))  # the redactor takes it
-    events = stream(DeltaRedactor(redactor.redact, hold=delta_hold(redactor)), pieces(text, size))
+    events = stream(delta_redactor(redactor), pieces(text, size))
     assert leaked(events, VALUE) == []
     assert client(events) == redactor.redact(text)
 
@@ -462,3 +469,85 @@ def test_a_value_stopped_at_a_quote_is_held_only_while_its_line_is_open() -> Non
     redactor = DeltaRedactor(REDACTOR.redact)
     shown = client(e for e in (redactor.feed(piece) for piece in pieces(text, 16)) if e is not None)
     assert len(shown) >= len(REDACTOR.redact(text)) - DELTA_HOLD_CHARS - DELTA_RELEASE
+
+
+# Review round 3 of 45c2ec7: the rules after the header rule may pair the header's stopping quote or take its
+# marker (a key's quoted value, an argv item, netrc's word, the #7 swallow), so the redacted text no longer
+# shows it. The stop is read on the text as the header rule leaves it (Redactor.redact_with_stop).
+LATER_RULES = {
+    "a key's quoted value": 'password: "Cookie: a="x\ny" z"{}" w"',
+    "a key's single-quoted value": "token = 'Cookie: a=\"x\ny\" z'{}' w'",
+    "an argv item": '"--password", "Cookie: a="x\ny" z"{}" w"',
+    "netrc's word": 'password Cookie:a="x\ny" z" {}" w',
+    "the #7 swallow": 'password=q=" Cookie: a="x\ny" z"{}" w"',
+}
+
+
+@pytest.mark.parametrize("form", list(LATER_RULES))
+@pytest.mark.parametrize("size", [1, 7, 16, 64, 255, 257])
+def test_a_header_stop_a_later_rule_rewrites_never_streams_raw(form: str, size: int) -> None:
+    text = INTRO + LATER_RULES[form].format(VALUE) + TAIL
+    assert not any(window in REDACTOR.redact(text) for window in windows(VALUE))  # the redactor takes it
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
+    assert leaked(events, VALUE) == []
+    assert client(events) == REDACTOR.redact(text)
+
+
+# The reviewer's per-prefix fuzz (sfuzz2.py) in short: a header value carried onto a later line by a
+# parameter's quote, among the later rules' atoms (keys, flags, argv items, netrc, the #7 swallow, markers,
+# literals with a quote or a backslash, URL credentials). Every release is a redaction (release 1), so every
+# cut is checked.
+FUZZ_VALUE = "Zq7" * 120
+FUZZ_LITERALS = ['Pa55"word9', "Pa55\\word9", "Pa55'word9"]
+FUZZ_HEADS = [
+    "Cookie: ",
+    "Cookie:",
+    "Authorization: Digest ",
+    "x-api-key: ",
+    "Set-Cookie: ",
+    '"Cookie": "',
+    "cookie:\n  ",
+]
+FUZZ_ATOMS = [
+    '"', "'", "=", '=" ', '="', "='", " ", ";", ",", "\\", "\n", "\r\n", "a", "b=", "z", 'Pa55"word9',
+    "Pa55\\word9", "Pa55'word9", 'https://u:p"q@h/x', "--token ", "Cookie: ", "Authorization: ", "[REDACTED]",
+    "token=", "password=", "password: ", "--password ", '"--password" ', '"--password", ', "password ",
+    "password Cookie:", "password=q=", "ghp_" + "a1B2" * 9, "it's", '""', "x\"y", "b='",
+]  # fmt: skip
+
+
+def _continued_header(rnd: random.Random) -> str:
+    def atoms(most: int) -> str:
+        return "".join(rnd.choice(FUZZ_ATOMS) for _ in range(rnd.randint(0, most)))
+
+    head = (
+        rnd.choice(FUZZ_HEADS)
+        + rnd.choice(['a="x', "a='x", 'realm="a', 'b="p'])
+        + rnd.choice(["\n", "\r\n", "\n "])
+    )
+    return (
+        "intro "
+        + atoms(3)
+        + head
+        + atoms(6)
+        + rnd.choice(['"', "'", 'y"', ""])
+        + atoms(4)
+        + FUZZ_VALUE
+        + atoms(4)
+    )
+
+
+def test_no_cut_of_a_continued_header_streams_its_value_raw() -> None:
+    redactor = Redactor(FUZZ_LITERALS)
+    rnd = random.Random(45)  # noqa: S311 - a reproducible fuzz, not a secret
+    for _ in range(150):
+        text = _continued_header(rnd)
+        if any(window in redactor.redact(text) for window in windows(FUZZ_VALUE)):
+            continue  # the redactor itself keeps the value: nothing for the stream to keep back
+        # As delta_redactor builds it, but every piece is a release: every cut of the text is checked.
+        deltas = DeltaRedactor(
+            redactor.redact, hold=delta_hold(redactor), release=1, redact_with_stop=redactor.redact_with_stop
+        )
+        events = stream(deltas, pieces(text, 4))
+        assert leaked(events, FUZZ_VALUE) == [], text
+        assert client(events) == redactor.redact(text), text

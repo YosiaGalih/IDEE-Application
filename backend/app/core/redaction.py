@@ -376,6 +376,18 @@ def _drop_value(match: re.Match[str]) -> str:
     return match.string[match.start() : match.start("value")] + REDACTED
 
 
+# A value a rule ended at a quote: its marker, then the quote.
+_STOPPED_AT_QUOTE = (REDACTED + '"', REDACTED + "'")
+
+
+def stopped_at_open_quote(redacted: str) -> int | None:
+    """Where, on the last line of ``redacted``, a value ends at a quote, or None: the marker of the value,
+    directly followed by the quote. The header rule ends a value at a quote its line has not closed, and the
+    line may still close it (``Redactor.redact_with_stop``). Two searches from the last line break: linear."""
+    line = max(redacted.rfind("\n"), redacted.rfind("\r")) + 1
+    return min((at for end in _STOPPED_AT_QUOTE if (at := redacted.find(end, line)) != -1), default=None)
+
+
 def _is_secret_flag(item: object) -> bool:
     """A command-line flag whose value is a secret: ``--password``, ``-api-key``. ``--password=V`` is not (its
     value is in the same string, which the text patterns redact); neither is ``--password-file``."""
@@ -406,23 +418,43 @@ class Redactor:
         return len(self._literals[0]) if self._literals else 0
 
     def redact(self, text: str) -> str:
-        """Each rule runs only on a text that holds what every match of it holds (WP-3.1f2c fix round: the
-        delta stream redacts a call's whole text up to about 100 times): a word of KEY_HINT for all of them,
-        and a character each needs (its separator, the marker's "[", a flag's "-"). Skipping a rule that
-        cannot match leaves the text as running it would."""
+        return self._redact(text, stop=False)[0]
+
+    def redact_with_stop(self, text: str) -> tuple[str, int | None]:
+        """``redact(text)``, and where in it a stream of the text, cut at its end, holds back from: the agent
+        runtime's delta stream (reviews of 0733969 and 45c2ec7). The header rule ends a value at a quote its
+        line may still close (CREDENTIAL_HEADER), and the value takes the quoted part once it closes. The
+        rules after it may pair that quote or take the marker before it, so the stop is read on the text as
+        the header rule leaves it (``stopped_at_open_quote``), then placed in the redacted text: at the same
+        place when no later rule changed anything up to it, else at the start of the redacted text's last line
+        (a later rule only replaces a value with the marker, never adds a line break, so that line holds all
+        that came after the stop). None when the header rule left no such stop."""
+        return self._redact(text, stop=True)
+
+    def _redact(self, text: str, *, stop: bool) -> tuple[str, int | None]:
+        """The rules in their one order. Each runs only on a text that holds what every match of it holds
+        (WP-3.1f2c fix round: the delta stream redacts a call's whole text up to about 100 times): a word of
+        KEY_HINT for all of them, and a character each needs (its separator, the marker's "[", a flag's "-").
+        Skipping a rule that cannot match leaves the text as running it would."""
         text = self._without_tokens(text)
         if KEY_HINT.search(text) is None:
-            return text  # no key, header name or marker: none of the rules below can match
+            return text, None  # no key, header name or marker: none of the rules below can match
         if "[" in text:
             text = _AFTER_REDACTED.sub(_drop_value, text)
+        at: int | None = None
         if ":" in text:
             text = CREDENTIAL_HEADER.sub(_drop_value, text)
+            at = stopped_at_open_quote(text) if stop else None
+        headed = text
         if ":" in text or "=" in text:
             text = _KEY_VALUE.sub(_drop_value, text)
         if "-" in text:
             text = _FLAG_VALUE.sub(_drop_value, text)
             text = _ARGV_VALUE.sub(_drop_value, text)
-        return _NETRC.sub(_drop_value, text)
+        text = _NETRC.sub(_drop_value, text)
+        if at is not None and not text.startswith(headed[: at + len(REDACTED) + 1]):
+            at = max(text.rfind("\n"), text.rfind("\r")) + 1
+        return text, at
 
     def _without_tokens(self, text: str, *, keep_lines: bool = False) -> str:
         """The text with configured literals, token patterns and URL credentials replaced: what

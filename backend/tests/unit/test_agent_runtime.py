@@ -1640,3 +1640,16 @@ async def test_the_run_holds_back_its_longest_configured_literal() -> None:
     assert (await run_b14(fakes, redactor=Redactor([literal]))).status == "succeeded"
     assert fakes.events.deltas
     assert not any(literal[i : i + 32] in sent for i in range(3) for sent in fakes.events.deltas)
+
+
+async def test_the_run_holds_a_header_value_a_later_rule_rewrites() -> None:
+    """Review round 3 of 45c2ec7: the run's delta stream reads the header rule's stop with
+    Redactor.redact_with_stop, so a key's quoted value that pairs the header's stopping quote streams nothing
+    raw."""
+    value = "Zq7" * 400
+    text = 'Set password: "Cookie: a="x\ny" z"' + value + '" w" and then goes on.' + " More." * 40
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.providers.provider = StreamsInPieces(fakes.providers.provider, text, 16)  # type: ignore[assignment]
+    assert (await run_b14(fakes)).status == "succeeded"
+    assert fakes.events.deltas
+    assert not any(value[i : i + 32] in sent for i in range(3) for sent in fakes.events.deltas)
