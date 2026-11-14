@@ -27,6 +27,67 @@ SENSITIVE_KEY_TAIL = (
 )
 _SENSITIVE_KEY_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAIL})$")
 
+
+def _capitalised(word: str) -> str:
+    return word[0].upper() + word[1:]  # "secrets?" -> "Secrets?": a tail word is letters and an optional "s?"
+
+
+def _camel_rest(words: list[str], *, after_lower: bool) -> str:
+    """The tail words after the first, joined as ``is_sensitive_key`` splits them: by "_" or "-" (the rest is
+    then snake, any case), or by a hump. A Capitalised word starts a word after any letter; an UPPER word only
+    after a lower-case letter (secretKEY splits, SECRETKEY does not)."""
+    if not words:
+        return ""
+    word, *more = words
+    joints = [rf"[_-](?i:{'[_-]'.join(words)})", _capitalised(word) + _camel_rest(more, after_lower=True)]
+    if after_lower:
+        joints.append(word.upper() + _camel_rest(more, after_lower=False))
+    return "(?:" + "|".join(joints) + ")"
+
+
+def _secret_key_pattern(tails: Iterable[str]) -> str:
+    """One sensitive key name, generated from the tails so a non-secret name never matches (Lead decision
+    3.1f2c #2): a pattern for any identifier would swallow ``note="password=v"`` whole, secret and all.
+
+    ``is_sensitive_key`` splits a name into words at "_", "-" and humps (``_CAMEL_BOUNDARY``) and asks
+    whether the last words spell a tail. The same name in free text:
+    - snake, kebab or UPPER: the tail starts the name or follows "_"/"-", its words joined by "_" or "-",
+      in any case (``db_password``, ``x-api-key``, ``SECRET_KEY``);
+    - camel and Pascal: the tail starts where a hump starts a word. A Capitalised tail follows any letter
+      or digit (``clientSecret``, ``DBPassword``); an UPPER tail only a lower-case letter or digit
+      (``dbPASSWORD``; ``DBPASSWORD`` has no hump); a lower-case tail only the start of a word
+      (``secretKey``).
+
+    The camel part is case-sensitive whatever the flags of the pattern it is embedded in: a hump is a case
+    change. The snake part is case-insensitive, so it also takes a mixed-case word (``PassWord``) that
+    ``is_sensitive_key`` splits: free text redacts more there, never less. No boundary lookaround: the
+    caller anchors the name (``_KEY_VALUE``, the delta stream's key check). Every alternative is a fixed
+    word after a run of ``[A-Za-z0-9]``, so a match tried from one start is linear in the name.
+    """
+    snake: list[str] = []
+    lower: list[str] = []
+    upper: list[str] = []
+    capital: list[str] = []
+    for tail in tails:
+        first, *more = tail.split("_")
+        snake.append("[_-]".join([first, *more]))
+        if more:  # a lower-case word alone is snake; it needs a hump inside the tail (secretKey)
+            lower.append(first + _camel_rest(more, after_lower=True))
+        upper.append(first.upper() + _camel_rest(more, after_lower=False))
+        capital.append(_capitalised(first) + _camel_rest(more, after_lower=True))
+    return (
+        r"(?:[A-Za-z0-9]+[_-])*"  # the words before the tail's own segment
+        rf"(?:(?i:{'|'.join(snake)})"
+        rf"|(?-i:(?:{'|'.join(lower)})"
+        rf"|(?:[A-Za-z0-9]*[a-z0-9])?(?:{'|'.join(upper)})"
+        rf"|[A-Za-z0-9]*(?:{'|'.join(capital)})))"
+    )
+
+
+# One sensitive key name, the free-text form of ``is_sensitive_key``: ``_KEY_VALUE`` here, the delta stream's
+# key check in app.agents.runtime. A regex source with no boundary lookaround; the caller adds the boundaries.
+SECRET_KEY_PATTERN = _secret_key_pattern(SENSITIVE_KEY_TAIL.split("|"))
+
 # Named so ``Redactor.find`` (security.scan_secrets) reports which rule matched, from the very same patterns.
 _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("anthropic_admin_key", re.compile(r"sk-ant-admin\d{0,2}-[A-Za-z0-9_\-]{8,}")),
@@ -77,7 +138,7 @@ _HEADERS = re.compile(
 # key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value, compound names included.
 _KEY_VALUE = re.compile(
     rf"""(?ix)
-    (?P<key>(?<![A-Za-z0-9_-])(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAIL})(?![A-Za-z0-9_-]))
+    (?P<key>(?<![A-Za-z0-9_-])(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
     (?P<sep>\\?["']?\s*[:=]\s*)
     (?P<value>
         \\"[^"\\]*\\"            # \"escaped json\"
@@ -95,11 +156,14 @@ _MIN_LITERAL_LENGTH = 8
 _PRIMITIVES = (str, int, float, bool, type(None))
 
 
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# Where a hump starts a word: after a lower-case letter or digit (clientSecret), and at the last capital of an
+# acronym before a word (SMTPPassword -> SMTP_Password; Lead decision 3.1f2c #14).
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 def is_sensitive_key(name: str) -> bool:
-    """``accessToken``, ``x-api-key`` and ``CLIENT_SECRET`` all normalise to a sensitive snake_case tail."""
+    """``accessToken``, ``x-api-key``, ``SMTPPassword`` and ``CLIENT_SECRET`` all normalise to a sensitive
+    snake_case tail. Free text matches the same names with ``SECRET_KEY_PATTERN``."""
     normalised = _CAMEL_BOUNDARY.sub("_", name).replace("-", "_")
     return bool(_SENSITIVE_KEY_NAME.match(normalised))
 

@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from app.core.redaction import REDACTED, Redactor
+from app.core.redaction import (
+    REDACTED,
+    SECRET_KEY_PATTERN,
+    SENSITIVE_KEY_TAIL,
+    Redactor,
+    is_sensitive_key,
+)
 
 FAKE_ANTHROPIC = "sk-ant-api03-" + "A" * 40
 FAKE_ADMIN = "sk-ant-admin01-" + "B" * 44
@@ -310,3 +318,112 @@ def test_find_never_returns_the_secret_and_ordinary_code_is_clean() -> None:
     assert [(f.line, f.rule) for f in found] == [(2, "anthropic_key")]
     assert FAKE_ANTHROPIC not in repr(found)
     assert redactor.find("token_count = 3\ndef tokenize(text): return text.split()\n") == []
+
+
+# --- One key predicate for free text and structure (WP-3.1f2c R-1; Lead decisions 3.1f2c #2, #3, #14) ---
+
+SECRET_VALUE = "Zq7" * 20
+SECRET_KEYS = [
+    # snake, UPPER, kebab
+    "password", "db_password", "DB_PASSWORD", "api-key", "x-api-key",
+    # camel and Pascal (AG-13 R-1)
+    "clientSecret", "ClientSecret", "accessToken", "refreshToken", "secretKey", "privateKey", "dbPassword",
+    "awsSecretAccessKey", "apiKey", "APIKey",
+    # an acronym before the tail word (#14); "session" stays a tail (#3)
+    "SMTPPassword", "DBPassword", "JWTSecret", "AWSSecretKey", "APIToken", "ACCESSToken", "userSession",
+    "HTTPSession",
+]  # fmt: skip
+# The tail is not the last word: these stay readable (Goal 3).
+PLAIN_KEYS = [
+    "token_count", "max_tokens", "password_policy", "secret_santa", "tokenizer", "sessionId", "cookieConsent",
+    "authorizationUrl", "passwordHint", "tokensUsed",
+]  # fmt: skip
+# Every spelling AG-13 tried: assignment, JSON, escaped JSON, query string, YAML.
+FORMS = ['{k} = "{v}"', "{k}={v}", '"{k}": "{v}"', '\\"{k}\\": \\"{v}\\"', "?{k}={v}&x=1", "{k}: '{v}'"]
+
+
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("key", [*SECRET_KEYS, *PLAIN_KEYS])
+def test_free_text_and_structure_agree_on_every_key(redactor: Redactor, key: str, form: str) -> None:
+    assert is_sensitive_key(key) == (key in SECRET_KEYS)  # the structure layer's verdict, as intended
+    out = redactor.redact(form.format(k=key, v=SECRET_VALUE))
+    assert (SECRET_VALUE not in out) == is_sensitive_key(key), out
+
+
+def _tails() -> list[list[str]]:
+    """Every tail of SENSITIVE_KEY_TAIL, plurals spelled out, as its words: "secret_key" -> [secret, key]."""
+    words: list[list[str]] = []
+    for tail in SENSITIVE_KEY_TAIL.split("|"):
+        stem = tail.removesuffix("s?")
+        words.append(stem.split("_"))
+        if stem != tail:  # "secrets?": the plural too
+            words.append((stem + "s").split("_"))
+    return words
+
+
+def _spellings(words: list[str]) -> list[str]:
+    """The spellings a developer writes a secret key in, each ending in the tail."""
+    pascal = "".join(word.capitalize() for word in words)
+    return [
+        "_".join(words), "_".join(words).upper(), "-".join(words), words[0] + pascal[len(words[0]):], pascal,
+        "db_" + "_".join(words), "DB_" + "_".join(words).upper(), "x-" + "-".join(words), "dbAuth" + pascal,
+        "DB" + pascal, "db2" + pascal, "db" + words[0].upper() + pascal[len(words[0]):], "my_app" + pascal,
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize("words", _tails(), ids="_".join)
+def test_free_text_and_structure_agree_on_every_tail_in_every_spelling(
+    redactor: Redactor, words: list[str]
+) -> None:
+    secret = _spellings(words)
+    # The same spellings with a word after the tail: not a secret key, in either layer (Goal 3).
+    plain = [
+        *(key + "Hint" for key in secret),
+        *(key + "_hint" for key in secret),
+        *(key + "-id" for key in secret),
+    ]
+    assert all(is_sensitive_key(key) for key in secret), [key for key in secret if not is_sensitive_key(key)]
+    assert not any(is_sensitive_key(key) for key in plain), [key for key in plain if is_sensitive_key(key)]
+    disagree = [
+        text
+        for key in [*secret, *plain]
+        for text in (form.format(k=key, v=SECRET_VALUE) for form in FORMS)
+        if (SECRET_VALUE not in redactor.redact(text)) != is_sensitive_key(key)
+    ]
+    assert not disagree, disagree
+
+
+def test_the_secret_key_pattern_is_the_predicate_whatever_the_enclosing_flags() -> None:
+    # _KEY_VALUE (and the delta stream's key check) embed SECRET_KEY_PATTERN in a case-insensitive pattern:
+    # the pattern carries its own case rules, so a camel hump is a hump there too.
+    # Without a hump or a separator there is no tail word: "DBPASSWORD" is one word, as in is_sensitive_key.
+    case_decides = ["DBPASSWORD", "SECRETKEY", "secretkey", "dbpassword"]
+    keys = [*SECRET_KEYS, *PLAIN_KEYS, *case_decides, *(k for w in _tails() for k in _spellings(w))]
+    for flags in (0, re.IGNORECASE):
+        wrong = [k for k in keys if bool(re.fullmatch(SECRET_KEY_PATTERN, k, flags)) != is_sensitive_key(k)]
+        assert not wrong, (flags, wrong)
+
+
+@pytest.mark.parametrize(
+    "key", ["SMTPPassword", "JWTSecret", "AWSSecretKey", "APIToken", "ACCESSToken", "HTTPSession"]
+)
+def test_acronym_keys_are_sensitive(redactor: Redactor, key: str) -> None:
+    assert is_sensitive_key(key)
+    assert redactor.redact_obj({key: "v"}) == {key: REDACTED}
+
+
+@pytest.mark.parametrize(
+    ("text", "plain_key"),
+    [
+        (f'note="password={SECRET_VALUE}"', "note"),
+        (f"url=https://x.test/?token={SECRET_VALUE}", "url"),
+        (f"msg: 'clientSecret: \"{SECRET_VALUE}\"'", "msg"),
+    ],
+    ids=["note", "url", "msg"],
+)
+def test_a_plain_pair_never_swallows_a_secret_pair(redactor: Redactor, text: str, plain_key: str) -> None:
+    # Keys are generated from the tails, not "any identifier, then the predicate": a non-secret pair matched
+    # whole would hide the secret pair inside its value from every later match (Lead decision 3.1f2c #2).
+    out = redactor.redact(text)
+    assert SECRET_VALUE not in out, out
+    assert out.startswith(plain_key), out
