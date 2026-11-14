@@ -49,9 +49,9 @@ def _secret_key_pattern(tails: Iterable[str]) -> str:
     """One sensitive key name, generated from the tails so a non-secret name never matches (Lead decision
     3.1f2c #2): a pattern for any identifier would swallow ``note="password=v"`` whole, secret and all.
 
-    ``is_sensitive_key`` drops a private name's leading underscores, splits the rest into words at "_",
-    "-" and humps (``_CAMEL_BOUNDARY``) and asks whether the last words spell a tail. The same name in free
-    text, after any leading underscores (``self._password``, ``__secret``):
+    ``is_sensitive_key`` drops leading underscores and dashes (a private name, a command-line flag), splits
+    the rest into words at "_", "-" and humps (``_CAMEL_BOUNDARY``) and asks whether the last words spell a
+    tail. The same name in free text, after any leading "_" or "-" (``self._password``, ``--api-key``):
     - snake, kebab or UPPER: the tail starts the name or follows "_"/"-", its words joined by "_" or "-",
       in any case (``db_password``, ``x-api-key``, ``SECRET_KEY``);
     - camel and Pascal: the tail starts where a hump starts a word. A Capitalised tail follows any letter
@@ -77,7 +77,7 @@ def _secret_key_pattern(tails: Iterable[str]) -> str:
         upper.append(first.upper() + _camel_rest(more, after_lower=False))
         capital.append(_capitalised(first) + _camel_rest(more, after_lower=True))
     return (
-        r"_*"  # a private name's leading underscores; the words start with a letter or digit, so no overlap
+        r"[_-]*"  # leading "_" (self._password) and "-" (--password); a word starts with a letter or digit
         r"(?:[A-Za-z0-9]+[_-])*"  # the words before the tail's own segment
         rf"(?:(?i:{'|'.join(snake)})"
         rf"|(?-i:(?:{'|'.join(lower)})"
@@ -137,17 +137,32 @@ _HEADERS = re.compile(
     """
 )
 
-# key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value, compound names included.
-_KEY_VALUE = re.compile(
-    rf"""(?ix)
-    (?P<key>(?<![A-Za-z0-9_-])(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
-    (?P<sep>\\?["']?\s*[:=]\s*)
-    (?P<value>
+# The value after a sensitive key and its separator, shared by the verbose patterns below.
+_VALUE = r"""
         \\"[^"\\]*\\"            # \"escaped json\"
       | "[^"]*"                  # "double quoted"
       | '[^']*'                  # 'single quoted'
       | (?:(?:bearer|basic|token)\s+)?[^\s"'&;,\\]+
-    )
+"""
+
+# key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value / --key=value, compound names.
+_KEY_VALUE = re.compile(
+    rf"""(?ix)
+    (?P<key>(?<![A-Za-z0-9_-])(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<sep>\\?["']?\s*[:=]\s*)
+    (?P<value>{_VALUE})
+    """
+)
+
+# A command-line flag and its value after spaces or tabs: --password V, -api-key "V" (_KEY_VALUE covers
+# --key=V). Only a flag: a bare "token V" is prose. The dash is a lookahead, not "-+": "-+" before the
+# pattern's own "[_-]*" would split a long run of dashes in every way (quadratic). Spaces and tabs only: a
+# flag at the end of a line does not take the next line.
+_FLAG_VALUE = re.compile(
+    rf"""(?ix)
+    (?P<key>(?<![A-Za-z0-9_-])(?=-)(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<sep>[\ \t]+)
+    (?P<value>{_VALUE})
     """
 )
 
@@ -164,10 +179,11 @@ _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 def is_sensitive_key(name: str) -> bool:
-    """``accessToken``, ``x-api-key``, ``SMTPPassword``, ``_password`` and ``CLIENT_SECRET`` all normalise
-    to a sensitive snake_case tail. A private name's leading underscores are not part of the name
-    (``self._password``). Free text matches the same names with ``SECRET_KEY_PATTERN``."""
-    normalised = _CAMEL_BOUNDARY.sub("_", name.lstrip("_")).replace("-", "_")
+    """``accessToken``, ``x-api-key``, ``SMTPPassword``, ``_password``, ``--password`` and ``CLIENT_SECRET``
+    all normalise to a sensitive snake_case tail. Leading underscores and dashes are not part of the name
+    (``self._password``, ``mysql --password``). Free text matches the same names with
+    ``SECRET_KEY_PATTERN``."""
+    normalised = _CAMEL_BOUNDARY.sub("_", name.lstrip("_-")).replace("-", "_")
     return bool(_SENSITIVE_KEY_NAME.match(normalised))
 
 
@@ -195,6 +211,7 @@ class Redactor:
         text = _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)
         text = _HEADERS.sub(rf"\g<name>\g<sep>{REDACTED}", text)
         text = _KEY_VALUE.sub(rf"\g<key>\g<sep>{REDACTED}", text)
+        text = _FLAG_VALUE.sub(rf"\g<key>\g<sep>{REDACTED}", text)
         return _NETRC.sub(rf"\g<key>\g<sep>{REDACTED}", text)
 
     def find(self, text: str) -> list[Finding]:
@@ -207,6 +224,7 @@ class Redactor:
             ("url_credentials", _URL_CREDENTIALS),
             ("credential_header", _HEADERS),
             ("credential_assignment", _KEY_VALUE),
+            ("credential_assignment", _FLAG_VALUE),
             ("credential_assignment", _NETRC),
         ]
         seen: set[tuple[int, str]] = set()

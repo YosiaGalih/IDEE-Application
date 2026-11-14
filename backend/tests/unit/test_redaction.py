@@ -334,11 +334,15 @@ SECRET_KEYS = [
     "HTTPSession",
     # a private name: leading underscores are not part of the name (Lead ruling on Task 1 concern 2)
     "_password", "__secret", "_clientSecret", "_accessToken", "__DB_PASSWORD",
+    # a command-line flag: leading dashes are not part of the name either (Lead ruling, flags);
+    # "--no-password" is no_password, a password key by the predicate (no special case)
+    "--password", "-password", "--api-key", "-api-key", "--client-secret", "--clientSecret", "--no-password",
 ]  # fmt: skip
 # The tail is not the last word: these stay readable (Goal 3).
 PLAIN_KEYS = [
     "token_count", "max_tokens", "password_policy", "secret_santa", "tokenizer", "sessionId", "cookieConsent",
     "authorizationUrl", "passwordHint", "tokensUsed", "_token_count", "__max_tokens",
+    "--token-count", "--max-tokens", "--password-file", "--session-id", "-password_policy",
 ]  # fmt: skip
 # Every spelling AG-13 tried: assignment, JSON, escaped JSON, query string, YAML; and an attribute assignment.
 FORMS = [
@@ -374,7 +378,8 @@ def _spellings(words: list[str]) -> list[str]:
         "db_" + "_".join(words), "DB_" + "_".join(words).upper(), "x-" + "-".join(words), "dbAuth" + pascal,
         "DB" + pascal, "db2" + pascal, "db" + words[0].upper() + pascal[len(words[0]):], "my_app" + pascal,
         "_" + "_".join(words), "__" + words[0] + pascal[len(words[0]):], "_" + pascal,
-        "__x_" + "_".join(words),
+        "__x_" + "_".join(words), "--" + "-".join(words), "-" + "_".join(words),
+        "--" + words[0] + pascal[len(words[0]):],
     ]  # fmt: skip
 
 
@@ -451,3 +456,65 @@ def test_a_private_name_is_the_name_after_its_underscores(
     redactor: Redactor, text: str, expected: str
 ) -> None:
     assert redactor.redact(text) == expected
+
+
+# --- Command-line flags (Lead ruling on Task 1 concern 2): a sensitive key after one or two dashes ---
+
+FLAG_SECRETS = [
+    ("mysql --password={v}", "mysql --password="),
+    ("curl --token {v}", "curl --token "),
+    ("cli -password={v}", "cli -password="),
+    ("--api-key={v}", "--api-key="),
+    ("docker login --password {v}", "docker login --password "),
+    ("tool --api-key {v} --verbose", "tool --api-key "),
+    ("tool --client-secret {v}", "tool --client-secret "),
+    ("tool --access-token {v}", "tool --access-token "),
+    ("tool --clientSecret {v}", "tool --clientSecret "),
+    ("tool -password {v}", "tool -password "),
+    ("tool --DB_PASSWORD {v}", "tool --DB_PASSWORD "),
+    ("tool --password: {v}", "tool --password: "),
+    ('tool --password "{v}"', "tool --password "),
+    ("tool --password '{v} more'", "tool --password "),
+    ("tool --token\t{v}", "tool --token\t"),
+    ('cmd="--password={v}"', 'cmd="--password='),
+    ("PGOPTIONS=--password={v}", "PGOPTIONS=--password="),
+    ("-password = {v}", "-password"),  # a removed diff line
+]
+
+
+@pytest.mark.parametrize(("template", "kept"), FLAG_SECRETS, ids=[t for t, _ in FLAG_SECRETS])
+def test_a_flag_hides_its_value(redactor: Redactor, template: str, kept: str) -> None:
+    text = template.format(v=SECRET_VALUE)
+    out = redactor.redact(text)
+    assert SECRET_VALUE not in out, out
+    assert out.startswith(kept), out  # the flag itself stays readable
+    assert "credential_assignment" in {f.rule for f in redactor.find(text)}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "tool --token-count 5",
+        "tool --max-tokens 4096",
+        "tool --password-file ./p.txt",
+        "tool --session-id 3",
+        "-password_policy = strict",
+        # A whitespace separator makes a value only after a flag: bare prose and code stay as they are.
+        f"the token {SECRET_VALUE}",
+        f"api-key {SECRET_VALUE}",
+        f"clientSecret {SECRET_VALUE}",
+        "tool --password",
+        "tool --password\t",
+    ],
+)
+def test_a_flag_that_is_not_secret_stays_readable(redactor: Redactor, text: str) -> None:
+    assert redactor.redact(text) == text
+
+
+def test_no_password_is_a_password_flag_by_the_predicate(redactor: Redactor) -> None:
+    # "--no-password" normalises to no_password, whose tail is "password": the predicate calls it sensitive,
+    # so its next token is redacted like any flag's, even when that token is another flag. No special case.
+    assert is_sensitive_key("--no-password")
+    assert redactor.redact("mysql --no-password --force") == f"mysql --no-password {REDACTED}"
+    assert redactor.redact("mysql --no-password") == "mysql --no-password"
+    assert redactor.redact("mysql --no-password=true") == f"mysql --no-password={REDACTED}"

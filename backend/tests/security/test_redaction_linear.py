@@ -26,6 +26,12 @@ CASES = [
     # that alternates them with letters.
     ("underscores_before_tail", "_" * KIB_64 + "password="),
     ("underscore_letter_run", "_a" * (KIB_64 // 2)),
+    # Command-line flags (--password=V, --token V): a long run of dashes before a tail and before a plain
+    # name, dashes alternating with letters, and many flags in a row.
+    ("dashes_before_tail", "-" * KIB_64 + "password=V"),
+    ("dashes_before_plain_name", "-" * KIB_64 + "x y"),
+    ("dash_letter_run", "--a" * 21_845),
+    ("flag_run", "--token " * 8_192),
 ]
 
 
