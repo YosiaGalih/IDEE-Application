@@ -635,6 +635,13 @@ BACKSLASH_BEFORE_A_CLOSE = {
     "shell single quotes": "export DB_PASSWORD='aB3\\'\nexport GITHUB_TOKEN='{}'\n",
     "yaml single quotes": "db:\n  password: 'p4ss\\'\n  api_key: '{}'\n",
     "double quotes": 'PASSWORD="ab\\"\nTOKEN="{}"\n',
+    # AG-13 M-1 (delta review of 2ac73c3): the same with both values on one line.
+    "yaml flow mapping, one line": "db: {{password: 'p4ss\\', api_key: '{}'}}\n",
+    "shell env prefix, one line": "env DB_PASSWORD='C:\\pw\\' GITHUB_TOKEN='{}' ./deploy.sh\n",
+    "docker -e flags, one line": "docker run -e DB_PASSWORD='x\\' -e API_KEY='{}' img\n",
+    "logfmt pairs, one line": "user=bob password='p\\' token='{}' ok\n",
+    "powershell, one line": "$password = 'C:\\k\\'; $token = '{}'\n",
+    "double quotes, one line": 'A_PASSWORD="ab\\" TOKEN="{}"\n',
 }
 
 

@@ -296,27 +296,30 @@ CREDENTIAL_HEADER_START = re.compile(rf"(?i){_HEADER_NAME_SEP}")
 # in this order (Lead decisions 3.1f2c #6, #8):
 # - triple quoted, one value across lines; never closed: to the end of the text;
 # - \"escaped JSON\": in the JSON-encoded text, \\ followed by \" or \\ is one escape of the inner string;
-# - "double" or 'single' quoted with backslash escapes ("ab\"c" is one string), closed on its own line;
-# - else, when the escape-aware close is on a later line, closed on its own line by the first quote of its
-#   kind, a backslash before it or not, if no letter, digit or "_" follows it: single-quoted shell, YAML, INI
-#   and PowerShell strings read no escapes ('C:\keys\'), and a value that read one there would take the next
-#   value's opening quote, on a later line, as its close (AG-13 F-1). A quote glued to a word ends no value
-#   ("\"V…": V is inside the string);
+# - "double" or 'single' quoted with backslash escapes ("ab\"c" is one string), closed on its own line by a
+#   quote no letter, digit or "_" follows: a close glued to a word is the next value's opening quote on the
+#   same line ('p4ss\', api_key: 'V'; AG-13 M-1, delta review of 2ac73c3);
+# - else, when the escape-aware close is on a later line or glued to a word, closed on its own line by the
+#   first quote of its kind, a backslash before it or not, if no letter, digit or "_" follows it:
+#   single-quoted shell, YAML, INI and PowerShell strings read no escapes ('C:\keys\'), and a value that read
+#   one there would take the next value's opening quote as its close (AG-13 F-1). A quote glued to a word
+#   ends no value ("\"V…": V is inside the string);
 # - else across lines, with backslash escapes;
 # - a quote never closed (with escapes): to the end of the text, like a PEM block without its END line. The
 #   rest of the text holds no closing quote of that kind, so what is over-redacted is bounded.
-# Each line-bound try reads at most the rest of the value's line; one that fails leaves no unescaped quote of
-# its kind on that line for a later value to open with, so a line is read so at most twice. The lookahead
-# before the plain close reads, as the try across lines does, up to the next unescaped quote of its kind: the
-# opening quote of any later value, so each stretch of text is read so a bounded number of times.
+# Linear: each try for "…" or '…' reads from the opening quote at most to the next unescaped quote of its kind
+# (a line-bound one stops sooner at a line break, the plain close at any quote of its kind), or, when there is
+# none, takes the rest of the text. A value opens only at a quote that follows no backslash, which is
+# unescaped however the text before it is read, so no later value opens inside that stretch: each stretch
+# between two unescaped quotes of a kind is read a bounded number of times.
 _QUOTED = r"""
         (?:[bBfFrRuU]{1,2}(?=["']))?
         (?:
         "{3}(?s:.*?)(?:"{3}|\Z)
       | '{3}(?s:.*?)(?:'{3}|\Z)
       | \\"(?:[^\\]|\\[^"\\]|\\\\(?:[^\\]|\\[\s\S]))*+\\"
-      | "(?:[^"\\\r\n]|\\[^\r\n])*+"
-      | '(?:[^'\\\r\n]|\\[^\r\n])*+'
+      | "(?:[^"\\\r\n]|\\[^\r\n])*+"(?![A-Za-z0-9_])
+      | '(?:[^'\\\r\n]|\\[^\r\n])*+'(?![A-Za-z0-9_])
       | (?="(?:[^"\\]|\\[\s\S])*+")"[^"\r\n]*+"(?![A-Za-z0-9_])
       | (?='(?:[^'\\]|\\[\s\S])*+')'[^'\r\n]*+'(?![A-Za-z0-9_])
       | "(?:[^"\\]|\\[\s\S])*+"

@@ -687,6 +687,31 @@ BACKSLASH_BEFORE_A_CLOSE = {
     "never closed, a space after the escaped quote": (f'password="\\" {V}', f"password={REDACTED}"),
     # A plain close glued to a word is no end of a value: the escape-aware close on a later line is taken.
     "plain close glued to a word": (f'Bearer="\\"{V}\n" next', f"Bearer={REDACTED} next"),
+    # AG-13 M-1 (delta review of 2ac73c3): two values on one line. The escape-aware close is the next value's
+    # opening quote, glued to that value: no close, so the plain close before it ends the first value.
+    "yaml flow mapping, one line": (
+        f"db: {{password: 'p4ss\\', api_key: '{V}'}}",
+        f"db: {{password: {REDACTED}, api_key: {REDACTED}}}",
+    ),
+    "shell env prefix, one line": (
+        f"env DB_PASSWORD='C:\\pw\\' GITHUB_TOKEN='{V}' ./deploy.sh",
+        f"env DB_PASSWORD={REDACTED} GITHUB_TOKEN={REDACTED} ./deploy.sh",
+    ),
+    "docker -e flags, one line": (
+        f"docker run -e DB_PASSWORD='x\\' -e API_KEY='{V}' img",
+        f"docker run -e DB_PASSWORD={REDACTED} -e API_KEY={REDACTED} img",
+    ),
+    "logfmt pairs, one line": (
+        f"user=bob password='p\\' token='{V}' ok",
+        f"user=bob password={REDACTED} token={REDACTED} ok",
+    ),
+    "powershell, one line": (
+        f"$password = 'C:\\k\\'; $token = '{V}'",
+        f"$password = {REDACTED}; $token = {REDACTED}",
+    ),
+    "double quotes, one line": (f'A_PASSWORD="ab\\" TOKEN="{V}"', f"A_PASSWORD={REDACTED} TOKEN={REDACTED}"),
+    # An escape-aware close glued to nothing still wins on one line (R-6, #8), with single quotes too.
+    "escaped apostrophe closed on its line": (f"password = 'ab\\'{V}'", f"password = {REDACTED}"),
 }
 
 

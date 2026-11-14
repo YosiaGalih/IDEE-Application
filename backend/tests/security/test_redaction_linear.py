@@ -98,6 +98,12 @@ CASES = [
     # single-quoted values on every line under a double-quoted one closed at the very end.
     ("escape_aware_close_far_away", 'password="a\\"\n' + "x" * KIB_64 + '"'),
     ("single_quoted_lines_under_a_double_quote", 'password="x\\"\n' + "token='y\\'\n" * (KIB_64 // 12) + '"'),
+    # AG-13 M-1 (delta review of 2ac73c3): an escape-aware close glued to a word ends no value. Two values on
+    # one line, again and again on one 64 KiB line, with single and double quotes; and one value whose only
+    # escape-aware close, glued to a word, is at the end of a long line of escaped quotes.
+    ("glued_closes_on_one_line", "password='a\\' token='b' " * (KIB_64 // 25)),
+    ("glued_double_closes_on_one_line", 'A_PASSWORD="a\\" TOKEN="b" ' * (KIB_64 // 27)),
+    ("escaped_quotes_before_a_glued_close", "password='" + "\\'" * (KIB_64 // 2) + "'b"),
     # AG-13 F-2: a bare value is never a key with its own value. Keys as values one after another, netrc's
     # key as a value, a key before 64 KiB of spaces, and one 64 KiB word read as a key.
     ("bare_value_key_run", "password=token=" * (KIB_64 // 15)),
