@@ -245,8 +245,8 @@ def _key_before(text: str, quote: int) -> int | None:
 def _open_header(text: str) -> int | None:
     """Where the value of a header whose line is still open starts, or None (Lead rulings, WP-3.1f2c fix
     rounds). Without an opening quote after its colon a header value is the rest of its line, and a quote
-    that opens a parameter may take later lines or the rest of the text (CREDENTIAL_HEADER): while the
-    header's line is the last line of the text, its value is held from its start. No quote is paired here:
+    that opens a parameter may take later lines or the rest of the text (the redactor's header rule): while
+    the header's line is the last line of the text, its value is held from its start. No quote is paired here:
     the redactor reads the text with tokens, URL credentials and literals replaced, and a replaced span may
     hold a quote or a backslash, so the raw text pairs its quotes differently (review I-1 of 50610b5).
 

@@ -22,7 +22,8 @@ from typing import Any
 REDACTED = "[REDACTED]"
 
 # A key is sensitive when its *last* segment(s) name a secret: GITHUB_TOKEN, client_secret, api-key. Public:
-# the agent runtime's delta stream holds a quoted value back after the same keys (app.agents.runtime).
+# SECRET_KEY_PATTERN, which the agent runtime's delta stream reads, is generated from it, and tests read it as
+# the list of tails.
 # "token_count", "max_tokens", "secret_santa" and "password_policy" stay readable.
 SENSITIVE_KEY_TAIL = (
     r"passwords?|passwd|passphrase|secrets?|secret_key|token|api_key|apikey|access_key|private_key"
@@ -32,10 +33,12 @@ _SENSITIVE_KEY_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAI
 
 # Well-known secret environment variables whose name ends in no tail. Exact names in any case, not tails:
 # "pwd" alone is the working directory in code and shells, and PGPASSFILE names a file (Lead ruling, 3.1f2c).
-KNOWN_SECRET_NAMES = frozenset({"pgpassword", "mysql_pwd", "rediscli_auth"})
+# Private, as _CREDENTIAL_HEADER: only this module reads them (backend review M4, final review of 74bf8d4).
+_KNOWN_SECRET_NAMES = frozenset({"pgpassword", "mysql_pwd", "rediscli_auth"})
 
-# The headers whose value is a credential, in the order CREDENTIAL_HEADER tries them. One list: it builds
-# CREDENTIAL_HEADER, CREDENTIAL_HEADER_START and KEY_HINT, and tests/unit/test_redaction.py reads it.
+# The headers whose value is a credential, in the order _CREDENTIAL_HEADER tries them. One list: it builds
+# _CREDENTIAL_HEADER, CREDENTIAL_HEADER_START and KEY_HINT. Public: the agent runtime's delta stream reads it,
+# as tests/unit/test_redaction_internals.py does.
 CREDENTIAL_HEADER_NAMES = ("proxy-authorization", "authorization", "set-cookie", "cookie", "x-api-key")
 _NETRC_KEY = "password"  # the one key _NETRC reads (KEY_HINT reads it too)
 
@@ -142,7 +145,7 @@ def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
 
 # One sensitive key name, the free-text form of ``is_sensitive_key``: ``_KEY_VALUE`` here, the delta stream's
 # key check in app.agents.runtime. A regex source with no boundary lookaround; the caller adds the boundaries.
-SECRET_KEY_PATTERN = _secret_key_pattern(SENSITIVE_KEY_TAIL.split("|"), KNOWN_SECRET_NAMES)
+SECRET_KEY_PATTERN = _secret_key_pattern(SENSITIVE_KEY_TAIL.split("|"), _KNOWN_SECRET_NAMES)
 
 # The characters a case-insensitive pattern takes for an ASCII letter besides its two cases (Python's re;
 # tests/unit/test_redaction.py checks all of Unicode for every letter).
@@ -157,7 +160,7 @@ def _hint_words() -> list[str]:
     names, the netrc key and the redaction marker. A word that holds another is left out: the other is
     found wherever it is."""
     words = {tail.split("_")[-1].removesuffix("s?") for tail in SENSITIVE_KEY_TAIL.split("|")}
-    words |= {*KNOWN_SECRET_NAMES, *CREDENTIAL_HEADER_NAMES, _NETRC_KEY, "[redacted]"}
+    words |= {*_KNOWN_SECRET_NAMES, *CREDENTIAL_HEADER_NAMES, _NETRC_KEY, "[redacted]"}
     return sorted(word for word in words if not any(other != word and other in word for other in words))
 
 
@@ -181,7 +184,7 @@ def _key_hint(words: Iterable[str]) -> re.Pattern[str]:
 
 
 # A word every key the key-value rules read holds (SECRET_KEY_PATTERN in _KEY_VALUE, _FLAG_VALUE and
-# _ARGV_VALUE; _NETRC_KEY in _NETRC), as do every header name (CREDENTIAL_HEADER) and the marker
+# _ARGV_VALUE; _NETRC_KEY in _NETRC), as do every header name (_CREDENTIAL_HEADER) and the marker
 # _AFTER_REDACTED reads, in the case-insensitive sense those rules use. A text with none of them is left as
 # it is by all six rules, so ``Redactor.redact`` skips them: they cost 15 ms per 64 KiB of plain text, and
 # the delta stream redacts a call's whole text up to about 100 times. Public: the delta stream's header
@@ -252,7 +255,7 @@ _HEADER_NAME_SEP = (
     rf"(?P<name>(?:{'|'.join(map(re.escape, CREDENTIAL_HEADER_NAMES))}))"
     r"""(?P<sep>\\?["']?\s*+:(?:\s*+(?=[^\s\\]|\\["'])|\s*(?=[^\S\r\n]))?(?P<open>\\?["'])?)"""
 )
-CREDENTIAL_HEADER = re.compile(
+_CREDENTIAL_HEADER = re.compile(
     rf"""(?ix)
     (?<![A-Za-z0-9_-]){_HEADER_NAME_SEP}
     (?P<value>(?(open)[^"'\\\r\n]+|(?:[^"'\\\r\n]|(?<==)"(?=[^\s"])[^"]*+"|(?<==)'(?=[^\s'])[^']*+'
@@ -260,7 +263,7 @@ CREDENTIAL_HEADER = re.compile(
     """
 )
 # Where a header's value starts, read from the raw text by the agent runtime's delta stream: the name and
-# separator alone, with no left boundary (a superset of CREDENTIAL_HEADER's starts, whatever the redactor
+# separator alone, with no left boundary (a superset of _CREDENTIAL_HEADER's starts, whatever the redactor
 # replaced before them), and no quote paired.
 CREDENTIAL_HEADER_START = re.compile(rf"(?i){_HEADER_NAME_SEP}")
 
@@ -428,7 +431,7 @@ def is_sensitive_key(name: str) -> bool:
     well-known secret name with no tail (``PGPASSWORD``) is sensitive as a whole name. Free text matches the
     same names with ``SECRET_KEY_PATTERN``."""
     bare = name.lstrip("_-")
-    return bare.lower() in KNOWN_SECRET_NAMES or any(
+    return bare.lower() in _KNOWN_SECRET_NAMES or any(
         _SENSITIVE_KEY_NAME.match(boundary.sub("_", bare).replace("-", "_")) for boundary in _WORD_BOUNDARIES
     )
 
@@ -500,7 +503,7 @@ class Redactor:
     def redact_with_stop(self, text: str) -> tuple[str, int | None]:
         """``redact(text)``, and where in it a stream of the text, cut at its end, holds back from: the agent
         runtime's delta stream (reviews of 0733969 and 45c2ec7). The header rule ends a value at a quote its
-        line may still close (CREDENTIAL_HEADER), and the value takes the quoted part once it closes. The
+        line may still close (_CREDENTIAL_HEADER), and the value takes the quoted part once it closes. The
         rules after it may pair that quote or take the marker before it, so the stop is read on the text as
         the header rule leaves it (``stopped_at_open_quote``), then placed in the redacted text: at the same
         place when no later rule changed anything up to it, else at the start of the redacted text's last line
@@ -520,7 +523,7 @@ class Redactor:
             text = _AFTER_REDACTED.sub(_drop_value, text)
         at: int | None = None
         if ":" in text:
-            text = CREDENTIAL_HEADER.sub(_drop_value, text)
+            text = _CREDENTIAL_HEADER.sub(_drop_value, text)
             at = stopped_at_open_quote(text) if stop else None
         headed = text
         if ":" in text or "=" in text:
@@ -559,7 +562,7 @@ class Redactor:
             *((f"literal_{index}", re.compile(re.escape(lit))) for index, lit in enumerate(self._literals)),
             *_NAMED_PATTERNS,
             ("url_credentials", _URL_CREDENTIALS),
-            ("credential_header", CREDENTIAL_HEADER),
+            ("credential_header", _CREDENTIAL_HEADER),
             ("credential_assignment", _KEY_VALUE),
             ("credential_assignment", _FLAG_VALUE),
             ("credential_assignment", _ARGV_VALUE),

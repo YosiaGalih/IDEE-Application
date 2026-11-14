@@ -18,21 +18,22 @@ from pathlib import Path
 
 import pytest
 
+from app.core import redaction
 from app.core.redaction import (
     _AFTER_REDACTED,
     _ARGV_VALUE,
     _CASE_FOLDS,
+    _CREDENTIAL_HEADER,
     _FLAG_VALUE,
     _KEY_VALUE,
+    _KNOWN_SECRET_NAMES,
     _NAMED_PATTERNS,
     _NETRC,
     _NETRC_KEY,
     _PATTERNS,
     _URL_CREDENTIALS,
-    CREDENTIAL_HEADER,
     CREDENTIAL_HEADER_NAMES,
     KEY_HINT,
-    KNOWN_SECRET_NAMES,
     REDACTED,
     SECRET_KEY_PATTERN,
     SENSITIVE_KEY_TAIL,
@@ -64,7 +65,7 @@ def _tail_words() -> list[str]:
 
 
 # The same sources KEY_HINT is built from (review M-2 of 50610b5): one header list, the netrc key, the marker.
-HINTED_WORDS = [*_tail_words(), *sorted(KNOWN_SECRET_NAMES), *CREDENTIAL_HEADER_NAMES, _NETRC_KEY, REDACTED]
+HINTED_WORDS = [*_tail_words(), *sorted(_KNOWN_SECRET_NAMES), *CREDENTIAL_HEADER_NAMES, _NETRC_KEY, REDACTED]
 
 
 def test_the_case_folds_are_every_character_a_case_insensitive_letter_takes() -> None:
@@ -91,7 +92,7 @@ def _every_rule(text: str) -> str:
     for pattern in _PATTERNS:
         text = pattern.sub(REDACTED, text)
     text = _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)
-    for rule in (_AFTER_REDACTED, CREDENTIAL_HEADER, _KEY_VALUE, _FLAG_VALUE, _ARGV_VALUE, _NETRC):
+    for rule in (_AFTER_REDACTED, _CREDENTIAL_HEADER, _KEY_VALUE, _FLAG_VALUE, _ARGV_VALUE, _NETRC):
         text = rule.sub(_drop_value, text)
     return text
 
@@ -150,7 +151,7 @@ def test_the_key_pattern_matches_what_it_did_without_its_lookaheads() -> None:
 
 
 def test_the_known_secret_names_are_the_three_the_lead_ruled() -> None:
-    assert frozenset(KNOWN_NAMES) == KNOWN_SECRET_NAMES
+    assert frozenset(KNOWN_NAMES) == _KNOWN_SECRET_NAMES
 
 
 # --- The black-box tests read no private name (backend review M1, final review of 74bf8d4) ---
@@ -169,3 +170,27 @@ def test_the_black_box_tests_import_only_the_public_api() -> None:
         for alias in node.names
     }
     assert imported == BLACK_BOX_NAMES
+
+
+# --- The public names are the ones other modules read (backend review M4, final review of 74bf8d4) ---
+
+# app.agents.runtime reads the header names, the header start, KEY_HINT, the key and URL scheme patterns and
+# stopped_at_open_quote; every outbound path reads Redactor (and Finding, from find); the tests read REDACTED,
+# SENSITIVE_KEY_TAIL and is_sensitive_key.
+PUBLIC_NAMES = {
+    "REDACTED", "SENSITIVE_KEY_TAIL", "SECRET_KEY_PATTERN", "CREDENTIAL_HEADER_NAMES",
+    "CREDENTIAL_HEADER_START", "KEY_HINT", "URL_SCHEME_PATTERN", "stopped_at_open_quote", "is_sensitive_key",
+    "Finding", "Redactor",
+}  # fmt: skip
+
+
+def test_the_public_names_are_the_ones_other_modules_read() -> None:
+    defined: set[str] = set()
+    for node in ast.parse(Path(redaction.__file__).read_text()).body:
+        if isinstance(node, ast.FunctionDef | ast.ClassDef):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            defined |= {target.id for target in node.targets if isinstance(target, ast.Name)}
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined.add(node.target.id)
+    assert {name for name in defined if not name.startswith("_")} == PUBLIC_NAMES
