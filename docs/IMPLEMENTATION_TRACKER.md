@@ -171,6 +171,7 @@ Spec: `docs/superpowers/specs/2026-10-24-wp-1.1a-backend-core-skeleton-design.md
 | Migrasi | `alembic upgrade head` → `downgrade base` → `upgrade head` | exit 0 ×3 (belum ada revisi; `0001_initial` = WP-1.1b) |
 | Registry | `python scripts/validate_registry.py agents/registry.v2.yaml` | `OK: 53 agents (41 specialists + ORCH + 11 K2) — schema_version 2` |
 | Audit dependensi | `uvx pip-audit --strict -r <uv export>` | No known vulnerabilities found. Sebelumnya `certifi 2026.7.22` PYSEC-2026-4320; dinaikkan ke 2026.10.23 lewat pengecualian umur per paket di `pyproject.toml`. |
+| Audit dependensi (14 Nov) | `uvx pip-audit --strict -r <uv export>` untuk `backend/uv.lock`, `sandbox_manager/uv.lock`, `sandbox-images/python/requirements.txt` | No known vulnerabilities found (ketiganya). Sebelumnya `opentelemetry-api 1.45.1` CVE-2026-126360 (job `security-scan` di `main` 6d20bd2 merah); dinaikkan ke 1.45.2 (rilis 29 Okt) lewat pengecualian umur per paket di kedua `pyproject.toml` dan `sandbox-images/lock.sh`, preseden certifi. |
 | Audit uv (alat build, 30 Okt) | `uvx pip-audit --strict -r infra/build/uv-requirements.txt` | No known vulnerabilities found. Sebelumnya uv 0.11.32 PYSEC-2026-4321 (EX-01); dinaikkan ke 0.13.4 (rilis 20 Okt) lewat pengecualian umur per paket di `infra/build/lock-uv.sh`. Dengan uv 0.13.4: `uv sync --locked` tidak mengubah kedua `uv.lock`; backend 1243 passed, 1 skipped; sandbox_manager 151 passed; image ter-build; stack `ci.env` healthy, live/ready/`/` 200 lewat Caddy. |
 | CI | `.github/workflows/backend.yml` | ⬜ belum berjalan — push ke GitHub ditolak 403 (akses Claude GitHub App belum ada) |
 
@@ -2594,3 +2595,26 @@ $ uv run python ../scripts/validate_registry.py ../agents/registry.v2.yaml   # e
 - **3.2:** `services/acceptance.verify_report` V1–V10 + test UPA-02 sebelum status A07 dikonsumsi (#36, #45), audit `malformed_ref` menyimpan ref dalam bentuk ter-escape atau tipe ref A07 menolak Cc/Cf (AG-13 D2-I3); AG-13 INFO-5 (`worker_id` unik per proses, `TaskWorkspace` dari baris task yang sama, penulis `AgentRunResult.output`/`pending_tool` meredaksi, transkrip resume diredaksi); transisi task dari hasil run, task `running` dengan provider belum siap → `interrupted/provider_not_ready` (#15); resume `tool_r3`; `GET /tasks/{id}/agent-runs`; penulis `tasks.title` meredaksi.
 - **WP yang me-render `agent.delta` (frontend):** wajib menghormati `reset` (API §5.1).
 - **PO:** keputusan temuan gitleaks (di atas); ratifikasi ADR-073 #6, ADR-074, ADR-075; butir 3.1f2 di #72.
+
+**Sesudah merge PR #31 (fakta, 14 Nov 2026) [Pasti]:**
+- PR #31 ditandai siap dan di-merge PO pada 14 Nov 2026 03:25 UTC (merge commit 6d20bd2, head b5fd6ea; tree `main` identik dengan b5fd6ea). Saat itu `security-scan` merah. Delapan job lain hijau.
+- Syarat sign-off AG-13 "CI 9/9 hijau termasuk `security-scan`" **tidak terpenuhi saat merge**. Ini sama dengan preseden PR #29.
+- Temuan gitleaks (PEM sintetis b35c3c7) tidak lagi memblokir. Scan push di `main` hanya mencakup rentang push, dan langkah gitleaks di run 6d20bd2 hijau. Scan PR berikutnya dimulai dari commit pertama PR itu. Literal itu tetap ada di riwayat `main`; scan riwayat penuh akan menandainya. Belum ada entri `.gitleaksignore` (keputusan PO).
+- **Yang tersembunyi di balik merah gitleaks:** di setiap run PR #31, langkah sesudah gitleaks dilewati, yaitu pip-audit, npm audit, kebijakan pengecualian, Semgrep, build image, dan Trivy. Kode WP-3.1f2a masuk `main` tanpa Semgrep dan Trivy pernah berjalan atasnya.
+- Di `main` 6d20bd2, gitleaks lulus lalu pip-audit gagal: `opentelemetry-api 1.45.1` CVE-2026-126360. Advisory ini baru; PR #31 tidak mengubah lockfile.
+- Perbaikannya ada di PR lanjutan (`opentelemetry-api` 1.45.2 di backend, sandbox-manager, dan image sandbox Python). Run CI PR itu adalah run Semgrep/Trivy pertama atas kode WP-3.1f2a.
+- Bukti lokal perbaikan @ commit ini (PostgreSQL 16 + Redis lokal):
+
+```text
+$ f1-pytest.sh -q                                   # backend, suite penuh
+3834 passed in 511.13s
+$ uv run ruff check . && uv run pyright && uv run lint-imports   # backend
+All checks passed! · 0 errors · Contracts: 10 kept, 0 broken
+$ cd sandbox_manager && uv run ruff check . && uv run pyright && uv run pytest -q
+All checks passed! · 0 errors · 155 passed, 1 skipped, 23 deselected
+$ uvx --exclude-newer 2026-10-10T00:00:00Z pip-audit --strict -r <export>   # backend, sandbox_manager, sandbox-images/python
+No known vulnerabilities found (×3)
+$ cd frontend && npm audit --omit=dev --audit-level=high
+found 0 vulnerabilities
+```
+
