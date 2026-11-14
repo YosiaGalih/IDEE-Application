@@ -127,6 +127,15 @@ def test_literal_configured_secrets_are_redacted() -> None:
     assert "short" in out
 
 
+def test_longest_literal() -> None:
+    """WP-3.1f2c D2-I1 (Lead decision #11): the delta stream holds back at least this many characters less
+    one, so a configured literal cut at the end of a streamed text is never sent in part. A literal too short
+    to be redacted does not count."""
+    assert Redactor().longest_literal == 0
+    assert Redactor(["short"]).longest_literal == 0
+    assert Redactor(["short", "x" * 9, "y" * 1200]).longest_literal == 1200
+
+
 def test_redact_obj_walks_nested_structures() -> None:
     redactor = Redactor(literals=["configured-secret-value"])
     obj = {"a": ["x", {"b": f"k={FAKE_ANTHROPIC}"}], "c": ("configured-secret-value", 3), "d": None}

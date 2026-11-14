@@ -316,6 +316,13 @@ class Redactor:
         # Longest first so a secret that contains another secret is removed whole.
         self._literals = sorted(unique, key=len, reverse=True)
 
+    @property
+    def longest_literal(self) -> int:
+        """The length of the longest configured literal it redacts, or 0. A stream of text redacted as it
+        grows holds back this many characters less one, so a literal cut at its end is never sent in part
+        (the agent runtime's delta stream; Lead decision 3.1f2c #11)."""
+        return len(self._literals[0]) if self._literals else 0
+
     def redact(self, text: str) -> str:
         text = self._without_tokens(text)
         text = _AFTER_REDACTED.sub(_drop_value, text)
