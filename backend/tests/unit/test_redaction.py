@@ -332,14 +332,19 @@ SECRET_KEYS = [
     # an acronym before the tail word (#14); "session" stays a tail (#3)
     "SMTPPassword", "DBPassword", "JWTSecret", "AWSSecretKey", "APIToken", "ACCESSToken", "userSession",
     "HTTPSession",
+    # a private name: leading underscores are not part of the name (Lead ruling on Task 1 concern 2)
+    "_password", "__secret", "_clientSecret", "_accessToken", "__DB_PASSWORD",
 ]  # fmt: skip
 # The tail is not the last word: these stay readable (Goal 3).
 PLAIN_KEYS = [
     "token_count", "max_tokens", "password_policy", "secret_santa", "tokenizer", "sessionId", "cookieConsent",
-    "authorizationUrl", "passwordHint", "tokensUsed",
+    "authorizationUrl", "passwordHint", "tokensUsed", "_token_count", "__max_tokens",
 ]  # fmt: skip
-# Every spelling AG-13 tried: assignment, JSON, escaped JSON, query string, YAML.
-FORMS = ['{k} = "{v}"', "{k}={v}", '"{k}": "{v}"', '\\"{k}\\": \\"{v}\\"', "?{k}={v}&x=1", "{k}: '{v}'"]
+# Every spelling AG-13 tried: assignment, JSON, escaped JSON, query string, YAML; and an attribute assignment.
+FORMS = [
+    '{k} = "{v}"', "{k}={v}", '"{k}": "{v}"', '\\"{k}\\": \\"{v}\\"', "?{k}={v}&x=1", "{k}: '{v}'",
+    'self.{k} = "{v}"',
+]  # fmt: skip
 
 
 @pytest.mark.parametrize("form", FORMS)
@@ -368,6 +373,8 @@ def _spellings(words: list[str]) -> list[str]:
         "_".join(words), "_".join(words).upper(), "-".join(words), words[0] + pascal[len(words[0]):], pascal,
         "db_" + "_".join(words), "DB_" + "_".join(words).upper(), "x-" + "-".join(words), "dbAuth" + pascal,
         "DB" + pascal, "db2" + pascal, "db" + words[0].upper() + pascal[len(words[0]):], "my_app" + pascal,
+        "_" + "_".join(words), "__" + words[0] + pascal[len(words[0]):], "_" + pascal,
+        "__x_" + "_".join(words),
     ]  # fmt: skip
 
 
@@ -427,3 +434,20 @@ def test_a_plain_pair_never_swallows_a_secret_pair(redactor: Redactor, text: str
     out = redactor.redact(text)
     assert SECRET_VALUE not in out, out
     assert out.startswith(plain_key), out
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f"foo_password={SECRET_VALUE}", f"foo_password={REDACTED}"),  # the whole name, never from its "_"
+        (f"self._password={SECRET_VALUE}", f"self._password={REDACTED}"),
+        (f"obj._accessToken={SECRET_VALUE}", f"obj._accessToken={REDACTED}"),
+        (f"__secret={SECRET_VALUE}", f"__secret={REDACTED}"),
+        (f"self._token_count={SECRET_VALUE}", f"self._token_count={SECRET_VALUE}"),
+    ],
+    ids=["foo_password", "self._password", "obj._accessToken", "__secret", "self._token_count"],
+)
+def test_a_private_name_is_the_name_after_its_underscores(
+    redactor: Redactor, text: str, expected: str
+) -> None:
+    assert redactor.redact(text) == expected

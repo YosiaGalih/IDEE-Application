@@ -49,8 +49,9 @@ def _secret_key_pattern(tails: Iterable[str]) -> str:
     """One sensitive key name, generated from the tails so a non-secret name never matches (Lead decision
     3.1f2c #2): a pattern for any identifier would swallow ``note="password=v"`` whole, secret and all.
 
-    ``is_sensitive_key`` splits a name into words at "_", "-" and humps (``_CAMEL_BOUNDARY``) and asks
-    whether the last words spell a tail. The same name in free text:
+    ``is_sensitive_key`` drops a private name's leading underscores, splits the rest into words at "_",
+    "-" and humps (``_CAMEL_BOUNDARY``) and asks whether the last words spell a tail. The same name in free
+    text, after any leading underscores (``self._password``, ``__secret``):
     - snake, kebab or UPPER: the tail starts the name or follows "_"/"-", its words joined by "_" or "-",
       in any case (``db_password``, ``x-api-key``, ``SECRET_KEY``);
     - camel and Pascal: the tail starts where a hump starts a word. A Capitalised tail follows any letter
@@ -76,6 +77,7 @@ def _secret_key_pattern(tails: Iterable[str]) -> str:
         upper.append(first.upper() + _camel_rest(more, after_lower=False))
         capital.append(_capitalised(first) + _camel_rest(more, after_lower=True))
     return (
+        r"_*"  # a private name's leading underscores; the words start with a letter or digit, so no overlap
         r"(?:[A-Za-z0-9]+[_-])*"  # the words before the tail's own segment
         rf"(?:(?i:{'|'.join(snake)})"
         rf"|(?-i:(?:{'|'.join(lower)})"
@@ -162,9 +164,10 @@ _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 def is_sensitive_key(name: str) -> bool:
-    """``accessToken``, ``x-api-key``, ``SMTPPassword`` and ``CLIENT_SECRET`` all normalise to a sensitive
-    snake_case tail. Free text matches the same names with ``SECRET_KEY_PATTERN``."""
-    normalised = _CAMEL_BOUNDARY.sub("_", name).replace("-", "_")
+    """``accessToken``, ``x-api-key``, ``SMTPPassword``, ``_password`` and ``CLIENT_SECRET`` all normalise
+    to a sensitive snake_case tail. A private name's leading underscores are not part of the name
+    (``self._password``). Free text matches the same names with ``SECRET_KEY_PATTERN``."""
+    normalised = _CAMEL_BOUNDARY.sub("_", name.lstrip("_")).replace("-", "_")
     return bool(_SENSITIVE_KEY_NAME.match(normalised))
 
 

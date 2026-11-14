@@ -22,6 +22,10 @@ CASES = [
     ("camel_run", "aB" * (KIB_64 // 2)),
     ("camel_tail_run", "secretKey" * 7_282),
     ("acronym_run_before_tail", "A" * KIB_64 + "Password="),
+    # Leading underscores of a private name (self._password): a long run of them before a tail, and a name
+    # that alternates them with letters.
+    ("underscores_before_tail", "_" * KIB_64 + "password="),
+    ("underscore_letter_run", "_a" * (KIB_64 // 2)),
 ]
 
 
