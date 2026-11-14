@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from app.core.redaction import Redactor
+from app.core.redaction import Redactor, is_sensitive_key
 
 KIB_64 = 65_536
 
@@ -32,6 +32,31 @@ CASES = [
     ("dashes_before_plain_name", "-" * KIB_64 + "x y"),
     ("dash_letter_run", "--a" * 21_845),
     ("flag_run", "--token " * 8_192),
+    # Value forms (R-4..R-6): quotes never closed, backslashes inside a string (plain and escaped JSON), the
+    # rule after a redacted token, an unclosed triple quote, bare quotes, and a bare value ending in ":"
+    # before a long gap (#7). A netrc "password" before a long gap, and quoted flags in an argv list.
+    ("unclosed_quote_run", 'password="' * 6_554),
+    ("backslashes_in_a_quote", 'password="' + "\\" * KIB_64),
+    ("backslashes_in_escaped_json", 'password=\\"' + "\\" * KIB_64),
+    ("escaped_quotes_in_escaped_json", 'password=\\"' + '\\\\\\"' * 16_384),
+    ("redacted_assignment_run", "[REDACTED]=" * 5_958),
+    ("unclosed_triple_quote", 'password = """' + "a" * KIB_64),
+    ("apostrophes", "'" * KIB_64),
+    ("double_quotes", '"' * KIB_64),
+    ("bare_value_before_spaces", "password=a:" + " " * KIB_64 + "x"),
+    ("netrc_before_spaces", "password" + " " * KIB_64 + "="),
+    ("quoted_flag_run", '"--password", ' * 4_096),
+    ("quoted_flag_without_separator_run", '"--password"' * 5_461),
+    ("secret_flag_run", "--password --token " * 3_449),
+    # The secret-flag check on a flag's value reads a key from the value's start: a long run of dashes there,
+    # quoted or not, and quoted dashes everywhere.
+    ("flag_value_of_dashes", "--password " + "-" * KIB_64),
+    ("flag_value_of_quoted_dashes", '--password "' + "-" * KIB_64),
+    ("quoted_dash_run", "'-" * (KIB_64 // 2)),
+    # A redacted token before a long gap (the rule after a token, #7), and string prefixes before no quote.
+    ("token_before_spaces", "ghp_" + "a" * 36 + ":" + " " * KIB_64),
+    ("string_prefix_run", "password=" + "rb" * (KIB_64 // 2)),
+    ("string_prefix_before_quotes", "password=b" + "'" * KIB_64),
 ]
 
 
@@ -42,3 +67,26 @@ def test_pattern_is_linear(name: str, text: str) -> None:
     redactor.redact(text)
     elapsed = time.perf_counter() - started
     assert elapsed < 1.0, f"{name}: {elapsed:.2f} s"
+
+
+def test_the_key_predicate_is_linear() -> None:
+    # _CAMEL_BOUNDARY splits a name at every hump: a 64 KiB name with a hump at every second character.
+    started = time.perf_counter()
+    is_sensitive_key("aB" * (KIB_64 // 2))
+    is_sensitive_key("-" * KIB_64 + "password")
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, f"{elapsed:.2f} s"
+
+
+@pytest.mark.parametrize(
+    "items",
+    [["--token"] * 8_192, ["--token", "x"] * 4_096, ["--no-password", "--token"] * 4_096],
+    ids=["flags", "flag_value_pairs", "secret_flags"],
+)
+def test_an_argv_list_is_linear(items: list[str]) -> None:
+    redactor = Redactor()
+    started = time.perf_counter()
+    redactor.redact_obj(items)
+    redactor.redact_obj(tuple(items))
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, f"{elapsed:.2f} s"

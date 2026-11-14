@@ -1,18 +1,21 @@
 """Secret redaction for every outbound path (SECURITY_MODEL §6.2, ADR-030, T12, M.2).
 
 Two layers:
-- text patterns (token prefixes, PEM, URL credentials, headers, ``key=value``), plus configured literals;
-- structure: a value stored under a sensitive key name is dropped whole, whatever it looks like.
+- text patterns (token prefixes, PEM, URL credentials, headers, ``key=value``, command-line flags), plus
+  configured literals;
+- structure: a value stored under a sensitive key name is dropped whole, whatever it looks like; so is the
+  string after a secret flag in a list or tuple (an argv list).
 
 Order matters: the labelled Anthropic admin-key pattern runs before the generic ``sk-ant-`` pattern so it
-stays covered even if the generic pattern is narrowed later.
+stays covered even if the generic pattern is narrowed later. A token pattern can run on into the key after it
+(``ghp_…password="V"``): the rule for a value after a redacted token (``_AFTER_REDACTED``) runs next.
 """
 
 from __future__ import annotations
 
 import bisect
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +29,10 @@ SENSITIVE_KEY_TAIL = (
     r"|ticket|credentials?|authorization|cookies?|set_cookie|session|jwt|bearer"
 )
 _SENSITIVE_KEY_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAIL})$")
+
+# Well-known secret environment variables whose name ends in no tail. Exact names in any case, not tails:
+# "pwd" alone is the working directory in code and shells, and PGPASSFILE names a file (Lead ruling, 3.1f2c).
+KNOWN_SECRET_NAMES = frozenset({"pgpassword", "mysql_pwd", "rediscli_auth"})
 
 
 def _capitalised(word: str) -> str:
@@ -45,12 +52,13 @@ def _camel_rest(words: list[str], *, after_lower: bool) -> str:
     return "(?:" + "|".join(joints) + ")"
 
 
-def _secret_key_pattern(tails: Iterable[str]) -> str:
+def _secret_key_pattern(tails: Iterable[str], names: Iterable[str]) -> str:
     """One sensitive key name, generated from the tails so a non-secret name never matches (Lead decision
     3.1f2c #2): a pattern for any identifier would swallow ``note="password=v"`` whole, secret and all.
 
-    ``is_sensitive_key`` drops leading underscores and dashes (a private name, a command-line flag), splits
-    the rest into words at "_", "-" and humps (``_CAMEL_BOUNDARY``) and asks whether the last words spell a
+    ``is_sensitive_key`` drops leading underscores and dashes (a private name, a command-line flag), then
+    takes a well-known secret name whole, in any case (``names``: ``PGPASSWORD``). Otherwise it splits the
+    rest into words at "_", "-" and humps (``_CAMEL_BOUNDARY``) and asks whether the last words spell a
     tail. The same name in free text, after any leading "_" or "-" (``self._password``, ``--api-key``):
     - snake, kebab or UPPER: the tail starts the name or follows "_"/"-", its words joined by "_" or "-",
       in any case (``db_password``, ``x-api-key``, ``SECRET_KEY``);
@@ -78,17 +86,19 @@ def _secret_key_pattern(tails: Iterable[str]) -> str:
         capital.append(_capitalised(first) + _camel_rest(more, after_lower=True))
     return (
         r"[_-]*"  # leading "_" (self._password) and "-" (--password); a word starts with a letter or digit
+        rf"(?:(?i:{'|'.join(sorted(names))})|"  # a well-known secret name, whole
         r"(?:[A-Za-z0-9]+[_-])*"  # the words before the tail's own segment
         rf"(?:(?i:{'|'.join(snake)})"
         rf"|(?-i:(?:{'|'.join(lower)})"
         rf"|(?:[A-Za-z0-9]*[a-z0-9])?(?:{'|'.join(upper)})"
         rf"|[A-Za-z0-9]*(?:{'|'.join(capital)})))"
+        r")"
     )
 
 
 # One sensitive key name, the free-text form of ``is_sensitive_key``: ``_KEY_VALUE`` here, the delta stream's
 # key check in app.agents.runtime. A regex source with no boundary lookaround; the caller adds the boundaries.
-SECRET_KEY_PATTERN = _secret_key_pattern(SENSITIVE_KEY_TAIL.split("|"))
+SECRET_KEY_PATTERN = _secret_key_pattern(SENSITIVE_KEY_TAIL.split("|"), KNOWN_SECRET_NAMES)
 
 # Named so ``Redactor.find`` (security.scan_secrets) reports which rule matched, from the very same patterns.
 _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -137,18 +147,68 @@ _HEADERS = re.compile(
     """
 )
 
-# The value after a sensitive key and its separator, shared by the verbose patterns below.
-_VALUE = r"""
-        \\"[^"\\]*\\"            # \"escaped json\"
-      | "[^"]*"                  # "double quoted"
-      | '[^']*'                  # 'single quoted'
-      | (?:(?:bearer|basic|token)\s+)?[^\s"'&;,\\]+
+# The value forms below are fragments of the verbose patterns after them. Each alternative starts at a fixed
+# point that a key, a flag or a redaction marker has anchored, and reads forward once: the strings are
+# unambiguous (one way to split them) and possessive, so a string never closed costs one pass, never a retry.
+
+# A quoted value, after a string prefix if any (r"…", b'…', rb"…": a bytes field in a repr), the alternatives
+# in this order (Lead decisions 3.1f2c #6, #8):
+# - triple quoted, one value across lines; never closed: to the end of the text;
+# - \"escaped JSON\": in the JSON-encoded text, \\ followed by \" or \\ is one escape of the inner string;
+# - "double" or 'single' quoted, across lines, with backslash escapes ("ab\"c" is one string);
+# - a quote never closed: to the end of the text, like a PEM block without its END line. The rest of the
+#   text holds no closing quote of that kind, so what is over-redacted is bounded.
+_QUOTED = r"""
+        (?:[bBfFrRuU]{1,2}(?=["']))?
+        (?:
+        "{3}(?s:.*?)(?:"{3}|\Z)
+      | '{3}(?s:.*?)(?:'{3}|\Z)
+      | \\"(?:[^\\]|\\[^"\\]|\\\\(?:[^\\]|\\[\s\S]))*+\\"
+      | "(?:[^"\\]|\\[\s\S])*+"
+      | '(?:[^'\\]|\\[\s\S])*+'
+      | (?:\\"|["'])(?s:.*)
+        )
+"""
+
+# An unquoted value: one word. A word that ends in ":" or "=" right before a quoted string takes the string
+# too: a key was taken as the value of the key before it (password : password: "V"; Lead decision #7).
+_BARE = rf"""
+        [^\s"'&;,\\]++(?:(?<=[:=])\s*+(?:{_QUOTED}))?
+"""
+
+# The value after a sensitive key and its separator (_KEY_VALUE, _AFTER_REDACTED): quoted or one word, after
+# an auth scheme word (token: Bearer V). The scheme word and its credential share a line: "token: bearer" at
+# the end of a line does not take the next line.
+_VALUE = rf"""
+        (?:(?:bearer|basic|token)[\ \t]++)?(?:{_QUOTED}|{_BARE})
+"""
+
+# A secret flag is never the value of the flag or netrc "password" before it, quoted or not: in
+# "--no-password --token V" the token's own value would be left raw after it.
+_NOT_A_SECRET_FLAG = rf"(?!\\?[\"']?(?=-)(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))"
+
+# The value of a command-line flag after spaces or a comma (_FLAG_VALUE, _ARGV_VALUE): one argv word, so no
+# scheme word ("--token TOKEN    The API token" keeps its help text). Never a separator: --api-key = V is
+# _KEY_VALUE's.
+_ARG = rf"""
+        (?![:=]){_NOT_A_SECRET_FLAG}(?:{_QUOTED}|{_BARE})
 """
 
 # key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value / --key=value, compound names.
 _KEY_VALUE = re.compile(
     rf"""(?ix)
     (?P<key>(?<![A-Za-z0-9_-])(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
+    (?P<sep>\\?["']?\s*[:=]\s*)
+    (?P<value>{_VALUE})
+    """
+)
+
+# A value right after a redacted token: a key the token pattern ran on into (ghp_…password="V",
+# sk-ant-…password=V; Lead decision #7). It reads the text with the literals, token patterns and URL
+# credentials already replaced (Redactor._without_tokens).
+_AFTER_REDACTED = re.compile(
+    rf"""(?ix)
+    {re.escape(REDACTED)}
     (?P<sep>\\?["']?\s*[:=]\s*)
     (?P<value>{_VALUE})
     """
@@ -161,13 +221,25 @@ _KEY_VALUE = re.compile(
 _FLAG_VALUE = re.compile(
     rf"""(?ix)
     (?P<key>(?<![A-Za-z0-9_-])(?=-)(?:{SECRET_KEY_PATTERN})(?![A-Za-z0-9_-]))
-    (?P<sep>[\ \t]+)
-    (?P<value>{_VALUE})
+    (?P<sep>[\ \t]++)
+    (?P<value>{_ARG})
     """
 )
 
-# .netrc: "... password <value>"
-_NETRC = re.compile(r"(?i)(?<![A-Za-z0-9_])(?P<key>password)(?P<sep>\s+)(?P<value>\S+)")
+# A quoted flag and its value after a comma or spaces: an argv list (["mysql", "--password", "V"], also as
+# escaped JSON) or a quoted shell word ("--password" "V", '--password' V). The opening quote anchors it.
+_ARGV_VALUE = re.compile(
+    rf"""(?ix)
+    (?P<key>(?P<quote>["'])(?=-)(?:{SECRET_KEY_PATTERN})\\?(?P=quote))
+    (?P<sep>\s*+,\s*+|[\ \t]++)
+    (?P<value>{_ARG})
+    """
+)
+
+# .netrc: "... password <value>", on one line. Never a separator: password = "V" is _KEY_VALUE's (#6).
+_NETRC = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_])(?P<key>password)(?P<sep>[ \t]++)(?P<value>(?![:=]){_NOT_A_SECRET_FLAG}\S+)"
+)
 
 _MIN_LITERAL_LENGTH = 8
 _PRIMITIVES = (str, int, float, bool, type(None))
@@ -181,10 +253,23 @@ _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 def is_sensitive_key(name: str) -> bool:
     """``accessToken``, ``x-api-key``, ``SMTPPassword``, ``_password``, ``--password`` and ``CLIENT_SECRET``
     all normalise to a sensitive snake_case tail. Leading underscores and dashes are not part of the name
-    (``self._password``, ``mysql --password``). Free text matches the same names with
-    ``SECRET_KEY_PATTERN``."""
+    (``self._password``, ``mysql --password``). A well-known secret name with no tail (``PGPASSWORD``) is
+    sensitive as a whole name. Free text matches the same names with ``SECRET_KEY_PATTERN``."""
     normalised = _CAMEL_BOUNDARY.sub("_", name.lstrip("_-")).replace("-", "_")
-    return bool(_SENSITIVE_KEY_NAME.match(normalised))
+    return bool(_SENSITIVE_KEY_NAME.match(normalised)) or name.lstrip("_-").lower() in KNOWN_SECRET_NAMES
+
+
+def _drop_value(match: re.Match[str]) -> str:
+    """A match with its ``value`` group replaced: the key (or marker) and the separator before it stay. A
+    function, not a ``\\g<key>`` template: ``sub`` looks a template up in a cache keyed by the pattern, and
+    for these long patterns that lookup cost more than scanning a short text (a log field)."""
+    return match.string[match.start() : match.start("value")] + REDACTED
+
+
+def _is_secret_flag(item: object) -> bool:
+    """A command-line flag whose value is a secret: ``--password``, ``-api-key``. ``--password=V`` is not (its
+    value is in the same string, which the text patterns redact); neither is ``--password-file``."""
+    return isinstance(item, str) and item.startswith("-") and is_sensitive_key(item)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,20 +289,34 @@ class Redactor:
         self._literals = sorted(unique, key=len, reverse=True)
 
     def redact(self, text: str) -> str:
+        text = self._without_tokens(text)
+        text = _AFTER_REDACTED.sub(_drop_value, text)
+        text = _HEADERS.sub(_drop_value, text)
+        text = _KEY_VALUE.sub(_drop_value, text)
+        text = _FLAG_VALUE.sub(_drop_value, text)
+        text = _ARGV_VALUE.sub(_drop_value, text)
+        return _NETRC.sub(_drop_value, text)
+
+    def _without_tokens(self, text: str, *, keep_lines: bool = False) -> str:
+        """The text with configured literals, token patterns and URL credentials replaced: what
+        ``_AFTER_REDACTED`` reads. With ``keep_lines`` (``find``), each marker comes after the line breaks of
+        what it replaced, so the marker and the text after it stay on their original line."""
+
+        def marker(removed: str) -> str:
+            return "\n" * removed.count("\n") + REDACTED if keep_lines else REDACTED
+
+        replace: Callable[[re.Match[str]], str] | str = (
+            (lambda match: marker(match[0])) if keep_lines else REDACTED
+        )
         for literal in self._literals:
-            text = text.replace(literal, REDACTED)
+            text = text.replace(literal, marker(literal))
         for pattern in _PATTERNS:
-            text = pattern.sub(REDACTED, text)
-        text = _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)
-        text = _HEADERS.sub(rf"\g<name>\g<sep>{REDACTED}", text)
-        text = _KEY_VALUE.sub(rf"\g<key>\g<sep>{REDACTED}", text)
-        text = _FLAG_VALUE.sub(rf"\g<key>\g<sep>{REDACTED}", text)
-        return _NETRC.sub(rf"\g<key>\g<sep>{REDACTED}", text)
+            text = pattern.sub(replace, text)
+        return _URL_CREDENTIALS.sub(rf"\g<scheme>{REDACTED}@", text)  # userinfo holds no line break
 
     def find(self, text: str) -> list[Finding]:
         """What ``redact`` would remove, as (line, rule), in text order; one finding per rule and line. The
         value itself is never returned (security.scan_secrets, SECURITY_MODEL T5)."""
-        starts = [0, *(m.end() for m in re.finditer("\n", text))]
         rules: list[tuple[str, re.Pattern[str]]] = [
             *((f"literal_{index}", re.compile(re.escape(lit))) for index, lit in enumerate(self._literals)),
             *_NAMED_PATTERNS,
@@ -225,13 +324,20 @@ class Redactor:
             ("credential_header", _HEADERS),
             ("credential_assignment", _KEY_VALUE),
             ("credential_assignment", _FLAG_VALUE),
+            ("credential_assignment", _ARGV_VALUE),
             ("credential_assignment", _NETRC),
         ]
         seen: set[tuple[int, str]] = set()
+        starts = _line_starts(text)
         for rule, pattern in rules:
-            for match in pattern.finditer(text):
-                name = "configured_secret" if rule.startswith("literal_") else rule
-                seen.add((bisect.bisect_right(starts, match.start()), name))
+            name = "configured_secret" if rule.startswith("literal_") else rule
+            seen.update((_line(starts, match), name) for match in pattern.finditer(text))
+        # A value after a redacted token is only there once the tokens are replaced, as in redact.
+        replaced = self._without_tokens(text, keep_lines=True)
+        starts = _line_starts(replaced)
+        seen.update(
+            (_line(starts, match), "credential_assignment") for match in _AFTER_REDACTED.finditer(replaced)
+        )
         return [Finding(line, rule) for line, rule in sorted(seen)]
 
     def redact_obj(self, obj: Any, *, stringify: bool = False) -> Any:
@@ -250,9 +356,9 @@ class Redactor:
                 for key, value in obj.items()
             }
         if isinstance(obj, list):
-            return [self.redact_obj(value, stringify=stringify) for value in obj]
+            return self._redact_items(obj, stringify=stringify)
         if isinstance(obj, tuple):
-            return tuple(self.redact_obj(value, stringify=stringify) for value in obj)
+            return tuple(self._redact_items(obj, stringify=stringify))
         if isinstance(obj, set | frozenset):
             return type(obj)(self.redact_obj(value, stringify=stringify) for value in obj)
         if stringify and not isinstance(obj, _PRIMITIVES):
@@ -260,3 +366,28 @@ class Redactor:
                 return self.redact(bytes(obj).decode("utf-8", errors="replace"))
             return self.redact(repr(obj))
         return obj
+
+    def _redact_items(self, items: Iterable[Any], *, stringify: bool) -> list[Any]:
+        """A list or tuple, read as a command line too: the string after a secret flag is dropped whole, like
+        a value under a sensitive key (``["mysql", "--password", "V"]``). A secret flag is never that value
+        (``["--no-password", "--token", "V"]``): it stays, and the string after it goes."""
+        out: list[Any] = []
+        after_flag = False
+        for item in items:
+            flag = _is_secret_flag(item)
+            if after_flag and isinstance(item, str) and not flag:
+                out.append(REDACTED)
+                after_flag = False
+            else:
+                out.append(self.redact_obj(item, stringify=stringify))
+                after_flag = flag
+        return out
+
+
+def _line_starts(text: str) -> list[int]:
+    return [0, *(m.end() for m in re.finditer("\n", text))]
+
+
+def _line(starts: list[int], match: re.Match[str]) -> int:
+    """The 1-based line a match starts on, given ``_line_starts`` of the text it is in."""
+    return bisect.bisect_right(starts, match.start())

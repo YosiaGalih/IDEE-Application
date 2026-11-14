@@ -478,7 +478,7 @@ FLAG_SECRETS = [
     ("tool --token\t{v}", "tool --token\t"),
     ('cmd="--password={v}"', 'cmd="--password='),
     ("PGOPTIONS=--password={v}", "PGOPTIONS=--password="),
-    ("-password = {v}", "-password"),  # a removed diff line
+    ("-password = {v}", "-password = "),  # a removed diff line; redacted once (exact: below)
 ]
 
 
@@ -518,3 +518,253 @@ def test_no_password_is_a_password_flag_by_the_predicate(redactor: Redactor) -> 
     assert redactor.redact("mysql --no-password --force") == f"mysql --no-password {REDACTED}"
     assert redactor.redact("mysql --no-password") == "mysql --no-password"
     assert redactor.redact("mysql --no-password=true") == f"mysql --no-password={REDACTED}"
+
+
+# --- Value forms (WP-3.1f2c R-4, R-5, R-6; Lead decisions 3.1f2c #6, #7, #8) ---
+
+V = SECRET_VALUE
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f'password = "{V}',
+        f"password = '{V}",
+        f'password: "{V}\nmore\nlines',
+        f'PASSWORD="line1\n{V}"',  # closed on a later line: still one value (#6)
+        # The same in the other spellings (spec, Test): JSON, escaped JSON, a flag, an argv list.
+        f'{{"password": "{V}',
+        f'{{\\"password\\": \\"{V}',
+        f'tool --password "a b {V}"',
+        f"tool --password '{V}",
+        f'["mysql", "--password", "{V}',
+        f'password = "{V}\\',  # a lone backslash at the very end
+    ],
+)
+def test_an_unclosed_quote_is_redacted_to_the_end(redactor: Redactor, text: str) -> None:
+    assert V not in redactor.redact(text)
+
+
+def test_a_quote_closed_on_a_later_line_ends_the_value_there(redactor: Redactor) -> None:
+    assert redactor.redact(f'PASSWORD="line1\n{V}"\nnext = 1') == f"PASSWORD={REDACTED}\nnext = 1"
+    assert redactor.redact(f'x = 1\npassword = "{V}\nmore') == f"x = 1\npassword = {REDACTED}"
+
+
+def test_netrc_never_takes_a_separator_as_the_value(redactor: Redactor) -> None:
+    out = Redactor().redact(f'password = "{V}')
+    assert "password [REDACTED]" not in out and V not in out, out
+    assert redactor.redact(f"password = {V}") == f"password = {REDACTED}"
+    assert redactor.redact(f"password : {V}") == f"password : {REDACTED}"
+    assert V not in redactor.redact(f"machine h login u password {V}")
+
+
+def test_netrc_value_stays_on_its_line(redactor: Redactor) -> None:
+    assert redactor.redact(f"password\n{V}") == f"password\n{V}"
+    assert redactor.redact(f"machine h login u password {V}") == f"machine h login u password {REDACTED}"
+    assert redactor.redact(f"machine h login u password\t{V}") == f"machine h login u password\t{REDACTED}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f'{{"password": "ab\\"{V}"}}',
+        f'password = """{V}"""',
+        f"password = '''{V}'''",
+        f'password = """{V}',  # never closed
+        f"password = '''{V}",
+        f'password = """\nline1\n{V}\n"""',
+        f'{{\\"password\\": \\"ab\\\\\\"{V}\\"}}',  # escaped JSON whose value holds an escaped quote
+        f"secret: 'it\\'s {V}'",
+    ],
+)
+def test_escaped_and_triple_quotes(redactor: Redactor, text: str) -> None:
+    assert V not in redactor.redact(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f'password = """{V}""" and more', f"password = {REDACTED} and more"),
+        (f'{{"password": "ab\\"{V}", "next": "kept"}}', f'{{"password": {REDACTED}, "next": "kept"}}'),
+        (
+            f'{{\\"password\\": \\"ab\\\\\\"{V}\\", \\"next\\": 1}}',
+            f'{{\\"password\\": {REDACTED}, \\"next\\": 1}}',
+        ),
+    ],
+)
+def test_a_quoted_value_ends_at_its_own_closing_quote(redactor: Redactor, text: str, expected: str) -> None:
+    assert redactor.redact(text) == expected
+
+
+def test_an_escaped_backslash_closes_the_string(redactor: Redactor) -> None:
+    # 'secret: "a\\" ' + V: the double backslash is one escaped backslash, so the quote after it closes the
+    # string before the space and V. Escapes are not over-read.
+    out = redactor.redact('secret: "a\\\\" ' + V)
+    assert V in out
+    assert out == f"secret: {REDACTED} {V}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ghp_" + "A1b2C3d4E5" * 4 + f'password="{V}"',
+        "sk-ant-api03-" + "A1b2C3d4" * 6 + f"password={V}",
+        f'password : password:\t"{V}"',
+        "ghp_" + "A1b2C3d4E5" * 4 + f"Password: '{V}",
+        f"password: x= '{V}'",
+        f'token: Bearer "{V}"',
+    ],
+)
+def test_a_key_swallowed_by_a_token_still_hides_its_value(redactor: Redactor, text: str) -> None:
+    assert V not in redactor.redact(text)
+
+
+def test_a_value_after_a_token_is_redacted_once(redactor: Redactor) -> None:
+    assert redactor.redact("ghp_" + "A1b2C3d4E5" * 4 + f'password="{V}"') == f"{REDACTED}={REDACTED}"
+    # A token in a list or a JSON value is followed by no assignment: nothing more is removed.
+    token = "ghp_" + "a" * 36
+    assert redactor.redact(f'["{token}", "kept"]') == f'["{REDACTED}", "kept"]'
+    assert redactor.redact(f'{{"a": "{token}", "b": "kept"}}') == f'{{"a": "{REDACTED}", "b": "kept"}}'
+
+
+def test_a_stray_apostrophe_after_a_key_redacts_one_word() -> None:
+    out = Redactor().redact("the token: it's here")
+    assert "'s here" in out
+    assert out == f"the token: {REDACTED}'s here"
+
+
+def test_find_names_the_new_rules() -> None:
+    rules = [f.rule for f in Redactor().find("ghp_" + "A1b2C3d4E5" * 4 + f'password="{V}"')]
+    assert "github_token" in rules and "credential_assignment" in rules
+
+
+def test_find_reports_a_value_after_a_multi_line_token_on_the_line_it_is_on() -> None:
+    pem = "\n".join(["-----BEGIN RSA PRIVATE KEY-----", "MIIE", "-----END RSA PRIVATE KEY-----"])
+    found = Redactor().find(f"a\n{pem}: {V}\nb = 1\n")
+    assert [(f.line, f.rule) for f in found] == [(2, "private_key"), (4, "credential_assignment")]
+
+
+# --- Command lines (Lead rulings on Task 1: argv lists, quoted flags, flag values on one line) ---
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f'["mysql", "--password", "{V}"]',
+        f"['curl', '--token', '{V}']",
+        f'("--api-key", "{V}")',
+        f'"--password" "{V}"',
+        f"'--password' {V}",
+        f"\"--password\" '{V}'",
+        f'[\\"mysql\\", \\"--password\\", \\"{V}\\"]',
+        f'[\n  "mysql",\n  "--password",\n  "{V}"\n]',
+        f'tool --password "a b {V}"',
+        f"tool --password '{V}",
+    ],
+)
+def test_an_argv_list_hides_the_flag_value(redactor: Redactor, text: str) -> None:
+    assert V not in redactor.redact(text)
+    assert "credential_assignment" in {f.rule for f in redactor.find(text)}
+
+
+def test_an_argv_list_keeps_everything_but_the_value(redactor: Redactor) -> None:
+    assert redactor.redact(f'["mysql", "--password", "{V}", "-h", "db"]') == (
+        f'["mysql", "--password", {REDACTED}, "-h", "db"]'
+    )
+    assert redactor.redact('["tool", "--password-file", "p.txt"]') == '["tool", "--password-file", "p.txt"]'
+
+
+def test_redact_obj_drops_the_item_after_a_secret_flag() -> None:
+    redactor = Redactor()
+    assert redactor.redact_obj(["mysql", "--password", V]) == ["mysql", "--password", REDACTED]
+    assert redactor.redact_obj(("mysql", "--password", V)) == ("mysql", "--password", REDACTED)
+    assert redactor.redact_obj(["--password-file", "p.txt"]) == ["--password-file", "p.txt"]
+    assert V not in repr(redactor.redact_obj([f"--password={V}", "next"]))
+    assert redactor.redact_obj([f"--password={V}", "next"])[1] == "next"
+    assert redactor.redact_obj({"argv": ["curl", "--token", V, "-v"]}) == {
+        "argv": ["curl", "--token", REDACTED, "-v"]
+    }
+    # Only a flag: a list of words is not a command line.
+    assert redactor.redact_obj(["the", "token", "was", "used"]) == ["the", "token", "was", "used"]
+
+
+def test_a_secret_flag_is_never_another_secret_flags_value(redactor: Redactor) -> None:
+    # "--no-password" takes the next word (Lead ruling #15), but never a secret flag: that flag's own value
+    # would be left raw after it.
+    assert redactor.redact(f"mysql --no-password --password {V}") == (
+        f"mysql --no-password --password {REDACTED}"
+    )
+    assert V not in redactor.redact(f'["--no-password", "--token", "{V}"]')
+    assert redactor.redact_obj(["--no-password", "--password", V]) == [
+        "--no-password",
+        "--password",
+        REDACTED,
+    ]
+    assert redactor.redact_obj(["--token", "--token"]) == ["--token", "--token"]
+
+
+def test_a_flag_value_is_one_word_on_its_line(redactor: Redactor) -> None:
+    # argparse help: the metavar after a flag is its "value"; the help text after it stays readable.
+    assert redactor.redact("--token TOKEN    The API token") == f"--token {REDACTED}    The API token"
+    assert redactor.redact("  --github-token TOKEN\n      GitHub token for the API") == (
+        f"  --github-token {REDACTED}\n      GitHub token for the API"
+    )
+    assert redactor.redact("tool --token bearer\n--verbose") == f"tool --token {REDACTED}\n--verbose"
+    # A scheme word and its credential share a line in key=value too.
+    assert redactor.redact("token: Bearer\nnext_line") == f"token: {REDACTED}\nnext_line"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f"-password = {V}", f"-password = {REDACTED}"),
+        (f"--api-key = {V}", f"--api-key = {REDACTED}"),
+        (f"--api-key : {V}", f"--api-key : {REDACTED}"),
+        (f'"--password" = "{V}"', f'"--password" = {REDACTED}'),
+    ],
+)
+def test_a_flag_with_a_spaced_separator_is_redacted_once(
+    redactor: Redactor, text: str, expected: str
+) -> None:
+    assert redactor.redact(text) == expected
+
+
+# --- Well-known secret environment names that end in no tail (Lead ruling on Task 1) ---
+
+
+@pytest.mark.parametrize("name", ["PGPASSWORD", "MYSQL_PWD", "REDISCLI_AUTH", "pgpassword", "MySQL_Pwd"])
+def test_well_known_secret_env_names(redactor: Redactor, name: str) -> None:
+    assert is_sensitive_key(name)
+    assert V not in redactor.redact(f"{name}={V}")
+    assert V not in redactor.redact(f'export {name}="{V}"')
+    assert redactor.redact_obj({name: V}) == {name: REDACTED}
+
+
+@pytest.mark.parametrize("text", ["pwd = /home/u", "PGPASSFILE=/x", "MYSQL_PWD_FILE=/x", "cd $(pwd)"])
+def test_names_near_a_known_secret_name_stay_readable(redactor: Redactor, text: str) -> None:
+    assert redactor.redact(text) == text
+
+
+def test_known_secret_names_are_exact_names_in_both_layers() -> None:
+    from app.core.redaction import KNOWN_SECRET_NAMES
+
+    assert KNOWN_SECRET_NAMES == frozenset({"pgpassword", "mysql_pwd", "rediscli_auth"})
+    near = ["PGPASSWORD", "--pgpassword", "_MYSQL_PWD", "pgpasswords", "MYSQL_PWD_FILE", "x_pgpassword"]
+    keys = [*KNOWN_SECRET_NAMES, *(name.upper() for name in KNOWN_SECRET_NAMES), *near, "mysql-pwd", "pwd"]
+    for flags in (0, re.IGNORECASE):
+        wrong = [k for k in keys if bool(re.fullmatch(SECRET_KEY_PATTERN, k, flags)) != is_sensitive_key(k)]
+        assert not wrong, (flags, wrong)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"password = r'{V}'",
+        f'SECRET_KEY = b"{V}"',
+        f"Login(user='bob', password=b'{V}')",  # a bytes field in a repr (logging, stringify=True)
+        f'token = rb"{V}',
+        f"--password b'{V}'",
+    ],
+)
+def test_a_string_prefix_is_part_of_the_quoted_value(redactor: Redactor, text: str) -> None:
+    assert V not in redactor.redact(text)
