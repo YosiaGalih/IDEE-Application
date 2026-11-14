@@ -63,7 +63,7 @@ def client(events: Iterable[Delta], shown: str = "") -> str:
 def test_a_long_quoted_secret_never_streams_raw_whatever_its_spelling(spelling: str, size: int) -> None:
     """D-L1: zero raw characters of the 1 200-character value in any payload."""
     text = "intro " * 40 + spelling.format(VALUE) + " tail" * 80
-    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
     assert all("Zq7" not in event.text for event in events)
     assert "Zq7" not in "".join(event.text for event in events)
     assert client(events) == REDACTOR.redact(text)
@@ -119,25 +119,37 @@ PATHOLOGICAL = {
     "header name, line breaks, quote": filled("Cookie:" + "\n" * 65_000, '"'),
     "header name, CRLF, quote": filled("Cookie:" + "\r\n" * 32_500, '"'),
     "header name, line breaks, last quote": "Cookie:" + "\n" * (KIB_64 - 8) + '"',
-    # The header stop read after the header rule (review of 45c2ec7): a line of markers and quotes, a JSON
-    # line of header values stopped at quotes among markers, and key values that pair a header's stopping
-    # quote.
-    "markers and quotes": filled("", '[REDACTED]"'),
-    "JSON of header stops": filled("{", '"h": "Cookie: a b\\"x", "k": "[REDACTED]\\"", '),
+    # The header stop read after the header rule (reviews of 45c2ec7 and 08fa05e): a header value stopped at a
+    # quote, then a line of markers and quotes; header lines each stopped at a quote, a marker and a quote
+    # after it; key values that pair a header's stopping quote.
+    "header markers and quotes": filled("Cookie: ", '[REDACTED]"'),
+    "header lines stopped at quotes": filled("", 'Cookie: a b"x [REDACTED]"\n'),
     "keys pairing header stops": filled("", 'password: "Cookie: a b"x '),
 }
 
 
 @pytest.mark.parametrize("name", list(PATHOLOGICAL))
 def test_a_pathological_64_kib_attempt_streams_in_under_a_second(name: str) -> None:
-    """D-M1: the open-candidate checks are linear scans from the end, not ``\\Z``-anchored searches."""
+    """D-M1: the open-candidate checks are linear scans from the end, not ``\\Z``-anchored searches. The
+    stream is a run's (``delta_redactor``), so its header stops are read too (review of 08fa05e)."""
     text = PATHOLOGICAL[name]
     assert len(text) == KIB_64
     started = time.perf_counter()
-    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, 16))
+    events = stream(delta_redactor(REDACTOR), pieces(text, 16))
     elapsed = time.perf_counter() - started
     assert elapsed < 1.0, (name, elapsed)
     assert client(events) == REDACTOR.redact(text)
+
+
+STOP_INPUTS = ["header markers and quotes", "header lines stopped at quotes", "keys pairing header stops"]
+
+
+@pytest.mark.parametrize("name", STOP_INPUTS)
+def test_the_inputs_aimed_at_the_header_stop_reach_it(name: str) -> None:
+    """Review of 08fa05e: the timed stream reads the stop in ``Redactor.redact_with_stop``, and these inputs
+    give it one to read: a cut of the text where the header rule ends a value at a quote."""
+    text = PATHOLOGICAL[name]
+    assert any(REDACTOR.redact_with_stop(text[:cut])[1] is not None for cut in range(16, 4_096, 16))
 
 
 def changes_once_z_arrives(text: str) -> str:
@@ -162,7 +174,7 @@ def test_a_reset_in_a_later_call_carries_the_text_of_the_calls_before() -> None:
 def test_a_restart_in_a_later_call_voids_only_that_attempt() -> None:
     """Item 11, M4: a restart goes back to the calls already ended, never to an empty text; a secret in the
     failed attempt reaches no payload."""
-    redactor = DeltaRedactor(REDACTOR.redact)
+    redactor = delta_redactor(REDACTOR)
     call_1 = "Here is what I found in the repository so far. " * 8
     first = stream(redactor, pieces(call_1, 16))
     failed = stream(redactor, pieces("Second call. " * 30 + 'password="' + VALUE[:600], 16), flush=False)
@@ -210,7 +222,7 @@ def test_the_last_window_holds_a_token_cut_at_a_release(name: str, cut: int) -> 
     redactor does not match yet sends none of it."""
     token = TOKENS[name]
     text = "x" * (DELTA_RELEASE - cut - 1) + " " + token + " and the answer goes on." * 20
-    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, 1))
+    events = stream(delta_redactor(REDACTOR), pieces(text, 1))
     assert token[4:cut] not in "".join(event.text for event in events)
     assert client(events) == REDACTOR.redact(text)
 
@@ -249,7 +261,7 @@ def test_a_key_far_from_its_quote_still_holds(gap: str, size: int) -> None:
     held from its key."""
     text = INTRO + "password =" + GAPS[gap] + '"' + VALUE + '"' + TAIL
     assert held_from(text, VALUE) == text.index("password")
-    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
     assert leaked(events, VALUE) == []
     assert client(events) == REDACTOR.redact(text)
 
@@ -268,7 +280,7 @@ def test_a_long_userinfo_never_streams_raw(url: str, size: int) -> None:
     scheme, so userinfo longer than the hold is redacted whole once its "@" arrives."""
     text = INTRO + URLS[url] + TAIL
     assert held_from(text, USERINFO) == text.index("https://")
-    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
     assert leaked(events, USERINFO) == []
     assert client(events) == REDACTOR.redact(text)
 
@@ -290,7 +302,7 @@ def test_a_long_configured_literal_never_streams_raw(size: int) -> None:
     follows the longest, so neither is ever sent in part."""
     redactor = Redactor([SHORT_LITERAL, LONG_LITERAL])
     text = INTRO + "first " + SHORT_LITERAL + " then " + LONG_LITERAL + TAIL
-    events = stream(DeltaRedactor(redactor.redact, hold=delta_hold(redactor)), pieces(text, size))
+    events = stream(delta_redactor(redactor), pieces(text, size))
     assert leaked(events, LONG_LITERAL) == []
     assert not any(SHORT_LITERAL in event.text for event in events)
     assert client(events) == redactor.redact(text)
@@ -306,7 +318,7 @@ def test_a_camel_key_quote_holds(key: str, size: int) -> None:
     """Goal 6: the delta's key check is SECRET_KEY_PATTERN, the redactor's own key names."""
     text = INTRO + key + ' = "' + VALUE + '"' + TAIL
     assert held_from(text, VALUE) == text.index(key)
-    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
     assert leaked(events, VALUE) == []
     assert client(events) == REDACTOR.redact(text)
 
@@ -317,7 +329,7 @@ def test_a_plain_link_at_the_end_is_kept() -> None:
     text = INTRO + "See https://example.com"
     assert open_candidate(text) == text.index("https://")
     for size in SIZES:
-        events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+        events = stream(delta_redactor(REDACTOR), pieces(text, size))
         assert client(events) == REDACTOR.redact(text) == text
         assert "https://example.com" in client(events)
 
@@ -363,7 +375,7 @@ def test_a_quoted_value_after_any_key_form_never_streams_raw(form: str, size: in
     assert not any(window in REDACTOR.redact(text) for window in windows(VALUE))  # the redactor takes it
     if key is not None:
         assert held_from(text, VALUE) == text.index(key)
-    events = stream(DeltaRedactor(REDACTOR.redact), pieces(text, size))
+    events = stream(delta_redactor(REDACTOR), pieces(text, size))
     assert leaked(events, VALUE) == []
     assert client(events) == REDACTOR.redact(text)
 
@@ -407,7 +419,7 @@ def test_a_header_value_is_held_while_its_line_is_open() -> None:
 
 def test_a_quoted_flag_in_prose_does_not_hold_the_rest_of_the_answer() -> None:
     text = 'Run it with "--password" and type the password when asked.' + " Then it carries on." * 40
-    redactor = DeltaRedactor(REDACTOR.redact)
+    redactor = delta_redactor(REDACTOR)
     shown = client(e for e in (redactor.feed(piece) for piece in pieces(text, 16)) if e is not None)
     assert len(shown) >= len(REDACTOR.redact(text)) - DELTA_HOLD_CHARS - DELTA_RELEASE
 
@@ -466,7 +478,7 @@ def test_a_value_stopped_at_a_quote_is_held_only_while_its_line_is_open() -> Non
     assert stopped_at_open_quote('Cookie: [REDACTED]"abc\nThe answer goes on.') is None
     assert stopped_at_open_quote("Cookie: [REDACTED] done") is None
     text = 'Cookie: a b"q\n' + "The answer goes on after it. " * 60
-    redactor = DeltaRedactor(REDACTOR.redact)
+    redactor = delta_redactor(REDACTOR)
     shown = client(e for e in (redactor.feed(piece) for piece in pieces(text, 16)) if e is not None)
     assert len(shown) >= len(REDACTOR.redact(text)) - DELTA_HOLD_CHARS - DELTA_RELEASE
 
@@ -544,10 +556,8 @@ def test_no_cut_of_a_continued_header_streams_its_value_raw() -> None:
         text = _continued_header(rnd)
         if any(window in redactor.redact(text) for window in windows(FUZZ_VALUE)):
             continue  # the redactor itself keeps the value: nothing for the stream to keep back
-        # As delta_redactor builds it, but every piece is a release: every cut of the text is checked.
-        deltas = DeltaRedactor(
-            redactor.redact, hold=delta_hold(redactor), release=1, redact_with_stop=redactor.redact_with_stop
-        )
+        # A run's stream, but every piece is a release: every cut of the text is checked.
+        deltas = delta_redactor(redactor, release=1)
         events = stream(deltas, pieces(text, 4))
         assert leaked(events, FUZZ_VALUE) == [], text
         assert client(events) == redactor.redact(text), text

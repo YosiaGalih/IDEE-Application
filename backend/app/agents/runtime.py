@@ -303,8 +303,9 @@ class DeltaRedactor:
     characters (a run's is ``delta_hold``: never less than its longest configured literal less one), and
     nothing from the start of a candidate still open at the end of the raw text (``open_candidate``), nor
     from a value the header rule ended at a quote its last line may still close (``redact_with_stop``, a
-    run's ``Redactor.redact_with_stop``; without it, ``stopped_at_open_quote`` of the redacted text), minus
-    what already went out. ``flush`` ends the call: its final redacted text goes
+    run's ``Redactor.redact_with_stop``; without it, ``stopped_at_open_quote`` of the redacted text, which
+    misses a stop a later rule took: a test's fake redaction only, as ``app`` builds a run's stream with
+    ``delta_redactor``), minus what already went out. ``flush`` ends the call: its final redacted text goes
     out and is committed, never redacted again. When redacting a longer text changes what already went out, a
     ``reset`` delta carries the committed text of the calls before, then the current call's stable text: the
     client replaces, never appends. ``restart`` (a retried attempt) voids the current call's text, held or
@@ -389,11 +390,17 @@ class DeltaRedactor:
         return len(before) if redacted.startswith(before) else _common_prefix(before, redacted)
 
 
-def delta_redactor(redactor: Redactor) -> DeltaRedactor:
+def delta_redactor(redactor: Redactor, *, release: int = DELTA_RELEASE_CHARS) -> DeltaRedactor:
     """A run's delta stream (WP-3.1f2c): the redactor's redaction, its hold (``delta_hold``) and its header
-    stops (``Redactor.redact_with_stop``)."""
+    stops (``Redactor.redact_with_stop``). It is the one place in ``app`` that builds a ``DeltaRedactor``
+    (``tests/unit/test_delta_redactor_guard.py``): one built without ``redact_with_stop`` reads the stop on
+    the redacted text, where a rule after the header rule may have taken it (review of 45c2ec7). A run keeps
+    the default ``release``; a test that checks every cut passes 1."""
     return DeltaRedactor(
-        redactor.redact, hold=delta_hold(redactor), redact_with_stop=redactor.redact_with_stop
+        redactor.redact,
+        hold=delta_hold(redactor),
+        release=release,
+        redact_with_stop=redactor.redact_with_stop,
     )
 
 

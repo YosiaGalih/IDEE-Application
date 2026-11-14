@@ -91,11 +91,14 @@ CASES = [
 
 @pytest.mark.parametrize(("name", "text"), CASES, ids=[name for name, _ in CASES])
 def test_pattern_is_linear(name: str, text: str) -> None:
+    """``redact``, and ``redact_with_stop``: the agent runtime's delta stream reads a header stop with it
+    (review of 08fa05e)."""
     redactor = Redactor()
-    started = time.perf_counter()
-    redactor.redact(text)
-    elapsed = time.perf_counter() - started
-    assert elapsed < 1.0, f"{name}: {elapsed:.2f} s"
+    for redact in (redactor.redact, redactor.redact_with_stop):
+        started = time.perf_counter()
+        redact(text)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.0, f"{name}, {redact.__name__}: {elapsed:.2f} s"
 
 
 def test_the_key_predicate_is_linear() -> None:

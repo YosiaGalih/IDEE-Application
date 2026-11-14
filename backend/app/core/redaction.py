@@ -418,6 +418,10 @@ class Redactor:
         return len(self._literals[0]) if self._literals else 0
 
     def redact(self, text: str) -> str:
+        """``text`` with every secret it finds replaced by REDACTED: the configured literals, token patterns
+        and URL credentials first, then the value after a redacted token, a credential header, a secret key,
+        a secret flag (also as an argv item) and netrc's ``password``, in that order (``_redact``). Linear in
+        the length of ``text`` (``tests/security/test_redaction_linear.py``)."""
         return self._redact(text, stop=False)[0]
 
     def redact_with_stop(self, text: str) -> tuple[str, int | None]:
