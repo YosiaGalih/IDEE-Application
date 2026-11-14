@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import string
@@ -774,7 +775,15 @@ def test_a_retry_after_a_held_attempt_streams_64_kib_in_under_a_second() -> None
 # --- the AG-13 delta 2 fuzz (poc_fuzz.py), with WP-3.1f2c's candidates and per-call resets (Goal 6) ---
 
 FUZZ_SEED = 20261114
-FUZZ_CASES = 2_000
+
+
+def fuzz_cases(default: int = 600) -> int:
+    """The fuzz's number of runs: ``default`` (about 7 s), or ``KK_FUZZ_CASES`` for a deep run
+    (``KK_FUZZ_CASES=5000``; backend review M2, final review of 74bf8d4)."""
+    return int(os.environ.get("KK_FUZZ_CASES", default))
+
+
+FUZZ_CASES = fuzz_cases()
 ALNUM = string.ascii_letters + string.digits
 FUZZ_KEYS = [
     "password", "db_password", "secret", "secrets", "client_secret", "token", "api_key", "apikey",
@@ -866,12 +875,22 @@ def secret_windows(events: list[Delta], secrets: list[str]) -> list[str]:
     return sorted(found)
 
 
+def test_the_fuzz_size_is_600_unless_kk_fuzz_cases_says(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KK_FUZZ_CASES", raising=False)
+    assert fuzz_cases() == 600
+    monkeypatch.setenv("KK_FUZZ_CASES", "5000")
+    assert fuzz_cases() == 5_000
+
+
 def test_fuzz_no_secret_window_in_any_payload() -> None:
     """Goal 6, AG-13 delta 2's fuzz (poc_fuzz.py), with the keys of R-1, key-to-quote gaps up to 200, long URL
     userinfo and long configured literals no longer left out: runs of one to three model calls, each call's
     attempt restarted at a random cut half of the time, streamed through a run's ``delta_redactor``. No
     32-character window of a secret the redactor takes reaches any payload, resets and restarts included, and
-    the reference client ends with each call's ``redact`` in call order."""
+    the reference client ends with each call's ``redact`` in call order.
+
+    600 runs by default; a deep run sets ``KK_FUZZ_CASES`` (``KK_FUZZ_CASES=5000 f1-pytest.sh -k
+    test_fuzz_no_secret_window``). The seed is fixed, so a run is reproducible at any size."""
     rng = random.Random(FUZZ_SEED)  # noqa: S311 - a reproducible fuzz, not a secret
     checked = restarts = 0
     for case in range(FUZZ_CASES):
