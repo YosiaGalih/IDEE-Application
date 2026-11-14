@@ -53,7 +53,7 @@ async def test_a_hidden_file_cannot_be_read(
 ) -> None:
     for raw in ({"path": path}, {"path": path, "start_line": 1, "end_line": 1}, {"path": f"./{path}"}):
         out = await call(sessions, scope, worktree, "repo.read_file", raw)
-        assert MARK not in out and out.startswith("error:"), (raw, out)
+        assert MARK not in out and out.startswith("denied:"), (raw, out)  # LOW-2: a policy refusal
 
 
 async def test_hidden_names_are_not_listed(
@@ -72,14 +72,14 @@ async def test_the_worktree_agentignore_cannot_unhide_what_repo_hides(
 ) -> None:
     (worktree.root / ".agentignore").write_text("")  # what sandboxed code can do
     out = await call(sessions, scope, worktree, "repo.read_file", {"path": "private/notes.md"})
-    assert MARK not in out and out.startswith("error:")
+    assert MARK not in out and out.startswith("denied:")
 
 
 async def test_related_tests_of_a_hidden_path_are_refused(
     sessions: async_sessionmaker[AsyncSession], scope: Scope, worktree: TaskWorkspace
 ) -> None:
     out = await call(sessions, scope, worktree, "repo.find_related_tests", {"path": "private/notes.md"})
-    assert out.startswith("error:") and "not read" in out
+    assert out.startswith("denied:") and "not read" in out
 
 
 # --- repo.search_text: hits in hidden files never reach the model (2.1d hand-off, Review Focus 1, 3) ---
@@ -285,7 +285,7 @@ async def test_related_tests_and_tree_never_reach_inside_a_hidden_folder(
     assert "private/" not in related and "scratch/" not in related and "node_modules/" not in related
     for folder in ("private", "scratch", "node_modules", "node_modules/lib"):
         out = await call(sessions, scope, worktree, "repo.get_tree", {"path": folder})
-        assert out.startswith("error:") and MARK not in out and "notes.md" not in out, (folder, out)
+        assert out.startswith("denied:") and MARK not in out and "notes.md" not in out, (folder, out)
 
 
 GITHUB_TOKEN = "ghp_" + "a1B2c3D4e5" * 4  # the redaction pattern's shape, not a real token

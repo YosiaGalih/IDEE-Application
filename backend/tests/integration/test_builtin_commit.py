@@ -80,10 +80,27 @@ async def test_only_the_task_branch_takes_commits(
 ) -> None:
     write(ws.root / "src" / "a.py", "changed\n")
     before = await head(ws)
-    for branch in ("main", "kk/task-99999999"):  # not a task branch; not the branch the worktree is on
-        other = TaskWorkspace(ws.root, repo=ws.repo, branch=branch, base_commit=ws.base_commit)
-        status, out = await run(sessions, scope, other, "wrong branch")
-        assert status == "error" and "task branch" in out, (branch, out)
+    main = TaskWorkspace(ws.root, repo=ws.repo, branch="main", base_commit=ws.base_commit)
+    status, out = await run(sessions, scope, main, "wrong branch")
+    assert status == "denied" and "task branch" in out, out  # LOW-2: a policy refusal
+    assert await head(ws) == before
+
+
+async def test_a_worktree_off_its_task_branch_is_an_error_not_a_denial(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope, ws: TaskWorkspace
+) -> None:
+    """Review L4: the workspace names a task branch the worktree is not on. The worktree is broken; the agent
+    asked for nothing the policy refuses, so the call ends ``error`` ``branch_mismatch``, not ``denied``."""
+    write(ws.root / "src" / "a.py", "changed\n")
+    before = await head(ws)
+    other = TaskWorkspace(ws.root, repo=ws.repo, branch="kk/task-99999999", base_commit=ws.base_commit)
+    built = gateway(sessions, *commit.specs())
+    ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=TOOLS, workspace=other)
+    result = await built.execute(ctx, "git.commit_task", {"message": "x"}, tool_use_id="toolu_mismatch")
+    assert (result.status, result.content) == ("error", "error: the worktree is not on the task branch")
+    (row,) = [r for r in await denials.calls(sessions, scope.task_id) if r.id == result.tool_call_id]
+    assert (row.status, row.error_code) == ("error", "branch_mismatch")
+    assert "tool.denied" not in [a.action for a in await denials.audits(sessions, row)]
     assert await head(ws) == before
 
 
@@ -100,7 +117,7 @@ async def test_a_worktree_on_a_non_task_branch_takes_no_commit(
     write(ws.root / "src" / "a.py", "changed\n")
     before = await head(on_feature)
     status, out = await run(sessions, scope, on_feature, "not a task branch")
-    assert status == "error" and "task branch" in out, out
+    assert status == "denied" and "task branch" in out, out
     assert await head(on_feature) == before
 
 

@@ -1,16 +1,21 @@
-"""``agent_profiles`` and ``agent_runs`` (DATA_MODEL M07, migration 0006; spec WP-3.1b goal 5)."""
+"""``agent_profiles`` and ``agent_runs`` (DATA_MODEL M07, migration 0006; spec WP-3.1b goal 5), and
+``agent_runs.error_code`` (migration 0011; spec WP-3.1f Keputusan Lead #15, #35)."""
 
 from __future__ import annotations
+
+import asyncio
+import uuid
 
 import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import Connection, func, select
+from sqlalchemy import Connection, func, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.models.agents import AgentProfile, AgentRun
+from app.models.enums import AGENT_RUN_ERROR_CODES
 from app.models.registry import Base
 from app.models.tasks import Task
 from tests.conftest import alembic_config, reset_data
@@ -126,6 +131,48 @@ async def test_run_enum_checks(session: AsyncSession, field: str, value: str, co
         await run_for(session, **{field: value})
 
 
+@pytest.mark.parametrize(
+    ("values", "constraint"),
+    [
+        ({"status": "failed", "error_code": "oops"}, "ck_agent_runs_error_code"),
+        ({"status": "failed"}, "ck_agent_runs_failed_has_code"),
+        ({"status": "succeeded", "error_code": "model_error"}, "ck_agent_runs_code_only_when_failed"),
+    ],
+)
+async def test_run_error_code_checks(
+    session: AsyncSession, values: dict[str, object], constraint: str
+) -> None:
+    with pytest.raises(IntegrityError, match=constraint):
+        await run_for(session, **values)
+
+
+@pytest.mark.parametrize("code", AGENT_RUN_ERROR_CODES)
+async def test_every_run_error_code_is_accepted_on_a_failed_run(session: AsyncSession, code: str) -> None:
+    run = await run_for(session, status="failed", error_code=code)
+    await session.refresh(run)
+    assert (run.status, run.error_code) == ("failed", code)
+
+
+def test_run_error_codes_are_the_lead_decision_set() -> None:
+    # Keputusan Lead #15 plus #35 (internal_error) and the 42bcb2e review (worker_cancelled); interrupted is
+    # the recovery code.
+    assert set(AGENT_RUN_ERROR_CODES) == {
+        "PROVIDER_DISABLED",
+        "provider_not_ready",
+        "provider_auth",
+        "usage_unrecorded",
+        "invalid_output",
+        "iteration_limit",
+        "timeout",
+        "lease_lost",
+        "model_error",
+        "internal_error",
+        "worker_cancelled",
+        "interrupted",
+    }
+    assert len(AGENT_RUN_ERROR_CODES) == len(set(AGENT_RUN_ERROR_CODES))
+
+
 async def test_approval_required_is_a_run_status(session: AsyncSession) -> None:
     run = await run_for(session, status="approval_required")  # ADR-025, from the start
     assert run.status == "approval_required"
@@ -176,3 +223,66 @@ def test_migration_round_trip(migrated_database: str) -> None:
     config = alembic_config(migrated_database)
     command.downgrade(config, "-1")
     command.upgrade(config, "head")
+
+
+async def _has_error_code(database_url: str) -> bool:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            found = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_name = 'agent_runs' AND column_name = 'error_code'"
+                )
+            )
+    finally:
+        await engine.dispose()
+    return found == 1
+
+
+async def _a_task_and_a_profile(database_url: str) -> uuid.UUID:
+    engine = create_async_engine(database_url)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            project = await make_project(session)
+            task = await make_task(session, project)
+            session.add(profile())
+            await session.commit()
+            return task.id
+    finally:
+        await engine.dispose()
+
+
+async def _sql(database_url: str, statement: str, **params: object) -> object:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            result = await connection.execute(text(statement), params)
+            return result.scalar() if result.returns_rows else None
+    finally:
+        await engine.dispose()
+
+
+def test_error_code_migration_round_trip(migrated_database: str) -> None:
+    config = alembic_config(migrated_database)
+    assert asyncio.run(_has_error_code(migrated_database))
+    task_id = asyncio.run(_a_task_and_a_profile(migrated_database))
+    command.downgrade(config, "-1")
+    try:
+        assert not asyncio.run(_has_error_code(migrated_database))
+        # A failed run written before 0011 (none exist in production: no writer yet) gets the recovery code.
+        run_id = uuid.uuid4()
+        asyncio.run(
+            _sql(
+                migrated_database,
+                "INSERT INTO agent_runs (id, task_id, agent_id, agent_version, step, status) "
+                "VALUES (:id, :task_id, 'A02', 1, 'intake', 'failed')",
+                id=run_id,
+                task_id=task_id,
+            )
+        )
+    finally:
+        command.upgrade(config, "head")
+    assert asyncio.run(_has_error_code(migrated_database))
+    code = asyncio.run(_sql(migrated_database, "SELECT error_code FROM agent_runs WHERE id = :id", id=run_id))
+    assert code == "interrupted"

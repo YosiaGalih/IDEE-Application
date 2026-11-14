@@ -113,13 +113,25 @@ DENIALS: Mapping[str, str] = {
     "tool_use_id_reused": "denied: this tool use id already belongs to another call",
     "r3_needs_agent_run": "denied: an R3 action can only be requested from an agent run",
     "secret_in_input": "denied: an R3 action input must not contain secrets",
+    # Refused by the handler (HANDLER_DENIALS).
+    "path_denied": "denied: agents may not read or write this path",
+    "delete_not_allowed": "denied: deleting a file needs filesystem scoped_write, as code.delete_file does",
+    "not_task_branch": "denied: commits go to the task branch only",
+    "hidden_paths_affected": (
+        "denied: the change would also change paths agents may not read; nothing was committed"
+    ),
 }
+# Policy refusals only a handler can make, since it sees the worktree (AG-13 3.1d2b LOW-2; spec WP-3.1f
+# Keputusan Lead #31): they end ``denied`` with an audit ``tool.denied``, like the gateway's own refusals.
+HANDLER_DENIALS: frozenset[str] = frozenset(
+    {"path_denied", "delete_not_allowed", "not_task_branch", "hidden_paths_affected"}
+)
 UNKNOWN_OUTCOME = (
     "error: this tool use was started before; it is still running or was interrupted, so its outcome is "
     "unknown. It is not run again."
 )
 # A replayed call reports the status its original row ended with.
-_REPLAYED: Mapping[str, ToolStatus] = {s: s for s in ("ok", "error", "timeout", "cancelled")}
+_REPLAYED: Mapping[str, ToolStatus] = {s: s for s in ("ok", "error", "timeout", "cancelled", "denied")}
 
 
 class TaskMissing(LookupError):
@@ -606,6 +618,8 @@ class ToolGateway:
         except asyncio.CancelledError:  # the handler cancelled itself; this task was not cancelled
             return _Outcome("error", "error: the tool stopped without a result", "internal")
         except ToolError as exc:
+            if exc.code in HANDLER_DENIALS:
+                return _Outcome("denied", DENIALS[exc.code], exc.code)
             return _Outcome("error", f"error: {exc.message}", _handler_code(exc.code))
         except AppError as exc:
             return _Outcome("error", f"error: {exc.message}", _handler_code(exc.code))
@@ -785,7 +799,11 @@ class ToolGateway:
             # Recorded already (the caller was cancelled and the shielded write won): one outcome per row.
             raise RuntimeError(f"tool call {row.id} was no longer running when its outcome was recorded")
         row.status = outcome.status
-        if spec.risk >= RiskLevel.R1:
+        if outcome.status == "denied":  # a policy refusal from the handler: audited as every denial
+            await self._audit_call(
+                session, ctx, row, "tool.denied", "denied", {"reason": outcome.error_code, "unmet": []}
+            )
+        elif spec.risk >= RiskLevel.R1:
             result = "success" if outcome.status == "ok" else "error"
             await self._audit_call(session, ctx, row, "tool.executed", result, {"status": outcome.status})
         await self._event(session, ctx, row, "tool.call_finished", summary)

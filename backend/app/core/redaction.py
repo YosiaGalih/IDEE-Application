@@ -18,13 +18,14 @@ from typing import Any
 
 REDACTED = "[REDACTED]"
 
-# A key is sensitive when its *last* segment(s) name a secret: GITHUB_TOKEN, client_secret, api-key.
+# A key is sensitive when its *last* segment(s) name a secret: GITHUB_TOKEN, client_secret, api-key. Public:
+# the agent runtime's delta stream holds a quoted value back after the same keys (app.agents.runtime).
 # "token_count", "max_tokens", "secret_santa" and "password_policy" stay readable.
-_SENSITIVE_TAIL = (
+SENSITIVE_KEY_TAIL = (
     r"passwords?|passwd|passphrase|secrets?|secret_key|token|api_key|apikey|access_key|private_key"
     r"|ticket|credentials?|authorization|cookies?|set_cookie|session|jwt|bearer"
 )
-_SENSITIVE_KEY_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{_SENSITIVE_TAIL})$")
+_SENSITIVE_KEY_NAME = re.compile(rf"(?i)^(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAIL})$")
 
 # Named so ``Redactor.find`` (security.scan_secrets) reports which rule matched, from the very same patterns.
 _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -76,7 +77,7 @@ _HEADERS = re.compile(
 # key=value / key: value / "key": "value" / \"key\": \"value\" / ?key=value, compound names included.
 _KEY_VALUE = re.compile(
     rf"""(?ix)
-    (?P<key>(?<![A-Za-z0-9_-])(?:[a-z0-9]+[_-])*(?:{_SENSITIVE_TAIL})(?![A-Za-z0-9_-]))
+    (?P<key>(?<![A-Za-z0-9_-])(?:[a-z0-9]+[_-])*(?:{SENSITIVE_KEY_TAIL})(?![A-Za-z0-9_-]))
     (?P<sep>\\?["']?\s*[:=]\s*)
     (?P<value>
         \\"[^"\\]*\\"            # \"escaped json\"

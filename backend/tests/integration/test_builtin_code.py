@@ -112,7 +112,7 @@ async def test_deleting_through_a_patch_needs_scoped_write(
     """Lead decision 3.1d2b #3: code.delete_file needs scoped_write, so a patch that deletes does too."""
     diff = "--- a/tests/test_a.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x = 1\n"
     out = await run(sessions, scope, ws, "code.apply_patch", {"diff": diff}, filesystem="test_only")
-    assert out.startswith("error|") and "scoped_write" in out, out
+    assert out.startswith("denied|") and "scoped_write" in out, out  # LOW-2: a policy refusal
     assert (ws.root / "tests" / "test_a.py").exists()
     out = await run(sessions, scope, ws, "code.apply_patch", {"diff": diff})
     assert out.startswith("ok|"), out

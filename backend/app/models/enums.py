@@ -58,6 +58,23 @@ AGENT_PRIORITIES = ("P0", "P1", "P2")
 MODEL_TIERS = ("fast", "default", "complex")
 # ADR-025: approval_required is a run status of its own, not "failed" with a message.
 AGENT_RUN_STATUSES = ("running", "succeeded", "failed", "cancelled", "budget_exceeded", "approval_required")
+# agent_runs.error_code (spec WP-3.1f Keputusan Lead #15, #35): set exactly when a run failed. internal_error
+# is an unexpected internal failure; worker_cancelled an asyncio cancel of the runtime from outside;
+# interrupted is written by recovery for a run its worker left behind (WP-3.1f2b).
+AGENT_RUN_ERROR_CODES = (
+    "PROVIDER_DISABLED",
+    "provider_not_ready",
+    "provider_auth",
+    "usage_unrecorded",
+    "invalid_output",
+    "iteration_limit",
+    "timeout",
+    "lease_lost",
+    "model_error",
+    "internal_error",
+    "worker_cancelled",
+    "interrupted",
+)
 # ADR-025: "actual" is reserved for provider-reported costs.
 COST_STATUSES = ("estimated", "partial", "actual", "unavailable")
 # DATA_MODEL approvals (v1 CHECK). waive_criterion stays in the CHECK but is never created (ADR-034).

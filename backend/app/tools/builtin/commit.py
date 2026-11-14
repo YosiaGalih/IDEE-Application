@@ -100,8 +100,8 @@ async def commit_task(ctx: ToolContext, raw: CommitTaskInput) -> ToolOutput:
     with workspace_errors():
         async with workspace.exclusive():
             state = await git.status(target)
-            if state.branch != workspace.branch:
-                raise ToolError("not_task_branch", "the worktree is not on the task branch")
+            if state.branch != workspace.branch:  # a broken worktree, not a refusal (review L4)
+                raise ToolError("branch_mismatch", "the worktree is not on the task branch")
             if state.head is None:
                 raise ToolError("no_base_commit", "the task branch has no commit to build on")
             policy = await workspace.policy()

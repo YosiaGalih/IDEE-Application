@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import get_args
 
 import pytest
 
+from app.agents.contracts import OUTPUT_CONTRACTS
 from app.core.cancel import CancelToken
 from app.llm.base import (
     ErrorKind,
@@ -17,6 +19,7 @@ from app.llm.base import (
     Usage,
 )
 from app.llm.scenarios import SCENARIOS
+from app.llm.scenarios.generic import OUTPUTS
 from app.llm.scenarios.model import Fail, Reply, Scenario
 from app.llm.scripted_provider import ScriptedProvider
 
@@ -153,9 +156,17 @@ async def test_requests_are_recorded() -> None:
 
 
 async def test_generic_calls_submit_result_only_when_offered() -> None:
-    offered = await provider().create_message(request(scenario="generic", tools=(READ, SUBMIT)))
+    offered = await provider().create_message(
+        _with_contract(request(scenario="generic", tools=(READ, SUBMIT)), "ImplementOutput")
+    )
     assert offered.stop_reason == "tool_use"
-    assert offered.content[-1] == ToolUseBlock("toolu_scripted_0", "submit_result", {})
+    assert offered.content[-1] == ToolUseBlock(
+        "toolu_scripted_0", "submit_result", dict(OUTPUTS["ImplementOutput"])
+    )
+    unknown = await provider().create_message(request(scenario="generic", tools=(READ, SUBMIT)))
+    assert unknown.content[-1] == ToolUseBlock(
+        "toolu_scripted_0", "submit_result", {}
+    )  # the runtime refuses it
     plain = await provider().create_message(request(scenario="generic", tools=(READ,)))
     assert plain.stop_reason == "end_turn"
     assert all(isinstance(block, TextBlock) for block in plain.content)
@@ -174,3 +185,50 @@ async def test_requests_are_not_kept_unless_asked() -> None:
     scripted = ScriptedProvider()
     await scripted.create_message(request(scenario="generic"))
     assert scripted.requests == []  # prompts are not held in memory by a long-running demo worker
+
+
+async def test_aclose_keeps_recorded_requests() -> None:
+    provider = ScriptedProvider(record_requests=True)
+    request = LLMRequest(model="m", system="s", messages=(Message("user", "hi"),))
+    await provider.create_message(request)
+    await provider.aclose()
+    await provider.aclose()
+    assert provider.requests == [request]
+
+
+def _with_contract(req: LLMRequest, contract: str) -> LLMRequest:
+    return dataclasses.replace(req, metadata={**req.metadata, "output_contract": contract})
+
+
+@pytest.mark.parametrize("runtime", sorted(OUTPUT_CONTRACTS))
+async def test_generic_submits_a_valid_output_for_every_contract(runtime: str) -> None:
+    contract = OUTPUT_CONTRACTS[runtime]
+    response = await provider().create_message(
+        _with_contract(request(scenario="generic", agent_id=runtime, tools=(READ, SUBMIT)), contract.__name__)
+    )
+    (submit,) = [b for b in response.content if isinstance(b, ToolUseBlock)]
+    assert submit.name == "submit_result"
+    assert contract.model_validate(submit.input)
+
+
+def test_generic_knows_every_output_contract() -> None:
+    assert set(OUTPUTS) == {c.__name__ for c in OUTPUT_CONTRACTS.values()}
+
+
+def test_generic_user_proxy_claims_nothing() -> None:
+    user_proxy = OUTPUTS["UserProxyOutput"]
+    assert (user_proxy["status"], user_proxy["criteria_results"]) == ("unverified", [])
+
+
+def test_generic_claims_no_change_and_no_finding() -> None:
+    assert OUTPUTS["ImplementOutput"]["changed_files"] == [] and OUTPUTS["DebugOutput"]["changed_files"] == []
+    assert OUTPUTS["ReviewOutput"]["findings"] == []
+
+
+async def test_generic_outputs_are_not_shared_between_answers() -> None:
+    first = await provider().create_message(
+        _with_contract(request(scenario="generic", tools=(READ, SUBMIT)), "ReviewOutput")
+    )
+    (submit,) = [b for b in first.content if isinstance(b, ToolUseBlock)]
+    submit.input["findings"].append("x")
+    assert OUTPUTS["ReviewOutput"]["findings"] == []

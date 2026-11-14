@@ -164,3 +164,7 @@ class LLMProvider(Protocol):
         on_text_delta: TextDeltaHandler | None = None,
         cancel: CancelToken | None = None,
     ) -> LLMResponse: ...
+
+    async def aclose(self) -> None:
+        """Release the provider's connections (one provider per agent run, WP-3.1f2a); idempotent."""
+        ...

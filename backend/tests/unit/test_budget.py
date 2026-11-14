@@ -39,6 +39,7 @@ from app.workflow.budget import (
     dump_budget,
     effective_budget,
     evaluate,
+    evaluate_before_tool,
     parse_budget,
     price_ceiling,
 )
@@ -517,3 +518,58 @@ def test_call_bound_refuses_bad_bounds() -> None:
         CallBound("claude-cheap", -1, 10)
     with pytest.raises(ValueError):
         CallBound("claude-cheap", 10, 0)
+
+
+# --- before a tool (spec WP-3.1f Keputusan Lead #19, #32; AG-13 3.1f1 L5; plan WP-3.1f2a Task 5) ------------
+
+TOOL_BUDGET = dataclasses.replace(BUDGET, max_tool_iterations=3)
+
+
+def test_tool_check_counts_the_tool_about_to_run() -> None:
+    evaluate_before_tool(TOOL_BUDGET, usage(tool_iterations=2))  # the third tool of three
+    with pytest.raises(BudgetExceeded) as raised:
+        evaluate_before_tool(TOOL_BUDGET, usage(tool_iterations=3))
+    assert (raised.value.kind, raised.value.limit, raised.value.used) == ("tool_iterations", 3, 3)
+    evaluate_before_tool(BUDGET, usage(tool_iterations=10_000))  # no cap: no check
+
+
+def test_a_zero_tool_cap_refuses_the_first_tool() -> None:
+    with pytest.raises(BudgetExceeded):
+        evaluate_before_tool(dataclasses.replace(BUDGET, max_tool_iterations=0), usage())
+
+
+@pytest.mark.parametrize(
+    ("used", "kind"),
+    [
+        ({"tokens": 10_000}, None),
+        ({"tokens": 10_001}, "tokens"),
+        ({"cost": Decimal("0.01")}, None),
+        ({"cost": Decimal("0.0100000001")}, "cost"),
+    ],
+)
+def test_tool_check_has_a_zero_token_and_cost_bound(used: dict[str, object], kind: str | None) -> None:
+    if kind is None:
+        evaluate_before_tool(BUDGET, usage(**used))
+        return
+    with pytest.raises(BudgetExceeded) as raised:
+        evaluate_before_tool(BUDGET, usage(**used))
+    assert raised.value.kind == kind
+    assert raised.value.next_bound == 0
+
+
+def test_tool_check_refuses_an_unbounded_cost() -> None:
+    with pytest.raises(BudgetExceeded) as raised:
+        evaluate_before_tool(BUDGET, usage(cost=None))
+    assert (raised.value.kind, raised.value.used) == ("cost", None)
+
+
+def test_tool_check_refuses_past_the_duration() -> None:
+    evaluate_before_tool(BUDGET, usage(elapsed=timedelta(minutes=59, seconds=59)))
+    with pytest.raises(BudgetExceeded) as raised:
+        evaluate_before_tool(BUDGET, usage(elapsed=timedelta(minutes=60)))
+    assert raised.value.kind == "duration"
+
+
+def test_the_attempt_check_still_lets_the_model_answer_after_the_last_tool(table: PricingTable) -> None:
+    # Keputusan plan #9: after N tools of N, the model may still be called to submit its result.
+    evaluate(TOOL_BUDGET, usage(tool_iterations=3), NEXT, table)

@@ -133,6 +133,10 @@ class AnthropicClaudeProvider:
     def __repr__(self) -> str:
         return "AnthropicClaudeProvider()"
 
+    async def aclose(self) -> None:
+        """Close the SDK's HTTP client (one provider per run, Keputusan Lead #28); idempotent."""
+        await self._client.close()
+
     async def create_message(
         self,
         req: LLMRequest,

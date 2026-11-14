@@ -247,7 +247,8 @@ async def _schema_state(database_url: str) -> tuple[bool, tuple[int, int]]:
 def test_migration_round_trip(migrated_database: str) -> None:
     config = alembic_config(migrated_database)
     assert asyncio.run(_schema_state(migrated_database)) == (True, (20, 10))
-    command.downgrade(config, "-1")
+    # Pinned to the revision under 0010: "-1" stops meaning 0010 once a later migration is head.
+    command.downgrade(config, "0009_provider_configs")
     # The downgrade gives agent_runs back the 0006 precision (Keputusan Lead #12).
     assert asyncio.run(_schema_state(migrated_database)) == (False, (12, 6))
     command.upgrade(config, "head")

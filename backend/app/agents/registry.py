@@ -46,8 +46,9 @@ TargetMode = Literal["llm", "profile", "tool"]
 Priority = Literal["P0", "P1", "P2"]
 ModelTier = Literal["fast", "default", "complex"]
 
-# The six runtimes and their I/O contracts (AGENT_CATALOG §7). The contract classes arrive with the
-# AgentRuntime (WP-3.1f, app/agents/contracts.py); until then this is the map the CI validator falls back to.
+# The six runtimes and their I/O contract names (AGENT_CATALOG §7). The classes are in
+# app/agents/contracts.py (WP-3.1f2a), whose OUTPUT_CONTRACTS/INPUT_CONTRACTS the CI validator reads;
+# tests/unit/test_contracts.py keeps this map equal to them.
 RUNTIME_CONTRACTS: Mapping[str, tuple[str, str]] = {
     "A02": ("IntakeInput", "IntakeOutput"),
     "A03": ("PlanInput", "PlanOutput"),

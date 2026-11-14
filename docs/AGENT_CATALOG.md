@@ -59,7 +59,7 @@ agents:
 | `agent_id` | string | unik; 41 ID PRD + `ORCH` harus ada; total tepat 42 entri |
 | `slug` | string | snake_case, unik |
 | `name`, `group`, `capabilities` | string / enum / list | harus sama persis dengan PRD §6 (salinan mekanis tertanam di validator) |
-| `version` | int ≥ 1 | — |
+| `version` | int ≥ 1 | — (WP-3.1f2a: definisi pertama kontrak I/O dan prompt bukan perubahan, jadi `version` tetap 1; plan WP-3.1f2a Temuan #11) |
 | `priority` | `P0`/`P1`/`P2` | — |
 | `mvp_mode` | enum | himpunan agent `llm` **harus sama** dengan kunci `OUTPUT_CONTRACTS` di `contracts.py` (A02, A03, B14, C20, D22, A07) |
 | `runtime_agent` | string/null | wajib & hanya untuk `profile`; harus menunjuk agent `llm` |
@@ -115,12 +115,12 @@ Profil permission per peran (PRD §7.3.2, access notes, AC-10):
 ## 4. Cara kerja tiap `mvp_mode`
 
 ### 4.1 `llm`
-`AgentRuntime.run(agent_id, …)` (ARCHITECTURE §6.1) memuat profil dari `agent_profiles`, membangun system prompt dari `agents/prompts/<agent_id>.md` (hash isi = `prompt_version`), menyajikan **hanya** tool di allowlist (`ToolGateway.tool_defs_for(profile)`), dan menjalankan tool-use loop sampai `submit_result` valid terhadap `output_contract` (ADR-013), batas `limits`, budget (`BudgetGuard`), atau cancel. Setiap tool call tetap divalidasi ulang oleh `ToolGateway` terhadap `permissions` (allowlist → schema → scope/path → risk/approval → quota).
+`AgentRuntime.run(AgentRunRequest)` (ARCHITECTURE §4.2, §6.1; WP-3.1f2a) membaca agent dari registry tervalidasi (`grant_for`), bukan dari baris `agent_profiles` (3.1b C3), membangun system prompt dari `backend/app/agents/prompts/<agent_id>.md` (12 hex pertama SHA-256 isi = `prompt_version`), menyajikan **hanya** tool `ToolGateway.tool_defs_for(grant)` (allowlist ∩ terdaftar ∩ prasyarat izin) ditambah `submit_result`, dan menjalankan tool-use loop sampai `submit_result` valid terhadap `output_contract` (ADR-013), batas `limits`, budget (`BudgetGuard`), atau cancel. Setiap tool call tetap divalidasi ulang oleh `ToolGateway` terhadap `permissions` (allowlist → schema → scope/path → risk/approval → quota).
 
 ### 4.2 `profile`
-Profil memakai **kelas runtime, kontrak input/output, dan step pipeline** milik `runtime_agent`, tetapi dengan identitas sendiri: `agent_runs.agent_id` = ID profil, prompt `agents/prompts/<profil>.md`, `tools`, `permissions`, `limits`, dan `model_tier` milik profil. Contoh: langkah plan dengan `specialist: "G35"` dijalankan oleh runtime B14 dengan `filesystem: docs_only`, sehingga `code.write_file` ke `src/app.py` ditolak gateway walau runtime-nya sama dengan B14.
+Profil memakai **kelas runtime, kontrak input/output, dan step pipeline** milik `runtime_agent`, tetapi dengan identitas sendiri: `agent_runs.agent_id` = ID profil, prompt `backend/app/agents/prompts/<profil>.md`, `tools`, `permissions`, `limits`, dan `model_tier` milik profil. Contoh: langkah plan dengan `specialist: "G35"` dijalankan oleh runtime B14 dengan `filesystem: docs_only`, sehingga `code.write_file` ke `src/app.py` ditolak gateway walau runtime-nya sama dengan B14.
 
-Dua profil bersifat **absorbed**: A01 (fungsi klasifikasi intent dikerjakan di dalam run A02 — kontrak `IntakeOutput` sudah memuat `workflow_type/complexity/risk/constraints`) dan C16 (strategi test dikerjakan di dalam run A03 — `PlanOutput.test_plan`). Keduanya tidak di-dispatch terpisah di MVP; entri registry-nya mendokumentasikan kapabilitas dan permission bila kelak dipisah. Planner hanya boleh menugaskan specialist implementer yang enabled (`B14`, `B09`, `B10`, `B13`, `G35`).
+Dua profil bersifat **absorbed**: A01 (fungsi klasifikasi intent dikerjakan di dalam run A02 — kontrak `IntakeOutput` sudah memuat `workflow_type/complexity/risk/constraints`) dan C16 (strategi test dikerjakan di dalam run A03 — `PlanOutput.test_plan`). Keduanya tidak di-dispatch terpisah di MVP; entri registry-nya mendokumentasikan kapabilitas dan permission bila kelak dipisah. Runtime menolak keduanya sebelum membuat baris run (`AgentNotRunnable`), dan keduanya tidak punya prompt (WP-3.1f2a). Planner hanya boleh menugaskan specialist implementer yang enabled (`B14`, `B09`, `B10`, `B13`, `G35`).
 
 ### 4.3 `tool`
 Kapabilitas diwujudkan sebagai kode deterministik (P7 "deterministic before LLM"). Agent tool-mode tetap punya identitas di registry agar (a) katalog/UI lengkap, (b) tool call yang dijalankan orchestrator atas namanya tercatat dengan `agent_id` yang benar di `tool_calls`/audit, dan (c) permission-nya ditegakkan gateway yang sama. Tidak ada `submit_result` dan kontrak I/O.
@@ -277,7 +277,53 @@ Kolom *PRD priority / access* adalah teks verbatim PRD. Daftar capability lengka
 | D22 Code Review Agent | S7 review | `ReviewInput` | `ReviewOutput` | — | default | 12 / 600 s |
 | A07 User Proxy / User Intent & Acceptance | S8 user proxy | `UserProxyInput` | `UserProxyOutput` | — | default | 12 / 300 s |
 
-Kontrak dimiliki Lead Architect (`backend/app/agents/contracts.py`). Mengubah kontrak = memperbarui skenario `ScriptedProvider`, prompt, dokumen ini, dan menaikkan `version` agent terkait. Validator membaca `OUTPUT_CONTRACTS`/`INPUT_CONTRACTS` langsung dari `contracts.py` (via `ast`), sehingga registry tidak dapat menunjuk kontrak yang tidak ada.
+Kontrak dimiliki Lead Architect (`backend/app/agents/contracts.py`). Mengubah kontrak = memperbarui skenario `ScriptedProvider`, prompt, dokumen ini, dan menaikkan `version` agent terkait. Validator membaca `OUTPUT_CONTRACTS`/`INPUT_CONTRACTS` langsung dari `contracts.py` (via `ast`), sehingga registry tidak dapat menunjuk kontrak yang tidak ada. Karena itu keduanya harus tetap dict literal tingkat modul; membungkusnya (mis. `MappingProxyType`) menyembunyikannya dari validator. Definisi pertama di WP-3.1f2a tidak menaikkan `version` (§2). `agent_runs.step` per runtime: `intake`, `plan`, `implement`, `debug`, `review`, `user_proxy`.
+
+**Field kontrak (WP-3.1f2a, Keputusan Lead 3.1f #25; ADR-075).** Aturan umum:
+- Setiap kelas turunan `Contract`: `extra="forbid"` dan beku (`frozen`); skema JSON memuat `additionalProperties: false` di setiap objek, termasuk `$defs`.
+- Setiap string dan list dibatasi panjangnya. Tipe dasar: `Line` 1–300 karakter, `Text` 1–4000, `Title` 1–200 (`tasks.title` varchar(200)), `Prompt` 1–20 000.
+- `RepoPath` 1–1000 karakter, relatif, tanpa karakter kontrol atau backslash, tanpa segmen `..`. Polanya tanpa look-around, karena mesin regex bawaan Pydantic (Rust) menolaknya saat kelas dibuat; segmen `..` ditolak validator.
+- Kunci: `RequirementKey` `REQ-1`…`REQ-999`; `CriterionKey` `AC-1`…`AC-999`; `StepId` `P1`…`P12`; `EvidenceRef` `test_run|artifact|finding|diff:<uuid huruf kecil>` (USER_PROXY_ACCEPTANCE §4); `DiffRef` `diff:<uuid>`; `CommitSha` 40 hex huruf kecil; `Category` `^[a-z][a-z0-9_]{0,59}$`.
+- Enum: `WorkflowType` `create|modify|debug|test|review|docs` (sama dengan `WORKFLOW_TYPES`); `Level` `low|medium|high`; `VerificationMethod` `test|api|browser|review|manual`; `FailureCategory` `assertion|lint|build|dependency|runner_crash|timeout|infra`; `Severity` `info|low|medium|high|critical`; `Specialist` `B14|B09|B10|B13|G35`.
+- Tidak ada field yang mengklaim status test (status test hanya dari `test_runs`) atau approval. Pesan validator menyebut aturan, tidak pernah nilai input.
+
+Bagian bersama (`?` = opsional, default `null`; angka dalam kurung = jumlah item):
+
+| Kelas | Field |
+|---|---|
+| `Criterion` | `key: CriterionKey`, `criterion: Text`, `verification_method: VerificationMethod`, `mandatory: bool` |
+| `Requirement` | `key: RequirementKey`, `title: Line`, `description: Text`, `priority: must\|should\|could`, `acceptance_criteria: [Criterion]` (1–10) |
+| `ClarificationQuestion` | `question: Line`, `blocking: bool` |
+| `PlanStep` | `id: StepId`, `title: Line`, `specialist: Specialist`, `description: Text`, `depends_on: [StepId]` (≤ 11), `requirement_keys: [RequirementKey]` (≤ 20), `files_hint: [RepoPath]` (≤ 20) |
+| `TestPlan` | `summary: Text`, `criterion_keys: [CriterionKey]` (≤ 100) |
+| `ChangedFile` | `path: RepoPath`, `change: added\|modified\|deleted` |
+| `FailureReport` | `category: FailureCategory`, `summary: Text`, `test_run_ref: EvidenceRef?` |
+| `Finding` | `severity: Severity`, `category: Category`, `title: Line`, `file_path: RepoPath?`, `line_start: int ≥ 1?`, `line_end: int ≥ 1?`, `evidence: Text`, `recommendation: Text`. `line_*` tanpa `file_path` ditolak; `line_end ≥ line_start` |
+| `CriterionView` | `key: CriterionKey`, `requirement_key: RequirementKey`, `criterion: Text`, `verification_method: VerificationMethod`, `mandatory: bool` |
+| `EvidenceItem` | `ref: EvidenceRef`, `label: Line` |
+| `CriterionResult` | `criterion_key: CriterionKey`, `status: passed\|failed\|blocked\|unverified`, `evidence_refs: [str]` (≤ 20; 1–80 karakter tanpa karakter kontrol, **tanpa** pola ref: `verify_report` yang memeriksa formatnya, USER_PROXY_ACCEPTANCE §5 V2; Keputusan Lead 3.1f #45), `rationale: Text` |
+
+Enam pasang kontrak:
+
+| Kontrak | Field | Aturan tambahan |
+|---|---|---|
+| `IntakeInput` | `task_id: UUID`, `prompt: Prompt`, `workflow_hint: WorkflowType?`, `stack_summary: Text?`, `user_feedback: Text?` | – |
+| `IntakeOutput` | `title: Title`, `summary: Text`, `workflow_type: WorkflowType`, `complexity: Level`, `risk: Level`, `requirements: [Requirement]` (1–20), `constraints: [Line]` (≤ 20), `detected_stack_hints: [Line]` (≤ 10), `clarification_questions: [ClarificationQuestion]` (≤ 5) | kunci `REQ-n` unik; kunci `AC-n` unik di seluruh task (USER_PROXY_ACCEPTANCE §2) |
+| `PlanInput` | `task_id: UUID`, `workflow_type: WorkflowType`, `requirements: [Requirement]` (1–20), `context_summary: Text?`, `user_feedback: Text?` | – |
+| `PlanOutput` | `steps: [PlanStep]` (1–12), `test_plan: TestPlan`, `risks: [Line]` (≤ 10), `needs_architect: bool = false` | id langkah unik; `depends_on` hanya menunjuk langkah sebelumnya (DAG tanpa siklus) |
+| `ImplementInput` | `task_id: UUID`, `step: PlanStep`, `requirements: [Requirement]` (≤ 20), `gap_feedback: Text?` | – |
+| `ImplementOutput` | `summary: Text`, `changed_files: [ChangedFile]` (≤ 200), `commit: CommitSha?`, `evidence_refs: [EvidenceRef]` (≤ 20), `follow_ups: [Line]` (≤ 10) | – |
+| `DebugInput` | `task_id: UUID`, `failure: FailureReport`, `attempt: int` (1–20), `requirements: [Requirement]` (≤ 20) | – |
+| `DebugOutput` | `root_cause: Text`, `category: FailureCategory`, `fix_summary: Text`, `changed_files: [ChangedFile]` (≤ 200), `next_step: retest\|escalate\|needs_clarification`, `evidence_refs: [EvidenceRef]` (≤ 20) | – |
+| `ReviewInput` | `task_id: UUID`, `diff_ref: DiffRef`, `changed_files: [RepoPath]` (≤ 200), `requirements: [Requirement]` (≤ 20) | – |
+| `ReviewOutput` | `summary: Text`, `findings: [Finding]` (≤ 50) | – |
+| `UserProxyInput` | `task_id: UUID`, `baseline_version: int ≥ 1`, `criteria: [CriterionView]` (≤ 100), `evidence: [EvidenceItem]` (≤ 200), `user_feedback: Text?` | – |
+| `UserProxyOutput` | `status: passed\|needs_changes\|blocked\|unverified`, `summary: Text`, `criteria_results: [CriterionResult]` (≤ 100), `next_actions: [Line]` (≤ 10), `confidence: Level` | `criterion_key` unik |
+
+Aturan runtime atas kontrak (WP-3.1f2a):
+- Input harus instance persis kelas input runtime-nya, `task_id`-nya sama dengan task run, dan JSON-nya ≤ 60 KB (ADR-011). Bila tidak, run ditolak sebelum ada baris `agent_runs`.
+- `submit_result.input_schema` = `model_json_schema()` kelas output, dan output divalidasi kelas itu. Profil memakai pasangan kontrak milik `runtime_agent`-nya.
+- Skenario `generic` ScriptedProvider memilih output menurut nama kontrak output yang dikirim runtime (`metadata.output_contract`). `app.llm` tidak mengimpor `app.agents`, jadi kecocokannya dengan kontrak nyata dijaga test, bukan kode.
 
 ## 8. Kosakata trigger
 

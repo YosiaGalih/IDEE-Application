@@ -15,9 +15,10 @@ writes; cache reads are left to the cost cap, since an agent loop resends its ca
 
 **Check.** Before each attempt: duration (``elapsed >= limit``, on the DB clock from ``tasks.started_at``;
 not checked before the task first runs), tool iterations (``used > limit``), then tokens and cost
-(``used + bound(next) > limit``). The first breach raises ``BudgetExceeded``; approvals and task transitions
-belong to the caller (3.1f2/3.2). Every check reads afresh in a short session of its own, without a row lock
-(ADR-070). It never calls a provider (import-linter contract).
+(``used + bound(next) > limit``). Before each tool (WP-3.1f2a): the same, with the tool about to run counted
+(``used + 1 > limit``) and a zero token bound. The first breach raises ``BudgetExceeded``; approvals and task
+transitions belong to the caller (3.1f2/3.2). Every check reads afresh in a short session of its own, without
+a row lock (ADR-070). It never calls a provider (import-linter contract).
 """
 
 from __future__ import annotations
@@ -358,6 +359,23 @@ def evaluate(
         raise BudgetExceeded("cost", budget.max_cost_usd, usage.cost, next_bound=bound.cost)
 
 
+def evaluate_before_tool(budget: EffectiveBudget, usage: BudgetUsage) -> None:
+    """Before a tool runs (AG-13 3.1f1 L5; spec WP-3.1f Keputusan Lead #19, #32): duration (``elapsed >=
+    limit``), tool iterations counting the tool about to run (``used + 1 > limit``: a cap of N lets exactly N
+    tools run), then tokens and cost against a zero bound (``used > limit``; a cost that cannot be bounded
+    refuses). Raises the first ``BudgetExceeded``."""
+    minutes = budget.max_duration_minutes
+    if usage.elapsed is not None and usage.elapsed >= timedelta(minutes=minutes):
+        raise BudgetExceeded("duration", minutes, _minutes(usage.elapsed))
+    tool_cap = budget.max_tool_iterations
+    if tool_cap is not None and usage.tool_iterations + 1 > tool_cap:
+        raise BudgetExceeded("tool_iterations", tool_cap, usage.tool_iterations)
+    if usage.tokens > budget.max_tokens:
+        raise BudgetExceeded("tokens", budget.max_tokens, usage.tokens)
+    if usage.cost is None or usage.cost > budget.max_cost_usd:
+        raise BudgetExceeded("cost", budget.max_cost_usd, usage.cost)
+
+
 def _ledger_usage(rows: Iterable[LedgerRow], pricing: PricingTable) -> tuple[int, Decimal | None]:
     tokens = 0
     cost: Decimal | None = Decimal(0)
@@ -399,6 +417,17 @@ class BudgetGuard:
     async def check_before_attempt(self, task_id: uuid.UUID, next_call: CallBound) -> BudgetSnapshot:
         """Read the caps and the usage of ``task_id`` afresh, then ``evaluate``. One short session that only
         reads; no row lock (ADR-070). ``BudgetTaskMissing`` when the task is gone."""
+        snapshot = await self._read(task_id)
+        evaluate(snapshot.budget, snapshot.usage, next_call, self._pricing)
+        return snapshot
+
+    async def check_before_tool(self, task_id: uuid.UUID) -> BudgetSnapshot:
+        """The same fresh read, then ``evaluate_before_tool`` (the tool about to run counts)."""
+        snapshot = await self._read(task_id)
+        evaluate_before_tool(snapshot.budget, snapshot.usage)
+        return snapshot
+
+    async def _read(self, task_id: uuid.UUID) -> BudgetSnapshot:
         async with self._sessions() as session:
             found = (
                 await session.execute(
@@ -433,7 +462,6 @@ class BudgetGuard:
             tool_iterations=tool_iterations or 0,
             elapsed=now - started_at if started_at is not None else None,
         )
-        evaluate(budget, usage, next_call, self._pricing)
         return BudgetSnapshot(budget, usage)
 
     def before_attempt(self, task_id: uuid.UUID, next_call: CallBound) -> Callable[[int], Awaitable[None]]:

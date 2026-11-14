@@ -144,6 +144,32 @@ async def test_tool_iterations_count_calls_that_reached_a_handler(
     assert (raised.value.kind, raised.value.limit, raised.value.used) == ("tool_iterations", 4, 5)
 
 
+async def test_guard_checks_a_tool_against_the_task_tool_calls(
+    session: AsyncSession, guard: BudgetGuard
+) -> None:
+    """Before a tool (Keputusan Lead #32): ``used + 1`` against the cap; denied and approval_required calls
+    never reached a handler and do not count (plan WP-3.1f2a Task 5)."""
+    task = await committed_task(session, budget_limit={"max_tool_iterations": 6})
+    for status in ("running", "ok", "error", "denied", "timeout", "approval_required", "cancelled"):
+        session.add(call(task, status=status))
+    await session.commit()
+    snapshot = await guard.check_before_tool(task.id)  # 5 counted: the sixth tool may run
+    assert snapshot.usage.tool_iterations == 5
+    await session.execute(
+        update(Task).where(Task.id == task.id).values(budget_limit={"max_tool_iterations": 5})
+    )
+    await session.commit()
+    with pytest.raises(BudgetExceeded) as raised:
+        await guard.check_before_tool(task.id)
+    assert (raised.value.kind, raised.value.limit, raised.value.used) == ("tool_iterations", 5, 5)
+    await guard.check_before_attempt(task.id, NEXT)  # the model may still answer after the last tool
+
+
+async def test_the_tool_check_refuses_a_missing_task(guard: BudgetGuard) -> None:
+    with pytest.raises(BudgetTaskMissing):
+        await guard.check_before_tool(uuid.uuid4())
+
+
 async def test_duration_runs_from_started_at_on_the_db_clock(
     session: AsyncSession, guard: BudgetGuard
 ) -> None:
