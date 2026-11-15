@@ -14,12 +14,14 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlalchemy import Integer, cast, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.prompt_book import PromptBook
 from app.agents.registry import AgentRegistry
 from app.agents.runtime import (
     ERROR_TEXT_MAX,
+    AgentRunIdConflict,
     AgentRuntime,
     BudgetBreach,
     BudgetRefused,
@@ -257,28 +259,42 @@ class AgentRunWriter:
         self._audit = audit
         self._projects: dict[uuid.UUID, uuid.UUID] = {}  # run -> project, for the audit of its end
 
-    async def start(self, run: RunStart) -> uuid.UUID:
+    async def start(self, run: RunStart) -> None:
         """INSERT ``agent_runs`` (``running``, the input redacted) and ``agent.run_started``, one transaction,
-        committed, then published."""
+        committed, then published. Idempotent on ``run.agent_run_id``: a row that exists for the same task
+        and agent is left as it is (no second event); for another task or agent, ``AgentRunIdConflict``."""
         redactor = self._audit.redactor
-        run_id = uuid.uuid4()
+        run_id = run.agent_run_id
         async with self._sessions() as session:
             await bound_transaction(session)
-            session.add(
-                AgentRun(
-                    id=run_id,
-                    task_id=run.task_id,
-                    agent_id=run.agent_id,
-                    agent_version=run.agent_version,
-                    step=run.step,
-                    model_provider=run.model_provider,
-                    model_name=run.model_name,
-                    prompt_version=run.prompt_version,
-                    status="running",
-                    input=redactor.redact_obj(dict(run.input)),
+            inserted = (
+                await session.execute(
+                    pg_insert(AgentRun)
+                    .values(
+                        id=run_id,
+                        task_id=run.task_id,
+                        agent_id=run.agent_id,
+                        agent_version=run.agent_version,
+                        step=run.step,
+                        model_provider=run.model_provider,
+                        model_name=run.model_name,
+                        prompt_version=run.prompt_version,
+                        status="running",
+                        input=redactor.redact_obj(dict(run.input)),
+                    )
+                    .on_conflict_do_nothing(index_elements=[AgentRun.id])
+                    .returning(AgentRun.id)
                 )
-            )
-            await session.flush()
+            ).scalar_one_or_none()
+            if inserted is None:
+                existing = (
+                    await session.execute(
+                        select(AgentRun.task_id, AgentRun.agent_id).where(AgentRun.id == run_id)
+                    )
+                ).one()
+                if (existing.task_id, existing.agent_id) != (run.task_id, run.agent_id):
+                    raise AgentRunIdConflict(f"agent run id {run_id} belongs to another task or agent")
+                return
             await emit_task_event(
                 session,
                 self._bus,
@@ -291,7 +307,6 @@ class AgentRunWriter:
             if self._bus is not None:
                 await publish_pending(session, self._bus)
         self._projects[run_id] = run.project_id
-        return run_id
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
         """Totals from the run's ledger rows; UPDATE status, code, redacted error (cut) and output,

@@ -32,6 +32,7 @@ from app.agents.runtime import (
     RunEnd,
     RunScope,
     RunStart,
+    RunStore,
     RuntimeConfig,
     RuntimePorts,
     RunUsage,
@@ -136,18 +137,22 @@ class FakeLedger:
 ZERO_USAGE = RunUsage(0, 0, 0, 0, Decimal(0), "estimated")
 
 
+async def begin(store: RunStore, run: RunStart) -> uuid.UUID:
+    """``store.start(run)``; the run's id, which the caller holds."""
+    await store.start(run)
+    return run.agent_run_id
+
+
 class FakeRuns:
     def __init__(self) -> None:
         self.starts: list[RunStart] = []
         self.finishes: list[tuple[uuid.UUID, RunEnd]] = []
-        self.ids: list[uuid.UUID] = []
+        self.ids: list[uuid.UUID] = []  # the id of each start, as the caller sent it
         self.failed_runs: list[uuid.UUID] = []
 
-    async def start(self, run: RunStart) -> uuid.UUID:
+    async def start(self, run: RunStart) -> None:
         self.starts.append(run)
-        run_id = uuid.uuid4()
-        self.ids.append(run_id)
-        return run_id
+        self.ids.append(run.agent_run_id)
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
         self.finishes.append((agent_run_id, end))

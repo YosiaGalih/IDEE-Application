@@ -1440,7 +1440,7 @@ async def test_a_retried_finish_that_finds_the_run_finished_is_not_unfinished() 
     assert lines[1]["correlation_id"] == f"agent_run:{run_id}"
 
 
-async def test_a_line_before_the_run_row_still_names_the_task() -> None:
+async def test_a_line_before_the_run_row_names_the_task_and_the_run() -> None:
     from structlog.testing import capture_logs
 
     fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
@@ -1449,10 +1449,11 @@ async def test_a_line_before_the_run_row_still_names_the_task() -> None:
     with capture_logs() as logs:
         assert (await make_runtime(fakes).run(request)).status == "succeeded"
     (line,) = [log for log in logs if log["event"] == "agent_run_beat_failed"]
+    # The caller holds the id, so even a line before the row names the run (WP-3.1f2b1 #10).
     assert (line["task_id"], line["agent_run_id"], line["correlation_id"]) == (
         str(request.task_id),
-        None,
-        None,
+        str(request.agent_run_id),
+        f"agent_run:{request.agent_run_id}",
     )
 
 
@@ -1726,3 +1727,34 @@ async def test_the_run_holds_a_header_value_a_later_rule_rewrites() -> None:
     assert (await run_b14(fakes)).status == "succeeded"
     assert fakes.events.deltas
     assert not any(value[i : i + 32] in sent for i in range(3) for sent in fakes.events.deltas)
+
+
+# --- the caller-held run id (WP-3.1f2b1, Keputusan Lead #10) ---------------------------------------
+
+
+async def test_the_run_uses_the_callers_id() -> None:
+    rid = uuid.uuid4()
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    result = await make_runtime(fakes).run(run_request("B14", agent_run_id=rid))
+    assert fakes.runs.starts[0].agent_run_id == rid and result.agent_run_id == rid
+    assert all(run_id == rid for run_id, _ in fakes.runs.finishes)
+
+
+class StartAckLostRuns(FakeRuns):
+    """The first start commits (it is recorded), then its ack is lost."""
+
+    async def start(self, run: Any) -> None:
+        await super().start(run)
+        if len(self.starts) == 1:
+            raise ConnectionError("the commit's ack was lost")
+
+
+async def test_a_lost_start_ack_retries_start_with_the_same_id_and_writes_one_end() -> None:
+    rid = uuid.uuid4()
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.runs = StartAckLostRuns()
+    with pytest.raises(ConnectionError):  # the unexpected error is raised again after the row is closed
+        await make_runtime(fakes).run(run_request("B14", agent_run_id=rid))
+    assert [s.agent_run_id for s in fakes.runs.starts] == [rid, rid]
+    assert [run_id for run_id, _ in fakes.runs.finishes] == [rid]
+    assert fakes.runs.failed_runs == []

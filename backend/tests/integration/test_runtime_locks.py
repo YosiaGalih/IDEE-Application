@@ -38,6 +38,7 @@ from tests.runtime_fakes import (
     OUTPUTS,
     WORKER_ID,
     FakeTools,
+    begin,
     compose,
     config,
     hold_lease,
@@ -139,7 +140,7 @@ async def test_a_lock_released_after_the_deadline_ends_the_run_timeout(
 
 
 def _start(task_id: uuid.UUID, project_id: uuid.UUID) -> RunStart:
-    return RunStart(task_id, project_id, "B14", 1, "implement", "scripted", "m", "0" * 12, {})
+    return RunStart(uuid.uuid4(), task_id, project_id, "B14", 1, "implement", "scripted", "m", "0" * 12, {})
 
 
 async def _beat(sessions: async_sessionmaker[AsyncSession], scope: RunScope) -> None:
@@ -147,7 +148,7 @@ async def _beat(sessions: async_sessionmaker[AsyncSession], scope: RunScope) -> 
 
 
 async def _start_run(sessions: async_sessionmaker[AsyncSession], scope: RunScope) -> None:
-    await AgentRunWriter(sessions, None, AUDIT).start(_start(scope.task_id, scope.project_id))
+    await begin(AgentRunWriter(sessions, None, AUDIT), _start(scope.task_id, scope.project_id))
 
 
 async def _usage_event(sessions: async_sessionmaker[AsyncSession], scope: RunScope) -> None:
@@ -175,7 +176,7 @@ async def test_a_port_that_writes_the_task_row_gives_up_on_a_held_lock(
     port: str,
 ) -> None:
     project_id, task_id = await a_task(session, settings)
-    run_id = await AgentRunWriter(sessions, None, AUDIT).start(_start(task_id, project_id))
+    run_id = await begin(AgentRunWriter(sessions, None, AUDIT), _start(task_id, project_id))
     scope = RunScope(project_id, task_id, run_id, "B14")
     locked = asyncio.Event()
     holder = asyncio.create_task(hold_task_row(engine, task_id, 9.0, locked))
@@ -244,7 +245,7 @@ async def test_the_ledger_gives_up_on_a_held_task_lock(
     (its foreign key). Behind a ``FOR UPDATE`` it gives up after ``lock_timeout`` 5 s; the PoC waited 7 s,
     until the lock was released."""
     project_id, task_id = await a_task(session, settings)
-    run_id = await AgentRunWriter(sessions, None, AUDIT).start(_start(task_id, project_id))
+    run_id = await begin(AgentRunWriter(sessions, None, AUDIT), _start(task_id, project_id))
     ctx, attempt = _paid_attempt(RunScope(project_id, task_id, run_id, "B14"))
     locked = asyncio.Event()
     holder = asyncio.create_task(hold_task_row(engine, task_id, 9.0, locked, mode="UPDATE"))
@@ -266,7 +267,7 @@ async def test_the_ledger_bounds_its_statements(
     pricing: PricingTable,
 ) -> None:
     project_id, task_id = await a_task(session, settings)
-    run_id = await AgentRunWriter(sessions, None, AUDIT).start(_start(task_id, project_id))
+    run_id = await begin(AgentRunWriter(sessions, None, AUDIT), _start(task_id, project_id))
     ctx, attempt = _paid_attempt(RunScope(project_id, task_id, run_id, "B14"))
     seen: dict[str, Any] = {}
     original = usage_module._check_context

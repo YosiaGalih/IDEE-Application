@@ -623,6 +623,10 @@ class AgentRunUnfinished(Exception):
     or the end already written. Raised from the cause; a result without its record is never returned."""
 
 
+class AgentRunIdConflict(ValueError):
+    """``RunStore.start``: the id exists for another task or agent. Never a retry of the same run."""
+
+
 class RunAlreadyFinished(LookupError):
     """``RunStore.finish``: the run is not ``running`` any more; a run is finished once, never overwritten."""
 
@@ -745,6 +749,7 @@ class PendingTool:
 
 @dataclass(frozen=True, slots=True)
 class RunStart:
+    agent_run_id: uuid.UUID  # held by the caller, so a retried ``start`` is the same row (Keputusan Lead #10)
     task_id: uuid.UUID
     project_id: uuid.UUID
     agent_id: str
@@ -786,6 +791,8 @@ class AgentRunRequest:
     cancel: CancelToken
     workspace: TaskWorkspace | None = None
     scenario: str | None = None  # scripted only (Keputusan Lead #27)
+    # The run's id is the caller's: a ``start`` whose ack is lost is retried with it and is not a second row.
+    agent_run_id: uuid.UUID = field(default_factory=uuid.uuid4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -819,7 +826,11 @@ class UsageLedgerPort(Protocol):
 
 
 class RunStore(Protocol):
-    async def start(self, run: RunStart) -> uuid.UUID: ...
+    async def start(self, run: RunStart) -> None:
+        """Idempotent on ``run.agent_run_id``: a row that exists for the same task and agent is left as it
+        is; for another task or agent, ``AgentRunIdConflict``."""
+        ...
+
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
         """Raises ``RunAlreadyFinished`` for a row that is not ``running``."""
         ...
@@ -915,12 +926,13 @@ class _Run:
     output_contract: type[Contract]
     input_content: str  # the <agent_input> content: redacted, escaped, within CONTEXT_MAX_BYTES
     deadline: float
+    agent_run_id: uuid.UUID
     deltas: (
         DeltaRedactor  # the run's streamed text, one for all its model calls: it numbers them (Delta.call)
     )
     stop: _RunStop = field(default_factory=_RunStop)
     tally: _Tally = field(default_factory=_Tally)
-    agent_run_id: uuid.UUID | None = None
+    started: bool = False  # the store acknowledged ``start``
     iterations: int = 0
     output: BaseModel | None = None
     pending: PendingTool | None = None
@@ -932,11 +944,11 @@ def _id(value: uuid.UUID | None) -> str | None:
 
 def _ctx(run: _Run) -> dict[str, str | None]:
     """What every runtime log line carries: ids only (review L5)."""
-    run_id = _id(run.agent_run_id)
+    run_id = str(run.agent_run_id)
     return {
         "task_id": str(run.request.task_id),
         "agent_run_id": run_id,
-        "correlation_id": f"agent_run:{run_id}" if run_id is not None else None,
+        "correlation_id": f"agent_run:{run_id}",
     }
 
 
@@ -1048,6 +1060,7 @@ class AgentRuntime:
             raise ScenarioNotAllowed("a scenario is only for the scripted provider (ADR-015)")
         return _Run(
             request=request,
+            agent_run_id=request.agent_run_id,
             spec=spec,
             grant=grant,
             prompt=prompt,
@@ -1060,6 +1073,7 @@ class AgentRuntime:
 
     def _run_start(self, run: _Run, provider: str | None, model: str | None) -> RunStart:
         return RunStart(
+            agent_run_id=run.agent_run_id,
             task_id=run.request.task_id,
             project_id=run.request.project_id,
             agent_id=run.spec.agent_id,
@@ -1116,7 +1130,8 @@ class AgentRuntime:
             async with self._ports.providers.open(lambda: _ctx(run)) as provider:
                 model = models[run.spec.model_tier]
                 start = self._run_start(run, provider.name, model)
-                run.agent_run_id = await self._port(run, self._ports.runs.start(start))
+                await self._port(run, self._ports.runs.start(start))
+                run.started = True
                 return await self._loop(run, provider, model)
         except _DeadlineReached:
             return self._timed_out(run)
@@ -1172,7 +1187,6 @@ class AgentRuntime:
         raise LeaseLostError("the task lease could not be renewed") from failure
 
     async def _loop(self, run: _Run, provider: LLMProvider, model: str) -> RunEnd:
-        assert run.agent_run_id is not None
         request = run.request
         scope = RunScope(request.project_id, request.task_id, run.agent_run_id, run.spec.agent_id)
         # What the gateway offers (grant ∩ registered ∩ preconditions, sorted; spec #22), then submit_result
@@ -1391,7 +1405,6 @@ class AgentRuntime:
         if run.tally.sent != run.tally.recorded:
             end = replace(end, usage_complete=False)
         usage = await self._record_end(run, end)
-        assert run.agent_run_id is not None
         return AgentRunResult(
             agent_run_id=run.agent_run_id,
             status=end.status,
@@ -1427,13 +1440,12 @@ class AgentRuntime:
                 )
                 if attempt == 1 and write.done():  # one retry; nothing is started after the last attempt
                     write = self._write(run, end)
-        if run.agent_run_id is not None:
-            mark = asyncio.ensure_future(self._ports.runs.fail(run.agent_run_id))
-            mark.add_done_callback(_retrieve)
-            try:
-                await asyncio.wait_for(asyncio.shield(mark), self._config.close_timeout_s)
-            except Exception as error:
-                _log.error("agent_run_unmarked", **_ctx(run), error_type=type(error).__name__)
+        mark = asyncio.ensure_future(self._ports.runs.fail(run.agent_run_id))
+        mark.add_done_callback(_retrieve)
+        try:
+            await asyncio.wait_for(asyncio.shield(mark), self._config.close_timeout_s)
+        except Exception as error:
+            _log.error("agent_run_unmarked", **_ctx(run), error_type=type(error).__name__)
         raise AgentRunUnfinished(
             f"the end of agent run {_id(run.agent_run_id)} was not recorded"
         ) from failure
@@ -1444,8 +1456,9 @@ class AgentRuntime:
         return write
 
     async def _write_end(self, run: _Run, end: RunEnd) -> RunUsage:
-        if run.agent_run_id is None:  # refused before the provider existed: the row names no model
-            run.agent_run_id = await self._ports.runs.start(self._run_start(run, None, None))
+        if not run.started:  # refused before the provider existed (or the ack was lost): idempotent
+            await self._ports.runs.start(self._run_start(run, None, None))
+            run.started = True
         return await self._ports.runs.finish(run.agent_run_id, end)
 
     async def _call_model(

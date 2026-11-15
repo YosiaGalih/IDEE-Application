@@ -85,7 +85,9 @@ def test_only_the_runtime_store_writes_agent_runs() -> None:
 
 def test_guard_sees_the_allowed_writer() -> None:
     hits = run_writes(ALLOWED_WRITER.read_text())
-    assert any("AgentRun(...)" in hit for hit in hits) and any("update(AgentRun)" in hit for hit in hits)
+    assert any("pg_insert(AgentRun)" in hit for hit in hits) and any(
+        "update(AgentRun)" in hit for hit in hits
+    )
 
 
 def test_guard_detects_a_second_writer() -> None:
@@ -95,6 +97,8 @@ def test_guard_detects_a_second_writer() -> None:
         "from sqlalchemy import update\nfrom app.models.agents import AgentRun\nq = update(AgentRun)\n",
         "from sqlalchemy import delete\nfrom app.models.agents import AgentRun\n"
         "q = delete(AgentRun.__table__)\n",
+        "from sqlalchemy.dialects.postgresql import insert as pg_insert\n"
+        "from app.models.agents import AgentRun\nq = pg_insert(AgentRun)\n",
         "Q = 'UPDATE agent_runs SET status = :s'\n",
         "Q = 'insert ' + 'into agent_runs (id) values (:id)'\n",
     ):

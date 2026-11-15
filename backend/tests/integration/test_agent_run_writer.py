@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -16,7 +17,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.agents.runtime import ERROR_TEXT_MAX, BudgetBreach, RunEnd, RunStart
+from app.agents.runtime import ERROR_TEXT_MAX, AgentRunIdConflict, BudgetBreach, RunEnd, RunStart
 from app.core.audit import AuditWriter
 from app.core.redaction import Redactor
 from app.llm.base import Usage
@@ -25,13 +26,14 @@ from app.llm.retry import AttemptRecord
 from app.models.agents import AgentRun
 from app.models.audit import AuditEvent
 from app.models.enums import AGENT_RUN_ERROR_CODES
+from app.models.projects import Project
 from app.models.tasks import TaskEvent
 from app.services.agent_runtime import AgentRunAlreadyFinished, AgentRunWriter
 from app.services.agents import sync_registry
 from app.services.usage import UsageCallContext, UsageLedger
 from tests.conftest import reset_data
 from tests.integration.test_task_schema import make_project, make_task
-from tests.runtime_fakes import REGISTRY, RecordingBus
+from tests.runtime_fakes import REGISTRY, RecordingBus, begin
 
 SECRET = "kk-writer-secret-" + "s" * 24  # built, not written: a test value
 AUDIT = AuditWriter(Redactor([SECRET]))
@@ -52,6 +54,7 @@ async def a_task(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
 
 def start(task_id: uuid.UUID, project_id: uuid.UUID, **overrides: Any) -> RunStart:
     values: dict[str, Any] = {
+        "agent_run_id": uuid.uuid4(),
         "task_id": task_id,
         "project_id": project_id,
         "agent_id": "B14",
@@ -103,7 +106,7 @@ async def test_start_writes_a_running_row_with_its_identity(
 ) -> None:
     project_id, task_id = await a_task(session)
     bus = RecordingBus()
-    run_id = await AgentRunWriter(sessions, bus, AUDIT).start(start(task_id, project_id))
+    run_id = await begin(AgentRunWriter(sessions, bus, AUDIT), start(task_id, project_id))
     row = await stored(session, run_id)
     assert (row.task_id, row.agent_id, row.agent_version, row.step, row.status) == (
         task_id,
@@ -127,8 +130,9 @@ async def test_a_run_refused_before_a_provider_names_no_model(
     session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
 ) -> None:
     project_id, task_id = await a_task(session)
-    run_id = await AgentRunWriter(sessions, None, AUDIT).start(
-        start(task_id, project_id, model_provider=None, model_name=None)
+    run_id = await begin(
+        AgentRunWriter(sessions, None, AUDIT),
+        start(task_id, project_id, model_provider=None, model_name=None),
     )
     row = await stored(session, run_id)
     assert (row.model_provider, row.model_name) == (None, None)
@@ -141,7 +145,7 @@ async def test_input_output_and_error_are_redacted(
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_input = {"gap_feedback": f"token {SECRET}", "api_key": "plain-value-1"} if column == "input" else {}
-    run_id = await writer.start(start(task_id, project_id, input=run_input))
+    run_id = await begin(writer, start(task_id, project_id, input=run_input))
     if column == "output":
         await writer.finish(
             run_id, RunEnd("succeeded", 1, output={"summary": SECRET, "api_key": "plain-value-1"})
@@ -163,7 +167,7 @@ async def test_finish_totals_come_from_the_run_ledger_rows(
 ) -> None:
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await ledger_row(sessions, pricing, project_id, task_id, run_id)
     await ledger_row(sessions, pricing, project_id, task_id, run_id)
     await ledger_row(sessions, pricing, project_id, task_id, run_id, status="cancelled", usage=None)
@@ -186,7 +190,7 @@ async def test_a_run_without_ledger_rows_is_estimated_zero(
 ) -> None:
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     usage = await writer.finish(
         run_id, RunEnd("failed", 0, "PROVIDER_DISABLED", "PROVIDER_DISABLED (kill_switch)")
     )
@@ -205,7 +209,7 @@ async def test_tiny_run_cost_keeps_ten_places(
 ) -> None:
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await ledger_row(
         sessions, pricing, project_id, task_id, run_id, usage=Usage(input_tokens=1, output_tokens=0)
     )
@@ -221,7 +225,7 @@ async def test_finish_writes_the_failed_code(
 ) -> None:
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await writer.finish(run_id, RunEnd("failed", 2, code, "text"))  # type: ignore[arg-type]
     row = await stored(session, run_id)
     assert (row.status, row.error_code, row.iterations) == ("failed", code, 2)
@@ -240,7 +244,7 @@ async def test_budget_exceeded_emits_the_event_and_the_audit_once(
     project_id, task_id = await a_task(session)
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     breach = BudgetBreach("cost", Decimal("2"), Decimal("1.9500000001"), Decimal("0.1"))
     await writer.finish(run_id, RunEnd("budget_exceeded", 3, budget=breach))
     (event,) = bus.of_type("usage.budget_exceeded")
@@ -278,7 +282,7 @@ async def test_an_unbounded_cost_is_used_null(
     project_id, task_id = await a_task(session)
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await writer.finish(
         run_id, RunEnd("budget_exceeded", 1, budget=BudgetBreach("cost", Decimal("2"), None, None))
     )
@@ -292,7 +296,7 @@ async def test_a_finished_run_is_not_finished_twice(
     project_id, task_id = await a_task(session)
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await writer.finish(run_id, RunEnd("succeeded", 1, output={"summary": "first"}))
     with pytest.raises(AgentRunAlreadyFinished):
         await writer.finish(run_id, RunEnd("failed", 2, "model_error", "second"))
@@ -307,7 +311,7 @@ async def test_run_finished_carries_status_code_and_usage(
     project_id, task_id = await a_task(session)
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await ledger_row(sessions, pricing, project_id, task_id, run_id)
     await writer.finish(run_id, RunEnd("failed", 1, "model_error", "LLMError: refusal"))
     (finished,) = bus.of_type("agent.run_finished")
@@ -332,7 +336,7 @@ async def test_an_incomplete_run_without_rows_is_unavailable_never_zero(
     project_id, task_id = await a_task(session)
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     usage = await writer.finish(run_id, RunEnd("failed", 1, "usage_unrecorded", "not recorded"))
     row = await stored(session, run_id)
     assert (row.input_tokens, row.output_tokens, row.estimated_cost, row.cost_status) == (
@@ -356,7 +360,7 @@ async def test_an_incomplete_run_with_rows_is_the_known_sum_partial(
 ) -> None:
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await ledger_row(sessions, pricing, project_id, task_id, run_id)
     usage = await writer.finish(run_id, RunEnd("cancelled", 1, usage_complete=False))
     row = await stored(session, run_id)
@@ -371,7 +375,7 @@ async def test_fail_is_the_minimal_end_of_a_running_run(
     """Review M5: when finish could not be written, failed internal_error, once, only for a running row."""
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await writer.fail(run_id)
     row = await stored(session, run_id)
     assert (row.status, row.error_code, row.finished_at is not None) == ("failed", "internal_error", True)
@@ -390,7 +394,7 @@ async def test_the_minimal_end_publishes_run_finished_once(
     project_id, task_id = await a_task(session)
     bus = RecordingBus(engine)
     writer = AgentRunWriter(sessions, bus, AUDIT)
-    run_id = await writer.start(start(task_id, project_id))
+    run_id = await begin(writer, start(task_id, project_id))
     await writer.fail(run_id)
     (finished,) = bus.of_type("agent.run_finished")
     assert finished["payload"] == {
@@ -418,15 +422,50 @@ async def test_the_run_store_keeps_no_project_of_an_ended_run(
     """Review L1: the run -> project map does not grow when finish raises or the minimal end is used."""
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
-    first = await writer.start(start(task_id, project_id))
+    first = await begin(writer, start(task_id, project_id))
     await writer.fail(first)
     assert first not in writer._projects
-    second = await writer.start(start(task_id, project_id))
+    second = await begin(writer, start(task_id, project_id))
     await writer.finish(second, RunEnd("cancelled", 0))
     assert second not in writer._projects
     with pytest.raises(AgentRunAlreadyFinished):
         await writer.finish(second, RunEnd("cancelled", 0))
-    third = await writer.start(start(task_id, project_id))
+    third = await begin(writer, start(task_id, project_id))
     with pytest.raises(AgentRunAlreadyFinished):
         await writer.finish(first, RunEnd("cancelled", 0))
     assert set(writer._projects) == {third}
+
+
+async def test_start_twice_with_one_id_writes_one_row_and_one_started_event(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    first = start(task_id, project_id)
+    await writer.start(first)
+    await writer.start(first)
+    rows = list(await session.scalars(select(AgentRun.id).where(AgentRun.task_id == task_id)))
+    assert rows == [first.agent_run_id]
+    assert len(bus.of_type("agent.run_started")) == 1
+    types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
+    assert types == ["agent.run_started"]
+
+
+async def test_start_with_a_known_id_for_another_task_is_refused(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    project_id, task_id = await a_task(session)
+    project = await session.get(Project, project_id)
+    assert project is not None
+    other = await make_task(session, project)
+    await session.commit()
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    first = start(task_id, project_id)
+    await writer.start(first)
+    with pytest.raises(AgentRunIdConflict):
+        await writer.start(replace(first, task_id=other.id))
+    with pytest.raises(AgentRunIdConflict):
+        await writer.start(replace(first, agent_id="B15"))
+    row = await stored(session, first.agent_run_id)
+    assert (row.task_id, row.agent_id) == (task_id, "B14")
