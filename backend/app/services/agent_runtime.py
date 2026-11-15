@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Literal
 
 from sqlalchemy import Integer, cast, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -244,6 +245,28 @@ class AgentRunAlreadyFinished(RunAlreadyFinished):
 def _number(value: int | Decimal | None) -> int | str | None:
     """A budget figure for an event or the audit: money as a decimal string, counts as they are."""
     return decimal_str(value) if isinstance(value, Decimal) else value
+
+
+@dataclass(frozen=True, slots=True)
+class RunOutcome:
+    """What the ``agent_runs`` row says about a run: ``missing`` (no row was written), ``running`` (belongs to
+    recovery) or ``finished`` with its status and code."""
+
+    state: Literal["finished", "running", "missing"]
+    status: str | None
+    error_code: str | None
+
+
+async def read_run_outcome(session: AsyncSession, agent_run_id: uuid.UUID) -> RunOutcome:
+    """The row's end, read only. For a caller whose ``AgentRuntime.run`` returned no result (Keputusan Lead
+    #11); not for ``AgentRunIdConflict``, whose row is another run's."""
+    row = (
+        await session.execute(select(AgentRun.status, AgentRun.error_code).where(AgentRun.id == agent_run_id))
+    ).one_or_none()
+    if row is None:
+        return RunOutcome("missing", None, None)
+    status, error_code = row
+    return RunOutcome("running" if status == "running" else "finished", status, error_code)
 
 
 class AgentRunWriter:

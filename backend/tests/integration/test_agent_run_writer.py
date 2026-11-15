@@ -28,7 +28,7 @@ from app.models.audit import AuditEvent
 from app.models.enums import AGENT_RUN_ERROR_CODES
 from app.models.projects import Project
 from app.models.tasks import TaskEvent
-from app.services.agent_runtime import AgentRunAlreadyFinished, AgentRunWriter
+from app.services.agent_runtime import AgentRunAlreadyFinished, AgentRunWriter, RunOutcome, read_run_outcome
 from app.services.agents import sync_registry
 from app.services.usage import UsageCallContext, UsageLedger
 from tests.conftest import reset_data
@@ -469,3 +469,20 @@ async def test_start_with_a_known_id_for_another_task_is_refused(
         await writer.start(replace(first, agent_id="B15"))
     row = await stored(session, first.agent_run_id)
     assert (row.task_id, row.agent_id) == (task_id, "B14")
+
+
+async def test_read_run_outcome_reports_missing_running_and_finished(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Keputusan Lead #11: the caller of a run that returned no result reads the row, never the exception."""
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    running_id = await begin(writer, start(task_id, project_id))
+    failed_id = await begin(writer, start(task_id, project_id))
+    await writer.finish(failed_id, RunEnd("failed", 1, "interrupted", "text"))
+    done_id = await begin(writer, start(task_id, project_id))
+    await writer.finish(done_id, RunEnd("succeeded", 1, output={}))
+    assert await read_run_outcome(session, uuid.uuid4()) == RunOutcome("missing", None, None)
+    assert await read_run_outcome(session, running_id) == RunOutcome("running", "running", None)
+    assert await read_run_outcome(session, failed_id) == RunOutcome("finished", "failed", "interrupted")
+    assert await read_run_outcome(session, done_id) == RunOutcome("finished", "succeeded", None)

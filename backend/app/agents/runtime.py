@@ -620,7 +620,13 @@ class AgentRunUnfinished(Exception):
     """The run's end is not known to the caller: it could not be written within ``close_timeout_s``, or a
     retried write found the row already finished (the first write committed, its ack was lost). The
     ``agent_runs`` row is the truth: ``running`` (recovery, WP-3.1f2b), the minimal ``failed internal_error``
-    or the end already written. Raised from the cause; a result without its record is never returned."""
+    or the end already written. Raised from the cause; a result without its record is never returned.
+    It names the run and its task: the caller reads the row's end from the id (``read_run_outcome``)."""
+
+    def __init__(self, message: str, *, agent_run_id: uuid.UUID, task_id: uuid.UUID) -> None:
+        super().__init__(message)
+        self.agent_run_id = agent_run_id
+        self.task_id = task_id
 
 
 class AgentRunIdConflict(ValueError):
@@ -1440,7 +1446,9 @@ class AgentRuntime:
                 # written over it; the caller still does not know the end.
                 _log.warning("agent_run_already_finished", **_ctx(run), attempt=attempt)
                 raise AgentRunUnfinished(
-                    f"the end of agent run {_id(run.agent_run_id)} was already recorded"
+                    f"the end of agent run {_id(run.agent_run_id)} was already recorded",
+                    agent_run_id=run.agent_run_id,
+                    task_id=run.request.task_id,
                 ) from error
             except Exception as error:  # a timeout or the store's error
                 failure = error
@@ -1456,7 +1464,9 @@ class AgentRuntime:
         except Exception as error:
             _log.error("agent_run_unmarked", **_ctx(run), error_type=type(error).__name__)
         raise AgentRunUnfinished(
-            f"the end of agent run {_id(run.agent_run_id)} was not recorded"
+            f"the end of agent run {_id(run.agent_run_id)} was not recorded",
+            agent_run_id=run.agent_run_id,
+            task_id=run.request.task_id,
         ) from failure
 
     def _write(self, run: _Run, end: RunEnd) -> asyncio.Future[RunUsage]:

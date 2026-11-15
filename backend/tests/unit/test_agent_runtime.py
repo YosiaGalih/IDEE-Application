@@ -1553,6 +1553,25 @@ async def test_a_failing_close_starts_the_write_and_one_retry_only() -> None:
     assert runs.writes == 2 and runs.failed_runs == runs.ids
 
 
+async def test_unfinished_names_the_run_and_its_task() -> None:
+    """Keputusan Lead #11: the caller learns the run's real end from the row, so the exception names it."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.runs = DownRuns()
+    request = run_request("B14")
+    with pytest.raises(AgentRunUnfinished) as raised:
+        await make_runtime(fakes, runtime_config=config(close_timeout_s=0.2)).run(request)
+    assert (raised.value.agent_run_id, raised.value.task_id) == (request.agent_run_id, request.task_id)
+
+
+async def test_an_already_finished_retry_names_the_run_and_its_task() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.runs = AckLostRuns()
+    request = run_request("B14")
+    with pytest.raises(AgentRunUnfinished) as raised:
+        await make_runtime(fakes).run(request)
+    assert (raised.value.agent_run_id, raised.value.task_id) == (request.agent_run_id, request.task_id)
+
+
 async def test_the_input_limit_is_measured_on_what_is_sent() -> None:
     """Code review of 073e68d (ADR-011): the limit applies to the ``<agent_input>`` content, the input JSON
     redacted and escaped. An input one byte under it whose escaped form is over is refused, with no run
