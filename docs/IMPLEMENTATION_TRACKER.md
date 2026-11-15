@@ -2697,3 +2697,57 @@ All checks passed! · 332 files already formatted · 0 errors · Contracts: 10 k
   - ratifikasi ADR-073 #6, ADR-074, ADR-075;
   - butir 3.1f2/3.1f2c di #72;
   - perluasan `redact_obj` (#14, #15, #17) dan kontrak `agent.delta.call` (#9) sebagai perubahan kontrak sebelum ada konsumen.
+
+**Sesudah merge PR #33 (fakta, 15 Nov 2026) [Pasti]:**
+- PO menandai PR #33 siap dan me-merge-nya pada 15 Nov 2026 00:50 UTC: merge commit 5baf4d5, head 36d93e4. Saat itu `security-scan` merah oleh gitleaks, jadi ini pilihan (c).
+  - Syarat AG-13 #3 ("CI 9/9 hijau di head final") tidak terpenuhi saat merge. Preseden yang sama: PR #29 dan #31.
+  - Lima fixture sintetis tetap ada di riwayat `main`, dan belum ada entri `.gitleaksignore`.
+- Push-CI `main` 5baf4d5 menjalankan Semgrep untuk pertama kali atas kode WP-3.1f2c (run `security` 43660165595).
+  - gitleaks, pip-audit, npm audit, dan kebijakan pengecualian lulus.
+  - Semgrep gagal dengan 2 temuan blocking, sehingga build image dan Trivy dilewati:
+    1. `generic.secrets.security.detected-pgp-private-key-block` di `backend/app/core/redaction.py:226`. Penyebabnya komentar yang memuat baris armour PGP lengkap.
+    2. `Syntax error` di `backend/app/agents/runtime.py:804` (`` `def` was unexpected ``). Artinya Semgrep tidak menganalisis modul itu sama sekali.
+- Akar masalah temuan (2), direproduksi lokal [Pasti]:
+  - Alat: semgrep 1.180.0 (versi dan `--exclude-newer` sama dengan CI) dan rule dari repo publik `semgrep-rules`. Registry `semgrep.dev` diblokir proxy container.
+  - Konversi tree-sitter Python di Semgrep 1.180 gagal (`Common.Impossible`) pada raw f-string yang punya teks di sekitar field, misalnya `rf"(?:{X})\Z"`. Pemicunya bergantung konteks: potongan seperti itu sendirian, ditambah class dengan `async def`, lolos (AG-13). Di modul ini, masing-masing dari kedua pola sudah cukup memicu galat.
+  - Semgrep lalu memakai parser lama (pfff). Parser ini menolak `async def` di dalam class, dan galatnya dilaporkan di baris yang tidak terkait.
+  - WP-3.1f2c menambah dua `rf"…"` di `runtime.py` (`_URL_SCHEME`, `_KEY_BEFORE_QUOTE`).
+  - Prefiks `fr"…"` lolos parser, tetapi `ruff format` 0.17 menulisnya kembali menjadi `rf"…"`/`Rf"…"`, dan keduanya gagal.
+- Perbaikan (PR lanjutan dari `main` 5baf4d5):
+  - Komentar di `redaction.py` ditulis ulang tanpa baris armour.
+  - Kedua pola di `runtime.py` dibangun tanpa raw f-string: `_URL_SCHEME` lewat konkatenasi, `_KEY_BEFORE_QUOTE` lewat `r"""…<SECRET_KEY>…""".replace("<SECRET_KEY>", SECRET_KEY_PATTERN)`. Alasannya dicatat di komentar kode.
+  - Hasil kompilasi kedua pola identik dengan `main`: `pattern` sama byte per byte, `flags` sama; ketujuh `re.Pattern` tingkat modul identik. Perilaku tidak berubah.
+- Keputusan Lead (perbaikan Semgrep):
+  - **Hanya `runtime.py` yang diubah.**
+    - Empat modul lain juga memakai `rf"…"`: `core/redaction.py`, `tools/untrusted.py`, `workspace/index.py`, dan `sandbox_manager/validation.py`. Semgrep tetap menganalisisnya lewat pfff tanpa galat; di scan lokal, temuan PGP di `redaction.py` keluar dari jalur ini.
+    - Menulis ulang 50+ regex di modul redaksi yang baru di-sign-off hanya demi parser cadangan tidak sepadan dengan risikonya [Kemungkinan Besar].
+  - **Tanpa test guard baru.**
+    - Gate Semgrep sudah memblokir setiap galat scan; yang kurang hanya diagnosisnya, dan itu kini tercatat di sini dan di komentar kode.
+    - Guard berbasis teks hanya menebak kombinasi pemicu yang sudah diketahui. Contohnya "tidak ada `rf` di modul yang punya method async".
+- Bukti lokal @ commit perbaikan (PostgreSQL 16 + Redis lokal):
+
+```text
+$ semgrep-core -lang python -tree_sitter_only -dump_ast backend/app/agents/runtime.py
+(sebelum) Common.Impossible  ·  (sesudah) AST tanpa galat
+$ uvx --exclude-newer 2026-10-10T00:00:00Z semgrep==1.180.0 scan --config <semgrep-rules/python> --config <semgrep-rules/generic/secrets>
+(sebelum, 5 modul ber-rf) errors 1 (runtime.py:804) · ERROR detected-pgp-private-key-block redaction.py:226
+(sesudah, seluruh repo)   errors 0 · 484 files scanned · tanpa temuan PGP; runtime.py kini dianalisis (2 WARNING maintainability, non-blocking, false positive atribut `is_error`)
+$ python: old/new _URL_SCHEME dan _KEY_BEFORE_QUOTE
+pattern identical: True · flags identical: True (keduanya)
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports   # backend
+All checks passed! · 332 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
+$ f1-pytest.sh -q                                   # backend, suite penuh (Semgrep + AG-13 berjalan bersamaan)
+1 failed, 5246 passed in 562.82s   # test_grep_parses_off_the_event_loop: timing flaky di bawah beban (WP-2.1d, di luar WP)
+$ uv run pytest -q <test itu> + test bukti T5 (delta_redaction, delta_streams, redaction, redaction_internals, secret_redaction, redaction_linear, delta_redactor_guard)   # kode final
+1278 passed in 34.32s
+```
+
+- Batasnya: rule set lokal adalah direktori `python/` dan `generic/secrets/` dari `semgrep-rules`, superset dari `p/python` dan `p/secrets` CI, bukan rule set yang sama. Bukti akhirnya adalah run `security-scan` di PR perbaikan.
+- **Konvensi (sampai Semgrep dinaikkan):** di modul target Semgrep yang punya method async di dalam class, hindari raw f-string dengan teks di sekitar field (`rf"…{x}…"`). Pakai konkatenasi atau template `.replace`. Aturan ini tidak memprediksi setiap kombinasi pemicu [Kemungkinan Besar]; gate tetap memblokir setiap galat scan.
+- **Tindak lanjut:** periksa versi Semgrep yang lebih baru saat `exclude-newer` dimajukan. Apakah versi baru memperbaiki parser ini belum diketahui [Menebak].
+- **AG-13 (perbaikan Semgrep): SIGNED OFF WITH CONDITIONS 🔒.** Tidak ada temuan CRITICAL/HIGH/MEDIUM. Dua temuan LOW sudah ditutup di commit ini:
+  - placeholder diganti dari `KEY` menjadi `<SECRET_KEY>` supaya kata lain di template tidak ikut terganti;
+  - rumusan pemicu di komentar dan konvensi dilunakkan.
+  Pola tetap identik sesudah kedua perubahan itu (7/7 `re.Pattern`, diverifikasi ulang). Syarat sign-off:
+  1. CI PR hijau di head final, termasuk test bukti T5 dan `security-scan` dengan rule registry `p/*` (errors 0, tanpa finding ERROR);
+  2. commit yang di-push berisi diff yang di-review ditambah kedua penutupan LOW di atas.
