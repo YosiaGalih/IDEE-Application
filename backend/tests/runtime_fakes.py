@@ -150,6 +150,7 @@ class FakeRuns:
         self.finishes: list[tuple[uuid.UUID, RunEnd]] = []
         self.ids: list[uuid.UUID] = []  # the id of each start, as the caller sent it
         self.failed_runs: list[tuple[uuid.UUID, BudgetBreach | None]] = []
+        self.fail_owners: list[tuple[uuid.UUID, str]] = []  # the (task_id, agent_id) each fail names
 
     async def start(self, run: RunStart) -> None:
         self.starts.append(run)
@@ -159,8 +160,16 @@ class FakeRuns:
         self.finishes.append((agent_run_id, end))
         return ZERO_USAGE
 
-    async def fail(self, agent_run_id: uuid.UUID, *, breach: BudgetBreach | None = None) -> None:
+    async def fail(
+        self,
+        agent_run_id: uuid.UUID,
+        *,
+        task_id: uuid.UUID,
+        agent_id: str,
+        breach: BudgetBreach | None = None,
+    ) -> None:
         self.failed_runs.append((agent_run_id, breach))
+        self.fail_owners.append((task_id, agent_id))
 
 
 class FakeEvents:

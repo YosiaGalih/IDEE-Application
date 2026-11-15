@@ -630,11 +630,14 @@ class AgentRunUnfinished(Exception):
 
 
 class AgentRunIdConflict(ValueError):
-    """``RunStore.start``: the id exists for another task or agent. Never a retry of the same run."""
+    """``RunStore.start``: the id exists for another task or agent. Never a retry of the same run. ``run()``
+    also raises it, from the store's ``RunAlreadyFinished``, for an id whose run has ended (ruling R5): the id
+    is spent, and nothing runs under it."""
 
 
 class RunAlreadyFinished(LookupError):
-    """``RunStore.finish``: the run is not ``running`` any more; a run is finished once, never overwritten."""
+    """``RunStore.finish``: the run is not ``running`` any more; a run is finished once, never overwritten.
+    ``RunStore.start``: the id's run, of this task and agent, has ended (a spent id is never reopened)."""
 
 
 class _DeadlineReached(Exception):
@@ -833,17 +836,28 @@ class UsageLedgerPort(Protocol):
 
 class RunStore(Protocol):
     async def start(self, run: RunStart) -> None:
-        """Idempotent on ``run.agent_run_id``: a row that exists for the same task and agent is left as it
-        is; for another task or agent, ``AgentRunIdConflict``."""
+        """Idempotent on ``run.agent_run_id`` while the run is ``running``: a row that exists for the same
+        task and agent and is still ``running`` is left as it is. For another task or agent,
+        ``AgentRunIdConflict``; for the same task and agent whose run has ended, ``RunAlreadyFinished``.
+        Fail-closed (ruling R5): ``start`` never reopens an ended run, so resuming under one id (WP-3.2) needs
+        its own explicit, AG-13-reviewed writer path."""
         ...
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
         """Raises ``RunAlreadyFinished`` for a row that is not ``running``."""
         ...
 
-    async def fail(self, agent_run_id: uuid.UUID, *, breach: BudgetBreach | None = None) -> None:
-        """The minimal end when ``finish`` could not be written: ``failed internal_error``. A known ``breach``
-        is still audited and published, in the same transaction (D-I5)."""
+    async def fail(
+        self,
+        agent_run_id: uuid.UUID,
+        *,
+        task_id: uuid.UUID,
+        agent_id: str,
+        breach: BudgetBreach | None = None,
+    ) -> None:
+        """The minimal end when ``finish`` could not be written: ``failed internal_error``, only for the row
+        of this id, task and agent that is still ``running`` (a foreign id ends nothing; ruling R6). A known
+        ``breach`` is still audited and published, in the same transaction (D-I5)."""
         ...
 
 
@@ -940,6 +954,7 @@ class _Run:
     stop: _RunStop = field(default_factory=_RunStop)
     tally: _Tally = field(default_factory=_Tally)
     started: bool = False  # the store acknowledged ``start``
+    start_sent: bool = False  # a ``start`` was sent (its ack may be lost): a later one is a retry
     iterations: int = 0
     output: BaseModel | None = None
     pending: PendingTool | None = None
@@ -1000,7 +1015,9 @@ class AgentRuntime:
         absorbed profile, no prompt, the wrong input contract, an input over 60 KB, a scenario outside
         scripted) raises before any row exists. From then on every exit leaves a closed ``agent_runs`` row:
         a classified end is returned; an asyncio cancel or an unexpected error closes the run and is raised
-        again."""
+        again. An id that is another run's, or spent (its run ended), raises ``AgentRunIdConflict``: nothing
+        runs under it and nothing is closed (rulings R2, R5). A cancel or an unexpected error already on its
+        way is still the one raised; the conflict is then logged."""
         run = self._admit(request)
         watchers = self._watch(run)
         try:
@@ -1039,6 +1056,10 @@ class AgentRuntime:
             await self._close(run, end)
         except AgentRunUnfinished:
             pass
+        except AgentRunIdConflict:
+            # The close's start found the id another run's (silent M3): nothing was closed, and the original
+            # error (a cancel, an internal error) is the one the caller gets.
+            _log.error("agent_run_id_conflict", **_ctx(run), agent_id=run.spec.agent_id)
 
     # --- before the run -------------------------------------------------------------------------------------
 
@@ -1098,6 +1119,21 @@ class AgentRuntime:
             input=run.request.agent_input.model_dump(mode="json"),
         )
 
+    async def _start(self, run: _Run, start: RunStart) -> None:
+        """``runs.start``: the request's first, or a retry after a lost ack. The store's
+        ``RunAlreadyFinished`` on the first start names a spent id (an ended run of this task and agent):
+        it is raised as ``AgentRunIdConflict``, so nothing runs and nothing is closed (ruling R5). On a retry
+        it is raised as it is: the row may be this run's, ended elsewhere (recovery), and the row is the
+        truth."""
+        first = not run.start_sent
+        run.start_sent = True
+        try:
+            await self._ports.runs.start(start)
+        except RunAlreadyFinished as error:
+            if not first:
+                raise
+            raise AgentRunIdConflict(f"agent run id {run.agent_run_id} already used") from error
+
     # --- the stop token and its sources (Keputusan plan #5, #6; Keputusan Lead #33) -------------------------
 
     def _watch(self, run: _Run) -> list[asyncio.Task[None]]:
@@ -1142,8 +1178,7 @@ class AgentRuntime:
             models = await self._port(run, self._ports.gate.check(request.project_id))
             async with self._ports.providers.open(lambda: _ctx(run)) as provider:
                 model = models[run.spec.model_tier]
-                start = self._run_start(run, provider.name, model)
-                await self._port(run, self._ports.runs.start(start))
+                await self._port(run, self._start(run, self._run_start(run, provider.name, model)))
                 run.started = True
                 return await self._loop(run, provider, model)
         except _DeadlineReached:
@@ -1432,9 +1467,10 @@ class AgentRuntime:
     async def _record_end(self, run: _Run, end: RunEnd) -> RunUsage:
         """The end, written shielded and bounded by ``close_timeout_s``, with one retry (review M5): a write
         still running is waited for once more, a write that failed is tried again. Then, if the row exists,
-        a minimal ``failed internal_error``, and ``AgentRunUnfinished``. Every failure is logged with the
-        run's ids. ``AgentRunIdConflict`` is the exception: the id is another run's, so it is raised at once,
-        with no retry and no ``fail`` (which would end that run)."""
+        a minimal ``failed internal_error`` that names the run's task and agent (the store ends no other row:
+        ruling R6), and ``AgentRunUnfinished``. Every failure is logged with the run's ids.
+        ``AgentRunIdConflict`` is the exception: the id is another run's, or spent, so it is raised at once,
+        with no retry and no ``fail``."""
         failure: BaseException | None = None
         write = self._write(run, end)
         for attempt in (1, 2):
@@ -1443,8 +1479,9 @@ class AgentRuntime:
             except AgentRunIdConflict:
                 raise  # the id is another run's: no retry, no minimal end, no AgentRunUnfinished
             except RunAlreadyFinished as error:
-                # The row is terminal: an earlier write committed and its ack was lost (review N4). Nothing is
-                # written over it; the caller still does not know the end.
+                # The row is terminal: an earlier write committed and its ack was lost (review N4), or a
+                # retried start found the run ended elsewhere (recovery). Nothing is written over it; the
+                # caller still does not know the end.
                 _log.warning("agent_run_already_finished", **_ctx(run), attempt=attempt)
                 raise AgentRunUnfinished(
                     f"the end of agent run {_id(run.agent_run_id)} was already recorded",
@@ -1458,7 +1495,11 @@ class AgentRuntime:
                 )
                 if attempt == 1 and write.done():  # one retry; nothing is started after the last attempt
                     write = self._write(run, end)
-        mark = asyncio.ensure_future(self._ports.runs.fail(run.agent_run_id, breach=end.budget))
+        mark = asyncio.ensure_future(
+            self._ports.runs.fail(
+                run.agent_run_id, task_id=run.request.task_id, agent_id=run.spec.agent_id, breach=end.budget
+            )
+        )
         mark.add_done_callback(_retrieve)
         try:
             await asyncio.wait_for(asyncio.shield(mark), self._config.close_timeout_s)
@@ -1477,7 +1518,7 @@ class AgentRuntime:
 
     async def _write_end(self, run: _Run, end: RunEnd) -> RunUsage:
         if not run.started:  # refused before the provider existed (or the ack was lost): idempotent
-            await self._ports.runs.start(self._run_start(run, None, None))
+            await self._start(run, self._run_start(run, None, None))
             run.started = True
         return await self._ports.runs.finish(run.agent_run_id, end)
 

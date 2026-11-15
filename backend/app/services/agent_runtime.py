@@ -241,8 +241,8 @@ class TaskRunEvents:
 
 
 class AgentRunAlreadyFinished(RunAlreadyFinished):
-    """The run is not ``running`` any more: a run is finished once (never overwritten). The runtime knows it
-    as the port's ``RunAlreadyFinished``."""
+    """The run is not ``running`` any more: a run is finished once (never overwritten), and its id is never
+    started again (spent; ruling R5). The runtime knows it as the port's ``RunAlreadyFinished``."""
 
 
 def _number(value: int | Decimal | None) -> int | str | None:
@@ -260,11 +260,18 @@ class RunOutcome:
     error_code: str | None
 
 
-async def read_run_outcome(session: AsyncSession, agent_run_id: uuid.UUID) -> RunOutcome:
+async def read_run_outcome(
+    session: AsyncSession, agent_run_id: uuid.UUID, *, task_id: uuid.UUID
+) -> RunOutcome:
     """The row's end, read only. For a caller whose ``AgentRuntime.run`` returned no result (Keputusan Lead
-    #11); not for ``AgentRunIdConflict``, whose row is another run's."""
+    #11); not for ``AgentRunIdConflict``, whose row is another run's. Only a row of ``task_id`` is read: a row
+    of another task is ``missing`` (ruling R6)."""
     row = (
-        await session.execute(select(AgentRun.status, AgentRun.error_code).where(AgentRun.id == agent_run_id))
+        await session.execute(
+            select(AgentRun.status, AgentRun.error_code).where(
+                AgentRun.id == agent_run_id, AgentRun.task_id == task_id
+            )
+        )
     ).one_or_none()
     if row is None:
         return RunOutcome("missing", None, None)
@@ -287,8 +294,10 @@ class AgentRunWriter:
 
     async def start(self, run: RunStart) -> None:
         """INSERT ``agent_runs`` (``running``, the input redacted) and ``agent.run_started``, one transaction,
-        committed, then published. Idempotent on ``run.agent_run_id``: a row that exists for the same task
-        and agent is left as it is (no second event); for another task or agent, ``AgentRunIdConflict``."""
+        committed, then published. Idempotent on ``run.agent_run_id`` while the run is ``running``: a row that
+        exists for the same task and agent and is still ``running`` is left as it is (no second event). For
+        another task or agent, ``AgentRunIdConflict``; for the same task and agent whose run has ended,
+        ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a run; ruling R5)."""
         redactor = self._audit.redactor
         run_id = run.agent_run_id
         async with self._sessions() as session:
@@ -315,11 +324,15 @@ class AgentRunWriter:
             if inserted is None:
                 existing = (
                     await session.execute(
-                        select(AgentRun.task_id, AgentRun.agent_id).where(AgentRun.id == run_id)
+                        select(AgentRun.task_id, AgentRun.agent_id, AgentRun.status).where(
+                            AgentRun.id == run_id
+                        )
                     )
                 ).one()
                 if (existing.task_id, existing.agent_id) != (run.task_id, run.agent_id):
                     raise AgentRunIdConflict(f"agent run id {run_id} belongs to another task or agent")
+                if existing.status != "running":
+                    raise AgentRunAlreadyFinished(f"agent run {run_id} has ended: its id is spent")
                 return
             await emit_task_event(
                 session,
@@ -413,9 +426,17 @@ class AgentRunWriter:
             cost_status=totals.cost_status,
         )
 
-    async def fail(self, agent_run_id: uuid.UUID, *, breach: BudgetBreach | None = None) -> None:
+    async def fail(
+        self,
+        agent_run_id: uuid.UUID,
+        *,
+        task_id: uuid.UUID,
+        agent_id: str,
+        breach: BudgetBreach | None = None,
+    ) -> None:
         """The minimal end when ``finish`` could not be written (review M5): ``failed internal_error`` with
-        its usage unknown, only for a row still ``running``; then, in the same transaction,
+        its usage unknown, only for the row of this id, task and agent that is still ``running`` (a foreign
+        id ends nothing; ruling R6); then, in the same transaction,
         ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d). A known ``breach`` also writes
         ``usage.budget_exceeded`` and the audit ``budget.exceeded`` (D-I5); the status stays
         ``failed internal_error``. The project is the cache's, else the task's."""
@@ -425,7 +446,12 @@ class AgentRunWriter:
             ended = (
                 await session.execute(
                     update(AgentRun)
-                    .where(AgentRun.id == agent_run_id, AgentRun.status == "running")
+                    .where(
+                        AgentRun.id == agent_run_id,
+                        AgentRun.task_id == task_id,
+                        AgentRun.agent_id == agent_id,
+                        AgentRun.status == "running",
+                    )
                     .values(
                         status="failed",
                         error_code="internal_error",
@@ -433,13 +459,12 @@ class AgentRunWriter:
                         cost_status="unavailable",
                         finished_at=func.now(),
                     )
-                    .returning(AgentRun.task_id, AgentRun.agent_id)
+                    .returning(AgentRun.id)
                     .execution_options(synchronize_session=False)
                 )
             ).one_or_none()
-            if ended is None:  # finished elsewhere: its end was already published
+            if ended is None:  # finished elsewhere (its end was already published), or not this run's row
                 return
-            task_id, agent_id = ended
             unknown = {"input_tokens": None, "output_tokens": None, "estimated_cost": None}
             await emit_task_event(
                 session,

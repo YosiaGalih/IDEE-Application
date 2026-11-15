@@ -17,7 +17,14 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.agents.runtime import ERROR_TEXT_MAX, AgentRunIdConflict, BudgetBreach, RunEnd, RunStart
+from app.agents.runtime import (
+    ERROR_TEXT_MAX,
+    AgentRunIdConflict,
+    BudgetBreach,
+    RunAlreadyFinished,
+    RunEnd,
+    RunStart,
+)
 from app.core.audit import AuditWriter
 from app.core.redaction import Redactor
 from app.llm.base import Usage
@@ -376,12 +383,12 @@ async def test_fail_is_the_minimal_end_of_a_running_run(
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
-    await writer.fail(run_id)
+    await writer.fail(run_id, task_id=task_id, agent_id="B14")
     row = await stored(session, run_id)
     assert (row.status, row.error_code, row.finished_at is not None) == ("failed", "internal_error", True)
     with pytest.raises(AgentRunAlreadyFinished):
         await writer.finish(run_id, RunEnd("succeeded", 1, output={}))
-    await writer.fail(run_id)  # a second time changes nothing
+    await writer.fail(run_id, task_id=task_id, agent_id="B14")  # a second time changes nothing
     assert (await stored(session, run_id)).error_code == "internal_error"
 
 
@@ -395,7 +402,7 @@ async def test_the_minimal_end_publishes_run_finished_once(
     bus = RecordingBus(engine)
     writer = AgentRunWriter(sessions, bus, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
-    await writer.fail(run_id)
+    await writer.fail(run_id, task_id=task_id, agent_id="B14")
     (finished,) = bus.of_type("agent.run_finished")
     assert finished["payload"] == {
         "agent_run_id": str(run_id),
@@ -412,7 +419,7 @@ async def test_the_minimal_end_publishes_run_finished_once(
     assert finished["seq"] is not None and bus.unseen == []  # stored, committed, then published
     row = await stored(session, run_id)
     assert (row.input_tokens, row.estimated_cost, row.cost_status) == (None, None, "unavailable")
-    await writer.fail(run_id)  # nothing matched: no second event
+    await writer.fail(run_id, task_id=task_id, agent_id="B14")  # nothing matched: no second event
     assert len(bus.of_type("agent.run_finished")) == 1
 
 
@@ -423,7 +430,7 @@ async def test_the_run_store_keeps_no_project_of_an_ended_run(
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
     first = await begin(writer, start(task_id, project_id))
-    await writer.fail(first)
+    await writer.fail(first, task_id=task_id, agent_id="B14")
     assert first not in writer._projects
     second = await begin(writer, start(task_id, project_id))
     await writer.finish(second, RunEnd("cancelled", 0))
@@ -482,10 +489,16 @@ async def test_read_run_outcome_reports_missing_running_and_finished(
     await writer.finish(failed_id, RunEnd("failed", 1, "interrupted", "text"))
     done_id = await begin(writer, start(task_id, project_id))
     await writer.finish(done_id, RunEnd("succeeded", 1, output={}))
-    assert await read_run_outcome(session, uuid.uuid4()) == RunOutcome("missing", None, None)
-    assert await read_run_outcome(session, running_id) == RunOutcome("running", "running", None)
-    assert await read_run_outcome(session, failed_id) == RunOutcome("finished", "failed", "interrupted")
-    assert await read_run_outcome(session, done_id) == RunOutcome("finished", "succeeded", None)
+    assert await read_run_outcome(session, uuid.uuid4(), task_id=task_id) == RunOutcome("missing", None, None)
+    assert await read_run_outcome(session, running_id, task_id=task_id) == RunOutcome(
+        "running", "running", None
+    )
+    assert await read_run_outcome(session, failed_id, task_id=task_id) == RunOutcome(
+        "finished", "failed", "interrupted"
+    )
+    assert await read_run_outcome(session, done_id, task_id=task_id) == RunOutcome(
+        "finished", "succeeded", None
+    )
 
 
 async def test_fail_with_a_breach_audits_budget_exceeded_in_its_transaction(
@@ -499,7 +512,7 @@ async def test_fail_with_a_breach_audits_budget_exceeded_in_its_transaction(
     run_id = await begin(writer, start(task_id, project_id))
     writer._projects.clear()  # a start that found its row leaves no cache entry
     breach = BudgetBreach("cost", Decimal("2"), Decimal("1.95"), Decimal("0.1"))
-    await writer.fail(run_id, breach=breach)
+    await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=breach)
     row = await stored(session, run_id)
     assert (row.status, row.error_code) == ("failed", "internal_error")
     audit = await session.scalar(
@@ -526,7 +539,7 @@ async def test_fail_on_a_finished_row_writes_no_audit(
     run_id = await begin(writer, start(task_id, project_id))
     await writer.finish(run_id, RunEnd("cancelled", 0))
     breach = BudgetBreach("tokens", 1, 1, 0)
-    await writer.fail(run_id, breach=breach)
+    await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=breach)
     audits = list(
         await session.scalars(
             select(AuditEvent).where(
@@ -535,3 +548,65 @@ async def test_fail_on_a_finished_row_writes_no_audit(
         )
     )
     assert audits == [] and bus.of_type("usage.budget_exceeded") == []
+
+
+async def test_start_of_an_ended_run_is_refused_and_changes_nothing(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """AG-13 MEDIUM-1 (ruling R5): an id whose run has ended is spent. ``start`` with it, for the same task
+    and agent, raises the port's ``RunAlreadyFinished``; the row stays as it ended and nothing is emitted."""
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    first = start(task_id, project_id)
+    await writer.start(first)
+    await writer.finish(first.agent_run_id, RunEnd("succeeded", 1, output={"summary": "first"}))
+    with pytest.raises(RunAlreadyFinished) as raised:
+        await writer.start(first)
+    assert isinstance(raised.value, AgentRunAlreadyFinished)
+    row = await stored(session, first.agent_run_id)
+    assert (row.status, row.output, row.error_code) == ("succeeded", {"summary": "first"}, None)
+    types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
+    assert types == ["agent.run_started", "agent.run_finished"]
+    assert len(bus.of_type("agent.run_started")) == 1
+    assert first.agent_run_id not in writer._projects
+    with pytest.raises(AgentRunIdConflict):  # another task's claim on the id is still the conflict
+        await writer.start(replace(first, agent_id="B15"))
+
+
+async def test_fail_ends_only_the_row_of_its_task_and_agent(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """AG-13 LOW-1 (ruling R6): the minimal end is bound to the run's identity. With another task's or
+    another agent's identity the id names a foreign row, which stays ``running`` with no event."""
+    project_id, task_id = await a_task(session)
+    project = await session.get(Project, project_id)
+    assert project is not None
+    other_id = (await make_task(session, project)).id
+    await session.commit()
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    foreign = await begin(writer, start(other_id, project_id))
+    breach = BudgetBreach("tokens", 1, 1, 0)
+    await writer.fail(foreign, task_id=task_id, agent_id="B14", breach=breach)
+    await writer.fail(foreign, task_id=other_id, agent_id="B15")
+    row = await stored(session, foreign)
+    assert (row.status, row.error_code, row.finished_at) == ("running", None, None)
+    assert bus.of_type("agent.run_finished") == [] and bus.of_type("usage.budget_exceeded") == []
+    await writer.fail(foreign, task_id=other_id, agent_id="B14")  # its own identity: ended
+    assert (await stored(session, foreign)).error_code == "internal_error"
+
+
+async def test_read_run_outcome_of_another_task_is_missing(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Ruling R6: the caller reads the row of its own task; a row of another task reads ``missing``."""
+    project_id, task_id = await a_task(session)
+    project = await session.get(Project, project_id)
+    assert project is not None
+    other = await make_task(session, project)
+    await session.commit()
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    run_id = await begin(writer, start(other.id, project_id))
+    assert await read_run_outcome(session, run_id, task_id=task_id) == RunOutcome("missing", None, None)
+    assert await read_run_outcome(session, run_id, task_id=other.id) == RunOutcome("running", "running", None)
