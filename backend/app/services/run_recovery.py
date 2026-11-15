@@ -19,8 +19,10 @@ and (lease_dead, or its run is closed in the same transaction, or its run is no 
 **Unit: the task, in one transaction.** The task row is locked first (``lock_task_row``: ``FOR NO KEY
 UPDATE SKIP LOCKED``, the gateway's order, task before tool call), then its matching runs and tool calls
 (``FOR UPDATE SKIP LOCKED``); every UPDATE is conditional on ``running``. A row that another sweep or the
-runtime holds is left to the next sweep. When recovery closes a run first, the runtime's ``finish`` raises
-``AgentRunAlreadyFinished``. The transaction commits, then its events are published.
+runtime holds is left to the next sweep, and counted and logged as skipped (``run_recovery_skipped``): a
+busy task row, or a candidate run or tool call the lock passed over. A skip is not a failure (a live
+transaction may hold the task row for a moment). When recovery closes a run first, the runtime's ``finish``
+raises ``AgentRunAlreadyFinished``. The transaction commits, then its events are published.
 
 This module writes ``agent_runs.status`` and so never holds the Task model (tests/unit/
 test_status_writer_guard.py); the task side comes from ``app.workflow.recovery``.
@@ -76,6 +78,14 @@ class RunRecoveryResult:
     runs: int  # agent_runs closed failed/interrupted
     tool_calls: int  # tool_calls closed error/outcome_unknown
     failed: int  # tasks whose transaction failed; the next sweep tries them again
+    skipped: int  # busy tasks plus candidate runs/tool calls held by another transaction; not a failure
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskRecovery:
+    runs: int
+    tool_calls: int
+    skipped: int
 
 
 class RunRecoveryIncomplete(RuntimeError):
@@ -128,33 +138,35 @@ async def recover_runs(
     )
     async with sessions() as db:
         candidates = (await db.scalars(candidates_query)).all()
-    runs = tool_calls = failed = 0
+    runs = tool_calls = failed = skipped = 0
     for task_id in candidates:
         try:
-            closed_runs, closed_calls = await _recover_task(sessions, bus, audit, task_id)
+            done = await _recover_task(sessions, bus, audit, task_id)
         except Exception as exc:
             # Type only: an exception text may carry row values. The next sweep tries this task again.
             failed += 1
             logger.error("run_recovery_failed", task_id=str(task_id), error_type=type(exc).__name__)
             continue
-        runs += closed_runs
-        tool_calls += closed_calls
-    result = RunRecoveryResult(len(candidates), runs, tool_calls, failed)
+        runs += done.runs
+        tool_calls += done.tool_calls
+        skipped += done.skipped
+    result = RunRecoveryResult(len(candidates), runs, tool_calls, failed, skipped)
     if failed:
         logger.warning("run_recovery_sweep", **asdict(result))
-    elif runs or tool_calls:
+    elif runs or tool_calls or skipped:
         logger.info("run_recovery_sweep", **asdict(result))
     return result
 
 
 async def _recover_task(
     sessions: async_sessionmaker[AsyncSession], bus: EventBus, audit: AuditWriter, task_id: uuid.UUID
-) -> tuple[int, int]:
+) -> _TaskRecovery:
     async with sessions() as db:
         await bound_transaction(db)
         project_id = await lock_task_row(db, task_id)
         if project_id is None:  # another sweep or a worker holds the task row: the next sweep sees it again
-            return 0, 0
+            logger.warning("run_recovery_skipped", task_id=str(task_id), reason="task_locked")
+            return _TaskRecovery(0, 0, 1)
         runs = (
             await db.execute(
                 _closable_runs()
@@ -162,13 +174,15 @@ async def _recover_task(
                 .with_for_update(of=AgentRun, skip_locked=True)
             )
         ).all()
+        run_ids = [run.id for run in runs]
         calls = (
             await db.scalars(
-                _closable_calls([run.id for run in runs])
+                _closable_calls(run_ids)
                 .where(ToolCall.task_id == task_id)
                 .with_for_update(of=ToolCall, skip_locked=True)
             )
         ).all()
+        held_runs, held_calls = await _held(db, task_id, run_ids, [call.id for call in calls])
         closed: list[str] = []
         for run in runs:
             if await _close_run(db, bus, audit.redactor, task_id, run.id, run.agent_id):
@@ -176,11 +190,35 @@ async def _recover_task(
         closed_calls = await close_abandoned_calls(db, audit, calls, project_id=project_id)
         await db.commit()
         await publish_pending(db, bus)
+    if held_runs or held_calls:
+        logger.warning(
+            "run_recovery_skipped",
+            task_id=str(task_id),
+            reason="rows_locked",
+            runs=held_runs,
+            tool_calls=held_calls,
+        )
     if closed or closed_calls:
         logger.info(
             "agent_runs_recovered", task_id=str(task_id), agent_run_ids=closed, tool_calls=closed_calls
         )
-    return len(closed), closed_calls
+    return _TaskRecovery(len(closed), closed_calls, held_runs + held_calls)
+
+
+async def _held(
+    db: AsyncSession, task_id: uuid.UUID, run_ids: Sequence[uuid.UUID], call_ids: Sequence[uuid.UUID]
+) -> tuple[int, int]:
+    """The task's runs and tool calls that match the predicates but were not locked (another transaction
+    holds them): read in the same transaction, right after the locking reads."""
+    held_runs = _closable_runs().where(AgentRun.task_id == task_id, AgentRun.id.not_in(run_ids))
+    held_calls = (
+        _closable_calls(run_ids)
+        .with_only_columns(ToolCall.id)
+        .where(ToolCall.task_id == task_id, ToolCall.id.not_in(call_ids))
+    )
+    runs = await db.scalar(select(func.count()).select_from(held_runs.subquery()))
+    calls = await db.scalar(select(func.count()).select_from(held_calls.subquery()))
+    return runs or 0, calls or 0
 
 
 async def _close_run(

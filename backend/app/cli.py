@@ -64,6 +64,7 @@ def _recover() -> int:
         "runs_recovered",
         "tool_calls_closed",
         "runs_failed",
+        "runs_skipped",
     )
     print(", ".join(f"{name}: {counts[name]}" for name in names))
     return 0 if counts["failed"] == 0 and counts["runs_failed"] == 0 else 1

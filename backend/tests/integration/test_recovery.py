@@ -246,7 +246,7 @@ def test_cli_recover_reports_counts(
     assert main(["recover"]) == 0
     out = capsys.readouterr().out
     assert "candidates: 1, recovered: 1, failed: 0, skipped: 0" in out
-    assert "runs_recovered: 0, tool_calls_closed: 0, runs_failed: 0" in out
+    assert "runs_recovered: 0, tool_calls_closed: 0, runs_failed: 0, runs_skipped: 0" in out
     assert asyncio.run(read_status(migrated_database, task_id)) == "interrupted"
 
 
@@ -265,6 +265,7 @@ def test_celery_job_runs_the_sweep(monkeypatch: pytest.MonkeyPatch, migrated_dat
         "runs_recovered": 0,
         "tool_calls_closed": 0,
         "runs_failed": 0,
+        "runs_skipped": 0,
     }
     assert asyncio.run(read_status(migrated_database, task_id)) == "interrupted"
 
@@ -301,7 +302,9 @@ def test_failed_recoveries_fail_the_celery_job(monkeypatch: pytest.MonkeyPatch) 
     assert isinstance(result.result, RecoveryIncomplete)
 
 
-def _patch_sweep_parts(monkeypatch: pytest.MonkeyPatch, tasks_failed: int, runs_failed: int) -> list[str]:
+def _patch_sweep_parts(
+    monkeypatch: pytest.MonkeyPatch, tasks_failed: int, runs_failed: int, runs_skipped: int = 0
+) -> list[str]:
     from app.worker import jobs
     from app.workflow.recovery import RecoveryResult
 
@@ -313,7 +316,7 @@ def _patch_sweep_parts(monkeypatch: pytest.MonkeyPatch, tasks_failed: int, runs_
 
     async def fake_runs(*_a: object, **_k: object) -> RunRecoveryResult:
         calls.append("runs")
-        return RunRecoveryResult(tasks=1, runs=2, tool_calls=3, failed=runs_failed)
+        return RunRecoveryResult(tasks=1, runs=2, tool_calls=3, failed=runs_failed, skipped=runs_skipped)
 
     monkeypatch.setattr(jobs, "recover_expired", fake_tasks)
     monkeypatch.setattr(jobs, "recover_runs", fake_runs)
@@ -362,13 +365,13 @@ def test_cli_recover_fails_on_run_failures_and_prints_all_counts(
     _patch_sweep_parts(monkeypatch, tasks_failed=0, runs_failed=1)
     assert main(["recover"]) == 1
     out = capsys.readouterr().out
-    assert "runs_recovered: 2, tool_calls_closed: 3, runs_failed: 1" in out
+    assert "runs_recovered: 2, tool_calls_closed: 3, runs_failed: 1, runs_skipped: 0" in out
 
 
 # Run recovery (WP-3.1f2b1, spec 3.1f2b Keputusan Lead #3-#8) ---------------------------------------------
 
 LIVE, DEAD = "30 seconds", "-5 seconds"
-NOTHING = RunRecoveryResult(tasks=0, runs=0, tool_calls=0, failed=0)
+NOTHING = RunRecoveryResult(tasks=0, runs=0, tool_calls=0, failed=0, skipped=0)
 
 
 @pytest.fixture
@@ -487,7 +490,7 @@ async def test_run_of_a_task_without_a_live_lease_is_interrupted(  # type: ignor
 
     result = await recover_runs(sessions, bus, AUDIT)
 
-    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0, skipped=0)
     row = await run_row(engine, run_id)
     assert (row.status, row.error_code, row.cost_status) == ("failed", "interrupted", "partial")
     assert row.input_tokens == ledger_input_sum and row.finished_at is not None
@@ -561,7 +564,7 @@ async def test_stale_run_under_a_live_lease_is_interrupted(  # type: ignore[no-u
     task_id = await make_task("running", LIVE)
     run_id = await start_run(engine, task_id, age_s=300 + 61)
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
-    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0, skipped=0)
     row = await run_row(engine, run_id)
     assert (row.status, row.error_code) == ("failed", "interrupted")
     assert row.duration_ms is not None and row.duration_ms >= 361_000  # from started_at, on the DB clock
@@ -585,7 +588,7 @@ async def test_run_without_a_profile_timeout_uses_3600_seconds(  # type: ignore[
     inside = await start_run(engine, task_id, age_s=3600 + 59)
     past = await start_run(engine, task_id, age_s=3600 + 61)
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
-    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0, skipped=0)
     assert (await run_row(engine, inside)).status == "running"  # not "always stale"
     assert (await run_row(engine, past)).error_code == "interrupted"  # not "never stale"
 
@@ -601,7 +604,7 @@ async def test_tool_calls_of_a_recovered_run_close_unknown(  # type: ignore[no-u
     r1 = await running_call(engine, task_id, run_id, risk=1, name="repo.write_file")
     bus = RecordingBus(engine)
     result = await recover_runs(make_sessionmaker(engine), bus, AUDIT)
-    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=2, failed=0)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=2, failed=0, skipped=0)
     assert await call_state(engine, r0) == ("error", "outcome_unknown")
     assert await call_state(engine, r1) == ("error", "outcome_unknown")
     async with make_sessionmaker(engine)() as session:
@@ -628,7 +631,7 @@ async def test_running_tool_call_of_a_finished_run_closes_under_a_live_lease(  #
         run_id, RunEnd("succeeded", 1, output={})
     )
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
-    assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0)
+    assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0, skipped=0)
     assert await call_state(engine, call_id) == ("error", "outcome_unknown")
     row = await run_row(engine, run_id)
     assert (row.status, row.error_code) == ("succeeded", None)  # the runtime's end stays
@@ -642,7 +645,7 @@ async def test_running_tool_call_without_a_run_on_a_dead_lease_closes(  # type: 
     orphan = await running_call(engine, dead, None)
     engine_call = await running_call(engine, live, None)  # an engine call (WP-3.2) whose worker is alive
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
-    assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0)
+    assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0, skipped=0)
     assert await call_state(engine, orphan) == ("error", "outcome_unknown")
     assert await call_state(engine, engine_call) == ("running", None)
 
@@ -754,7 +757,7 @@ async def test_a_bad_profile_timeout_uses_3600_seconds_and_stops_nothing(  # typ
     inside = await start_run(engine, task_id, age_s=3600 + 59)
     past = await start_run(engine, task_id, age_s=3600 + 61)
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
-    assert result == RunRecoveryResult(tasks=2, runs=2, tool_calls=0, failed=0)
+    assert result == RunRecoveryResult(tasks=2, runs=2, tool_calls=0, failed=0, skipped=0)
     assert (await run_row(engine, other_run)).error_code == "interrupted"
     assert (await run_row(engine, inside)).status == "running"
     assert (await run_row(engine, past)).error_code == "interrupted"
@@ -768,7 +771,7 @@ async def test_a_run_older_than_the_int4_milliseconds_still_closes(  # type: ign
     task_id = await make_task("running", DEAD)
     run_id = await start_run(engine, task_id, age_s=25 * 24 * 3600)
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
-    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0, skipped=0)
     row = await run_row(engine, run_id)
     assert (row.status, row.error_code, row.duration_ms) == ("failed", "interrupted", 2_147_483_647)
 
@@ -797,7 +800,7 @@ async def test_one_failing_task_does_not_stop_the_run_sweep(  # type: ignore[no-
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
     other_row = await run_row(engine, other_run)
     assert result.failed == 1 and other_row.status == "failed"
-    assert result == RunRecoveryResult(tasks=2, runs=1, tool_calls=1, failed=1)
+    assert result == RunRecoveryResult(tasks=2, runs=1, tool_calls=1, failed=1, skipped=0)
     assert (await run_row(engine, bad_run)).status == "running"  # its run's close rolled back with the task
     out = capsys.readouterr().out
     assert "run_recovery_failed" in out and "RuntimeError" in out
@@ -806,7 +809,7 @@ async def test_one_failing_task_does_not_stop_the_run_sweep(  # type: ignore[no-
 
 def test_run_recovery_incomplete_is_rebuilt_from_its_result() -> None:
     """Celery re-creates a task's exception from ``__reduce__`` (like ``RecoveryIncomplete``)."""
-    result = RunRecoveryResult(tasks=3, runs=1, tool_calls=2, failed=1)
+    result = RunRecoveryResult(tasks=3, runs=1, tool_calls=2, failed=1, skipped=0)
     rebuild, args = RunRecoveryIncomplete(result).__reduce__()
     rebuilt = rebuild(*args)
     assert isinstance(rebuilt, RunRecoveryIncomplete) and rebuilt.result == result
@@ -820,3 +823,187 @@ def test_run_recovery_reads_only_the_db_clock() -> None:
     modules |= {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
     assert not {m.split(".")[0] for m in modules} & {"datetime", "time"}
     assert "clock_timestamp" in inspect.getsource(run_recovery)
+
+
+# Final fix wave (WP-3.1f2b1 F5, F7) ------------------------------------------------------------------------
+
+
+async def test_a_busy_task_is_skipped_reported_and_recovered_later(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    """Silent M1: a task row another transaction holds is skipped, counted and logged, never hidden behind a
+    healthy-looking idle sweep. A skip does not fail the sweep; the next one closes the run."""
+    from structlog.testing import capture_logs
+
+    task_id = await make_task("running", DEAD)
+    run_id = await start_run(engine, task_id)
+    sessions = make_sessionmaker(engine)
+    async with engine.connect() as holder:
+        transaction = await holder.begin()
+        await holder.execute(text("SELECT id FROM tasks WHERE id = :id FOR UPDATE"), {"id": task_id})
+        with capture_logs() as logs:
+            result = await recover_runs(sessions, RecordingBus(), AUDIT)
+        await transaction.rollback()
+    assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=0, failed=0, skipped=1)
+    assert (await run_row(engine, run_id)).status == "running"
+    [skipped] = [log for log in logs if log["event"] == "run_recovery_skipped"]
+    assert (skipped["log_level"], skipped["task_id"], skipped["reason"]) == (
+        "warning",
+        str(task_id),
+        "task_locked",
+    )
+    later = await recover_runs(sessions, RecordingBus(), AUDIT)
+    assert later == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0, skipped=0)
+
+
+async def test_held_run_and_tool_call_rows_are_skipped_and_reported(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    """Silent M1: inside a task, a candidate run or tool call row that ``SKIP LOCKED`` passed over is counted
+    as skipped (and logged with the task); the rows it could lock are still closed."""
+    from structlog.testing import capture_logs
+
+    task_id = await make_task("running", DEAD)
+    held_run, free_run = await start_run(engine, task_id), await start_run(engine, task_id)
+    held_call = await running_call(engine, task_id, None)
+    async with engine.connect() as holder:
+        transaction = await holder.begin()
+        await holder.execute(text("SELECT id FROM agent_runs WHERE id = :id FOR UPDATE"), {"id": held_run})
+        await holder.execute(text("SELECT id FROM tool_calls WHERE id = :id FOR UPDATE"), {"id": held_call})
+        with capture_logs() as logs:
+            result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+        await transaction.rollback()
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0, skipped=2)
+    assert (await run_row(engine, free_run)).error_code == "interrupted"
+    assert (await run_row(engine, held_run)).status == "running"
+    assert await call_state(engine, held_call) == ("running", None)
+    [skipped] = [log for log in logs if log["event"] == "run_recovery_skipped"]
+    assert (skipped["task_id"], skipped["reason"], skipped["runs"], skipped["tool_calls"]) == (
+        str(task_id),
+        "rows_locked",
+        1,
+        1,
+    )
+
+
+def test_skipped_rows_never_fail_the_job_and_are_counted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], migrated_database: str
+) -> None:
+    from app.cli import main
+    from app.worker import jobs
+    from tests.conftest import make_test_env
+
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    _patch_sweep_parts(monkeypatch, tasks_failed=0, runs_failed=0, runs_skipped=2)
+    result = jobs.recovery_sweep.apply()
+    assert result.successful() and result.get()["runs_skipped"] == 2
+    assert main(["recover"]) == 0
+    assert "runs_failed: 0, runs_skipped: 2" in capsys.readouterr().out
+
+
+def _patch_raising_phases(
+    monkeypatch: pytest.MonkeyPatch,
+    tasks: BaseException | int,
+    runs: BaseException | int,
+) -> list[str]:
+    """``recover_expired``/``recover_runs`` that raise the given exception, or return a result with that many
+    failures."""
+    from app.worker import jobs
+    from app.workflow.recovery import RecoveryResult
+
+    calls: list[str] = []
+
+    async def fake_tasks(*_a: object, **_k: object) -> RecoveryResult:
+        calls.append("tasks")
+        if isinstance(tasks, BaseException):
+            raise tasks
+        return RecoveryResult(candidates=1, recovered=1 - tasks, failed=tasks, skipped=0)
+
+    async def fake_runs(*_a: object, **_k: object) -> RunRecoveryResult:
+        calls.append("runs")
+        if isinstance(runs, BaseException):
+            raise runs
+        return RunRecoveryResult(tasks=1, runs=1 - runs, tool_calls=0, failed=runs, skipped=0)
+
+    monkeypatch.setattr(jobs, "recover_expired", fake_tasks)
+    monkeypatch.setattr(jobs, "recover_runs", fake_runs)
+    return calls
+
+
+def test_a_raising_task_phase_never_starves_run_recovery(
+    monkeypatch: pytest.MonkeyPatch, migrated_database: str
+) -> None:
+    """Backend M2 / silent L3 (ruling R8): an exception of task recovery is held; run recovery still runs,
+    then the task phase's exception is raised (the job fails loudly)."""
+    from app.worker import jobs
+    from tests.conftest import make_test_env
+
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    boom = RuntimeError("task phase down")
+    calls = _patch_raising_phases(monkeypatch, tasks=boom, runs=0)
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(jobs.run_recovery_sweep())
+    assert raised.value is boom
+    assert calls == ["tasks", "runs"]
+
+
+def test_a_hung_task_phase_times_out_alone(monkeypatch: pytest.MonkeyPatch, migrated_database: str) -> None:
+    """Ruling R8: each phase has its own half of the sweep's timeout; a hung task phase times out and run
+    recovery still gets its own half."""
+    from app.worker import jobs
+    from app.workflow.recovery import RecoveryResult
+    from tests.conftest import make_test_env
+
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(jobs, "SWEEP_TIMEOUT_SECONDS", 0.4)
+    calls: list[str] = []
+
+    async def hung_tasks(*_a: object, **_k: object) -> RecoveryResult:
+        calls.append("tasks")
+        await asyncio.sleep(10)
+        raise AssertionError("not reached")
+
+    async def slow_runs(*_a: object, **_k: object) -> RunRecoveryResult:
+        await asyncio.sleep(0.1)  # inside its own 0.2 s, though the task phase used all of its time
+        calls.append("runs")
+        return RunRecoveryResult(tasks=0, runs=0, tool_calls=0, failed=0, skipped=0)
+
+    monkeypatch.setattr(jobs, "recover_expired", hung_tasks)
+    monkeypatch.setattr(jobs, "recover_runs", slow_runs)
+    with pytest.raises(TimeoutError):
+        asyncio.run(jobs.run_recovery_sweep())
+    assert calls == ["tasks", "runs"]
+
+
+@pytest.mark.parametrize(
+    ("tasks", "runs", "raised"),
+    [
+        (RuntimeError("tasks"), ValueError("runs"), RuntimeError),  # the task phase's exception first
+        (1, ValueError("runs"), "RecoveryIncomplete"),  # then RecoveryIncomplete
+        (0, ValueError("runs"), ValueError),  # then the run phase's exception
+        (0, 1, "RunRecoveryIncomplete"),  # then RunRecoveryIncomplete
+    ],
+)
+def test_the_sweep_raises_in_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    migrated_database: str,
+    tasks: BaseException | int,
+    runs: BaseException | int,
+    raised: type[BaseException] | str,
+) -> None:
+    from app.worker import jobs
+    from app.workflow.recovery import RecoveryIncomplete
+    from tests.conftest import make_test_env
+
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    calls = _patch_raising_phases(monkeypatch, tasks=tasks, runs=runs)
+    expected = {"RecoveryIncomplete": RecoveryIncomplete, "RunRecoveryIncomplete": RunRecoveryIncomplete}
+    kind = expected[raised] if isinstance(raised, str) else raised
+    with pytest.raises(Exception) as info:  # the exact type is checked below
+        asyncio.run(jobs.run_recovery_sweep())
+    assert type(info.value) is kind
+    assert calls == ["tasks", "runs"]
