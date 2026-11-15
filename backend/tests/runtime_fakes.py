@@ -28,6 +28,7 @@ from app.agents.registry import AgentRegistry, AgentSpec, load_registry
 from app.agents.runtime import (
     AgentRunRequest,
     AgentRuntime,
+    BudgetBreach,
     ModelCall,
     RunEnd,
     RunScope,
@@ -148,7 +149,7 @@ class FakeRuns:
         self.starts: list[RunStart] = []
         self.finishes: list[tuple[uuid.UUID, RunEnd]] = []
         self.ids: list[uuid.UUID] = []  # the id of each start, as the caller sent it
-        self.failed_runs: list[uuid.UUID] = []
+        self.failed_runs: list[tuple[uuid.UUID, BudgetBreach | None]] = []
 
     async def start(self, run: RunStart) -> None:
         self.starts.append(run)
@@ -158,8 +159,8 @@ class FakeRuns:
         self.finishes.append((agent_run_id, end))
         return ZERO_USAGE
 
-    async def fail(self, agent_run_id: uuid.UUID) -> None:
-        self.failed_runs.append(agent_run_id)
+    async def fail(self, agent_run_id: uuid.UUID, *, breach: BudgetBreach | None = None) -> None:
+        self.failed_runs.append((agent_run_id, breach))
 
 
 class FakeEvents:

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
-from sqlalchemy import Integer, cast, func, select, update
+from sqlalchemy import Integer, cast, column, func, select, table, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -74,6 +74,9 @@ from app.workflow.budget import BudgetDefaults, BudgetExceeded, BudgetGuard, Cal
 from app.workflow.lease import LeaseLost, renew_lease
 
 _log = get_logger(__name__)
+# Only the project of a task is read, and only for the audit of a minimal end: this module may not import the
+# task model (the runtime never moves a task; the import contract), and a column is all it needs.
+_TASK_PROJECT = table("tasks", column("id"), column("project_id"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,7 +397,9 @@ class AgentRunWriter:
                 redactor=redactor,
             )
             if end.budget is not None:
-                await self._budget_exceeded(session, agent_run_id, task_id, agent_id, end.budget)
+                await self._budget_exceeded(
+                    session, agent_run_id, task_id, agent_id, self._projects.get(agent_run_id), end.budget
+                )
             await session.commit()
             if self._bus is not None:
                 await publish_pending(session, self._bus)
@@ -408,11 +413,13 @@ class AgentRunWriter:
             cost_status=totals.cost_status,
         )
 
-    async def fail(self, agent_run_id: uuid.UUID) -> None:
+    async def fail(self, agent_run_id: uuid.UUID, *, breach: BudgetBreach | None = None) -> None:
         """The minimal end when ``finish`` could not be written (review M5): ``failed internal_error`` with
         its usage unknown, only for a row still ``running``; then, in the same transaction,
-        ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d)."""
-        self._projects.pop(agent_run_id, None)
+        ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d). A known ``breach`` also writes
+        ``usage.budget_exceeded`` and the audit ``budget.exceeded`` (D-I5); the status stays
+        ``failed internal_error``. The project is the cache's, else the task's."""
+        project_id = self._projects.pop(agent_run_id, None)
         async with self._sessions() as session:
             await bound_transaction(session)
             ended = (
@@ -448,6 +455,12 @@ class AgentRunWriter:
                 },
                 redactor=self._audit.redactor,
             )
+            if breach is not None:
+                if project_id is None:  # an idempotent start that found its row filled no cache entry
+                    project_id = await session.scalar(
+                        select(_TASK_PROJECT.c.project_id).where(_TASK_PROJECT.c.id == task_id)
+                    )
+                await self._budget_exceeded(session, agent_run_id, task_id, agent_id, project_id, breach)
             await session.commit()
             if self._bus is not None:
                 await publish_pending(session, self._bus)
@@ -458,6 +471,7 @@ class AgentRunWriter:
         agent_run_id: uuid.UUID,
         task_id: uuid.UUID,
         agent_id: str,
+        project_id: uuid.UUID | None,
         breach: BudgetBreach,
     ) -> None:
         await emit_task_event(
@@ -476,7 +490,7 @@ class AgentRunWriter:
             result="denied",
             resource_type="agent_run",
             resource_id=str(agent_run_id),
-            project_id=self._projects.get(agent_run_id),
+            project_id=project_id,
             metadata={
                 "task_id": str(task_id),
                 "kind": breach.kind,

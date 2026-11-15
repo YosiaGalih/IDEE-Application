@@ -1031,7 +1031,7 @@ class FlakyRuns(FakeRuns):
             raise RuntimeError("database blip")
         return await super().finish(agent_run_id, end)
 
-    async def fail(self, agent_run_id: uuid.UUID) -> None:
+    async def fail(self, agent_run_id: uuid.UUID, *, breach: BudgetBreach | None = None) -> None:
         self.failed.append(agent_run_id)
 
 
@@ -1550,7 +1550,7 @@ async def test_a_failing_close_starts_the_write_and_one_retry_only() -> None:
     with pytest.raises(AgentRunUnfinished):
         await make_runtime(fakes, runtime_config=config(close_timeout_s=0.2)).run(run_request("B14"))
     await asyncio.sleep(0.1)  # a write started after the last attempt would run now
-    assert runs.writes == 2 and runs.failed_runs == runs.ids
+    assert runs.writes == 2 and runs.failed_runs == [(rid, None) for rid in runs.ids]
 
 
 async def test_unfinished_names_the_run_and_its_task() -> None:
@@ -1795,3 +1795,15 @@ async def test_a_foreign_run_id_writes_nothing_and_ends_nothing() -> None:
         await make_runtime(fakes).run(run_request("B14"))
     assert fakes.runs.failed_runs == [] and fakes.runs.finishes == []
     assert len(fakes.runs.starts) == 1
+
+
+async def test_a_budget_end_that_could_not_be_written_passes_its_breach_to_fail() -> None:
+    """D-I5 (#12): the minimal end keeps the known breach, so its audit and event are not lost."""
+    fakes = Fakes(scripted(tool_turn("repo.read_file", {"path": "a"}), submit_turn(VALID_IMPLEMENT)))
+    fakes.budget.tools.refuse[1] = BudgetRefused("tool_iterations", 3, 3, next_bound=0)
+    runs = DownRuns()
+    fakes.runs = runs
+    with pytest.raises(AgentRunUnfinished):
+        await make_runtime(fakes, runtime_config=config(close_timeout_s=0.2)).run(run_request("B14"))
+    breach = BudgetBreach("tool_iterations", 3, 3, 0)
+    assert runs.failed_runs == [(runs.ids[0], breach)]

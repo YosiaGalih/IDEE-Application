@@ -486,3 +486,52 @@ async def test_read_run_outcome_reports_missing_running_and_finished(
     assert await read_run_outcome(session, running_id) == RunOutcome("running", "running", None)
     assert await read_run_outcome(session, failed_id) == RunOutcome("finished", "failed", "interrupted")
     assert await read_run_outcome(session, done_id) == RunOutcome("finished", "succeeded", None)
+
+
+async def test_fail_with_a_breach_audits_budget_exceeded_in_its_transaction(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """D-I5 (#12): the minimal end of a ``budget_exceeded`` run keeps the audit and the event; the status
+    stays ``failed internal_error``. The project comes from the task when the cache is empty."""
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    run_id = await begin(writer, start(task_id, project_id))
+    writer._projects.clear()  # a start that found its row leaves no cache entry
+    breach = BudgetBreach("cost", Decimal("2"), Decimal("1.95"), Decimal("0.1"))
+    await writer.fail(run_id, breach=breach)
+    row = await stored(session, run_id)
+    assert (row.status, row.error_code) == ("failed", "internal_error")
+    audit = await session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "budget.exceeded", AuditEvent.resource_id == str(run_id)
+        )
+    )
+    assert audit is not None and audit.project_id == project_id and audit.resource_id == str(run_id)
+    kinds = [event.type for event in await session.scalars(select(TaskEvent).order_by(TaskEvent.seq))]
+    assert [k for k in kinds if k in ("agent.run_finished", "usage.budget_exceeded")] == [
+        "agent.run_finished",
+        "usage.budget_exceeded",
+    ]
+    (event,) = bus.of_type("usage.budget_exceeded")
+    assert event["payload"] == {"kind": "cost", "limit": "2", "used": "1.95"}
+
+
+async def test_fail_on_a_finished_row_writes_no_audit(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    run_id = await begin(writer, start(task_id, project_id))
+    await writer.finish(run_id, RunEnd("cancelled", 0))
+    breach = BudgetBreach("tokens", 1, 1, 0)
+    await writer.fail(run_id, breach=breach)
+    audits = list(
+        await session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "budget.exceeded", AuditEvent.resource_id == str(run_id)
+            )
+        )
+    )
+    assert audits == [] and bus.of_type("usage.budget_exceeded") == []

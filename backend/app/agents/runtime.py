@@ -841,8 +841,9 @@ class RunStore(Protocol):
         """Raises ``RunAlreadyFinished`` for a row that is not ``running``."""
         ...
 
-    async def fail(self, agent_run_id: uuid.UUID) -> None:
-        """The minimal end when ``finish`` could not be written: ``failed internal_error``."""
+    async def fail(self, agent_run_id: uuid.UUID, *, breach: BudgetBreach | None = None) -> None:
+        """The minimal end when ``finish`` could not be written: ``failed internal_error``. A known ``breach``
+        is still audited and published, in the same transaction (D-I5)."""
         ...
 
 
@@ -1457,7 +1458,7 @@ class AgentRuntime:
                 )
                 if attempt == 1 and write.done():  # one retry; nothing is started after the last attempt
                     write = self._write(run, end)
-        mark = asyncio.ensure_future(self._ports.runs.fail(run.agent_run_id))
+        mark = asyncio.ensure_future(self._ports.runs.fail(run.agent_run_id, breach=end.budget))
         mark.add_done_callback(_retrieve)
         try:
             await asyncio.wait_for(asyncio.shield(mark), self._config.close_timeout_s)
