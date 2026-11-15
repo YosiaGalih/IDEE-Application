@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import re
 from types import MappingProxyType
+from typing import Any
 
 import pytest
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -156,16 +158,35 @@ async def test_an_r3_call_outside_an_agent_run_is_refused(
     assert await _approvals(sessions) == []
 
 
+class R3ArgvInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    argv: list[Any]
+
+
+@pytest.mark.parametrize(
+    ("raw", "input_model"),
+    [
+        ({"target": f"x {SECRET}"}, None),
+        # Silent-failure review MEDIUM-1 (final review of 74bf8d4): a secret flag's value that is no string
+        # (a list here) is still a secret; redact_obj drops it, so the input changes and is refused.
+        ({"argv": ["mysql", "--password", ["hunter2hunter2"]]}, R3ArgvInput),
+    ],
+    ids=["configured secret", "argv value in a list"],
+)
 async def test_an_r3_input_carrying_a_secret_is_refused(
-    sessions: async_sessionmaker[AsyncSession], scope: Scope
+    sessions: async_sessionmaker[AsyncSession],
+    scope: Scope,
+    raw: dict[str, Any],
+    input_model: type[BaseModel] | None,
 ) -> None:
     # An approval payload is stored and shown as is; it cannot be redacted without breaking its hash.
-    built = gateway(sessions, spec("test.r3", Recorder()))
+    overrides = {} if input_model is None else {"input_model": input_model}
+    built = gateway(sessions, spec("test.r3", Recorder(), **overrides))
     async with sessions() as session:
         run_id = await make_run(session, scope.task_id)
         await session.commit()
     ctx = context(task_id=scope.task_id, project_id=scope.project_id, tools=["test.r3"], agent_run_id=run_id)
-    result = await built.execute(ctx, "test.r3", {"target": f"x {SECRET}"}, tool_use_id="toolu_1")
+    result = await built.execute(ctx, "test.r3", raw, tool_use_id="toolu_1")
     assert (result.status, result.content) == ("denied", DENIALS["secret_in_input"])
     assert await _approvals(sessions) == []
 

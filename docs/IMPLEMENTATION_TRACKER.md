@@ -2618,3 +2618,82 @@ $ cd frontend && npm audit --omit=dev --audit-level=high
 found 0 vulnerabilities
 ```
 
+
+**Syarat sesudah PR #32 [Pasti]:** PR #32 (opentelemetry-api 1.45.2) CI 9/9 `success` di 783249e, termasuk run Semgrep dan Trivy pertama atas kode WP-3.1f2a: kesebelas langkah `security-scan` lulus. Di-merge PO 14 Nov 2026 (8251c84). Push-CI `main` di 8251c84 hijau.
+
+### WP-3.1f2c (🔒 pengerasan redaksi) — `Redactor` R-1..R-6, sisa delta D2-L1/D2-L2/D2-I1/D2-I2, `agent.delta` reset per panggilan (T5, T4; SECURITY_MODEL §6.2; Keputusan Lead 3.1f #49)
+
+Spec: `docs/superpowers/specs/2026-11-14-wp-3.1f2c-redaction-hardening-design.md` (Keputusan Lead 3.1f2c #1–#22, builder check). Plan: `docs/superpowers/plans/2026-11-14-wp-3.1f2c-redaction-hardening.md` (7 task). Dieksekusi dengan subagent-driven-development: implementer per task, review per task (spec + kualitas), dan putaran perbaikan. PR #33.
+
+**Yang berubah (ringkas):**
+- **Satu predikat kunci** untuk teks bebas, `redact_obj`, dan kandidat delta (`is_sensitive_key`/`SECRET_KEY_PATTERN`): camel, Pascal, akronim (`SMTPPassword`), ejaan campuran, `_privat`, `--flag`, nama env tetap.
+- **Bentuk nilai:**
+  - kutip tak tertutup → sampai akhir teks; escape dan triple-quote; `b''`/`r""`;
+  - argv (teks dan `redact_obj`, termasuk item non-str, bytes, `--x=`/`--x:`);
+  - `[REDACTED]`+pemisah; netrc satu baris;
+  - header dengan bagian berkutip dan kutip parameter lintas baris; PGP;
+  - kunci sesudah `\n`/`\r`/`\t` ter-escape. Ini menutup output tool yang di-`json.dumps` sebelum diredaksi.
+- **Prefilter** yang tidak mengubah output.
+- **`agent.delta`:**
+  - `{agent_run_id, call, text, reset}`, reset per panggilan model;
+  - kandidat baru;
+  - `hold` ≥ literal terpanjang;
+  - titik henti header lewat `Redactor.redact_with_stop`;
+  - perbaikan reset penuh saat `flush` bila sebuah delta gagal dipublikasikan;
+  - `delta_redactor` sebagai satu-satunya konstruktor di `app/` (test AST).
+
+**Bukti:**
+
+```text
+$ f1-pytest.sh -q -rf                 # @ c287306, suite backend penuh (implementer; AG-13 mengulang: 5226 passed in 508.07s)
+5226 passed in 500.57s
+$ f1-pytest.sh tests/security/test_delta_streams.py -k every_candidate_open_at_flush   # @ 4b45b72 (test saja)
+21 passed
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 332 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
+```
+
+- Satu `redact()` atas 64 KiB teks biasa: 10,1 ms di main → ±2 ms. Setiap aliran patologis 64 KiB lewat `delta_redactor` < 1 dtk; yang terlambat 0,59 dtk. Test waktu memakai `tests/timing.py::best_of`.
+- Mutan satu per run (`scratchpad/mutants_3_1f2c.py`, Z1–Z49 beserta varian): semua RED, kecuali Z14i (ekuivalen) dan mutan yang hanya memengaruhi waktu (Z22, Z45, Z48–Z48d; batas 1 dtk punya margin ±2×).
+- **Fuzz AG-13 (tiga arah, 300 000 teks):** sekitar 317 000 secret baru tertutup terhadap main, dan 413 bentuk mundur terhadap main. Kemunduran ini adalah kompromi desain dan tercatat di SECURITY_MODEL §13 (RS-2..RS-7). Fuzz delta (`fuzz_delta`, `fuzz_struct2`) tidak menemukan kebocoran, kecuali RD-4 yang sudah ada di main.
+- **Penyimpangan proses:**
+  - Fixture secret di test redaksi tidak dibangun lewat konkatenasi, sehingga gitleaks menandai 5 fixture sintetis dan `security-scan` PR #33 merah (keputusan PO, lihat di bawah).
+  - Aturan SDD "satu gelombang perbaikan akhir" dilanggar satu kali secara sadar (gelombang terakhir M-1/M-2, Keputusan Lead di ledger).
+
+**Review:**
+
+| Review | Hasil | Penutupan |
+|---|---|---|
+| Review per task (spec + kualitas), 6 task | Task 1–3 bersih atau 1 putaran; Task 4+5 empat putaran (kebocoran pasangan kutip header, header lintas baris, penanda tertimpa aturan berikutnya, test waktu lewat jalur cadangan); Task 6 satu putaran | Semua ditutup; keputusan di spec #16–#22 |
+| `kk-backend-reviewer` @ 74bf8d4 | **APPROVE WITH NOTES**, 5 MEDIUM: impor privat di test, fuzz 23 dtk, batas waktu flaky, API publik terlalu lebar, `runtime.py` besar | Gelombang akhir: C1 file test internals, C2 fuzz 600 kasus + `KK_FUZZ_CASES`, C3 `best_of`, A7 nama privat. M5 (modul delta stream sendiri) ditunda |
+| `kk-silent-failure-hunter` @ 74bf8d4 | 0 CRITICAL/HIGH; MEDIUM-1 argv `redact_obj` (non-str lolos; dipakai deteksi `secret_in_input` gateway); MEDIUM-2 delta gagal publikasi; 4 LOW | A5, A6, B1, B3; LOW-2/LOW-4 → §13 RP-4/RD-6 |
+| AG-13 utuh @ 74bf8d4 | **SIGNED OFF WITH CONDITIONS**; R-1..R-6 dan D2-* **tertutup**; regresi F-1/F-2/F-3, CPU F-4, F-8 (kunci sesudah `\n` ter-escape, sudah ada sebelumnya); residual 1–16 | Gelombang akhir A1–A4, B2; F-7 koreksi dokumen |
+| AG-13 delta @ 2ac73c3 | **SIGNED OFF WITH CONDITIONS**; F-2/F-3/F-8 tertutup; MEDIUM M-1 (F-1 satu baris), MEDIUM M-2 (CPU dari gelombang akhir) | Gelombang terakhir f551be9 (M-1, sama dengan prototipe AG-13), c2e08e1 (M-2), c287306 (L-2) |
+| `/code-review` Standards @ c287306 | Tidak ada pelanggaran keras; kontrak belum menyebut perbaikan `flush` (`mark_lost`); smell (Feature Envy `open_candidate` atas internal redaksi, ukuran modul, fallback `redact_with_stop=None`, tuple tanpa nama) | API §5.1 diperbarui; smell → tindak lanjut modul delta stream |
+| `/code-review` Spec @ c287306 | Residual yang sudah diputuskan; selisih dokumen (`_KNOWN_SECRET_NAMES`, batas payload, ADR-075 #7); test kandidat-saat-`flush` belum ada | Dokumen dirapikan; 4b45b72 (test saja) |
+| AG-13 delta @ c287306 | **SIGNED OFF WITH CONDITIONS**, 0 CRITICAL/HIGH/MEDIUM terbuka; M-1, M-2, L-2 **tertutup**; LOW M-1r (sisa F-1 dengan karakter awal non-kata), INFO L-2r, stand-in M-2, mutan waktu; 4b45b72 diverifikasi 21/21 terhadap c287306 | §13 RS-7, RP-3, RD-4, RD-9 di PR ini |
+
+**Status sign-off AG-13 WP-3.1f2c: SIGNED OFF WITH CONDITIONS 🔒** (74bf8d4 utuh; delta 2ac73c3; delta c287306). Syarat merge:
+1. baris §13 di PR ini (terpenuhi);
+2. tracker ini (terpenuhi);
+3. CI 9/9 hijau di head final.
+
+`security-scan` merah karena 5 fixture sintetis yang ditandai gitleaks. Keputusannya di PO (komentar PR #33): (a) fingerprint di `.gitleaksignore` per fingerprint, bukan mematikan rule; (b) izin menulis ulang riwayat branch; (c) merge merah. Selama merah, pip-audit, Semgrep, dan Trivy dilewati. Sesudah 4b45b72 hanya ada commit dokumen dan tracker.
+
+**Syarat yang dibawa:**
+- **Kandidat WP lexer (Approach B):** pemicunya sudah terpenuhi, karena famili R-5/R-6 muncul lagi. Diputuskan ulang di gate WP-3.2 dengan angka fuzz tiga arah, atau segera bila famili regresi baru ditemukan (§13 RS-2..RS-7, RP-2, RD-5).
+- **Sebelum ada literal multi-baris di proses runtime** (mis. PEM GitHub App): RD-4.
+- **WP `tests.run` (R2):** RP-1. Output sandbox dinormalisasi (ANSI, escape lain) sebelum diredaksi.
+- **WP-3.2:** RD-2 (UI memuat ulang dari `agent_runs`) dan RD-6.
+- **Tindak lanjut kode:**
+  - pindahkan delta stream ke `app/agents/delta_stream.py`;
+  - `redact_with_stop` wajib;
+  - tuple bernama;
+  - pecah file test besar.
+- **Test flaky di luar WP:** `tests/integration/test_git_adapter.py::test_grep_parses_off_the_event_loop` (0,55 dtk > 0,5 dtk di bawah beban; WP-2.1d) dua kali terlihat gagal-lalu-lulus.
+- **Konvensi:** setiap plan memuat aturan "fixture secret dibangun lewat konkatenasi" di Global Constraints.
+- **PO:**
+  - keputusan gitleaks PR #33;
+  - ratifikasi ADR-073 #6, ADR-074, ADR-075;
+  - butir 3.1f2/3.1f2c di #72;
+  - perluasan `redact_obj` (#14, #15, #17) dan kontrak `agent.delta.call` (#9) sebagai perubahan kontrak sebelum ada konsumen.

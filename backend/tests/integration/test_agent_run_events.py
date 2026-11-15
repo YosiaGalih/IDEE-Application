@@ -259,6 +259,86 @@ async def test_a_failed_attempt_leaves_no_held_text_behind(
     assert sent.startswith("SECOND ") and not any(d["payload"]["reset"] for d in events[1:])
 
 
+async def test_a_delta_names_its_model_call(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    """WP-3.1f2c D2-L1 (Lead decision #9; API_CONTRACTS §5.1): every ``agent.delta`` payload carries ``call``,
+    the run's model call from 1, and each call's deltas show that call's text."""
+    project_id, task_id = await a_task(session, settings)
+    bus = RecordingBus()
+    first = Reply(
+        (TextBlock("FIRST " + FILLER), ToolUseBlock("toolu_1", "repo.get_tree", {})), stop_reason="tool_use"
+    )
+    run = compose(
+        sessions,
+        settings,
+        pricing,
+        scripted(first, final_turn("SECOND " + FILLER)),
+        tools=FakeTools([]),
+        events=TaskRunEvents(sessions, bus, Redactor()),
+    )
+    result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert result.status == "succeeded"
+    payloads = [d["payload"] for d in bus.of_type("agent.delta")]
+    assert all(set(p) == {"agent_run_id", "call", "text", "reset"} for p in payloads)
+    assert [p["call"] for p in payloads] == sorted(p["call"] for p in payloads)
+    assert {p["call"] for p in payloads} == {1, 2} and not any(p["reset"] for p in payloads)
+    for call, text in ((1, "FIRST " + FILLER), (2, "SECOND " + FILLER)):
+        assert "".join(p["text"] for p in payloads if p["call"] == call) == text
+
+
+async def test_a_restart_in_the_first_call_empties_that_call(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    pricing: PricingTable,
+) -> None:
+    """WP-3.1f2c D2-L1 (Lead decision #9): the restart of the first call's attempt is
+    ``{"call": 1, "text": "", "reset": true}``; the retry's deltas belong to the same call."""
+    from tests.runtime_fakes import in_order
+
+    project_id, task_id = await a_task(session, settings)
+    bus = RecordingBus()
+
+    class StreamThenFail:
+        name = "scripted"
+
+        def __init__(self) -> None:
+            self.inner = scripted(in_order(final_turn("SECOND " + FILLER)))
+            self.calls = 0
+            self.requests = self.inner.requests
+
+        async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+            from app.llm.base import LLMError
+
+            self.calls += 1
+            if self.calls == 1:
+                assert on_text_delta is not None
+                await on_text_delta("FIRSTATTEMPT" * 40)
+                raise LLMError("overloaded")
+            return await self.inner.create_message(req, on_text_delta=on_text_delta, cancel=cancel)
+
+    run = compose(
+        sessions,
+        settings,
+        pricing,
+        StreamThenFail(),  # type: ignore[arg-type]
+        tools=FakeTools([]),
+        events=TaskRunEvents(sessions, bus, Redactor()),
+    )
+    result = await run.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    assert result.status == "succeeded"
+    payloads = [d["payload"] for d in bus.of_type("agent.delta")]
+    resets = [p for p in payloads if p["reset"]]
+    assert resets == [{"agent_run_id": str(result.agent_run_id), "call": 1, "text": "", "reset": True}]
+    after = payloads[payloads.index(resets[0]) + 1 :]
+    assert {p["call"] for p in payloads} == {1}
+    assert "".join(p["text"] for p in after) == "SECOND " + FILLER
+
+
 async def test_run_started_is_committed_before_the_first_model_call(
     session: AsyncSession,
     sessions: async_sessionmaker[AsyncSession],

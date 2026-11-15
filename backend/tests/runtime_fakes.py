@@ -160,11 +160,13 @@ class FakeRuns:
 class FakeEvents:
     def __init__(self) -> None:
         self.deltas: list[str] = []
+        self.calls: list[int] = []
         self.resets: list[bool] = []
         self.usage_updates = 0
 
-    async def delta(self, scope: RunScope, text: str, *, reset: bool = False) -> None:
+    async def delta(self, scope: RunScope, text: str, *, call: int, reset: bool = False) -> None:
         self.deltas.append(text)
+        self.calls.append(call)
         self.resets.append(reset)
 
     async def usage_updated(self, scope: RunScope) -> None:
