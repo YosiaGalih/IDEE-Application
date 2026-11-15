@@ -491,14 +491,16 @@ async def test_read_run_outcome_reports_missing_running_and_finished(
     await writer.finish(failed_id, RunEnd("failed", 1, "interrupted", "text"))
     done_id = await begin(writer, start(task_id, project_id))
     await writer.finish(done_id, RunEnd("succeeded", 1, output={}))
-    assert await read_run_outcome(session, uuid.uuid4(), task_id=task_id) == RunOutcome("missing", None, None)
-    assert await read_run_outcome(session, running_id, task_id=task_id) == RunOutcome(
+    assert await read_run_outcome(session, uuid.uuid4(), task_id=task_id, agent_id="B14") == RunOutcome(
+        "missing", None, None
+    )
+    assert await read_run_outcome(session, running_id, task_id=task_id, agent_id="B14") == RunOutcome(
         "running", "running", None
     )
-    assert await read_run_outcome(session, failed_id, task_id=task_id) == RunOutcome(
+    assert await read_run_outcome(session, failed_id, task_id=task_id, agent_id="B14") == RunOutcome(
         "finished", "failed", "interrupted"
     )
-    assert await read_run_outcome(session, done_id, task_id=task_id) == RunOutcome(
+    assert await read_run_outcome(session, done_id, task_id=task_id, agent_id="B14") == RunOutcome(
         "finished", "succeeded", None
     )
 
@@ -613,8 +615,12 @@ async def test_read_run_outcome_of_another_task_is_missing(
     await session.commit()
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_id = await begin(writer, start(other.id, project_id))
-    assert await read_run_outcome(session, run_id, task_id=task_id) == RunOutcome("missing", None, None)
-    assert await read_run_outcome(session, run_id, task_id=other.id) == RunOutcome("running", "running", None)
+    assert await read_run_outcome(session, run_id, task_id=task_id, agent_id="B14") == RunOutcome(
+        "missing", None, None
+    )
+    assert await read_run_outcome(session, run_id, task_id=other.id, agent_id="B14") == RunOutcome(
+        "running", "running", None
+    )
 
 
 async def audits_of(session: AsyncSession, run_id: uuid.UUID) -> list[AuditEvent]:
@@ -714,6 +720,7 @@ async def test_a_failing_breach_audit_never_rolls_back_the_minimal_end(
     [lost] = [log for log in logs if log["event"] == "budget_audit_unrecorded"]
     assert (lost["log_level"], lost["agent_run_id"], lost["task_id"]) == ("error", str(run_id), str(task_id))
     assert lost["error_type"] == "DBAPIError"  # the type only: an exception text may carry row values
+    assert lost["breach_kind"] == "cost"  # which limit the lost audit was about (AG-13 delta INFO-2)
 
 
 async def test_read_run_outcome_reports_a_paused_run(
@@ -725,7 +732,7 @@ async def test_read_run_outcome_reports_a_paused_run(
     run_id = await begin(writer, start(task_id, project_id))
     pending = {"pending_tool": {"tool_use_id": "toolu_1", "tool_name": "git.push"}}
     await writer.finish(run_id, RunEnd("approval_required", 2, output=pending))
-    outcome = await read_run_outcome(session, run_id, task_id=task_id)
+    outcome = await read_run_outcome(session, run_id, task_id=task_id, agent_id="B14")
     assert outcome == RunOutcome("paused", "approval_required", None)
 
 
@@ -749,3 +756,19 @@ async def test_a_first_start_with_a_used_id_is_refused_whatever_its_row(
     assert duplicate._projects == {}
     types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
     assert types == ["agent.run_started"] and len(bus.of_type("agent.run_started")) == 1
+
+
+async def test_read_run_outcome_of_another_agent_is_missing(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """AG-13 delta LOW-2: the caller reads the row of its own task *and* agent; the same task's row of
+    another agent reads ``missing``."""
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    run_id = await begin(writer, start(task_id, project_id, agent_id="B15"))
+    assert await read_run_outcome(session, run_id, task_id=task_id, agent_id="B14") == RunOutcome(
+        "missing", None, None
+    )
+    assert await read_run_outcome(session, run_id, task_id=task_id, agent_id="B15") == RunOutcome(
+        "running", "running", None
+    )

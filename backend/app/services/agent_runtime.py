@@ -259,15 +259,15 @@ class RunOutcome:
 
 
 async def read_run_outcome(
-    session: AsyncSession, agent_run_id: uuid.UUID, *, task_id: uuid.UUID
+    session: AsyncSession, agent_run_id: uuid.UUID, *, task_id: uuid.UUID, agent_id: str
 ) -> RunOutcome:
     """The row's end, read only. For a caller whose ``AgentRuntime.run`` returned no result (Keputusan Lead
-    #11); not for ``AgentRunIdConflict``, whose row is another run's. Only a row of ``task_id`` is read: a row
-    of another task is ``missing`` (ruling R6)."""
+    #11); not for ``AgentRunIdConflict``, whose row is another run's. Only the row of this id, ``task_id`` and
+    ``agent_id`` is read: a row of another task or agent is ``missing`` (rulings R6, G2)."""
     row = (
         await session.execute(
             select(AgentRun.status, AgentRun.error_code).where(
-                AgentRun.id == agent_run_id, AgentRun.task_id == task_id
+                AgentRun.id == agent_run_id, AgentRun.task_id == task_id, AgentRun.agent_id == agent_id
             )
         )
     ).one_or_none()
@@ -503,6 +503,7 @@ class AgentRunWriter:
                         "budget_audit_unrecorded",
                         agent_run_id=str(agent_run_id),
                         task_id=str(task_id),
+                        breach_kind=breach.kind,
                         error_type=type(error).__name__,
                     )
             await session.commit()
