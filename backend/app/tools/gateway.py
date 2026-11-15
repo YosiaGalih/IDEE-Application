@@ -23,7 +23,8 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable, Mapping
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -653,7 +654,8 @@ class ToolGateway:
 
     async def _settle_cancelled(self, ctx: ToolContext, row: ToolCall, spec: ToolSpec) -> None:
         """The caller was cancelled after the claim: record ``cancelled`` (shielded). If that fails the row
-        stays ``running`` (a replay closes it as unknown) and the cancellation still propagates."""
+        stays ``running`` (recovery closes it as unknown, ``close_abandoned_calls``) and the cancellation
+        still propagates."""
         unknown = _unknown_outcome(spec)
         outcome = _Outcome("cancelled", f"cancelled: the run was cancelled.{unknown}")
         try:
@@ -859,3 +861,62 @@ class ToolGateway:
     async def _publish(self, session: AsyncSession) -> None:
         if self._bus is not None:
             await publish_pending(session, self._bus)
+
+
+async def close_abandoned_calls(
+    session: AsyncSession, audit: AuditWriter, calls: Sequence[ToolCall], *, project_id: uuid.UUID
+) -> int:
+    """Close ``running`` calls whose run is gone as ``error``/``outcome_unknown`` (recovery, WP-3.1f2b1 #8).
+
+    ``calls`` are rows the caller already locked; this runs in the caller's transaction and neither commits
+    nor publishes (the task events are queued for the caller to publish after its commit). Like ``_replay``,
+    each UPDATE is conditional on ``running``: a row that finished meanwhile is left alone. R1+ rows are
+    audited ``tool.executed`` by the recovery actor. Returns how many rows were closed."""
+    closed = 0
+    for call in calls:
+        won = await session.scalar(
+            update(ToolCall)
+            .where(ToolCall.id == call.id, ToolCall.status == "running")
+            .values(status="error", error_code="outcome_unknown", output_summary=UNKNOWN_OUTCOME)
+            .returning(ToolCall.id)
+            .execution_options(synchronize_session=False)
+        )
+        if won is None:
+            continue
+        closed += 1
+        await session.refresh(call)
+        if call.risk_level >= RiskLevel.R1:
+            await audit.write(
+                session,
+                actor_type="system",
+                actor_id="recovery",  # app.workflow.recovery.ACTOR (tools may not import workflow)
+                action="tool.executed",
+                result="error",
+                resource_type="tool_call",
+                resource_id=str(call.id),
+                project_id=project_id,
+                metadata={
+                    "tool": call.tool_name,
+                    "risk_level": call.risk_level,
+                    "task_id": str(call.task_id),
+                    "agent_run_id": str(call.agent_run_id) if call.agent_run_id else None,
+                    "approval_id": str(call.approval_id) if call.approval_id else None,
+                    "status": "error",
+                    "recovered": True,
+                },
+            )
+        await emit_task_event(
+            session,
+            None,
+            call.task_id,
+            "tool.call_finished",
+            {
+                "tool_call_id": str(call.id),
+                "tool_name": call.tool_name,
+                "risk_level": call.risk_level,
+                "status": call.status,
+                "summary": UNKNOWN_OUTCOME[:_EVENT_SUMMARY_MAX],
+            },
+            redactor=audit.redactor,
+        )
+    return closed
