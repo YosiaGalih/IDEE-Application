@@ -1,25 +1,42 @@
-"""Recovery sweep (ARCHITECTURE §5.3, RUNBOOK): orphaned running|validating tasks are interrupted."""
+"""Recovery sweep (ARCHITECTURE §5.3, RUNBOOK): orphaned running|validating tasks are interrupted.
+
+Run recovery (WP-3.1f2b1, spec 3.1f2b Keputusan Lead #3-#8): ``agent_runs`` and ``tool_calls`` left
+``running`` without a live worker are closed per task on the DB clock; a live worker's run is never touched.
+"""
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import uuid
 from typing import Any
 
 import pytest
 from sqlalchemy import func, select, text
+from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.agents.runtime import ERROR_TEXTS, RunEnd, RunStart
 from app.core.audit import AuditWriter
 from app.core.db import make_sessionmaker
+from app.core.money import decimal_str
 from app.core.redaction import Redactor
 from app.core.security import hash_password
+from app.llm.pricing import PricingTable
 from app.models.audit import AuditEvent
 from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task, TaskEvent
+from app.models.tools import ToolCall
+from app.services import run_recovery
+from app.services.agent_runtime import AgentRunAlreadyFinished, AgentRunWriter
+from app.services.agents import sync_registry
+from app.services.run_recovery import RunRecoveryIncomplete, RunRecoveryResult, recover_runs
 from app.workflow.recovery import recover_expired
 from tests.conftest import reset_data
+from tests.integration.test_agent_run_writer import ledger_row
+from tests.runtime_fakes import REGISTRY, RecordingBus
 
 AUDIT = AuditWriter(Redactor())
 
@@ -272,3 +289,419 @@ def test_failed_recoveries_fail_the_celery_job(monkeypatch: pytest.MonkeyPatch) 
     result = jobs.recovery_sweep.apply()
     assert result.failed()
     assert isinstance(result.result, RecoveryIncomplete)
+
+
+# Run recovery (WP-3.1f2b1, spec 3.1f2b Keputusan Lead #3-#8) ---------------------------------------------
+
+LIVE, DEAD = "30 seconds", "-5 seconds"
+NOTHING = RunRecoveryResult(tasks=0, runs=0, tool_calls=0, failed=0)
+
+
+@pytest.fixture
+async def profiles(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """The registry's agent profiles, synced after ``make_task`` reset the data (a run needs its profile)."""
+    async with make_sessionmaker(engine)() as session:
+        await sync_registry(session, REGISTRY, AUDIT)
+        await session.commit()
+
+
+async def project_of(engine: AsyncEngine, task_id: uuid.UUID) -> uuid.UUID:
+    async with engine.connect() as conn:
+        query = text("SELECT project_id FROM tasks WHERE id = :id")
+        return (await conn.execute(query, {"id": task_id})).scalar_one()
+
+
+async def start_run(engine: AsyncEngine, task_id: uuid.UUID, *, age_s: int | None = None) -> uuid.UUID:
+    """A ``running`` row from the runtime's writer; ``age_s`` back-dates ``started_at`` on the DB clock."""
+    run = RunStart(
+        agent_run_id=uuid.uuid4(),
+        task_id=task_id,
+        project_id=await project_of(engine, task_id),
+        agent_id="B14",
+        agent_version=1,
+        step="implement",
+        model_provider="scripted",
+        model_name="claude-haiku-5-5",
+        prompt_version="0123456789ab",
+        input={},
+    )
+    await AgentRunWriter(make_sessionmaker(engine), None, AUDIT).start(run)
+    if age_s is not None:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE agent_runs SET started_at = clock_timestamp() - make_interval(secs => :s) "
+                    "WHERE id = :id"
+                ),
+                {"s": float(age_s), "id": run.agent_run_id},
+            )
+    return run.agent_run_id
+
+
+async def set_profile_timeout(engine: AsyncEngine, seconds: int | None) -> None:
+    """B14's ``limits.timeout_seconds``; ``None`` removes the key. The FK agent_runs -> agent_profiles keeps
+    the profile row, so a run without a timeout is a profile whose ``limits`` lacks it (ledger ruling R1)."""
+    async with engine.begin() as conn:
+        if seconds is None:
+            await conn.execute(
+                text("UPDATE agent_profiles SET limits = limits - 'timeout_seconds' WHERE agent_id = 'B14'")
+            )
+        else:
+            await conn.execute(
+                text(
+                    "UPDATE agent_profiles SET limits = jsonb_set(limits, '{timeout_seconds}', "
+                    "to_jsonb(CAST(:t AS integer))) WHERE agent_id = 'B14'"
+                ),
+                {"t": seconds},
+            )
+
+
+async def running_call(
+    engine: AsyncEngine,
+    task_id: uuid.UUID,
+    run_id: uuid.UUID | None,
+    *,
+    risk: int = 0,
+    name: str = "repo.read_file",
+) -> uuid.UUID:
+    async with make_sessionmaker(engine)() as session:
+        call = ToolCall(
+            task_id=task_id,
+            agent_run_id=run_id,
+            agent_id="B14",
+            tool_name=name,
+            risk_level=risk,
+            input_hash="a" * 64,
+            sanitized_input={"path": "a.md"},
+            status="running",
+            tool_use_id="toolu_" + uuid.uuid4().hex,
+        )
+        session.add(call)
+        await session.commit()
+        return call.id
+
+
+async def run_row(engine: AsyncEngine, run_id: uuid.UUID) -> Row[Any]:
+    async with engine.connect() as conn:
+        query = text(
+            "SELECT status, error_code, error, output, input_tokens, output_tokens, estimated_cost, "
+            "cost_status, finished_at, duration_ms FROM agent_runs WHERE id = :id"
+        )
+        return (await conn.execute(query, {"id": run_id})).one()
+
+
+async def call_state(engine: AsyncEngine, call_id: uuid.UUID) -> tuple[str, str | None]:
+    async with engine.connect() as conn:
+        query = text("SELECT status, error_code FROM tool_calls WHERE id = :id")
+        status, code = (await conn.execute(query, {"id": call_id})).one()
+    return status, code
+
+
+async def test_run_of_a_task_without_a_live_lease_is_interrupted(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles, pricing: PricingTable
+) -> None:
+    task_id = await make_task("running", DEAD)
+    run_id = await start_run(engine, task_id)  # just started: only the dead lease closes it
+    sessions = make_sessionmaker(engine)
+    project_id = await project_of(engine, task_id)
+    await ledger_row(sessions, pricing, project_id, task_id, run_id)
+    await ledger_row(sessions, pricing, project_id, task_id, run_id)
+    ledger_input_sum = 200
+    bus = RecordingBus(engine)
+
+    result = await recover_runs(sessions, bus, AUDIT)
+
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0)
+    row = await run_row(engine, run_id)
+    assert (row.status, row.error_code, row.cost_status) == ("failed", "interrupted", "partial")
+    assert row.input_tokens == ledger_input_sum and row.finished_at is not None
+    assert row.output_tokens == 40 and row.duration_ms is not None and row.duration_ms >= 0
+    assert row.error == ERROR_TEXTS["interrupted"] and row.output is None
+    [message] = bus.of_type("agent.run_finished")
+    event = message["payload"]
+    assert event["status"] == "failed" and event["usage"]["cost_status"] == "partial"
+    assert event == {
+        "agent_run_id": str(run_id),
+        "agent_id": "B14",
+        "status": "failed",
+        "error_code": "interrupted",
+        "usage": {
+            "input_tokens": ledger_input_sum,
+            "output_tokens": 40,
+            "estimated_cost": decimal_str(row.estimated_cost),
+            "cost_status": "partial",
+        },
+    }
+    assert bus.unseen == []  # published only after the commit
+    assert (await status_of(engine, task_id))[0] == "running"  # the task is task recovery's, never moved here
+    async with sessions() as session:
+        audited = (
+            await session.scalars(select(AuditEvent.id).where(AuditEvent.resource_id == str(run_id)))
+        ).all()
+    assert audited == []  # Keputusan #6: a recovered run is not audited on its own
+
+
+async def test_recovered_run_without_ledger_rows_reports_unavailable_usage(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    task_id = await make_task("running", DEAD)
+    run_id = await start_run(engine, task_id)
+    bus = RecordingBus()
+    await recover_runs(make_sessionmaker(engine), bus, AUDIT)
+    row = await run_row(engine, run_id)
+    assert row.cost_status == "unavailable" and row.input_tokens is None
+    assert (row.status, row.error_code, row.output_tokens, row.estimated_cost) == (
+        "failed",
+        "interrupted",
+        None,
+        None,
+    )
+    [message] = bus.of_type("agent.run_finished")
+    assert message["payload"]["usage"] == {
+        "input_tokens": None,
+        "output_tokens": None,
+        "estimated_cost": None,
+        "cost_status": "unavailable",
+    }
+
+
+async def test_live_run_under_a_live_lease_is_untouched_with_its_running_tool_call(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    task_id = await make_task("running", LIVE)
+    run_id = await start_run(engine, task_id)
+    call_id = await running_call(engine, task_id, run_id, risk=1, name="repo.write_file")
+    bus = RecordingBus()
+    assert await recover_runs(make_sessionmaker(engine), bus, AUDIT) == NOTHING
+    assert (await run_row(engine, run_id)).status == "running"
+    assert await call_state(engine, call_id) == ("running", None)
+    assert bus.messages == []
+
+
+async def test_stale_run_under_a_live_lease_is_interrupted(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    await set_profile_timeout(engine, 300)
+    task_id = await make_task("running", LIVE)
+    run_id = await start_run(engine, task_id, age_s=300 + 61)
+    result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0)
+    row = await run_row(engine, run_id)
+    assert (row.status, row.error_code) == ("failed", "interrupted")
+    assert row.duration_ms is not None and row.duration_ms >= 361_000  # from started_at, on the DB clock
+
+
+async def test_run_inside_its_bound_is_not_stale(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    await set_profile_timeout(engine, 300)
+    task_id = await make_task("running", LIVE)
+    run_id = await start_run(engine, task_id, age_s=300 + 59)
+    assert await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT) == NOTHING
+    assert (await run_row(engine, run_id)).status == "running"
+
+
+async def test_run_without_a_profile_timeout_uses_3600_seconds(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    await set_profile_timeout(engine, None)
+    task_id = await make_task("running", LIVE)
+    inside = await start_run(engine, task_id, age_s=3600 + 59)
+    past = await start_run(engine, task_id, age_s=3600 + 61)
+    result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0)
+    assert (await run_row(engine, inside)).status == "running"  # not "always stale"
+    assert (await run_row(engine, past)).error_code == "interrupted"  # not "never stale"
+
+
+async def test_tool_calls_of_a_recovered_run_close_unknown(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    """Under a live lease the calls close only because their run is closed in the same transaction (#8 b)."""
+    await set_profile_timeout(engine, 300)
+    task_id = await make_task("running", LIVE)
+    run_id = await start_run(engine, task_id, age_s=300 + 61)
+    r0 = await running_call(engine, task_id, run_id, risk=0, name="repo.read_file")
+    r1 = await running_call(engine, task_id, run_id, risk=1, name="repo.write_file")
+    bus = RecordingBus(engine)
+    result = await recover_runs(make_sessionmaker(engine), bus, AUDIT)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=2, failed=0)
+    assert await call_state(engine, r0) == ("error", "outcome_unknown")
+    assert await call_state(engine, r1) == ("error", "outcome_unknown")
+    async with make_sessionmaker(engine)() as session:
+        audited = (
+            await session.execute(
+                select(AuditEvent.resource_id, AuditEvent.actor_type, AuditEvent.actor_id).where(
+                    AuditEvent.action == "tool.executed", AuditEvent.resource_id.in_([str(r0), str(r1)])
+                )
+            )
+        ).all()
+    assert [tuple(a) for a in audited] == [(str(r1), "system", "recovery")]  # R1+ only
+    finished = {m["payload"]["tool_call_id"] for m in bus.of_type("tool.call_finished")}
+    assert finished == {str(r0), str(r1)}
+    assert bus.unseen == []
+
+
+async def test_running_tool_call_of_a_finished_run_closes_under_a_live_lease(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    task_id = await make_task("running", LIVE)
+    run_id = await start_run(engine, task_id)
+    call_id = await running_call(engine, task_id, run_id)
+    await AgentRunWriter(make_sessionmaker(engine), None, AUDIT).finish(
+        run_id, RunEnd("succeeded", 1, output={})
+    )
+    result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0)
+    assert await call_state(engine, call_id) == ("error", "outcome_unknown")
+    row = await run_row(engine, run_id)
+    assert (row.status, row.error_code) == ("succeeded", None)  # the runtime's end stays
+
+
+async def test_running_tool_call_without_a_run_on_a_dead_lease_closes(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    dead = await make_task("running", DEAD)
+    live = await make_task("running", LIVE)
+    orphan = await running_call(engine, dead, None)
+    engine_call = await running_call(engine, live, None)  # an engine call (WP-3.2) whose worker is alive
+    result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0)
+    assert await call_state(engine, orphan) == ("error", "outcome_unknown")
+    assert await call_state(engine, engine_call) == ("running", None)
+
+
+async def test_parallel_run_sweeps_close_each_row_once(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    tasks = [await make_task("running", DEAD) for _ in range(4)]
+    calls = []
+    for task_id in tasks:
+        run_id = await start_run(engine, task_id)
+        calls.append(str(await running_call(engine, task_id, run_id, risk=1, name="repo.write_file")))
+    sessions = make_sessionmaker(engine)
+    buses = [RecordingBus(), RecordingBus()]
+    results = await asyncio.gather(*(recover_runs(sessions, bus, AUDIT) for bus in buses))
+    assert sum(r.runs for r in results) == 4 and sum(r.tool_calls for r in results) == 4
+    assert sum(r.failed for r in results) == 0
+    async with sessions() as session:
+        per_row = (
+            await session.execute(
+                select(TaskEvent.task_id, TaskEvent.type, func.count())
+                .where(
+                    TaskEvent.task_id.in_(tasks),
+                    TaskEvent.type.in_(["agent.run_finished", "tool.call_finished"]),
+                )
+                .group_by(TaskEvent.task_id, TaskEvent.type)
+            )
+        ).all()
+        audits = await session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.action == "tool.executed", AuditEvent.resource_id.in_(calls))
+        )
+    assert sorted(count for *_, count in per_row) == [1] * 8  # one end per run and per call, per task
+    assert audits == 4
+    assert len([m for bus in buses for m in bus.messages]) == 8
+
+
+async def test_runtime_finish_after_recovery_is_already_finished(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    task_id = await make_task("running", DEAD)
+    run_id = await start_run(engine, task_id)
+    sessions = make_sessionmaker(engine)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    await recover_runs(sessions, RecordingBus(), AUDIT)
+    end = RunEnd("succeeded", 1, output={"summary": "late"})
+    with pytest.raises(AgentRunAlreadyFinished):
+        await writer.finish(run_id, end)
+    row = await run_row(engine, run_id)
+    assert row.error_code == "interrupted"
+    assert (row.status, row.output) == ("failed", None)
+    async with sessions() as session:
+        ends = await session.scalar(
+            select(func.count())
+            .select_from(TaskEvent)
+            .where(TaskEvent.task_id == task_id, TaskEvent.type == "agent.run_finished")
+        )
+    assert ends == 1
+
+
+@pytest.mark.parametrize("recovery_first", [False, True])
+async def test_runtime_finish_racing_a_recovery_ends_the_run_once(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles, recovery_first: bool
+) -> None:
+    """The first write wins; the other skips (recovery) or raises ``AgentRunAlreadyFinished`` (runtime)."""
+    task_id = await make_task("running", DEAD)  # the lease lapsed while the worker was still finishing
+    run_id = await start_run(engine, task_id)
+    sessions = make_sessionmaker(engine)
+    finishing = AgentRunWriter(sessions, None, AUDIT).finish(run_id, RunEnd("succeeded", 1, output={}))
+    recovering = recover_runs(sessions, RecordingBus(), AUDIT)
+    if recovery_first:
+        recovery, finish = await asyncio.gather(recovering, finishing, return_exceptions=True)
+    else:
+        finish, recovery = await asyncio.gather(finishing, recovering, return_exceptions=True)
+    assert isinstance(recovery, RunRecoveryResult) and recovery.failed == 0
+    row = await run_row(engine, run_id)
+    if isinstance(finish, AgentRunAlreadyFinished):
+        assert (recovery.runs, row.status, row.error_code) == (1, "failed", "interrupted")
+    else:
+        assert not isinstance(finish, BaseException), finish
+        assert (recovery.runs, row.status, row.error_code) == (0, "succeeded", None)
+    async with sessions() as session:
+        ends = await session.scalar(
+            select(func.count())
+            .select_from(TaskEvent)
+            .where(TaskEvent.task_id == task_id, TaskEvent.type == "agent.run_finished")
+        )
+    assert ends == 1
+
+
+async def test_one_failing_task_does_not_stop_the_run_sweep(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine,
+    make_task,
+    profiles,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bad = await make_task("running", DEAD)
+    good = await make_task("running", DEAD)
+    bad_run, other_run = await start_run(engine, bad), await start_run(engine, good)
+    await running_call(engine, bad, bad_run)
+    await running_call(engine, good, other_run)
+    real = run_recovery.close_abandoned_calls
+    detail = "kk-detail-" + "d" * 12  # an exception text: never logged
+
+    async def flaky(session, audit, calls, *, project_id):  # type: ignore[no-untyped-def]
+        if any(call.task_id == bad for call in calls):
+            raise RuntimeError("boom " + detail)
+        return await real(session, audit, calls, project_id=project_id)
+
+    monkeypatch.setattr(run_recovery, "close_abandoned_calls", flaky)
+    result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    other_row = await run_row(engine, other_run)
+    assert result.failed == 1 and other_row.status == "failed"
+    assert result == RunRecoveryResult(tasks=2, runs=1, tool_calls=1, failed=1)
+    assert (await run_row(engine, bad_run)).status == "running"  # its run's close rolled back with the task
+    out = capsys.readouterr().out
+    assert "run_recovery_failed" in out and "RuntimeError" in out
+    assert detail not in out  # logged by type only
+
+
+def test_run_recovery_incomplete_is_rebuilt_from_its_result() -> None:
+    """Celery re-creates a task's exception from ``__reduce__`` (like ``RecoveryIncomplete``)."""
+    result = RunRecoveryResult(tasks=3, runs=1, tool_calls=2, failed=1)
+    rebuild, args = RunRecoveryIncomplete(result).__reduce__()
+    rebuilt = rebuild(*args)
+    assert isinstance(rebuilt, RunRecoveryIncomplete) and rebuilt.result == result
+    assert "1 of 3" in str(rebuilt)
+
+
+def test_run_recovery_reads_only_the_db_clock() -> None:
+    """Every time comparison is ``clock_timestamp()`` in SQL: the module never imports a worker clock."""
+    tree = ast.parse(inspect.getsource(run_recovery))
+    modules = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+    modules |= {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+    assert not {m.split(".")[0] for m in modules} & {"datetime", "time"}
+    assert "clock_timestamp" in inspect.getsource(run_recovery)
