@@ -282,9 +282,9 @@ async def read_run_outcome(
 
 
 class AgentRunWriter:
-    """``RunStore``: the only writer of ``agent_runs`` in 3.1f2a (tests/unit/test_agent_run_writer_guard.py;
-    recovery joins in 3.1f2b). Everything stored goes through the audit's redactor, which knows the
-    configured secret literals (3.1b C4)."""
+    """``RunStore``: one of the two writers of ``agent_runs`` (tests/unit/test_agent_run_writer_guard.py); the
+    other is ``app.services.run_recovery`` (WP-3.1f2b1). Everything stored goes through the audit's redactor,
+    which knows the configured secret literals (3.1b C4)."""
 
     def __init__(
         self, sessions: async_sessionmaker[AsyncSession], bus: EventBus | None, audit: AuditWriter

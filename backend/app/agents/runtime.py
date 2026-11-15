@@ -619,9 +619,10 @@ class UsageUnrecorded(Exception):
 class AgentRunUnfinished(Exception):
     """The run's end is not known to the caller: it could not be written within ``close_timeout_s``, or a
     retried write found the row already finished (the first write committed, its ack was lost). The
-    ``agent_runs`` row is the truth: ``running`` (recovery, WP-3.1f2b), the minimal ``failed internal_error``
-    or the end already written. Raised from the cause; a result without its record is never returned.
-    It names the run and its task: the caller reads the row's end from the id (``read_run_outcome``)."""
+    ``agent_runs`` row is the truth: ``running`` (left to ``app.services.run_recovery``), the minimal
+    ``failed internal_error`` or the end already written. Raised from the cause; a result without its record
+    is never returned. It names the run and its task: the caller reads the row's end from the id
+    (``read_run_outcome``)."""
 
     def __init__(self, message: str, *, agent_run_id: uuid.UUID, task_id: uuid.UUID) -> None:
         super().__init__(message)
