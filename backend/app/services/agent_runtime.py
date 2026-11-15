@@ -294,12 +294,15 @@ class AgentRunWriter:
         self._audit = audit
         self._projects: dict[uuid.UUID, uuid.UUID] = {}  # run -> project, for the audit of its end
 
-    async def start(self, run: RunStart) -> None:
+    async def start(self, run: RunStart, *, retry: bool) -> None:
         """INSERT ``agent_runs`` (``running``, the input redacted) and ``agent.run_started``, one transaction,
-        committed, then published. Idempotent on ``run.agent_run_id`` while the run is ``running``: a row that
-        exists for the same task and agent and is still ``running`` is left as it is (no second event). For
-        another task or agent, ``AgentRunIdConflict``; for the same task and agent whose run has ended,
-        ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a run; ruling R5)."""
+        committed, then published. A first start (``retry=False``) whose INSERT creates no row is refused
+        with ``AgentRunIdConflict``, whatever that row's task, agent or status: a duplicate request never
+        takes over a live run's row (ruling R10). A retry after a lost ack (``retry=True``) is idempotent
+        while the run is ``running``: a row of the same task and agent that is still ``running`` is left as
+        it is (no second event); for another task or agent, ``AgentRunIdConflict``; for the same task and
+        agent whose run has ended, ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a
+        run; ruling R5)."""
         redactor = self._audit.redactor
         run_id = run.agent_run_id
         async with self._sessions() as session:
@@ -324,6 +327,8 @@ class AgentRunWriter:
                 )
             ).scalar_one_or_none()
             if inserted is None:
+                if not retry:  # nothing was written: the id is another request's, live or ended (R10)
+                    raise AgentRunIdConflict(f"agent run id {run_id} is already used")
                 existing = (
                     await session.execute(
                         select(AgentRun.task_id, AgentRun.agent_id, AgentRun.status).where(

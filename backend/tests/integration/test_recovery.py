@@ -405,7 +405,7 @@ async def start_run(
         prompt_version="0123456789ab",
         input={},
     )
-    await AgentRunWriter(make_sessionmaker(engine), None, AUDIT).start(run)
+    await AgentRunWriter(make_sessionmaker(engine), None, AUDIT).start(run, retry=False)
     if age_s is not None:
         async with engine.begin() as conn:
             await conn.execute(

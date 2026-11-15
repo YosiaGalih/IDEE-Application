@@ -835,12 +835,14 @@ class UsageLedgerPort(Protocol):
 
 
 class RunStore(Protocol):
-    async def start(self, run: RunStart) -> None:
-        """Idempotent on ``run.agent_run_id`` while the run is ``running``: a row that exists for the same
-        task and agent and is still ``running`` is left as it is. For another task or agent,
-        ``AgentRunIdConflict``; for the same task and agent whose run has ended, ``RunAlreadyFinished``.
-        Fail-closed (ruling R5): ``start`` never reopens an ended run, so resuming under one id (WP-3.2) needs
-        its own explicit, AG-13-reviewed writer path."""
+    async def start(self, run: RunStart, *, retry: bool) -> None:
+        """A first start (``retry=False``) whose id already has a row raises ``AgentRunIdConflict``, whatever
+        the row's task, agent or status, and writes nothing (ruling R10). A retry after a lost ack
+        (``retry=True``) is idempotent while the run is ``running``: a row that exists for the same task and
+        agent and is still ``running`` is left as it is; for another task or agent, ``AgentRunIdConflict``;
+        for the same task and agent whose run has ended, ``RunAlreadyFinished``. Fail-closed (rulings R5,
+        R10): ``start`` never takes over a live row nor reopens an ended one, so resuming under one id
+        (WP-3.2) needs its own explicit, AG-13-reviewed writer path."""
         ...
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
@@ -1058,9 +1060,9 @@ class AgentRuntime:
         except AgentRunUnfinished:
             pass
         except AgentRunIdConflict:
-            # The close's start found the id another run's (silent M3): nothing was closed, and the original
-            # error (a cancel, an internal error) is the one the caller gets.
-            _log.error("agent_run_id_conflict", **_ctx(run), agent_id=run.spec.agent_id)
+            # The close's start found the id another run's (silent M3; logged by _record_end): nothing was
+            # closed, and the original error (a cancel, an internal error) is the one the caller gets.
+            pass
 
     # --- before the run -------------------------------------------------------------------------------------
 
@@ -1121,17 +1123,17 @@ class AgentRuntime:
         )
 
     async def _start(self, run: _Run, start: RunStart) -> None:
-        """``runs.start``: the request's first, or a retry after a lost ack. The store's
-        ``RunAlreadyFinished`` on the first start names a spent id (an ended run of this task and agent):
-        it is raised as ``AgentRunIdConflict``, so nothing runs and nothing is closed (ruling R5). On a retry
-        it is raised as it is: the row may be this run's, ended elsewhere (recovery), and the row is the
-        truth."""
-        first = not run.start_sent
+        """``runs.start``: the request's first (``retry=False``: an existing row is the store's
+        ``AgentRunIdConflict``, ruling R10), or a retry after a lost ack (``retry=True``). A store's
+        ``RunAlreadyFinished`` on the first start still names a used id: it is raised as
+        ``AgentRunIdConflict``, so nothing runs and nothing is closed (ruling R5). On a retry it is raised as
+        it is: the row may be this run's, ended elsewhere (recovery), and the row is the truth."""
+        retry = run.start_sent
         run.start_sent = True
         try:
-            await self._ports.runs.start(start)
+            await self._ports.runs.start(start, retry=retry)
         except RunAlreadyFinished as error:
-            if not first:
+            if retry:
                 raise
             raise AgentRunIdConflict(f"agent run id {run.agent_run_id} already used") from error
 
@@ -1478,7 +1480,10 @@ class AgentRuntime:
             try:
                 return await asyncio.wait_for(asyncio.shield(write), self._config.close_timeout_s)
             except AgentRunIdConflict:
-                raise  # the id is another run's: no retry, no minimal end, no AgentRunUnfinished
+                # The id is another run's: no retry, no minimal end, no AgentRunUnfinished. Logged here, the
+                # one place every close path passes (AG-13 delta INFO-1).
+                _log.error("agent_run_id_conflict", **_ctx(run), agent_id=run.spec.agent_id)
+                raise
             except RunAlreadyFinished as error:
                 # The row is terminal: an earlier write committed and its ack was lost (review N4), or a
                 # retried start found the run ended elsewhere (recovery). Nothing is written over it; the

@@ -139,8 +139,8 @@ ZERO_USAGE = RunUsage(0, 0, 0, 0, Decimal(0), "estimated")
 
 
 async def begin(store: RunStore, run: RunStart) -> uuid.UUID:
-    """``store.start(run)``; the run's id, which the caller holds."""
-    await store.start(run)
+    """``store.start(run, retry=False)``, a first start; the run's id, which the caller holds."""
+    await store.start(run, retry=False)
     return run.agent_run_id
 
 
@@ -151,10 +151,12 @@ class FakeRuns:
         self.ids: list[uuid.UUID] = []  # the id of each start, as the caller sent it
         self.failed_runs: list[tuple[uuid.UUID, BudgetBreach | None]] = []
         self.fail_owners: list[tuple[uuid.UUID, str]] = []  # the (task_id, agent_id) each fail names
+        self.retries: list[bool] = []  # the ``retry`` flag of each start
 
-    async def start(self, run: RunStart) -> None:
+    async def start(self, run: RunStart, *, retry: bool) -> None:
         self.starts.append(run)
         self.ids.append(run.agent_run_id)
+        self.retries.append(retry)
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
         self.finishes.append((agent_run_id, end))

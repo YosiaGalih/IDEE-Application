@@ -443,15 +443,16 @@ async def test_the_run_store_keeps_no_project_of_an_ended_run(
     assert set(writer._projects) == {third}
 
 
-async def test_start_twice_with_one_id_writes_one_row_and_one_started_event(
+async def test_a_retried_start_with_one_id_writes_one_row_and_one_started_event(
     session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
 ) -> None:
+    """A retry after a lost ack (``retry=True``) finds its own ``running`` row: a no-op."""
     project_id, task_id = await a_task(session)
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
     first = start(task_id, project_id)
-    await writer.start(first)
-    await writer.start(first)
+    await writer.start(first, retry=False)
+    await writer.start(first, retry=True)
     rows = list(await session.scalars(select(AgentRun.id).where(AgentRun.task_id == task_id)))
     assert rows == [first.agent_run_id]
     assert len(bus.of_type("agent.run_started")) == 1
@@ -469,11 +470,12 @@ async def test_start_with_a_known_id_for_another_task_is_refused(
     await session.commit()
     writer = AgentRunWriter(sessions, None, AUDIT)
     first = start(task_id, project_id)
-    await writer.start(first)
-    with pytest.raises(AgentRunIdConflict):
-        await writer.start(replace(first, task_id=other.id))
-    with pytest.raises(AgentRunIdConflict):
-        await writer.start(replace(first, agent_id="B15"))
+    await writer.start(first, retry=False)
+    for retry in (False, True):
+        with pytest.raises(AgentRunIdConflict):
+            await writer.start(replace(first, task_id=other.id), retry=retry)
+        with pytest.raises(AgentRunIdConflict):
+            await writer.start(replace(first, agent_id="B15"), retry=retry)
     row = await stored(session, first.agent_run_id)
     assert (row.task_id, row.agent_id) == (task_id, "B14")
 
@@ -553,25 +555,28 @@ async def test_fail_on_a_finished_row_writes_no_audit(
 async def test_start_of_an_ended_run_is_refused_and_changes_nothing(
     session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
 ) -> None:
-    """AG-13 MEDIUM-1 (ruling R5): an id whose run has ended is spent. ``start`` with it, for the same task
-    and agent, raises the port's ``RunAlreadyFinished``; the row stays as it ended and nothing is emitted."""
+    """AG-13 MEDIUM-1 (ruling R5): an id whose run has ended is spent. A retried ``start`` with it, for the
+    same task and agent, raises the port's ``RunAlreadyFinished`` (a first start: ``AgentRunIdConflict``,
+    ruling R10); the row stays as it ended and nothing is emitted."""
     project_id, task_id = await a_task(session)
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
     first = start(task_id, project_id)
-    await writer.start(first)
+    await writer.start(first, retry=False)
     await writer.finish(first.agent_run_id, RunEnd("succeeded", 1, output={"summary": "first"}))
     with pytest.raises(RunAlreadyFinished) as raised:
-        await writer.start(first)
+        await writer.start(first, retry=True)
     assert isinstance(raised.value, AgentRunAlreadyFinished)
+    with pytest.raises(AgentRunIdConflict):
+        await writer.start(first, retry=False)
     row = await stored(session, first.agent_run_id)
     assert (row.status, row.output, row.error_code) == ("succeeded", {"summary": "first"}, None)
     types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
     assert types == ["agent.run_started", "agent.run_finished"]
     assert len(bus.of_type("agent.run_started")) == 1
     assert first.agent_run_id not in writer._projects
-    with pytest.raises(AgentRunIdConflict):  # another task's claim on the id is still the conflict
-        await writer.start(replace(first, agent_id="B15"))
+    with pytest.raises(AgentRunIdConflict):  # another agent's claim on the id is still the conflict
+        await writer.start(replace(first, agent_id="B15"), retry=True)
 
 
 async def test_fail_ends_only_the_row_of_its_task_and_agent(
@@ -627,9 +632,9 @@ async def test_an_idempotent_start_fills_the_project_cache(
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
     run = start(task_id, project_id)
-    await writer.start(run)
-    writer._projects.clear()  # the first start's process is gone; a retry in another one found the row
-    await writer.start(run)
+    await writer.start(run, retry=False)
+    writer._projects.clear()  # the first start's ack was lost; its retry found the row
+    await writer.start(run, retry=True)
     assert writer._projects == {run.agent_run_id: project_id}
 
 
@@ -722,3 +727,25 @@ async def test_read_run_outcome_reports_a_paused_run(
     await writer.finish(run_id, RunEnd("approval_required", 2, output=pending))
     outcome = await read_run_outcome(session, run_id, task_id=task_id)
     assert outcome == RunOutcome("paused", "approval_required", None)
+
+
+async def test_a_first_start_with_a_used_id_is_refused_whatever_its_row(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """AG-13 MEDIUM-2 (ruling R10): a first start (``retry=False``) whose INSERT creates no row is a conflict,
+    whatever the row's task, agent or status: a duplicate request never takes over a live run's row. Nothing
+    is written and nothing is emitted."""
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus()
+    live = start(task_id, project_id)
+    await AgentRunWriter(sessions, bus, AUDIT).start(live, retry=False)
+    duplicate = AgentRunWriter(sessions, bus, AUDIT)  # another request, possibly on another worker
+    with pytest.raises(AgentRunIdConflict):
+        await duplicate.start(
+            replace(live, input={"task_id": str(task_id), "gap_feedback": "dup"}), retry=False
+        )
+    row = await stored(session, live.agent_run_id)
+    assert (row.status, row.input, row.finished_at) == ("running", dict(live.input), None)
+    assert duplicate._projects == {}
+    types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
+    assert types == ["agent.run_started"] and len(bus.of_type("agent.run_started")) == 1

@@ -1770,8 +1770,8 @@ async def test_the_run_uses_the_callers_id() -> None:
 class StartAckLostRuns(FakeRuns):
     """The first start commits (it is recorded), then its ack is lost."""
 
-    async def start(self, run: Any) -> None:
-        await super().start(run)
+    async def start(self, run: Any, *, retry: bool) -> None:
+        await super().start(run, retry=retry)
         if len(self.starts) == 1:
             raise ConnectionError("the commit's ack was lost")
 
@@ -1790,8 +1790,8 @@ async def test_a_lost_start_ack_retries_start_with_the_same_id_and_writes_one_en
 class ConflictRuns(FakeRuns):
     """The id is another run's: ``start`` refuses it."""
 
-    async def start(self, run: Any) -> None:
-        await super().start(run)
+    async def start(self, run: Any, *, retry: bool) -> None:
+        await super().start(run, retry=retry)
         raise AgentRunIdConflict(f"agent run id {run.agent_run_id} belongs to another task or agent")
 
 
@@ -1823,8 +1823,8 @@ async def test_the_minimal_end_names_the_runs_task_and_agent() -> None:
     is never ended: tests/security/test_agent_run_ids.py)."""
 
     class FlakyThenSlowConflictRuns(FakeRuns):
-        async def start(self, run: Any) -> None:
-            await super().start(run)
+        async def start(self, run: Any, *, retry: bool) -> None:
+            await super().start(run, retry=retry)
             if len(self.starts) == 1:
                 raise ConnectionError("connection reset")
             await asyncio.sleep(1.0)  # longer than both close attempts below
@@ -1843,8 +1843,8 @@ async def test_the_minimal_end_names_the_runs_task_and_agent() -> None:
 class SpentIdRuns(FakeRuns):
     """The id names a run of the same task and agent that has ended: ``start`` refuses it (ruling R5)."""
 
-    async def start(self, run: Any) -> None:
-        await super().start(run)
+    async def start(self, run: Any, *, retry: bool) -> None:
+        await super().start(run, retry=retry)
         raise RunAlreadyFinished(f"agent run {run.agent_run_id} has ended")
 
 
@@ -1887,8 +1887,8 @@ async def test_a_retried_start_that_finds_its_run_ended_is_unfinished() -> None:
     raised after the close."""
 
     class AckLostThenEndedRuns(FakeRuns):
-        async def start(self, run: Any) -> None:
-            await super().start(run)
+        async def start(self, run: Any, *, retry: bool) -> None:
+            await super().start(run, retry=retry)
             if len(self.starts) == 1:
                 raise ConnectionError("the commit's ack was lost")
             raise RunAlreadyFinished(f"agent run {run.agent_run_id} has ended")
@@ -1932,3 +1932,43 @@ async def test_a_conflicting_id_never_replaces_a_cancel_before_the_first_start()
     assert len(conflicts) == 1
     assert conflicts[0]["agent_run_id"] == str(request.agent_run_id)
     assert conflicts[0]["task_id"] == str(request.task_id)
+
+
+async def test_only_the_start_after_a_lost_ack_is_a_retry() -> None:
+    """Ruling R10: the store is told which start is the request's first (``retry=False``: an existing row is a
+    conflict) and which retries one whose ack was lost (``retry=True``: idempotent)."""
+    ok = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    await make_runtime(ok).run(run_request("B14"))
+    assert ok.runs.retries == [False]
+
+    refused = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    refused.gate.refuse[1] = ProviderBlocked("provider_not_ready", "unknown")
+    await make_runtime(refused).run(run_request("B14"))
+    assert refused.runs.retries == [False]  # the close's start is this request's first
+
+    lost = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    lost.runs = StartAckLostRuns()
+    with pytest.raises(ConnectionError):
+        await make_runtime(lost).run(run_request("B14"))
+    assert lost.runs.retries == [False, True]
+
+
+async def test_a_conflict_at_the_close_is_logged_once_with_the_runs_ids() -> None:
+    """AG-13 delta INFO-1: a run refused before a provider existed; the close's (first) start finds the id
+    used. The conflict reaches the caller and is logged once, with the run's ids."""
+    from structlog.testing import capture_logs
+
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.gate.refuse[1] = ProviderBlocked("provider_not_ready", "unknown")
+    fakes.runs = ConflictRuns()
+    request = run_request("B14")
+    with capture_logs() as logs:
+        with pytest.raises(AgentRunIdConflict):
+            await make_runtime(fakes).run(request)
+    [conflict] = [log for log in logs if log["event"] == "agent_run_id_conflict"]
+    assert (conflict["log_level"], conflict["agent_run_id"], conflict["task_id"]) == (
+        "error",
+        str(request.agent_run_id),
+        str(request.task_id),
+    )
+    assert conflict["correlation_id"] == f"agent_run:{request.agent_run_id}"
