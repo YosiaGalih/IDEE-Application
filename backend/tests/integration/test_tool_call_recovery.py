@@ -13,6 +13,7 @@ from app.tools.gateway import (
     UNKNOWN_OUTCOME,
     close_abandoned_calls,
 )
+from app.workflow.recovery import ACTOR
 from tests.integration import test_gateway_denials as denials
 from tests.integration.test_gateway_denials import Scope, audits, calls, timeline
 from tests.tool_fakes import AUDIT
@@ -101,3 +102,20 @@ async def test_a_call_no_longer_running_is_left_alone(
         assert not (
             await session.scalars(select(TaskEvent).where(TaskEvent.type == "tool.call_finished"))
         ).all()
+
+
+async def test_the_recovery_actor_is_task_recoverys(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope
+) -> None:
+    """Backend M4: the gateway may not import the workflow, so its actor is written as literals; they stay
+    equal to ``app.workflow.recovery.ACTOR``."""
+    async with sessions() as session:
+        row = running(scope, "repo.write_file", 1, "t1")
+        session.add(row)
+        await session.commit()
+        locked = await session.get(ToolCall, row.id, with_for_update=True)
+        assert locked is not None
+        await close_abandoned_calls(session, AUDIT, [locked], project_id=scope.project_id)
+        await session.commit()
+    [audit] = await audits(sessions, row)
+    assert (audit.actor_type, audit.actor_id) == (ACTOR.type, ACTOR.id)

@@ -371,6 +371,7 @@ def test_cli_recover_fails_on_run_failures_and_prints_all_counts(
 # Run recovery (WP-3.1f2b1, spec 3.1f2b Keputusan Lead #3-#8) ---------------------------------------------
 
 LIVE, DEAD = "30 seconds", "-5 seconds"
+MARGIN_S = 10  # each side of a stale bound (timeout + 60 s): a slow test run never crosses it (backend M3)
 NOTHING = RunRecoveryResult(tasks=0, runs=0, tool_calls=0, failed=0, skipped=0)
 
 
@@ -562,12 +563,12 @@ async def test_stale_run_under_a_live_lease_is_interrupted(  # type: ignore[no-u
 ) -> None:
     await set_profile_timeout(engine, 300)
     task_id = await make_task("running", LIVE)
-    run_id = await start_run(engine, task_id, age_s=300 + 61)
+    run_id = await start_run(engine, task_id, age_s=300 + 60 + MARGIN_S)
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
     assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0, skipped=0)
     row = await run_row(engine, run_id)
     assert (row.status, row.error_code) == ("failed", "interrupted")
-    assert row.duration_ms is not None and row.duration_ms >= 361_000  # from started_at, on the DB clock
+    assert row.duration_ms is not None and row.duration_ms >= (360 + MARGIN_S) * 1000  # from started_at
 
 
 async def test_run_inside_its_bound_is_not_stale(  # type: ignore[no-untyped-def]
@@ -575,7 +576,7 @@ async def test_run_inside_its_bound_is_not_stale(  # type: ignore[no-untyped-def
 ) -> None:
     await set_profile_timeout(engine, 300)
     task_id = await make_task("running", LIVE)
-    run_id = await start_run(engine, task_id, age_s=300 + 59)
+    run_id = await start_run(engine, task_id, age_s=300 + 60 - MARGIN_S)
     assert await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT) == NOTHING
     assert (await run_row(engine, run_id)).status == "running"
 
@@ -585,8 +586,8 @@ async def test_run_without_a_profile_timeout_uses_3600_seconds(  # type: ignore[
 ) -> None:
     await set_profile_timeout(engine, None)
     task_id = await make_task("running", LIVE)
-    inside = await start_run(engine, task_id, age_s=3600 + 59)
-    past = await start_run(engine, task_id, age_s=3600 + 61)
+    inside = await start_run(engine, task_id, age_s=3600 + 60 - MARGIN_S)
+    past = await start_run(engine, task_id, age_s=3600 + 60 + MARGIN_S)
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
     assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0, skipped=0)
     assert (await run_row(engine, inside)).status == "running"  # not "always stale"
@@ -599,7 +600,7 @@ async def test_tool_calls_of_a_recovered_run_close_unknown(  # type: ignore[no-u
     """Under a live lease the calls close only because their run is closed in the same transaction (#8 b)."""
     await set_profile_timeout(engine, 300)
     task_id = await make_task("running", LIVE)
-    run_id = await start_run(engine, task_id, age_s=300 + 61)
+    run_id = await start_run(engine, task_id, age_s=300 + 60 + MARGIN_S)
     r0 = await running_call(engine, task_id, run_id, risk=0, name="repo.read_file")
     r1 = await running_call(engine, task_id, run_id, risk=1, name="repo.write_file")
     bus = RecordingBus(engine)
@@ -648,6 +649,19 @@ async def test_running_tool_call_without_a_run_on_a_dead_lease_closes(  # type: 
     assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0, skipped=0)
     assert await call_state(engine, orphan) == ("error", "outcome_unknown")
     assert await call_state(engine, engine_call) == ("running", None)
+
+
+async def test_running_tool_call_without_a_run_on_a_task_without_a_lease_closes(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    """Spec #4a/#8a, accepted (silent L5): a NULL lease is a dead lease, with no grace (unlike task recovery's
+    ``NO_LEASE_GRACE``). A runless call (an engine call, WP-3.2) on a task without a lease is closed: WP-3.2
+    holds a live lease while any tool runs (ARCHITECTURE §5.3)."""
+    task_id = await make_task("running", None)  # lease_expires_at NULL
+    call_id = await running_call(engine, task_id, None, risk=1, name="repo.write_file")
+    result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0, skipped=0)
+    assert await call_state(engine, call_id) == ("error", "outcome_unknown")
 
 
 async def test_parallel_run_sweeps_close_each_row_once(  # type: ignore[no-untyped-def]
@@ -754,8 +768,8 @@ async def test_a_bad_profile_timeout_uses_3600_seconds_and_stops_nothing(  # typ
     other = await make_task("running", DEAD)
     other_run = await start_run(engine, other, agent_id="A02")  # another task, another (valid) profile
     task_id = await make_task("running", LIVE)
-    inside = await start_run(engine, task_id, age_s=3600 + 59)
-    past = await start_run(engine, task_id, age_s=3600 + 61)
+    inside = await start_run(engine, task_id, age_s=3600 + 60 - MARGIN_S)
+    past = await start_run(engine, task_id, age_s=3600 + 60 + MARGIN_S)
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
     assert result == RunRecoveryResult(tasks=2, runs=2, tool_calls=0, failed=0, skipped=0)
     assert (await run_row(engine, other_run)).error_code == "interrupted"
