@@ -610,3 +610,102 @@ async def test_read_run_outcome_of_another_task_is_missing(
     run_id = await begin(writer, start(other.id, project_id))
     assert await read_run_outcome(session, run_id, task_id=task_id) == RunOutcome("missing", None, None)
     assert await read_run_outcome(session, run_id, task_id=other.id) == RunOutcome("running", "running", None)
+
+
+async def audits_of(session: AsyncSession, run_id: uuid.UUID) -> list[AuditEvent]:
+    session.expire_all()
+    query = select(AuditEvent).where(
+        AuditEvent.action == "budget.exceeded", AuditEvent.resource_id == str(run_id)
+    )
+    return list(await session.scalars(query))
+
+
+async def test_an_idempotent_start_fills_the_project_cache(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Backend M1: a start that found its row still ``running`` caches the run's project like a first one."""
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    run = start(task_id, project_id)
+    await writer.start(run)
+    writer._projects.clear()  # the first start's process is gone; a retry in another one found the row
+    await writer.start(run)
+    assert writer._projects == {run.agent_run_id: project_id}
+
+
+async def test_finish_with_an_empty_project_cache_audits_the_tasks_project(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Backend M1 / silent L2: ``finish`` and ``fail`` resolve the audit's project the same way, the cache,
+    else the task's project (``app.core.events.task_project_id``)."""
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    run_id = await begin(writer, start(task_id, project_id))
+    writer._projects.clear()
+    breach = BudgetBreach("tokens", 10, 12, 4)
+    await writer.finish(run_id, RunEnd("budget_exceeded", 2, budget=breach))
+    [audit] = await audits_of(session, run_id)
+    assert audit.project_id == project_id
+
+
+async def test_a_budget_audit_whose_project_is_unknown_is_logged(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from structlog.testing import capture_logs
+
+    from app.services import agent_runtime
+
+    async def unknown(_session: AsyncSession, _task_id: uuid.UUID) -> None:
+        return None
+
+    monkeypatch.setattr(agent_runtime, "task_project_id", unknown)
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    run_id = await begin(writer, start(task_id, project_id))
+    writer._projects.clear()
+    with capture_logs() as logs:
+        await writer.finish(run_id, RunEnd("budget_exceeded", 1, budget=BudgetBreach("tokens", 1, 1, 0)))
+    [missing] = [log for log in logs if log["event"] == "budget_audit_project_missing"]
+    assert (missing["log_level"], missing["agent_run_id"], missing["task_id"]) == (
+        "error",
+        str(run_id),
+        str(task_id),
+    )
+    [audit] = await audits_of(session, run_id)
+    assert audit.project_id is None  # still audited: the trail is kept, its project is not invented
+
+
+async def test_a_failing_breach_audit_never_rolls_back_the_minimal_end(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Silent M4 (ruling R7): the breach's event and audit are written in a savepoint of ``fail``'s
+    transaction. A database error there rolls back the savepoint only: the minimal end and its
+    ``agent.run_finished`` are committed, and the lost audit is logged with the run's ids and error type."""
+    from sqlalchemy import text
+    from structlog.testing import capture_logs
+
+    audit = AuditWriter(Redactor([SECRET]))
+    real_write = audit.write
+
+    async def broken_write(db: AsyncSession, **fields: Any) -> int:
+        if fields.get("action") == "budget.exceeded":
+            await db.execute(text("SELECT 1 / 0"))  # a database error: the transaction is aborted
+        return await real_write(db, **fields)
+
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus(engine)
+    writer = AgentRunWriter(sessions, bus, audit)
+    run_id = await begin(writer, start(task_id, project_id))
+    audit.write = broken_write  # type: ignore[method-assign]
+    with capture_logs() as logs:
+        await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=BudgetBreach("cost", 2, 3, 1))
+    row = await stored(session, run_id)
+    assert (row.status, row.error_code) == ("failed", "internal_error")
+    types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
+    assert types == ["agent.run_started", "agent.run_finished"]  # the savepoint's event is gone
+    assert [m["type"] for m in bus.messages] == ["agent.run_started", "agent.run_finished"]
+    assert bus.unseen == []
+    assert await audits_of(session, run_id) == []
+    [lost] = [log for log in logs if log["event"] == "budget_audit_unrecorded"]
+    assert (lost["log_level"], lost["agent_run_id"], lost["task_id"]) == ("error", str(run_id), str(task_id))
+    assert lost["error_type"] == "DBAPIError"  # the type only: an exception text may carry row values

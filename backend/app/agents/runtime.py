@@ -857,7 +857,8 @@ class RunStore(Protocol):
     ) -> None:
         """The minimal end when ``finish`` could not be written: ``failed internal_error``, only for the row
         of this id, task and agent that is still ``running`` (a foreign id ends nothing; ruling R6). A known
-        ``breach`` is still audited and published, in the same transaction (D-I5)."""
+        ``breach`` is still audited and published, in the same transaction (D-I5), within a savepoint: their
+        failure never rolls the minimal end back (ruling R7)."""
         ...
 
 

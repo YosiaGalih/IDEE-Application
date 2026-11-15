@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
-from sqlalchemy import Integer, cast, column, func, select, table, update
+from sqlalchemy import Integer, cast, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -43,7 +43,7 @@ from app.agents.runtime import (
 from app.core.audit import AuditWriter
 from app.core.config import Settings
 from app.core.db import bound_transaction
-from app.core.events import EventBus, emit_task_event, publish_pending
+from app.core.events import EventBus, emit_task_event, publish_pending, task_project_id
 from app.core.logging import get_logger
 from app.core.money import decimal_str, stored_cost
 from app.core.redaction import Redactor
@@ -74,9 +74,6 @@ from app.workflow.budget import BudgetDefaults, BudgetExceeded, BudgetGuard, Cal
 from app.workflow.lease import LeaseLost, renew_lease
 
 _log = get_logger(__name__)
-# Only the project of a task is read, and only for the audit of a minimal end: this module may not import the
-# task model (the runtime never moves a task; the import contract), and a column is all it needs.
-_TASK_PROJECT = table("tasks", column("id"), column("project_id"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +330,7 @@ class AgentRunWriter:
                     raise AgentRunIdConflict(f"agent run id {run_id} belongs to another task or agent")
                 if existing.status != "running":
                     raise AgentRunAlreadyFinished(f"agent run {run_id} has ended: its id is spent")
+                self._projects[run_id] = run.project_id  # its end is audited like a first start's
                 return
             await emit_task_event(
                 session,
@@ -439,7 +437,9 @@ class AgentRunWriter:
         id ends nothing; ruling R6); then, in the same transaction,
         ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d). A known ``breach`` also writes
         ``usage.budget_exceeded`` and the audit ``budget.exceeded`` (D-I5); the status stays
-        ``failed internal_error``. The project is the cache's, else the task's."""
+        ``failed internal_error``. Those two are written in a savepoint (ruling R7): when they fail, the
+        savepoint alone is rolled back, ``budget_audit_unrecorded`` is logged with the run's ids and the error
+        type, and the minimal end is still committed."""
         project_id = self._projects.pop(agent_run_id, None)
         async with self._sessions() as session:
             await bound_transaction(session)
@@ -481,11 +481,20 @@ class AgentRunWriter:
                 redactor=self._audit.redactor,
             )
             if breach is not None:
-                if project_id is None:  # an idempotent start that found its row filled no cache entry
-                    project_id = await session.scalar(
-                        select(_TASK_PROJECT.c.project_id).where(_TASK_PROJECT.c.id == task_id)
+                try:
+                    async with session.begin_nested():
+                        await self._budget_exceeded(
+                            session, agent_run_id, task_id, agent_id, project_id, breach
+                        )
+                except (
+                    Exception
+                ) as error:  # the end is the record; the audit of its breach is best-effort here
+                    _log.error(
+                        "budget_audit_unrecorded",
+                        agent_run_id=str(agent_run_id),
+                        task_id=str(task_id),
+                        error_type=type(error).__name__,
                     )
-                await self._budget_exceeded(session, agent_run_id, task_id, agent_id, project_id, breach)
             await session.commit()
             if self._bus is not None:
                 await publish_pending(session, self._bus)
@@ -496,9 +505,15 @@ class AgentRunWriter:
         agent_run_id: uuid.UUID,
         task_id: uuid.UUID,
         agent_id: str,
-        project_id: uuid.UUID | None,
+        cached_project: uuid.UUID | None,
         breach: BudgetBreach,
     ) -> None:
+        """``usage.budget_exceeded`` and the audit ``budget.exceeded``, for ``finish`` and ``fail`` alike. The
+        audit's project is the one ``start`` cached, else the task's; when neither is known the audit is still
+        written, without a project, and ``budget_audit_project_missing`` is logged."""
+        project_id = cached_project if cached_project is not None else await task_project_id(session, task_id)
+        if project_id is None:
+            _log.error("budget_audit_project_missing", agent_run_id=str(agent_run_id), task_id=str(task_id))
         await emit_task_event(
             session,
             self._bus,

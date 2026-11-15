@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from redis.asyncio import Redis
-from sqlalchemy import event, update
+from sqlalchemy import event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, SessionTransaction
 
@@ -99,6 +99,13 @@ async def emit_task_event(
     _hook(db.sync_session)
     db.info.setdefault(_UNCOMMITTED, []).append(_message(task_id, seq, type, now, safe_payload))
     return seq
+
+
+async def task_project_id(db: AsyncSession, task_id: uuid.UUID) -> uuid.UUID | None:
+    """The project of the task, read only; ``None`` for an unknown task. For a module that emits a task's
+    events but may not import the task model itself (the runtime's run store, under the "never moves a task"
+    import contract), here the project of a ``budget.exceeded`` audit (WP-3.1f2b1 F6)."""
+    return await db.scalar(select(Task.project_id).where(Task.id == task_id))
 
 
 async def publish_pending(db: AsyncSession, bus: EventBus) -> None:
