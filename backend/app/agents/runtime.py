@@ -1002,6 +1002,12 @@ class AgentRuntime:
             _log.warning("agent_run_worker_cancelled", **_ctx(run), agent_id=run.spec.agent_id)
             await asyncio.shield(self._wrap_up_after_error(watchers, run, self._end_for(cancelled, run)))
             raise
+        except AgentRunIdConflict:
+            # A reused or foreign id is the caller's bug: nothing is written for this request, and above all
+            # nothing is closed, for the row is another run's.
+            _log.error("agent_run_id_conflict", **_ctx(run), agent_id=run.spec.agent_id)
+            await asyncio.shield(_stop(watchers, run))
+            raise
         except Exception as error:
             _log.error(
                 "agent_run_internal_error",
@@ -1420,12 +1426,15 @@ class AgentRuntime:
         """The end, written shielded and bounded by ``close_timeout_s``, with one retry (review M5): a write
         still running is waited for once more, a write that failed is tried again. Then, if the row exists,
         a minimal ``failed internal_error``, and ``AgentRunUnfinished``. Every failure is logged with the
-        run's ids."""
+        run's ids. ``AgentRunIdConflict`` is the exception: the id is another run's, so it is raised at once,
+        with no retry and no ``fail`` (which would end that run)."""
         failure: BaseException | None = None
         write = self._write(run, end)
         for attempt in (1, 2):
             try:
                 return await asyncio.wait_for(asyncio.shield(write), self._config.close_timeout_s)
+            except AgentRunIdConflict:
+                raise  # the id is another run's: no retry, no minimal end, no AgentRunUnfinished
             except RunAlreadyFinished as error:
                 # The row is terminal: an earlier write committed and its ack was lost (review N4). Nothing is
                 # written over it; the caller still does not know the end.

@@ -27,6 +27,7 @@ from app.agents.runtime import (
     SUBMIT_RESULT,
     AgentInputInvalid,
     AgentInputTooLarge,
+    AgentRunIdConflict,
     AgentRunResult,
     AgentRunUnfinished,
     BudgetBreach,
@@ -1758,3 +1759,20 @@ async def test_a_lost_start_ack_retries_start_with_the_same_id_and_writes_one_en
     assert [s.agent_run_id for s in fakes.runs.starts] == [rid, rid]
     assert [run_id for run_id, _ in fakes.runs.finishes] == [rid]
     assert fakes.runs.failed_runs == []
+
+
+class ConflictRuns(FakeRuns):
+    """The id is another run's: ``start`` refuses it."""
+
+    async def start(self, run: Any) -> None:
+        await super().start(run)
+        raise AgentRunIdConflict(f"agent run id {run.agent_run_id} belongs to another task or agent")
+
+
+async def test_a_foreign_run_id_writes_nothing_and_ends_nothing() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.runs = ConflictRuns()
+    with pytest.raises(AgentRunIdConflict):
+        await make_runtime(fakes).run(run_request("B14"))
+    assert fakes.runs.failed_runs == [] and fakes.runs.finishes == []
+    assert len(fakes.runs.starts) == 1
