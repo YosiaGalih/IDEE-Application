@@ -119,3 +119,20 @@ async def test_the_recovery_actor_is_task_recoverys(
         await session.commit()
     [audit] = await audits(sessions, row)
     assert (audit.actor_type, audit.actor_id) == (ACTOR.type, ACTOR.id)
+
+
+async def test_a_runless_recovered_calls_audit_has_its_code_and_no_correlation(
+    sessions: async_sessionmaker[AsyncSession], scope: Scope
+) -> None:
+    """AG-13 INFO-1: ``error_code`` in the metadata; no run, so no correlation id (never an invented one)."""
+    async with sessions() as session:
+        row = running(scope, "repo.write_file", 1, "t1")
+        session.add(row)
+        await session.commit()
+        locked = await session.get(ToolCall, row.id, with_for_update=True)
+        assert locked is not None
+        await close_abandoned_calls(session, AUDIT, [locked], project_id=scope.project_id)
+        await session.commit()
+    [audit] = await audits(sessions, row)
+    assert audit.metadata_["error_code"] == "outcome_unknown"
+    assert audit.metadata_["agent_run_id"] is None and audit.correlation_id is None

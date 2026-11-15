@@ -871,7 +871,10 @@ async def close_abandoned_calls(
     ``calls`` are rows the caller already locked; this runs in the caller's transaction and neither commits
     nor publishes (the task events are queued for the caller to publish after its commit). Like ``_replay``,
     each UPDATE is conditional on ``running``: a row that finished meanwhile is left alone. R1+ rows are
-    audited ``tool.executed`` by the recovery actor. Returns how many rows were closed."""
+    audited ``tool.executed`` by the recovery actor, with ``error_code`` and, for a call of a run, the run's
+    correlation id (``agent_run:<id>``, as the runtime's calls carry; none without a run). Returns how many
+    rows were closed. Its only caller is ``app.services.run_recovery`` (tests/unit/
+    test_close_abandoned_calls_guard.py)."""
     closed = 0
     for call in calls:
         won = await session.scalar(
@@ -902,8 +905,10 @@ async def close_abandoned_calls(
                     "agent_run_id": str(call.agent_run_id) if call.agent_run_id else None,
                     "approval_id": str(call.approval_id) if call.approval_id else None,
                     "status": "error",
+                    "error_code": "outcome_unknown",
                     "recovered": True,
                 },
+                correlation_id=f"agent_run:{call.agent_run_id}" if call.agent_run_id else None,
             )
         await emit_task_event(
             session,

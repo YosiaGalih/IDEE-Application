@@ -622,6 +622,26 @@ async def test_tool_calls_of_a_recovered_run_close_unknown(  # type: ignore[no-u
     assert bus.unseen == []
 
 
+async def test_a_recovered_calls_audit_names_its_code_and_its_run(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    """AG-13 INFO-1: the audit of a recovered R1+ call carries ``error_code`` and, for a call of a run, the
+    run's correlation id, like the gateway's own audit of the call (``agent_run:<id>``)."""
+    task_id = await make_task("running", DEAD)
+    run_id = await start_run(engine, task_id)
+    call_id = await running_call(engine, task_id, run_id, risk=1, name="repo.write_file")
+    await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    async with make_sessionmaker(engine)() as session:
+        audit = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "tool.executed", AuditEvent.resource_id == str(call_id)
+            )
+        )
+    assert audit is not None
+    assert audit.metadata_["error_code"] == "outcome_unknown"
+    assert audit.correlation_id == f"agent_run:{run_id}"
+
+
 async def test_running_tool_call_of_a_finished_run_closes_under_a_live_lease(  # type: ignore[no-untyped-def]
     engine: AsyncEngine, make_task, profiles
 ) -> None:

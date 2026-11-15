@@ -250,9 +250,10 @@ def _number(value: int | Decimal | None) -> int | str | None:
 @dataclass(frozen=True, slots=True)
 class RunOutcome:
     """What the ``agent_runs`` row says about a run: ``missing`` (no row was written), ``running`` (belongs to
-    recovery) or ``finished`` with its status and code."""
+    recovery), ``paused`` (``approval_required``: waiting for a human decision, not an end) or ``finished``
+    with its status and code."""
 
-    state: Literal["finished", "running", "missing"]
+    state: Literal["finished", "paused", "running", "missing"]
     status: str | None
     error_code: str | None
 
@@ -273,7 +274,11 @@ async def read_run_outcome(
     if row is None:
         return RunOutcome("missing", None, None)
     status, error_code = row
-    return RunOutcome("running" if status == "running" else "finished", status, error_code)
+    if status == "running":
+        return RunOutcome("running", status, error_code)
+    if status == "approval_required":  # a pause for a human decision: the run has not ended (silent L1)
+        return RunOutcome("paused", status, error_code)
+    return RunOutcome("finished", status, error_code)
 
 
 class AgentRunWriter:

@@ -709,3 +709,16 @@ async def test_a_failing_breach_audit_never_rolls_back_the_minimal_end(
     [lost] = [log for log in logs if log["event"] == "budget_audit_unrecorded"]
     assert (lost["log_level"], lost["agent_run_id"], lost["task_id"]) == ("error", str(run_id), str(task_id))
     assert lost["error_type"] == "DBAPIError"  # the type only: an exception text may carry row values
+
+
+async def test_read_run_outcome_reports_a_paused_run(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Silent L1: ``approval_required`` is a pause waiting for a human, not an end: ``paused``."""
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    run_id = await begin(writer, start(task_id, project_id))
+    pending = {"pending_tool": {"tool_use_id": "toolu_1", "tool_name": "git.push"}}
+    await writer.finish(run_id, RunEnd("approval_required", 2, output=pending))
+    outcome = await read_run_outcome(session, run_id, task_id=task_id)
+    assert outcome == RunOutcome("paused", "approval_required", None)
