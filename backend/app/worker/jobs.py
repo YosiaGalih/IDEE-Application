@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 
 from celery import shared_task
 from redis.asyncio import Redis
@@ -12,7 +13,8 @@ from app.core.config import load_settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.events import RedisEventBus
 from app.core.redaction import Redactor
-from app.workflow.recovery import RecoveryIncomplete, recover_expired
+from app.services.run_recovery import RunRecoveryIncomplete, RunRecoveryResult, recover_runs
+from app.workflow.recovery import RecoveryIncomplete, RecoveryResult, recover_expired
 
 # Shorter than the 30 s beat interval: a hung database must not pin a worker slot (review WP-1.1f).
 SWEEP_TIMEOUT_SECONDS = 25.0
@@ -24,20 +26,37 @@ def recovery_sweep() -> dict[str, int]:
     return asyncio.run(run_recovery_sweep())
 
 
-async def run_recovery_sweep() -> dict[str, int]:
+async def sweep_recoveries() -> tuple[RecoveryResult, RunRecoveryResult]:
+    """Task recovery, then run recovery, both inside one timeout. Neither failure starves the other."""
     settings = load_settings()
     engine = make_engine(settings.database_url)
     redis = Redis.from_url(settings.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0)
     try:
         async with asyncio.timeout(SWEEP_TIMEOUT_SECONDS):
-            result = await recover_expired(
-                make_sessionmaker(engine),
-                RedisEventBus(redis),
-                AuditWriter(Redactor(settings.secret_values())),
-            )
+            sessions = make_sessionmaker(engine)
+            bus = RedisEventBus(redis)
+            audit = AuditWriter(Redactor(settings.secret_values()))
+            tasks = await recover_expired(sessions, bus, audit)
+            runs = await recover_runs(sessions, bus, audit)
     finally:
         await redis.aclose()
         await engine.dispose()
-    if result.failed:
-        raise RecoveryIncomplete(result)
-    return dict(result.__dict__)
+    return tasks, runs
+
+
+async def run_recovery_sweep() -> dict[str, int]:
+    tasks, runs = await sweep_recoveries()
+    if tasks.failed:
+        raise RecoveryIncomplete(tasks)
+    if runs.failed:
+        raise RunRecoveryIncomplete(runs)
+    return recovery_counts(tasks, runs)
+
+
+def recovery_counts(tasks: RecoveryResult, runs: RunRecoveryResult) -> dict[str, int]:
+    return {
+        **asdict(tasks),
+        "runs_recovered": runs.runs,
+        "tool_calls_closed": runs.tool_calls,
+        "runs_failed": runs.failed,
+    }

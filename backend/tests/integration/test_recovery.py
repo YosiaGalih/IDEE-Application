@@ -244,7 +244,9 @@ def test_cli_recover_reports_counts(
     for key, value in make_test_env().items():
         monkeypatch.setenv(key, value)
     assert main(["recover"]) == 0
-    assert "candidates: 1, recovered: 1, failed: 0, skipped: 0" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "candidates: 1, recovered: 1, failed: 0, skipped: 0" in out
+    assert "runs_recovered: 0, tool_calls_closed: 0, runs_failed: 0" in out
     assert asyncio.run(read_status(migrated_database, task_id)) == "interrupted"
 
 
@@ -255,7 +257,15 @@ def test_celery_job_runs_the_sweep(monkeypatch: pytest.MonkeyPatch, migrated_dat
     task_id = asyncio.run(seed_orphan(migrated_database))
     for key, value in make_test_env().items():
         monkeypatch.setenv(key, value)
-    assert recovery_sweep.apply().get() == {"candidates": 1, "recovered": 1, "failed": 0, "skipped": 0}
+    assert recovery_sweep.apply().get() == {
+        "candidates": 1,
+        "recovered": 1,
+        "failed": 0,
+        "skipped": 0,
+        "runs_recovered": 0,
+        "tool_calls_closed": 0,
+        "runs_failed": 0,
+    }
     assert asyncio.run(read_status(migrated_database, task_id)) == "interrupted"
 
 
@@ -289,6 +299,70 @@ def test_failed_recoveries_fail_the_celery_job(monkeypatch: pytest.MonkeyPatch) 
     result = jobs.recovery_sweep.apply()
     assert result.failed()
     assert isinstance(result.result, RecoveryIncomplete)
+
+
+def _patch_sweep_parts(monkeypatch: pytest.MonkeyPatch, tasks_failed: int, runs_failed: int) -> list[str]:
+    from app.worker import jobs
+    from app.workflow.recovery import RecoveryResult
+
+    calls: list[str] = []
+
+    async def fake_tasks(*_a: object, **_k: object) -> RecoveryResult:
+        calls.append("tasks")
+        return RecoveryResult(candidates=1, recovered=1 - tasks_failed, failed=tasks_failed, skipped=0)
+
+    async def fake_runs(*_a: object, **_k: object) -> RunRecoveryResult:
+        calls.append("runs")
+        return RunRecoveryResult(tasks=1, runs=2, tool_calls=3, failed=runs_failed)
+
+    monkeypatch.setattr(jobs, "recover_expired", fake_tasks)
+    monkeypatch.setattr(jobs, "recover_runs", fake_runs)
+    return calls
+
+
+def test_failed_run_recoveries_fail_the_celery_job(
+    monkeypatch: pytest.MonkeyPatch, migrated_database: str
+) -> None:
+    from app.worker import jobs
+    from tests.conftest import make_test_env
+
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    calls = _patch_sweep_parts(monkeypatch, tasks_failed=0, runs_failed=1)
+    result = jobs.recovery_sweep.apply()
+    assert result.failed()
+    assert isinstance(result.result, RunRecoveryIncomplete)
+    assert result.result.result.failed == 1
+    assert calls == ["tasks", "runs"]
+
+
+def test_failed_task_recovery_does_not_starve_run_recovery(
+    monkeypatch: pytest.MonkeyPatch, migrated_database: str
+) -> None:
+    from app.worker import jobs
+    from app.workflow.recovery import RecoveryIncomplete
+    from tests.conftest import make_test_env
+
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    calls = _patch_sweep_parts(monkeypatch, tasks_failed=1, runs_failed=1)
+    result = jobs.recovery_sweep.apply()
+    assert isinstance(result.result, RecoveryIncomplete)  # tasks first
+    assert calls == ["tasks", "runs"]  # runs still ran
+
+
+def test_cli_recover_fails_on_run_failures_and_prints_all_counts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], migrated_database: str
+) -> None:
+    from app.cli import main
+    from tests.conftest import make_test_env
+
+    for key, value in make_test_env().items():
+        monkeypatch.setenv(key, value)
+    _patch_sweep_parts(monkeypatch, tasks_failed=0, runs_failed=1)
+    assert main(["recover"]) == 1
+    out = capsys.readouterr().out
+    assert "runs_recovered: 2, tool_calls_closed: 3, runs_failed: 1" in out
 
 
 # Run recovery (WP-3.1f2b1, spec 3.1f2b Keputusan Lead #3-#8) ---------------------------------------------
