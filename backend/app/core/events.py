@@ -5,7 +5,8 @@ events are numbered without gaps or duplicates.
 
 Publishing to Redis happens only for events whose transaction committed:
 - session hooks move queued events to a "committed" list on commit;
-- they drop them on rollback, including a rolled-back savepoint;
+- they drop them on rollback: a full rollback drops every queued event, a rolled-back savepoint only the
+  events queued inside it, also when a flush failure inside it rolls it back (WP-3.1f2b1 G3);
 - ``publish_pending`` (or ``commit_and_publish``) then sends only the committed ones. A subscriber can
   therefore never see an event the database does not have.
 
@@ -169,13 +170,25 @@ def _on_commit(session: Session) -> None:
 
 
 def _on_rollback(session: Session, previous_transaction: SessionTransaction) -> None:
+    """Drop what the database rolled back. That is the boundary ``SessionTransaction.rollback`` rolls back:
+    the nearest savepoint at or above the rolled-back transaction, else the whole transaction. A flush failure
+    rolls back the flush's subtransaction (not nested, with a parent): inside a savepoint its boundary is
+    that savepoint, so only the events queued since the savepoint began are gone (re-review N1)."""
     uncommitted = session.info.get(_UNCOMMITTED, [])
-    mark = session.info.get(_SAVEPOINTS, {}).pop(id(previous_transaction), None)
-    if previous_transaction.nested and mark is not None:
-        del uncommitted[mark:]  # only the savepoint's events are gone
-    else:
-        uncommitted.clear()
-        session.info[_SAVEPOINTS] = {}
+    savepoints = session.info.get(_SAVEPOINTS, {})
+    boundary = previous_transaction
+    while not boundary.nested and boundary.parent is not None:
+        boundary = boundary.parent
+    if boundary.nested:
+        # The savepoint's own rollback (which comes after its subtransaction's) forgets its mark.
+        own = boundary is previous_transaction
+        mark = savepoints.pop(id(boundary), None) if own else savepoints.get(id(boundary))
+        if mark is not None:
+            del uncommitted[mark:]  # only the savepoint's events are gone
+            return
+    # The whole transaction, or a savepoint opened before the first event was queued (all events are its).
+    uncommitted.clear()
+    session.info[_SAVEPOINTS] = {}
 
 
 def _message(task_id: uuid.UUID, seq: int | None, type: str, ts: datetime, payload: Any) -> dict[str, Any]:

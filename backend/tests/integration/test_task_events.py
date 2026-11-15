@@ -6,12 +6,14 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.db import make_sessionmaker
@@ -300,3 +302,101 @@ async def test_hung_bus_does_not_block_publishing_forever(session: AsyncSession,
     await emit_task_event(session, None, task_id, "task.log", {"m": 1}, redactor=REDACTOR)
     await session.commit()
     await asyncio.wait_for(publish_pending(session, HungBus()), timeout=10)
+
+
+# The rollback hook against flush failures (WP-3.1f2b1 last fix wave G3, re-review N1) -----------------------
+
+
+class Recorded:
+    """An ``EventBus`` that keeps what it is sent."""
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    async def publish(self, channel: str, message: dict[str, Any]) -> None:
+        self.messages.append(message)
+
+    def said(self) -> list[str]:
+        return [m["payload"]["message"] for m in self.messages]
+
+
+async def say(session: AsyncSession, bus: Recorded, task_id: uuid.UUID, message: str) -> None:
+    await emit_task_event(session, bus, task_id, "task.log", {"message": message}, redactor=REDACTOR)
+
+
+async def flush_a_broken_row(session: AsyncSession) -> None:
+    """A failure at flush time (the FK of an event row to an unknown task): SQLAlchemy rolls back the flush's
+    subtransaction, a non-nested transaction whose rollback boundary is the nearest savepoint, else the whole
+    transaction."""
+    session.add(TaskEvent(task_id=uuid.uuid4(), seq=1, type="x", payload={}, created_at=datetime.now(UTC)))
+    await session.flush()
+
+
+async def stored_messages(engine: AsyncEngine, task_id: uuid.UUID) -> list[str]:
+    async with make_sessionmaker(engine)() as other:
+        rows = await other.scalars(
+            select(TaskEvent).where(TaskEvent.task_id == task_id).order_by(TaskEvent.seq)
+        )
+        return [row.payload["message"] for row in rows]
+
+
+async def test_a_flush_failure_in_a_savepoint_drops_only_the_savepoints_events(
+    session: AsyncSession, engine: AsyncEngine, task_id: uuid.UUID
+) -> None:
+    bus = Recorded()
+    await say(session, bus, task_id, "before")
+    with pytest.raises(IntegrityError):
+        async with session.begin_nested():
+            await say(session, bus, task_id, "inside")
+            await flush_a_broken_row(session)
+    await say(session, bus, task_id, "after")
+    await session.commit()
+    await publish_pending(session, bus)
+    assert bus.said() == ["before", "after"] == await stored_messages(engine, task_id)
+
+
+async def test_a_flush_failure_in_an_inner_savepoint_keeps_the_outer_savepoints_events(
+    session: AsyncSession, engine: AsyncEngine, task_id: uuid.UUID
+) -> None:
+    bus = Recorded()
+    await say(session, bus, task_id, "before")
+    async with session.begin_nested():
+        await say(session, bus, task_id, "outer")
+        with pytest.raises(IntegrityError):
+            async with session.begin_nested():
+                await say(session, bus, task_id, "inner")
+                await flush_a_broken_row(session)
+        await say(session, bus, task_id, "outer after")
+    await session.commit()
+    await publish_pending(session, bus)
+    assert bus.said() == ["before", "outer", "outer after"] == await stored_messages(engine, task_id)
+
+
+async def test_a_flush_failure_outside_a_savepoint_still_clears_the_queue(
+    session: AsyncSession, engine: AsyncEngine, task_id: uuid.UUID
+) -> None:
+    """No savepoint: the flush failure rolls the whole transaction back, so every queued event goes."""
+    bus = Recorded()
+    await say(session, bus, task_id, "lost")
+    with pytest.raises(IntegrityError):
+        await flush_a_broken_row(session)
+    await session.rollback()
+    await say(session, bus, task_id, "fresh")
+    await session.commit()
+    await publish_pending(session, bus)
+    assert bus.said() == ["fresh"] == await stored_messages(engine, task_id)
+
+
+async def test_a_full_rollback_after_a_savepoint_flush_failure_clears_the_queue(
+    session: AsyncSession, engine: AsyncEngine, task_id: uuid.UUID
+) -> None:
+    bus = Recorded()
+    await say(session, bus, task_id, "kept by the savepoint, lost by the rollback")
+    with pytest.raises(IntegrityError):
+        async with session.begin_nested():
+            await flush_a_broken_row(session)
+    await session.rollback()
+    await say(session, bus, task_id, "fresh")
+    await session.commit()
+    await publish_pending(session, bus)
+    assert bus.said() == ["fresh"] == await stored_messages(engine, task_id)

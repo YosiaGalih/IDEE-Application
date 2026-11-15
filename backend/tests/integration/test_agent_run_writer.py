@@ -772,3 +772,40 @@ async def test_read_run_outcome_of_another_agent_is_missing(
     assert await read_run_outcome(session, run_id, task_id=task_id, agent_id="B15") == RunOutcome(
         "running", "running", None
     )
+
+
+async def test_a_breach_audit_failing_at_flush_still_publishes_the_minimal_end(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], engine: AsyncEngine
+) -> None:
+    """Re-review N1 (G3): the breach audit fails at *flush* time inside fail()'s savepoint (an ORM add, as
+    AuditWriter.write itself does). SQLAlchemy then rolls back a subtransaction whose boundary is the
+    savepoint; the event hook drops only the savepoint's events, so the committed ``agent.run_finished`` is
+    still published."""
+    from datetime import UTC, datetime
+
+    from structlog.testing import capture_logs
+
+    audit = AuditWriter(Redactor([SECRET]))
+    real_write = audit.write
+
+    async def broken_write(db: AsyncSession, **fields: Any) -> int:
+        if fields.get("action") == "budget.exceeded":  # an event row of an unknown task: a FK error at flush
+            db.add(TaskEvent(task_id=uuid.uuid4(), seq=1, type="x", payload={}, created_at=datetime.now(UTC)))
+            await db.flush()
+        return await real_write(db, **fields)
+
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus(engine)
+    writer = AgentRunWriter(sessions, bus, audit)
+    run_id = await begin(writer, start(task_id, project_id))
+    audit.write = broken_write  # type: ignore[method-assign]
+    with capture_logs() as logs:
+        await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=BudgetBreach("cost", 2, 3, 1))
+    row = await stored(session, run_id)
+    assert (row.status, row.error_code) == ("failed", "internal_error")
+    types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
+    assert types == ["agent.run_started", "agent.run_finished"]
+    assert [m["type"] for m in bus.messages] == ["agent.run_started", "agent.run_finished"]
+    assert bus.unseen == []
+    [lost] = [log for log in logs if log["event"] == "budget_audit_unrecorded"]
+    assert (lost["error_type"], lost["breach_kind"]) == ("IntegrityError", "cost")

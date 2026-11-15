@@ -507,6 +507,7 @@ WORKSPACE_ROOT/
 
 - `task_events(task_id, seq, type, payload, created_at)`; `seq` monotonic per task dari `UPDATE tasks SET event_seq = event_seq + 1 RETURNING event_seq` dalam transaksi yang sama.
 - Setelah commit → publish ke Redis channel `kk:task:{id}`. Event `ephemeral` (`agent.delta`, `test.output`) hanya dipublish (tanpa seq), tidak disimpan.
+- Rollback (hook sesi di `app/core/events.py`) membuang dari antrean publish persis apa yang di-rollback database: rollback penuh membuang semua event yang belum di-commit; savepoint yang di-rollback, termasuk karena flush gagal di dalamnya (subtransaction SQLAlchemy yang batasnya savepoint itu), hanya membuang event yang di-queue sejak savepoint itu dimulai. Event sebelum savepoint tetap dipublish sesudah commit (WP-3.1f2b1 G3) [Pasti, `tests/integration/test_task_events.py`].
 - SSE `GET /api/v1/tasks/{id}/events` mendukung header `Last-Event-ID` / query `after_seq`: replay dari DB → subscribe Redis → dedupe `seq` → heartbeat `: ping` tiap 15 dtk. UI selalu dapat memulihkan status dari `GET /tasks/{id}` + replay.
 
 ## 10. Approval (PRD §10.4, AC-13)
