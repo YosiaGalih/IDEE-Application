@@ -985,23 +985,25 @@ def test_a_raising_task_phase_never_starves_run_recovery(
 
 def test_a_hung_task_phase_times_out_alone(monkeypatch: pytest.MonkeyPatch, migrated_database: str) -> None:
     """Ruling R8: each phase has its own half of the sweep's timeout; a hung task phase times out and run
-    recovery still gets its own half."""
+    recovery still gets its own half. The margins are wide (re-review N6): the task phase would sleep 60x its
+    half, and the run phase needs under a third of its own half, but more than a shared budget would leave
+    it (nothing)."""
     from app.worker import jobs
     from app.workflow.recovery import RecoveryResult
     from tests.conftest import make_test_env
 
     for key, value in make_test_env().items():
         monkeypatch.setenv(key, value)
-    monkeypatch.setattr(jobs, "SWEEP_TIMEOUT_SECONDS", 0.4)
+    monkeypatch.setattr(jobs, "SWEEP_TIMEOUT_SECONDS", 2.0)  # 1 s per phase
     calls: list[str] = []
 
     async def hung_tasks(*_a: object, **_k: object) -> RecoveryResult:
         calls.append("tasks")
-        await asyncio.sleep(10)
+        await asyncio.sleep(60)
         raise AssertionError("not reached")
 
     async def slow_runs(*_a: object, **_k: object) -> RunRecoveryResult:
-        await asyncio.sleep(0.1)  # inside its own 0.2 s, though the task phase used all of its time
+        await asyncio.sleep(0.3)  # inside its own 1 s, though the task phase used all of its time
         calls.append("runs")
         return RunRecoveryResult(tasks=0, runs=0, tool_calls=0, failed=0, skipped=0)
 
