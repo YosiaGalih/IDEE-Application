@@ -173,14 +173,21 @@ def _on_rollback(session: Session, previous_transaction: SessionTransaction) -> 
     """Drop what the database rolled back. That is the boundary ``SessionTransaction.rollback`` rolls back:
     the nearest savepoint at or above the rolled-back transaction, else the whole transaction. A flush failure
     rolls back the flush's subtransaction (not nested, with a parent): inside a savepoint its boundary is
-    that savepoint, so only the events queued since the savepoint began are gone (re-review N1)."""
+    that savepoint, so only the events queued since the savepoint began are gone (re-review N1). A savepoint
+    without a mark was opened before the session's first event, so every queued event is its own
+    (tests/integration/test_task_events.py, test_task_event_rollbacks.py)."""
     uncommitted = session.info.get(_UNCOMMITTED, [])
     savepoints = session.info.get(_SAVEPOINTS, {})
     boundary = previous_transaction
     while not boundary.nested and boundary.parent is not None:
         boundary = boundary.parent
     if boundary.nested:
-        # The savepoint's own rollback (which comes after its subtransaction's) forgets its mark.
+        # Only the savepoint's own soft rollback forgets its mark (an execute-level failure, a Python error).
+        # On the common flush path, ``async with begin_nested()`` finds the savepoint already DEACTIVE and
+        # closes it instead (sqlalchemy/engine/util.py, TransactionalContext.__exit__): only the
+        # subtransaction's rollback fires here, and the mark stays until the outer commit or a root rollback
+        # resets the dict. Harmless: a closed savepoint's mark is never read again, and a new savepoint
+        # writes its own mark on creation.
         own = boundary is previous_transaction
         mark = savepoints.pop(id(boundary), None) if own else savepoints.get(id(boundary))
         if mark is not None:

@@ -12,8 +12,8 @@ from typing import Any
 import pytest
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.db import make_sessionmaker
@@ -400,3 +400,32 @@ async def test_a_full_rollback_after_a_savepoint_flush_failure_clears_the_queue(
     await session.commit()
     await publish_pending(session, bus)
     assert bus.said() == ["fresh"] == await stored_messages(engine, task_id)
+
+
+@pytest.mark.parametrize("failure", ["flush", "execute"])
+async def test_a_savepoint_opened_before_the_first_event_drops_its_events(
+    engine: AsyncEngine, task_id: uuid.UUID, failure: str
+) -> None:
+    """AG-13 delta-2 LOW-2: the session's first event is queued inside a savepoint opened before it, so the
+    savepoint has no mark (the hooks are registered at the first event). Its rollback, whether a flush
+    failure (a subtransaction whose boundary is the savepoint) or an execute failure (the savepoint's own
+    rollback), drops every queued event: all of them are the savepoint's. Published equals stored."""
+    bus = Recorded()
+    async with make_sessionmaker(engine)() as fresh:
+        with pytest.raises(DBAPIError):
+            async with fresh.begin_nested():  # before the session's first event: no mark
+                await say(fresh, bus, task_id, "inside")
+                if failure == "flush":
+                    await flush_a_broken_row(fresh)
+                else:
+                    await fresh.execute(text("SELECT 1 / 0"))
+        await say(fresh, bus, task_id, "after")
+        await fresh.commit()
+        await publish_pending(fresh, bus)
+    published = [(m["seq"], m["payload"]["message"]) for m in bus.messages]
+    async with make_sessionmaker(engine)() as other:
+        rows = await other.scalars(
+            select(TaskEvent).where(TaskEvent.task_id == task_id).order_by(TaskEvent.seq)
+        )
+        stored = [(row.seq, row.payload["message"]) for row in rows]
+    assert published == stored == [(1, "after")]

@@ -841,8 +841,11 @@ class RunStore(Protocol):
         (``retry=True``) is idempotent while the run is ``running``: a row that exists for the same task and
         agent and is still ``running`` is left as it is; for another task or agent, ``AgentRunIdConflict``;
         for the same task and agent whose run has ended, ``RunAlreadyFinished``. Fail-closed (rulings R5,
-        R10): ``start`` never takes over a live row nor reopens an ended one, so resuming under one id
-        (WP-3.2) needs its own explicit, AG-13-reviewed writer path."""
+        R10): a first start never takes over a live row and no start reopens an ended one, so resuming under
+        one id (WP-3.2) needs its own explicit, AG-13-reviewed writer path. A retry adopts a ``running`` row
+        of the same task and agent: if the first start died before its INSERT and a duplicate request with
+        the same id wrote its row meanwhile, that row is adopted (SECURITY_MODEL §13; the caller's fresh id
+        per ``run()``, ARCHITECTURE §6.1, is the control)."""
         ...
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
