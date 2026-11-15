@@ -8,8 +8,10 @@ through ``app.tools.gateway.close_abandoned_calls``.
 **Predicates**, on the DB clock (``clock_timestamp()``), never the worker's:
 - lease_dead: ``tasks.lease_expires_at IS NULL OR tasks.lease_expires_at < clock_timestamp()``
   (``app.workflow.recovery.lease_dead``, an EXISTS on the run's or call's task);
-- stale: ``agent_runs.started_at + make_interval(secs => COALESCE((agent_profiles.limits->>'timeout_seconds')
-  ::int, 3600) + 60) < clock_timestamp()``, the profile outer-joined on ``agent_id``.
+- stale: ``agent_runs.started_at + make_interval(secs => timeout + 60) < clock_timestamp()``, the profile
+  outer-joined on ``agent_id``; ``timeout`` = ``limits->'timeout_seconds'`` clamped into 0..3600 when it is a
+  JSON number, else 3600 (missing profile, missing key, or a hand-edited non-number: never a failed cast that
+  would stop the whole sweep; controller ruling R3).
 
 A run is closed when it is ``running`` and (lease_dead or stale). A tool call is closed when it is ``running``
 and (lease_dead, or its run is closed in the same transaction, or its run is no longer ``running``).
@@ -31,7 +33,20 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Final
 
-from sqlalchemy import ColumnElement, Integer, Select, cast, exists, func, or_, select, union, update
+from sqlalchemy import (
+    ColumnElement,
+    Integer,
+    Numeric,
+    Select,
+    case,
+    cast,
+    exists,
+    func,
+    or_,
+    select,
+    union,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.runtime import ERROR_TEXTS
@@ -50,6 +65,7 @@ from app.workflow.recovery import lease_dead, lock_task_row
 RUN_CLOSE_BOUND_S: Final = 60  # above a run's own close-out (ARCHITECTURE §5.3, ±25 s), plus clock margin
 MAX_TIMEOUT_S: Final = 3600  # the registry's ceiling (AgentLimits.timeout_seconds, le=3600)
 _CODE: Final = "interrupted"
+_INT4_MAX: Final = 2_147_483_647  # duration_ms is int4: an orphan older than ±24.8 days keeps this ceiling
 
 logger = get_logger(__name__)
 
@@ -74,7 +90,9 @@ class RunRecoveryIncomplete(RuntimeError):
 
 
 def _stale() -> ColumnElement[bool]:
-    timeout = func.coalesce(AgentProfile.limits["timeout_seconds"].astext.cast(Integer), MAX_TIMEOUT_S)
+    raw = AgentProfile.limits["timeout_seconds"]
+    clamped = func.least(func.greatest(raw.astext.cast(Numeric), 0), MAX_TIMEOUT_S)
+    timeout = case((func.jsonb_typeof(raw) == "number", cast(clamped, Integer)), else_=MAX_TIMEOUT_S)
     # make_interval(years, months, weeks, days, hours, mins, secs): positional for make_interval(secs => ...)
     bound = func.make_interval(0, 0, 0, 0, 0, 0, timeout + RUN_CLOSE_BOUND_S)
     return AgentRun.started_at + bound < func.clock_timestamp()
@@ -193,7 +211,9 @@ async def _close_run(
             estimated_cost=cost,
             cost_status=totals.cost_status,
             finished_at=func.now(),
-            duration_ms=cast(func.extract("epoch", func.now() - AgentRun.started_at) * 1000, Integer),
+            duration_ms=cast(
+                func.least(func.extract("epoch", func.now() - AgentRun.started_at) * 1000, _INT4_MAX), Integer
+            ),
         )
         .returning(AgentRun.id)
         .execution_options(synchronize_session=False)

@@ -311,13 +311,15 @@ async def project_of(engine: AsyncEngine, task_id: uuid.UUID) -> uuid.UUID:
         return (await conn.execute(query, {"id": task_id})).scalar_one()
 
 
-async def start_run(engine: AsyncEngine, task_id: uuid.UUID, *, age_s: int | None = None) -> uuid.UUID:
+async def start_run(
+    engine: AsyncEngine, task_id: uuid.UUID, *, age_s: int | None = None, agent_id: str = "B14"
+) -> uuid.UUID:
     """A ``running`` row from the runtime's writer; ``age_s`` back-dates ``started_at`` on the DB clock."""
     run = RunStart(
         agent_run_id=uuid.uuid4(),
         task_id=task_id,
         project_id=await project_of(engine, task_id),
-        agent_id="B14",
+        agent_id=agent_id,
         agent_version=1,
         step="implement",
         model_provider="scripted",
@@ -656,6 +658,45 @@ async def test_runtime_finish_racing_a_recovery_ends_the_run_once(  # type: igno
             .where(TaskEvent.task_id == task_id, TaskEvent.type == "agent.run_finished")
         )
     assert ends == 1
+
+
+@pytest.mark.parametrize("raw", ['"abc"', "100000"])
+async def test_a_bad_profile_timeout_uses_3600_seconds_and_stops_nothing(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles, raw: str
+) -> None:
+    """Ruling R3: a hand-edited ``timeout_seconds`` (not a number, or above the registry's ceiling) falls back
+    to or is clamped at 3600 s; it never fails the candidate query of the whole sweep."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE agent_profiles SET limits = jsonb_set(limits, '{timeout_seconds}', "
+                "CAST(:v AS jsonb)) WHERE agent_id = 'B14'"
+            ),
+            {"v": raw},
+        )
+    other = await make_task("running", DEAD)
+    other_run = await start_run(engine, other, agent_id="A02")  # another task, another (valid) profile
+    task_id = await make_task("running", LIVE)
+    inside = await start_run(engine, task_id, age_s=3600 + 59)
+    past = await start_run(engine, task_id, age_s=3600 + 61)
+    result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    assert result == RunRecoveryResult(tasks=2, runs=2, tool_calls=0, failed=0)
+    assert (await run_row(engine, other_run)).error_code == "interrupted"
+    assert (await run_row(engine, inside)).status == "running"
+    assert (await run_row(engine, past)).error_code == "interrupted"
+
+
+async def test_a_run_older_than_the_int4_milliseconds_still_closes(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles
+) -> None:
+    """``duration_ms`` is int4 (±24.8 days in ms): an older orphan closes with the duration clamped, instead
+    of failing its task on every sweep."""
+    task_id = await make_task("running", DEAD)
+    run_id = await start_run(engine, task_id, age_s=25 * 24 * 3600)
+    result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
+    assert result == RunRecoveryResult(tasks=1, runs=1, tool_calls=0, failed=0)
+    row = await run_row(engine, run_id)
+    assert (row.status, row.error_code, row.duration_ms) == ("failed", "interrupted", 2_147_483_647)
 
 
 async def test_one_failing_task_does_not_stop_the_run_sweep(  # type: ignore[no-untyped-def]
