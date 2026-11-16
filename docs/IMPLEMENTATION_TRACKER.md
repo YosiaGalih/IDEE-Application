@@ -2752,6 +2752,8 @@ $ uv run pytest -q <test itu> + test bukti T5 (delta_redaction, delta_streams, r
   1. CI PR hijau di head final, termasuk test bukti T5 dan `security-scan` dengan rule registry `p/*` (errors 0, tanpa finding ERROR);
   2. commit yang di-push berisi diff yang di-review ditambah kedua penutupan LOW di atas.
 
+**Sesudah PR #34 (fakta, 16 Nov 2026) [Pasti]:** PR #34 (perbaikan Semgrep) CI 9/9 di 2503265, di-merge PO 16 Nov 2026 (688e7e5). Push-CI `main` 688e7e5: `security-scan` hijau, kesebelas langkah termasuk Semgrep dan Trivy; frontend, sandbox, infra hijau. Syarat AG-13 perbaikan Semgrep terpenuhi.
+
 ### WP-3.1f2b1 (🔒 integritas akhir run) — recovery `agent_runs`/`tool_calls`, sweep run basi, id run dari pemanggil, `start` idempoten, `read_run_outcome`, `fail()` membawa breach (G1–G6 spec 3.1f2b; T10, T4, T5)
 
 **Dokumen kerja:**
