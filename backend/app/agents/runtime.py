@@ -165,7 +165,10 @@ _PEM_BEGIN: Final = "-----BEGIN"
 _PEM_END: Final = "-----END"
 # A URL's userinfo grows until "@"; a "/" or a space ends the URL before any (Lead decision 3.1f2c #11).
 _URL_CLOSED: Final = re.compile(r"[@/\s]")
-_URL_SCHEME: Final = re.compile(rf"(?:{URL_SCHEME_PATTERN})\Z")  # the redactor's own scheme, leftmost
+# The two patterns below are built without rf"…{x}…": in this module either one made Semgrep 1.180's
+# tree-sitter conversion fail, and its fallback parser refuses the module's async methods, so the whole module
+# went unscanned (main 5baf4d5). ruff format turns fr"…" back into rf"…".
+_URL_SCHEME: Final = re.compile("(?:" + URL_SCHEME_PATTERN + r")\Z")  # the redactor's own scheme, leftmost
 _SCHEME_WINDOW: Final = 64  # longer than any scheme URL_SCHEME_PATTERN takes (32)
 # What opens a quoted value before its quote: a string prefix (b"…, rb'…, as the redactor reads one) or the
 # backslash of an escaped JSON quote (\"…). Spaces before it are the gap, not part of the key's separator.
@@ -180,12 +183,12 @@ _VALUE_OPENER: Final = re.compile(r"(?:(?<![A-Za-z0-9_])[bBfFrRuU]{1,2}|\\)\Z")
 # that ran on into the key (ghp_…password="V", which the redactor reads as [REDACTED]="V") leaves the key in
 # the raw text.
 _KEY_BEFORE_QUOTE: Final = re.compile(
-    rf"""(?ix)
-    (?: (?:{SECRET_KEY_PATTERN}) \\?["']? \s*[:=]
-      | ["'](?=-)(?:{SECRET_KEY_PATTERN}) \\?["'] \s*,
-      | (?P<word> (?=-)(?:{SECRET_KEY_PATTERN}) | ["'](?=-)(?:{SECRET_KEY_PATTERN}) \\?["'] )
+    r"""(?ix)
+    (?: (?:<SECRET_KEY>) \\?["']? \s*[:=]
+      | ["'](?=-)(?:<SECRET_KEY>) \\?["'] \s*,
+      | (?P<word> (?=-)(?:<SECRET_KEY>) | ["'](?=-)(?:<SECRET_KEY>) \\?["'] )
     )\Z
-    """
+    """.replace("<SECRET_KEY>", SECRET_KEY_PATTERN)
 )
 _KEY_WINDOW: Final = 128  # how far before the last character before the gap the key is looked for
 _LONGEST_HEADER_NAME: Final = max(map(len, CREDENTIAL_HEADER_NAMES))

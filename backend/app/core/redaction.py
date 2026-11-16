@@ -223,8 +223,8 @@ _NAMED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     ("password_hash", re.compile(r"\$argon2(?:id|i|d)\$[A-Za-z0-9+/=,$]+")),  # PHC string
-    # PEM and PGP blocks ("-----BEGIN PGP PRIVATE KEY BLOCK-----"), including a truncated block with no END
-    # marker (Lead decision 3.1f2c #5).
+    # PEM and PGP private-key blocks (PGP armour ends its BEGIN line in "PRIVATE KEY BLOCK"), including a
+    # truncated block with no END marker (Lead decision 3.1f2c #5).
     (
         "private_key",
         re.compile(
