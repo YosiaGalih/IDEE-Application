@@ -2189,3 +2189,45 @@ async def test_a_newer_report_about_another_model_is_never_the_one_rejected() ->
     fakes.gate = RefreshedGate(fakes.log, dict.fromkeys(MODELS, "claude-other-model"))
     await run_b14(fakes)
     assert fakes.gate.rejects == [("not_found", REPORT_AT)]
+
+
+# --- a rejection whose attempt the ledger lost (silent M1) --------------------------------------------------
+
+
+def unrecorded(error: LLMError) -> tuple[Fakes, RaisingProvider]:
+    """``error`` from the provider, and a ledger that fails to record that attempt."""
+    fakes, provider = rejecting(error)
+    fakes.ledger = FakeLedger(fakes.log, refuse={1: RuntimeError("ledger " + "down")})
+    return fakes, provider
+
+
+async def test_an_unrecorded_attempt_carries_its_provider_error() -> None:
+    fakes, provider = unrecorded(LLMError("auth", status_code=401))
+    with pytest.raises(UsageUnrecorded) as caught:
+        await make_runtime(fakes)._call_model(a_model_call(), provider, cancel=CancelToken())  # type: ignore[arg-type]
+    assert caught.value.provider_error is provider.error
+    assert str(caught.value) == f"attempt 1 of call {caught.value.call_id} was not recorded"  # ids only
+
+
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [(LLMError("auth", status_code=401), "auth"), (LLMError("bad_request", status_code=404), "not_found")],
+    ids=repr,
+)
+async def test_a_rejection_the_ledger_lost_still_resets_readiness(error: LLMError, cause: str) -> None:
+    """Silent M1: the ledger failed for the rejected attempt; the end stays ``usage_unrecorded`` and the gate
+    still hears the rejection."""
+    fakes, _ = unrecorded(error)
+    result = await run_b14(fakes)
+    assert (result.status, result.error_code) == ("failed", "usage_unrecorded")
+    assert fakes.gate.rejects == [(cause, REPORT_AT)]
+
+
+async def test_an_unrecorded_answer_or_transient_error_resets_nothing() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    fakes.ledger = FakeLedger(fakes.log, refuse={1: RuntimeError("ledger " + "down")})
+    result = await run_b14(fakes)  # the answer came, its record did not
+    assert result.error_code == "usage_unrecorded" and fakes.gate.rejects == []
+    fakes, _ = unrecorded(LLMError("overloaded", status_code=529))
+    result = await run_b14(fakes)
+    assert result.error_code == "usage_unrecorded" and fakes.gate.rejects == []

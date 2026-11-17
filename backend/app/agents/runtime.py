@@ -611,13 +611,17 @@ class LeaseLostError(Exception):
 
 
 class UsageUnrecorded(Exception):
-    """The ledger port failed to record an attempt: raised by the runtime, from the ledger's error. It carries
-    the attempt's ids only."""
+    """The ledger port failed to record an attempt: raised by the runtime, from the ledger's error. Its text
+    carries the attempt's ids only. ``provider_error`` is the provider's own error when that attempt failed:
+    a real ``auth``/404 is then still told to the gate (silent M1), and the end stays ``usage_unrecorded``."""
 
-    def __init__(self, attempt: int, call_id: uuid.UUID | str) -> None:
+    def __init__(
+        self, attempt: int, call_id: uuid.UUID | str, *, provider_error: LLMError | None = None
+    ) -> None:
         super().__init__(f"attempt {attempt} of call {call_id} was not recorded")
         self.attempt = attempt
         self.call_id = call_id
+        self.provider_error = provider_error
 
 
 class AgentRunUnfinished(Exception):
@@ -1235,7 +1239,12 @@ class AgentRuntime:
             end = self._end_for(error, run)  # ruling R3: fixed before the reject, which a stop cannot rewrite
             await self._reject(run, error)
             return end
-        except (ProviderBlocked, LeaseLostError, BudgetRefused, UsageUnrecorded) as error:
+        except UsageUnrecorded as error:
+            end = self._end_for(error, run)  # usage_unrecorded, whatever the provider said
+            if error.provider_error is not None:  # silent M1: the ledger lost the attempt, not the rejection
+                await self._reject(run, error.provider_error)
+            return end
+        except (ProviderBlocked, LeaseLostError, BudgetRefused) as error:
             return self._end_for(error, run)
 
     async def _reject(self, run: _Run, error: LLMError) -> None:
@@ -1656,7 +1665,7 @@ class AgentRuntime:
                 async with asyncio.timeout(limit):
                     await record(attempt)
             except Exception as error:  # the bound or the ledger's own error: the attempt is unrecorded
-                raise UsageUnrecorded(attempt.attempt, call.call_id) from error
+                raise UsageUnrecorded(attempt.attempt, call.call_id, provider_error=attempt.error) from error
             if run is not None:
                 run.tally.recorded += 1
 
