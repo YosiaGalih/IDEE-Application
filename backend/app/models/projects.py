@@ -131,6 +131,8 @@ class Message(UUIDPrimaryKey, Base):
         CheckConstraint(in_values("role", MESSAGE_ROLES), name="role"),
         Index("ix_messages_conversation_id_created_at", "conversation_id", "created_at", "id"),
         Index("ix_messages_task_id", "task_id"),
+        Index("ix_messages_project_id", "project_id"),
+        Index("ix_messages_user_id", "user_id"),
     )
 
     conversation_id: Mapped[uuid.UUID] = mapped_column(

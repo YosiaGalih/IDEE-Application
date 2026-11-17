@@ -61,6 +61,9 @@ def upgrade() -> None:
         "ix_messages_conversation_id_created_at", "messages", ["conversation_id", "created_at", "id"]
     )
     op.create_index("ix_messages_task_id", "messages", ["task_id"])
+    # FK scans: deleting a project cascades to its messages, deleting a user sets theirs to null (Ruling R9).
+    op.create_index("ix_messages_project_id", "messages", ["project_id"])
+    op.create_index("ix_messages_user_id", "messages", ["user_id"])
     op.add_column(
         "tasks",
         sa.Column("context_refs", postgresql.JSONB(), server_default=sa.text("'[]'::jsonb"), nullable=False),
@@ -69,6 +72,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_column("tasks", "context_refs")
+    op.drop_index("ix_messages_user_id", table_name="messages")
+    op.drop_index("ix_messages_project_id", table_name="messages")
     op.drop_index("ix_messages_task_id", table_name="messages")
     op.drop_index("ix_messages_conversation_id_created_at", table_name="messages")
     op.drop_table("messages")

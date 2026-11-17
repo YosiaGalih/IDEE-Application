@@ -184,6 +184,9 @@ async def test_models_match_the_migration(engine: AsyncEngine) -> None:
     }
     assert "(conversation_id, created_at, id)" in indexes["ix_messages_conversation_id_created_at"]
     assert "(task_id)" in indexes["ix_messages_task_id"]
+    # Ruling R9: the FK actions (project delete cascades, user delete sets null) scan by these columns.
+    assert "(project_id)" in indexes["ix_messages_project_id"]
+    assert "(user_id)" in indexes["ix_messages_user_id"]
 
 
 async def _schema_state(database_url: str) -> tuple[bool, bool]:
