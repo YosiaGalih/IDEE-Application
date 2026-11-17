@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.agents import readiness
 from app.core.db import make_sessionmaker
+from app.models.approvals import Approval
 from app.models.audit import AuditEvent
 from app.models.tasks import Task
 from app.services.project_budget import BUDGET_MAX_TOKENS
@@ -32,6 +33,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     signed_in,
     workspace_root,
 )
+from tests.integration.test_usage_tables import record
 
 PASSWORD = "user-long-passphrase"  # make_user's
 
@@ -359,3 +361,128 @@ async def test_the_prompt_limit_is_measured_after_strip(owner: httpx.AsyncClient
     assert (await post_task(owner, project_id, prompt="x" * (PROMPT_MAX + 1))).status_code == 422
     assert (await post_task(owner, project_id, prompt="\x00" + "\r\n")).status_code == 422
     assert (await post_task(owner, project_id, prompt="a\r‮b")).status_code == 422
+
+
+TASKS_OF = PROJECTS + "/{}/tasks"
+
+
+async def make_tasks(client: httpx.AsyncClient, project_id: str, *prompts: str) -> list[str]:
+    ids = []
+    for prompt in prompts:
+        response = await post_task(client, project_id, prompt=prompt)
+        assert response.status_code == 202, response.text
+        ids.append(response.json()["data"]["id"])
+    return ids
+
+
+async def test_list_filters_and_pages(owner: httpx.AsyncClient, open_gate: None, engine: AsyncEngine) -> None:  # noqa: F811
+    project_id = await project(owner)
+    a, b, c = await make_tasks(owner, project_id, "satu", "dua", "tiga")
+    async with engine.begin() as conn:  # the status guard accepts only workflow.states.transition's marker
+        await conn.execute(text("SELECT set_config('kk.status_writer', 'transition', true)"))
+        await conn.execute(text("UPDATE tasks SET status = 'cancelled' WHERE id = :id"), {"id": uuid.UUID(c)})
+    url = TASKS_OF.format(project_id)
+    body = (await owner.get(url)).json()
+    assert body["meta"]["total"] == 3
+    assert [t["id"] for t in body["data"]] == [c, b, a]  # updated_at desc (c was just updated)
+    assert (await owner.get(url, params={"status": "draft"})).json()["meta"]["total"] == 2
+    both = await owner.get(url, params={"status": "draft,cancelled"})
+    assert both.status_code == 200 and both.json()["meta"]["total"] == 3
+    bad = await owner.get(url, params={"status": "nope"})
+    assert bad.status_code == 422
+    assert bad.json()["error"]["details"][0]["loc"] == ["query", "status"]
+    paged = (await owner.get(url, params={"page_size": 2})).json()
+    assert len(paged["data"]) == 2 and paged["meta"]["total"] == 3
+    page2 = (await owner.get(url, params={"page_size": 2, "page": 2})).json()
+    assert len(page2["data"]) == 1
+    row = body["data"][0]
+    assert set(row) == {
+        "id", "project_id", "title", "status", "status_reason", "current_step", "workflow_type", "priority",
+        "iteration", "usage", "has_pending_approval", "created_at", "updated_at",
+    }  # fmt: skip
+
+
+async def test_list_q_is_literal(owner: httpx.AsyncClient, open_gate: None) -> None:  # noqa: F811
+    project_id = await project(owner)
+    await make_tasks(
+        owner, project_id, "diskon 50% hari ini", "diskon 500 hari ini", "snake_case rule", "snakeXcase"
+    )
+    url = TASKS_OF.format(project_id)
+    hit = (await owner.get(url, params={"q": "50%"})).json()
+    assert [t["title"] for t in hit["data"]] == ["diskon 50% hari ini"]
+    under = (await owner.get(url, params={"q": "e_c"})).json()
+    assert [t["title"] for t in under["data"]] == ["snake_case rule"]
+    assert (await owner.get(url, params={"q": "DISKON"})).json()["meta"]["total"] == 2
+
+
+async def test_list_usage_and_pending_approval(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    project_id = await project(owner)
+    a, b = await make_tasks(owner, project_id, "tugas a", "tugas b")
+    pid, aid = uuid.UUID(project_id), uuid.UUID(a)
+    async with make_sessionmaker(engine)() as session:
+        session.add_all([record(pid, task_id=aid), record(pid, task_id=aid)])
+        session.add(
+            Approval(
+                project_id=pid,
+                task_id=aid,
+                action_type="tool_r3",
+                risk_level=3,
+                summary="R3",
+                payload={"tool": "x"},
+                payload_hash="b" * 64,
+                requested_by="system:tool_gateway",
+            )
+        )
+        await session.commit()
+    rows = {t["id"]: t for t in (await owner.get(TASKS_OF.format(project_id))).json()["data"]}
+    assert rows[a]["usage"]["input_tokens"] == 20 and rows[a]["usage"]["output_tokens"] == 10
+    assert rows[a]["has_pending_approval"] is True
+    assert rows[b]["has_pending_approval"] is False
+    assert rows[b]["usage"]["input_tokens"] == 0
+
+
+async def test_list_out_of_scope_is_404(
+    app,  # type: ignore[no-untyped-def]  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+) -> None:
+    project_id = await project(owner)
+    await make_user(engine, "eve@example.test")
+    eve = await signed_in(app, "eve@example.test", PASSWORD)
+    try:
+        assert (await eve.get(TASKS_OF.format(project_id))).status_code == 404
+    finally:
+        await eve.aclose()
+
+
+async def test_detail_matches_create(owner: httpx.AsyncClient, open_gate: None) -> None:  # noqa: F811
+    project_id = await project(owner)
+    created = (await post_task(owner, project_id)).json()["data"]
+    response = await owner.get(f"/api/v1/tasks/{created['id']}")
+    assert response.status_code == 200, response.text
+    detail = response.json()["data"]
+    for data in (created, detail):
+        data.pop("updated_at")
+    assert detail == created
+
+
+async def test_detail_out_of_scope_is_404(
+    app,  # type: ignore[no-untyped-def]  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    project_id = await project(owner)
+    [task_id] = await make_tasks(owner, project_id, "rahasia")
+    await make_user(engine, "eve@example.test")
+    eve = await signed_in(app, "eve@example.test", PASSWORD)
+    try:
+        assert (await eve.get(f"/api/v1/tasks/{task_id}")).status_code == 404
+        assert (await eve.get(f"/api/v1/tasks/{uuid.uuid4()}")).status_code == 404
+        assert (await owner.get(f"/api/v1/tasks/{uuid.uuid4()}")).status_code == 404
+    finally:
+        await eve.aclose()

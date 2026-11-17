@@ -14,9 +14,10 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any, Final, Literal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents import readiness
@@ -30,10 +31,12 @@ from app.services.approvals import ApprovalView
 from app.services.context_refs import ContextRef, validate_refs
 from app.services.project_budget import BUDGET_SETTINGS_KEY
 from app.services.projects import (
+    PAGE_SIZE_MAX,
     Actor,
     ProjectEnv,
     authorize,
     has_hidden_characters,
+    not_found,
     permissions_for,
     repo_path,
 )
@@ -81,6 +84,25 @@ class TaskView:
     iteration_max: int
     cancel_requested: bool
     context_refs: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class TaskSummary:
+    """One row of the task list (§11 #2): no prompt, plan or budget."""
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    title: str
+    status: str
+    status_reason: str | None
+    current_step: str | None
+    workflow_type: str
+    priority: str
+    iteration: int
+    usage: UsageTotals
+    has_pending_approval: bool
+    created_at: datetime
+    updated_at: datetime
 
 
 def _conflict(reason: str, message: str) -> AppError:
@@ -237,6 +259,82 @@ async def create_task(
         return await task_view(session, task, iteration_max=iteration_max, actor=actor)
 
 
+def _escape_like(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def list_tasks(
+    env: ProjectEnv,
+    actor: Actor,
+    project_id: uuid.UUID,
+    *,
+    statuses: frozenset[str] | None,
+    q: str | None,
+    page: int,
+    page_size: int,
+) -> tuple[list[TaskSummary], int]:
+    """A project's tasks, newest change first; ``q`` is a literal, case-insensitive title match."""
+    if page < 1 or not 1 <= page_size <= PAGE_SIZE_MAX:
+        raise AppError(
+            "VALIDATION_ERROR",
+            "Input did not pass validation",
+            http_status=422,
+            details=[{"loc": ["query", "page_size"], "msg": f"page >= 1 and page_size 1-{PAGE_SIZE_MAX}"}],
+        )
+    async with env.sessions() as session:
+        await authorize(session, actor, project_id, "task:read")
+        conditions = [Task.project_id == project_id]
+        if statuses is not None:
+            conditions.append(Task.status.in_(sorted(statuses)))
+        if q:
+            conditions.append(Task.title.ilike(f"%{_escape_like(q)}%", escape="\\"))
+        total = await session.scalar(select(func.count()).select_from(Task).where(*conditions)) or 0
+        rows = list(
+            await session.scalars(
+                select(Task)
+                .where(*conditions)
+                .order_by(Task.updated_at.desc(), Task.created_at.desc(), Task.id)
+                .limit(page_size)
+                .offset((page - 1) * page_size)
+            )
+        )
+        ids = [t.id for t in rows]
+        usage = await task_usage(session, ids)
+        pending = set(
+            await session.scalars(
+                select(Approval.task_id).where(Approval.task_id.in_(ids), Approval.status == "pending")
+            )
+        )
+        return [
+            TaskSummary(
+                id=t.id,
+                project_id=t.project_id,
+                title=t.title,
+                status=t.status,
+                status_reason=t.status_reason,
+                current_step=t.current_step,
+                workflow_type=t.workflow_type,
+                priority=t.priority,
+                iteration=t.iteration,
+                usage=usage.get(t.id, EMPTY_TOTALS),
+                has_pending_approval=t.id in pending,
+                created_at=t.created_at,
+                updated_at=t.updated_at,
+            )
+            for t in rows
+        ], total
+
+
+async def get_task(env: ProjectEnv, actor: Actor, task_id: uuid.UUID, *, iteration_max: int) -> TaskView:
+    """The task, or ``not_found()`` when it does not exist or its project is out of the actor's scope."""
+    async with env.sessions() as session:
+        task = await session.get(Task, task_id)
+        if task is None:
+            raise not_found()
+        await authorize(session, actor, task.project_id, "task:read")
+        return await task_view(session, task, iteration_max=iteration_max, actor=actor)
+
+
 async def task_view(
     session: AsyncSession, task: Task, *, iteration_max: int, actor: Actor | None = None
 ) -> TaskView:
@@ -280,12 +378,15 @@ __all__ = [
     "PROMPT_MAX",
     "TITLE_MAX",
     "TaskCreate",
+    "TaskSummary",
     "TaskView",
     "clean_prompt_text",
     "create_task",
     "derive_title",
     "ensure_engine_available",
+    "get_task",
     "insert_task",
+    "list_tasks",
     "lock_project_for_task",
     "task_view",
 ]

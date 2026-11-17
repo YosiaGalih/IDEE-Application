@@ -11,24 +11,27 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agents.contracts import WorkflowType  # == WORKFLOW_TYPES
-from app.api.deps import require_project_permission
+from app.api.deps import CurrentActor, require_project_permission
 from app.api.routes.approval_out import ApprovalOut
 from app.api.routes.dashboard import UsageOut
 from app.api.routes.projects import EnvDep, _respond
+from app.core.errors import AppError
+from app.models.enums import TASK_STATUSES
 from app.services import tasks
 from app.services.context_refs import MAX_CONTEXT_REFS, ContextRef
 from app.services.project_budget import BudgetDefaults
-from app.services.projects import Actor
-from app.services.tasks import PROMPT_MAX, TITLE_MAX, TaskCreate, TaskView
+from app.services.projects import PAGE_SIZE_MAX, Actor
+from app.services.tasks import PROMPT_MAX, TITLE_MAX, TaskCreate, TaskSummary, TaskView
 
 router = APIRouter(tags=["tasks"])
 
 TaskCreator = Annotated[Actor, Depends(require_project_permission("task:create"))]
+TaskReader = Annotated[Actor, Depends(require_project_permission("task:read"))]
 
 
 class TaskCreateIn(BaseModel):
@@ -135,6 +138,87 @@ class TaskOut(BaseModel):
             cancel_requested=view.cancel_requested,
             context_refs=view.context_refs,
         )
+
+
+class TaskSummaryOut(BaseModel):
+    """A row of the task list (§11 #2)."""
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    title: str
+    status: str
+    status_reason: str | None
+    current_step: str | None
+    workflow_type: str
+    priority: str
+    iteration: int
+    usage: UsageOut
+    has_pending_approval: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def of(cls, row: TaskSummary) -> TaskSummaryOut:
+        return cls(
+            id=row.id,
+            project_id=row.project_id,
+            title=row.title,
+            status=row.status,
+            status_reason=row.status_reason,
+            current_step=row.current_step,
+            workflow_type=row.workflow_type,
+            priority=row.priority,
+            iteration=row.iteration,
+            usage=UsageOut.of(row.usage),
+            has_pending_approval=row.has_pending_approval,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+
+def _statuses(raw: str | None) -> frozenset[str] | None:
+    """``status=a,b`` -> the set; an unknown value is a 422 at ``["query", "status"]``."""
+    if raw is None:
+        return None
+    values = [part.strip() for part in raw.split(",")]
+    unknown = [v for v in values if v not in TASK_STATUSES]
+    if unknown:
+        raise AppError(
+            "VALIDATION_ERROR",
+            "Input did not pass validation",
+            http_status=422,
+            details=[{"loc": ["query", "status"], "msg": f"unknown status: {', '.join(unknown)[:80]}"}],
+        )
+    return frozenset(values)
+
+
+@router.get("/projects/{project_id}/tasks")
+async def list_tasks(
+    request: Request,
+    project_id: uuid.UUID,
+    actor: TaskReader,
+    env: EnvDep,
+    status: Annotated[str | None, Query(max_length=400)] = None,
+    q: Annotated[str | None, Query(max_length=200)] = None,
+    page: Annotated[int, Query(ge=1, le=100_000)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=PAGE_SIZE_MAX)] = 50,
+) -> JSONResponse:
+    rows, total = await tasks.list_tasks(
+        env, actor, project_id, statuses=_statuses(status), q=q, page=page, page_size=page_size
+    )
+    return _respond(
+        request,
+        [TaskSummaryOut.of(row).model_dump(mode="json") for row in rows],
+        meta={"total": total, "page": page, "page_size": page_size},
+    )
+
+
+@router.get("/tasks/{task_id}")
+async def get_task(request: Request, task_id: uuid.UUID, actor: CurrentActor, env: EnvDep) -> JSONResponse:
+    view = await tasks.get_task(
+        env, actor, task_id, iteration_max=request.app.state.settings.task_max_iterations
+    )
+    return _respond(request, TaskOut.of(view).model_dump(mode="json"))
 
 
 @router.post("/projects/{project_id}/tasks")

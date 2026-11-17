@@ -52,6 +52,7 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("GET", "/api/v1/projects/{id}/budget", None),
     ("PATCH", "/api/v1/projects/{id}/budget", {"max_tokens": 1000}),
     ("DELETE", "/api/v1/projects/{id}", None),  # R3: only asks for a project_delete approval
+    ("GET", "/api/v1/projects/{id}/tasks", None),
     ("POST", "/api/v1/projects/{id}/tasks", {"prompt": "x"}),  # 404/403 answer before the engine gate
 ]
 FILE = "README.md"  # exists in every blank project
