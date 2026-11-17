@@ -355,5 +355,16 @@ async def test_the_api_verdict_ignores_pricing(session: AsyncSession) -> None:
 async def test_the_same_tariff_passes(session: AsyncSession) -> None:
     anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
     row = await record(session, anthropic, report("anthropic"))
-    same = service.WorkerCredentials(KEY, None)
+    same = service.WorkerCredentials(KEY, None, pricing_version="2026-11-08")  # the row's version
     assert service.provider_ready(row, anthropic, held=same).state == "ready"
+
+
+async def test_a_report_priced_with_no_tariff_cannot_vouch_for_a_held_one(session: AsyncSession) -> None:
+    """Controller ruling R1: a NULL row version against a held version fails closed."""
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    row.pricing_version = None
+    held = service.WorkerCredentials(KEY, None, pricing_version="2026-11-08")
+    assert service.provider_ready(row, anthropic, held=held) == service.ProviderVerdict(
+        "unknown", "pricing_changed"
+    )
