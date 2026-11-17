@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import uuid
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 from pydantic import TypeAdapter
@@ -166,3 +167,25 @@ async def test_reason_names_the_index(session: AsyncSession, repo: Path) -> None
     assert detail["loc"] == ["body", "context_refs", 2]
     assert isinstance(detail["msg"], str)
     assert "nope" not in detail["msg"]
+
+
+async def test_missing_repo_root_is_internal_not_input(session: AsyncSession, tmp_path: Path) -> None:
+    project = await make_project(session)
+    for raw in (file_ref("a.py"), folder_ref("src")):
+        with pytest.raises(AppError) as caught:
+            await validate_refs(session, Workspace(tmp_path / "gone"), project.id, refs(raw))
+        assert caught.value.http_status == 500
+        assert caught.value.code == "INTERNAL_ERROR"
+        assert "gone" not in str(caught.value.details)
+
+
+async def test_unrecognised_app_error_from_workspace_propagates(session: AsyncSession, repo: Path) -> None:
+    class Broken(Workspace):
+        async def read_file(self, *args: object, **kwargs: object) -> NoReturn:
+            raise AppError("INTERNAL_ERROR", "Internal error", http_status=500)
+
+    project = await make_project(session)
+    with pytest.raises(AppError) as caught:
+        await validate_refs(session, Broken(repo), project.id, refs(file_ref("src/app.py")))
+    assert caught.value.code == "INTERNAL_ERROR"
+    assert caught.value.http_status == 500

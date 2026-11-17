@@ -8,6 +8,7 @@ they are for the agent.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Sequence
 from typing import Annotated, Final, Literal
@@ -17,11 +18,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError
+from app.core.logging import get_logger
 from app.models.tasks import Task
 from app.workspace.errors import PathViolation, WorkspaceNotFound
 from app.workspace.fs import Workspace
 from app.workspace.paths import split_rel
 from app.workspace.policy import Access
+
+logger = get_logger(__name__)
 
 MAX_CONTEXT_REFS: Final = 20
 
@@ -84,14 +88,13 @@ ContextRef = Annotated[
 ]
 
 
-def _reason_for(exc: AppError) -> str:
+def _reason_for(exc: PathViolation | WorkspaceNotFound) -> str:
     if isinstance(exc, WorkspaceNotFound):
         return NOT_FOUND
-    if isinstance(exc, PathViolation):
-        if exc.reason in _HIDDEN_REASONS:
-            return HIDDEN
-        if exc.reason in _NOT_FOUND_REASONS:
-            return NOT_FOUND
+    if exc.reason in _HIDDEN_REASONS:
+        return HIDDEN
+    if exc.reason in _NOT_FOUND_REASONS:
+        return NOT_FOUND
     return INVALID
 
 
@@ -119,8 +122,14 @@ async def _check_path(workspace: Workspace, ref: FileRef | FolderRef) -> str | N
             await workspace.read_file(ref.path, Access.AGENT_READ, max_bytes=1)
         else:
             await workspace.tree(ref.path, Access.AGENT_READ, depth=1, max_entries=1)
-    except AppError as exc:
+    except WorkspaceNotFound as exc:
+        # The same exception names a missing subpath (the user's mistake) and a missing root (ours).
+        if not await asyncio.to_thread(workspace.root.is_dir):
+            logger.error("context_refs_repository_root_missing")
+            raise AppError("INTERNAL_ERROR", "Internal error", http_status=500) from None
         return _reason_for(exc)
+    except PathViolation as exc:
+        return _reason_for(exc)  # any other AppError is not input: it propagates
     return None
 
 
