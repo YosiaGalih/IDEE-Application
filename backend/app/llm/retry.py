@@ -23,7 +23,7 @@ import functools
 import random
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from app.core.cancel import CancelToken
@@ -50,6 +50,9 @@ class AttemptRecord:
     duration_ms: int
     status: Literal["ok", "error", "cancelled"]
     error_kind: ErrorKind | None  # None for an unexpected (non-LLMError) failure
+    # The provider's own error for a failed attempt: a handler whose write fails can still pass it on (the
+    # runtime tells the gate a real rejection the ledger lost; WP-3.1f2b2). Not stored, never in a repr.
+    error: LLMError | None = field(default=None, repr=False, compare=False)
 
 
 _log = get_logger(__name__)
@@ -190,7 +193,15 @@ async def _report(
     elif error is not None:
         status: Literal["error", "cancelled"] = "cancelled" if error.kind == "cancelled" else "error"
         record = AttemptRecord(
-            provider.name, req.model, attempt, error.request_id, error.usage, duration_ms, status, error.kind
+            provider.name,
+            req.model,
+            attempt,
+            error.request_id,
+            error.usage,
+            duration_ms,
+            status,
+            error.kind,
+            error=error,
         )
     elif cancelled:
         record = AttemptRecord(

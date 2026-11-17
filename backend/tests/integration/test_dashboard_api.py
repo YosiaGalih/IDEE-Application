@@ -19,10 +19,12 @@ from app.core.db import make_sessionmaker
 from app.core.money import MONEY_PATTERN
 from app.core.redaction import Redactor
 from app.llm.base import Usage
+from app.models.agents import AgentProfile, AgentRun
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.services.dashboard import current_period
 from app.workflow.states import Actor, TaskStatus, transition
+from tests.integration.test_agent_tables import profile
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     app,
     clean_state,
@@ -181,7 +183,7 @@ async def test_dashboard_marks_what_is_not_recorded(
 ) -> None:
     data, meta, response = await board(owner)
     assert data["agent_activity"] == []
-    assert meta["unavailable"] == ["agent_activity"]  # usage now comes from the ledger (WP-3.1f1)
+    assert meta["unavailable"] == []  # usage (WP-3.1f1) and agent runs (WP-3.1f2b2) are both recorded
     start, end = current_period(datetime.now(UTC))
     assert data["usage"] == {
         "period": {
@@ -451,3 +453,56 @@ async def test_dashboard_money_is_a_decimal_string(
     costs = [data["usage"]["estimated_cost"], data["recent_tasks"][0]["usage"]["estimated_cost"]]
     assert costs == ["0.0000005", "0.0000005"]  # never 5E-7, never a float, never rounded to 0
     assert all(isinstance(cost, str) and re.fullmatch(MONEY_PATTERN, cost) for cost in costs)
+
+
+async def add_runs(
+    engine: AsyncEngine, task_id: uuid.UUID, count: int, *, agent_id: str = "A02", running_last: bool = False
+) -> list[uuid.UUID]:
+    """``count`` runs of ``task_id``, one minute apart (the first the oldest); the newest one is still running
+    when ``running_last``. Returns their ids oldest first."""
+    base = datetime.now(UTC) - timedelta(hours=1)
+    ids: list[uuid.UUID] = []
+    async with make_sessionmaker(engine)() as session:
+        if await session.get(AgentProfile, agent_id) is None:
+            session.add(profile(agent_id))
+            await session.flush()
+        for n in range(count):
+            last = running_last and n == count - 1
+            run = AgentRun(
+                task_id=task_id,
+                agent_id=agent_id,
+                agent_version=1,
+                step="intake",
+                started_at=base + timedelta(minutes=n),
+                **({} if last else {"status": "succeeded", "duration_ms": 1000 + n}),
+            )
+            session.add(run)
+            await session.flush()
+            ids.append(run.id)
+        await session.commit()
+    return ids
+
+
+async def test_dashboard_lists_the_ten_newest_runs(
+    owner: httpx.AsyncClient,  # noqa: F811
+    engine: AsyncEngine,
+    owner_id: uuid.UUID,  # noqa: F811
+) -> None:
+    project = await add_project(engine, owner_id, "Runs")
+    task = await add_task(engine, project, owner_id, "running", "T")
+    ids = await add_runs(engine, task, 12, running_last=True)
+    data, meta, _ = await board(owner)
+    activity = data["agent_activity"]
+    assert [r["id"] for r in activity] == [str(i) for i in reversed(ids[2:])]  # newest ten, newest first
+    assert activity[0]["status"] == "running" and activity[0]["duration_ms"] is None  # a live run is listed
+    assert set(activity[0]) == {
+        "id", "task_id", "project_id", "agent_id", "agent_name", "status", "started_at", "duration_ms",
+    }  # fmt: skip
+    assert (activity[0]["project_id"], activity[0]["task_id"]) == (str(project), str(task))
+    assert activity[0]["agent_name"] == "Requirement Analyst"  # agent_profiles.name
+    assert meta["unavailable"] == []
+
+
+async def test_dashboard_without_runs_has_an_empty_activity(owner: httpx.AsyncClient) -> None:  # noqa: F811
+    data, meta, _ = await board(owner)
+    assert data["agent_activity"] == [] and meta["unavailable"] == []

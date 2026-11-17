@@ -2849,3 +2849,100 @@ semua 10+1 tertangkap; mutan hook mark_none_keeps/old/keep_on_sub tertangkap (st
   - `Session.close()` dengan transaksi terbuka meninggalkan antrean event (sudah ada sebelumnya, tidak berbahaya untuk sesi per unit kerja).
 - **Test flaky di luar WP:** `tests/integration/test_git_adapter.py::test_grep_parses_off_the_event_loop`.
 - **3.1f2b2 (berikutnya):** G7–G10 spec 3.1f2b, yaitu reset readiness `auth`/404, `pricing_version`, `agent_activity`, dan teks `RUNTIMES_AVAILABLE`.
+
+**Sesudah PR #35 (fakta, 17 Nov 2026) [Pasti]:**
+- PR #35 (WP-3.1f2b1) mencapai CI 9/9 di 88c0d0f, yang memenuhi syarat AG-13 #4.
+- PO me-merge-nya pada 17 Nov 2026 03:22 UTC (d0abaa5).
+- Push-CI `main` d0abaa5: `security-scan`, frontend, sandbox, dan infra hijau.
+
+### WP-3.1f2b2 (🔒 gerbang belajar dan tampilan) — reset readiness pada penolakan nyata, `pricing_version` di gerbang worker, dashboard `agent_activity`, teks `runtime_unavailable` (G7–G10 spec 3.1f2b; T10, T4, T5, AC-01)
+
+**Dokumen kerja:**
+- Spec `docs/superpowers/specs/2026-11-15-wp-3.1f2b-runtime-recovery-design.md`: Keputusan Lead #9 dan #13–#15, ditambah blok "Penajaman final review".
+- Plan `docs/superpowers/plans/2026-11-17-wp-3.1f2b2-gate-learns.md` (5 task).
+
+**Cara dikerjakan:** subagent-driven-development, dengan implementer dan review per task. Task 3 butuh satu putaran perbaikan, karena test tarif sama ternyata vakum. Sesudah itu ada review akhir dari empat reviewer, satu fix wave (F1–F13), dan delta AG-13.
+
+**Yang dibangun:**
+- **Port runtime:**
+  - `ProviderGate.check` kini mengembalikan `GateResult(models, report_at)`. `report_at` bernilai `None` bila readiness tidak diwajibkan.
+  - Port baru `reject(cause, *, report_at, scope)`. Runtime memanggilnya bila ada `auth` (401/403, termasuk billing/permission dari stream) atau 404/`not_found_error` yang nyata, dan hanya bila stop run belum terpasang.
+  - Akhir run dihitung **sebelum** reset, sehingga stop yang datang selama reset tidak mengubahnya.
+  - Reset bersifat best-effort, dengan batas tenggat + `REJECT_GRACE_S` 5 dtk. Kegagalannya di-log `provider_reject_unrecorded`.
+  - Penolakan nyata yang percobaannya hilang dari ledger tetap dilaporkan lewat `AttemptRecord.error` (`repr=False`, tidak disimpan).
+  - `report_at` yang lebih baru hanya diambil dari check yang model tier-nya sama dengan model run.
+- **`provider_readiness.invalidate_report`:**
+  - Compare-and-set pada `readiness_checked_at`, dibaca segar (`populate_existing`) di bawah `FOR UPDATE`.
+  - Satu reset per laporan, karena laporan yang sudah `invalidated` dilewati.
+  - Menulis `readiness_status=unknown` dan penanda `invalidated {cause, at}`.
+  - Audit `provider.readiness_reset` ditulis di transaksi yang sama. Isinya metadata `{provider, cause}`, `project_id`, dan `correlation_id` `agent_run:<id>`.
+  - No-op di-log `provider_reset_skipped` dengan alasannya.
+- **Verdict:**
+  - Penanda `auth`/`not_found` → `provider_rejected`.
+  - Gerbang worker menolak dengan `pricing_changed` bila `pricing_version` laporan berbeda dari tabel tarif yang dipegang worker. Laporan tanpa versi juga ditolak (R1, gagal tertutup).
+  - Penolakan tarif dicatat dengan penanda dan audit yang sama (cause `pricing_changed`), sehingga verdict api dan layar Settings ikut menampilkan `pricing_changed` (R2). Ini menajamkan #14.
+- **Dashboard `agent_activity`:** 10 run terbaru di project yang terlihat (`services/agents.recent_runs`, dipakai juga oleh `get_agent`), di snapshot yang sama dengan bagian lain. `meta.unavailable` kini `[]`.
+- **Layar:**
+  - Teks untuk dua alasan baru.
+  - `runtime_unavailable` berbunyi "belum ada mesin yang menjalankan agent", tanpa nomor WP.
+  - `RUNTIMES_AVAILABLE` tetap `False` (#9).
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ f1-pytest.sh -q                                   # suite penuh @ f7f4477 (kode sama dengan head)
+5378 passed
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 337 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
+$ cd frontend && npm run format:check && npm run lint && npm run lint:guards && npm run typecheck && npm test
+603 passed (45+ file); lint guards: every contract rule rejects its violation
+PoC AG-13 (LOW-1 stop saat reject, LOW-2 identity map basi, LOW-3 audit tak tertelusur) → lulus di f7f4477; 20 reject paralel → 1 reset + 1 audit; 8 gerbang tarif paralel → 1 audit
+```
+
+**Review:**
+
+| Review | Hasil | Ditutup di |
+|---|---|---|
+| Per task (5) | T3 Needs fixes (test tarif sama vakum); lainnya Approved | 134cd10 |
+| `kk-backend-reviewer` @ dbd4a0b | APPROVE WITH NOTES; 2 MEDIUM (`populate_existing`, audit wajib) | F5, F6 |
+| `kk-frontend-reviewer` @ dbd4a0b | APPROVE WITH NOTES (assert lewat kunci, nomor WP di teks, fixture `unknown`) | F12 |
+| `kk-silent-failure-hunter` @ dbd4a0b | 0 CRITICAL; 1 HIGH (`pricing_changed` tak terlihat di layar), 3 MEDIUM (reset hilang bila ledger gagal, stop mengubah akhir, 404 model lama mereset laporan baru), 4 LOW | F1–F4, F8, F9 |
+| AG-13 @ dbd4a0b | SIGNED OFF WITH CONDITIONS; LOW-1/LOW-2 (PoC), LOW-3, INFO-1..6 | F3, F5, F7, F10, F13 |
+| Re-review fix wave @ f7f4477 | F1–F13 ADDRESSED; Clean (3 INFO) | — |
+| AG-13 delta @ f7f4477 | **SIGNED OFF WITH CONDITIONS 🔒**; LOW-1..3 tertutup; LOW-A baru (gateway); INFO-A..D | d6999b0 (LOW-A) |
+| `/code-review` | Standards: tanpa pelanggaran keras, smell ditunda. Spec: tanpa celah pemblokir (402 sudah diungkap di §13) | — |
+
+**Status sign-off AG-13 WP-3.1f2b2: SIGNED OFF WITH CONDITIONS 🔒** (dbd4a0b; delta f7f4477). Syarat-syaratnya:
+1. `security-scan` hijau di CI pada head final.
+2. LOW-A dicatat. Terpenuhi: SECURITY_MODEL §13 baris (a) kini memuat batas gateway dan respons operator.
+3. Daftar ditunda masuk tracker. Terpenuhi, lihat di bawah.
+
+**Keputusan Lead selama eksekusi (ruling):**
+- **R1:** laporan tanpa `pricing_version` vs worker yang memegang versi → `pricing_changed` (gagal tertutup).
+- **R2:** penolakan tarif dicatat lewat penanda yang sama, sehingga api ikut melihatnya (menajamkan #14).
+- **R3:** akhir run dihitung sebelum reset, dan reset punya grace 5 dtk sendiri.
+- **R4:** `report_at` hanya diambil dari check yang model tier-nya sama dengan model run.
+- **R5:** LOW-3 diperbaiki sekarang (port membawa scope run), bukan ditunda.
+- **R6:** teks `runtime_unavailable` tanpa nomor WP.
+
+**Ditunda (bukan blocker):**
+- identitas worker sebagai `actor_id` audit (B-L1, relevan untuk T10);
+- detail log reject;
+- total `agent_activity`;
+- satu sumber `RejectCause`;
+- `RunSummaryOut` dipindah ke modul `*_out` bersama;
+- helper penanda `invalidated` (kini dicek di tiga tempat) dan tipe `Invalidation` dengan pemetaan cause→reason;
+- `_invalidate` privat bersama di `DbProviderGate`;
+- konstanta `UNAVAILABLE` kosong;
+- id review dalam komentar kode diganti kalimat mandiri;
+- `AttemptRecord.error` sebagai pembawa;
+- penanda tarif ditulis sebelum project dinilai (INFO-A, audit bisa ber-`project_id` project yang tidak ada);
+- event platform ber-`project_id` (INFO-B, untuk WP tampilan audit);
+- test stop-saat-reject tanpa timeout tingkat test;
+- ADR-032 sebaiknya diamandemen dengan penanda jelas.
+
+**Syarat yang dibawa ke WP-3.2:**
+- bootstep worker memuat tabel tarif yang sama di semua worker (SECURITY_MODEL §13 baris c);
+- tampilan audit platform vs project (INFO-B);
+- 402 `billing_error` ke `auth` bila PO menghendaki (§13 baris b);
+- syarat WP-3.1f2b1 tetap berlaku.

@@ -21,7 +21,7 @@ function answer(data: unknown, meta: unknown = dashboardMeta()) {
 
 describe("getDashboard", () => {
   it("returns the validated dashboard with what is unavailable and the queue total", async () => {
-    answer(dashboardData());
+    answer(dashboardData(), dashboardMeta({ unavailable: ["agent_activity", "usage"] }));
     const result = await getDashboard();
     expect(result.data.metrics.failed_tasks).toBe(1);
     expect(result.data.failed_queue[0]?.project_name).toBe("Kalkulator");
@@ -67,7 +67,7 @@ describe("getDashboard", () => {
       },
     ],
   ])("refuses an answer that contradicts itself: %s", async (_, make) => {
-    answer(make());
+    answer(make(), dashboardMeta({ unavailable: ["agent_activity", "usage"] }));
     await expect(getDashboard()).rejects.toMatchObject({ kind: "bad_response" });
   });
 

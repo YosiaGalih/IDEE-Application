@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
@@ -140,6 +141,9 @@ CLOSE_TIMEOUT_S: Final = 5.0
 # is spent, so its row gets a short grace; past it the attempt is unrecorded.
 LEDGER_GRACE_S: Final = 5.0
 TOOL_STOP_GRACE_S: Final = 10.0  # past the deadline, for the gateway to record a cancelled tool
+# A real ``auth``/404 is still told to the gate this long past the deadline (ruling R3, silent M2): the run's
+# end is already fixed, so the reset only adds to the close-out (within RUN_CLOSE_BOUND_S, ARCHITECTURE §5.3).
+REJECT_GRACE_S: Final = 5.0
 # A field location is named only when it looks like a field name: a key the model invented is input too.
 _FIELD = re.compile(r"[a-z_][a-z0-9_]{0,39}")
 
@@ -607,13 +611,17 @@ class LeaseLostError(Exception):
 
 
 class UsageUnrecorded(Exception):
-    """The ledger port failed to record an attempt: raised by the runtime, from the ledger's error. It carries
-    the attempt's ids only."""
+    """The ledger port failed to record an attempt: raised by the runtime, from the ledger's error. Its text
+    carries the attempt's ids only. ``provider_error`` is the provider's own error when that attempt failed:
+    a real ``auth``/404 is then still told to the gate (silent M1), and the end stays ``usage_unrecorded``."""
 
-    def __init__(self, attempt: int, call_id: uuid.UUID | str) -> None:
+    def __init__(
+        self, attempt: int, call_id: uuid.UUID | str, *, provider_error: LLMError | None = None
+    ) -> None:
         super().__init__(f"attempt {attempt} of call {call_id} was not recorded")
         self.attempt = attempt
         self.call_id = call_id
+        self.provider_error = provider_error
 
 
 class AgentRunUnfinished(Exception):
@@ -820,9 +828,28 @@ class AgentRunResult:
 # --- ports --------------------------------------------------------------------------------------------------
 
 
+RejectCause = Literal["auth", "not_found"]
+
+
+@dataclass(frozen=True, slots=True)
+class GateResult:
+    """What one gate check judged: the effective model per tier, and the timestamp of the readiness report it
+    relied on (``None``: no report, or a verdict that needs none, ``readiness_not_required``). ``reject`` is
+    told that timestamp, so it never undoes a newer report, nor one the gate did not rely on (silent L2)."""
+
+    models: Mapping[str, str]
+    report_at: datetime | None
+
+
 class ProviderGate(Protocol):
-    async def check(self, project_id: uuid.UUID) -> Mapping[str, str]:
-        """The effective model per tier, or ``ProviderBlocked``."""
+    async def check(self, project_id: uuid.UUID) -> GateResult:
+        """The effective model per tier and the report judged, or ``ProviderBlocked``."""
+        ...
+
+    async def reject(self, cause: RejectCause, *, report_at: datetime | None, scope: RunScope) -> None:
+        """The provider itself refused a run (``auth``, or a missing model): readiness drops to unknown,
+        unless a report newer than ``report_at`` exists. ``scope`` names the run, so the reset's audit row
+        traces back to it (AG-13 LOW-3). The runtime swallows what this raises."""
         ...
 
 
@@ -960,6 +987,7 @@ class _Run:
     )
     stop: _RunStop = field(default_factory=_RunStop)
     tally: _Tally = field(default_factory=_Tally)
+    report_at: datetime | None = None  # the readiness report the last gate check judged
     started: bool = False  # the store acknowledged ``start``
     start_sent: bool = False  # a ``start`` was sent (its ack may be lost): a later one is a retry
     iterations: int = 0
@@ -967,8 +995,24 @@ class _Run:
     pending: PendingTool | None = None
 
 
+def _reject_cause(error: LLMError) -> RejectCause | None:
+    """``auth`` (401/403, and the stream's billing and permission errors; an HTTP 402 is ``bad_request``),
+    or a missing model or path: HTTP 404 or the vendor's ``not_found_error``, whatever kind the adapter gave
+    it (the exact rule, plan Global Constraints)."""
+    if error.kind == "auth":
+        return "auth"
+    if error.status_code == 404 or error.vendor_type == "not_found_error":
+        return "not_found"
+    return None
+
+
 def _id(value: uuid.UUID | None) -> str | None:
     return str(value) if value is not None else None
+
+
+def _scope(run: _Run) -> RunScope:
+    request = run.request
+    return RunScope(request.project_id, request.task_id, run.agent_run_id, run.spec.agent_id)
 
 
 def _ctx(run: _Run) -> dict[str, str | None]:
@@ -1182,7 +1226,9 @@ class AgentRuntime:
         request = run.request
         try:
             await self._beat(run)
-            models = await self._port(run, self._ports.gate.check(request.project_id))
+            judged = await self._port(run, self._ports.gate.check(request.project_id))
+            run.report_at = judged.report_at
+            models = judged.models
             async with self._ports.providers.open(lambda: _ctx(run)) as provider:
                 model = models[run.spec.model_tier]
                 await self._port(run, self._start(run, self._run_start(run, provider.name, model)))
@@ -1190,8 +1236,37 @@ class AgentRuntime:
                 return await self._loop(run, provider, model)
         except _DeadlineReached:
             return self._timed_out(run)
-        except (ProviderBlocked, LeaseLostError, BudgetRefused, UsageUnrecorded, LLMError) as error:
+        except LLMError as error:
+            end = self._end_for(error, run)  # ruling R3: fixed before the reject, which a stop cannot rewrite
+            await self._reject(run, error)
+            return end
+        except UsageUnrecorded as error:
+            end = self._end_for(error, run)  # usage_unrecorded, whatever the provider said
+            if error.provider_error is not None:  # silent M1: the ledger lost the attempt, not the rejection
+                await self._reject(run, error.provider_error)
+            return end
+        except (ProviderBlocked, LeaseLostError, BudgetRefused) as error:
             return self._end_for(error, run)
+
+    async def _reject(self, run: _Run, error: LLMError) -> None:
+        """A real ``auth`` or a missing model (404 / ``not_found_error``) from the provider tells the gate,
+        once per run, naming the run (AG-13 LOW-3). Not when the run's own stop caused the error. Bounded by
+        the deadline plus ``REJECT_GRACE_S`` (ruling R3: a rejection that came near the deadline is still
+        told). A failure, a deadline included, is logged and never changes the run's end, which the caller
+        fixed before this."""
+        cause = _reject_cause(error)
+        if cause is None or run.stop.reason is not None:
+            return
+        try:
+            await self._port(
+                run,
+                self._ports.gate.reject(cause, report_at=run.report_at, scope=_scope(run)),
+                grace=REJECT_GRACE_S,
+            )
+        except Exception as failure:
+            _log.warning(
+                "provider_reject_unrecorded", **_ctx(run), cause=cause, error_type=type(failure).__name__
+            )
 
     # --- bounded ports (reviews of 42bcb2e: a held lock never stalls a run) ---------------------------------
 
@@ -1243,7 +1318,7 @@ class AgentRuntime:
 
     async def _loop(self, run: _Run, provider: LLMProvider, model: str) -> RunEnd:
         request = run.request
-        scope = RunScope(request.project_id, request.task_id, run.agent_run_id, run.spec.agent_id)
+        scope = _scope(run)
         # What the gateway offers (grant ∩ registered ∩ preconditions, sorted; spec #22), then submit_result
         # last: a stable prompt prefix.
         defs = [d for d in self._ports.tools.tool_defs_for(run.grant) if d.name != SUBMIT_RESULT]
@@ -1560,7 +1635,12 @@ class AgentRuntime:
                 await ports.budget.before_model_attempt(call)
                 return
             await self._beat(run)
-            await self._port(run, ports.gate.check(scope.project_id))
+            judged = await self._port(run, ports.gate.check(scope.project_id))
+            # Ruling R4 (silent M3): the run keeps the model its first check chose, so it adopts a newer
+            # report only when that report chose the same model; a 404 for the run's model then never resets
+            # a newer report about another one.
+            if judged.models.get(run.spec.model_tier) == call.request.model:
+                run.report_at = judged.report_at
             await self._port(run, ports.budget.before_model_attempt(call))
             run.tally.sent += 1  # the hooks passed: the request goes out, unless its restart stops it
 
@@ -1586,7 +1666,7 @@ class AgentRuntime:
                 async with asyncio.timeout(limit):
                     await record(attempt)
             except Exception as error:  # the bound or the ledger's own error: the attempt is unrecorded
-                raise UsageUnrecorded(attempt.attempt, call.call_id) from error
+                raise UsageUnrecorded(attempt.attempt, call.call_id, provider_error=attempt.error) from error
             if run is not None:
                 run.tally.recorded += 1
 

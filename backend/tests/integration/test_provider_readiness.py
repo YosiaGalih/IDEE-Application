@@ -3,17 +3,22 @@ writes, and the predicates 3.1f enforces."""
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import hashlib
 import json
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from structlog.testing import capture_logs
 
 from app.core.audit import AuditWriter
 from app.core.config import Settings, load_settings
+from app.core.db import make_sessionmaker
 from app.core.redaction import Redactor
 from app.llm.readiness import CHECK_KEYS, Check, ReadinessReport
 from app.models.audit import AuditEvent
@@ -259,4 +264,202 @@ async def test_a_policy_changed_while_the_smoke_ran_records_unknown(
     assert event is not None and event.metadata_["stale"] is True
 
 
+# --- WP-3.1f2b2: a real rejection resets the report (Keputusan Lead #13, K10) -----------------
+
+
+async def reset_events(session: AsyncSession, since: int = 0) -> list[AuditEvent]:
+    """The reset rows after audit id ``since`` (the audit table is append-only: ``reset_data`` keeps it)."""
+    query = select(AuditEvent).where(AuditEvent.action == "provider.readiness_reset", AuditEvent.id > since)
+    return list((await session.scalars(query)).all())
+
+
+async def last_audit_id(session: AsyncSession) -> int:
+    return (await session.scalar(select(func.coalesce(func.max(AuditEvent.id), 0)))) or 0
+
+
+async def invalidate(session: AsyncSession, cause: service.ResetCause, report_at: datetime | None) -> bool:
+    """``invalidate_report`` with no run to name (the run's ids are asserted in tests/security/
+    test_runtime_gate.py)."""
+    return await service.invalidate_report(
+        session, cause=cause, report_at=report_at, audit=AUDIT, project_id=None, correlation_id=None
+    )
+
+
+async def test_a_rejection_resets_the_report_it_judged(session: AsyncSession, settings: Settings) -> None:
+    row = await record(session, settings, report())
+    since = await last_audit_id(session)
+    assert await invalidate(session, "auth", RAN_AT) is True
+    await session.commit()
+    await session.refresh(row)
+    assert row.readiness_status == "unknown" and row.readiness_report["invalidated"]["cause"] == "auth"
+    assert row.readiness_report["ready"] is True  # the rest of the report is kept
+    assert service.provider_ready(row, settings) == service.ProviderVerdict("unknown", "provider_rejected")
+    (event,) = await reset_events(session, since)
+    assert (event.actor_type, event.actor_id) == ("system", "worker")
+    assert event.metadata_ == {"provider": "anthropic", "cause": "auth"}  # no error text
+
+
+async def test_a_newer_smoke_is_never_overwritten(session: AsyncSession, settings: Settings) -> None:
+    row = await record(session, settings, report())
+    since = await last_audit_id(session)
+    older = datetime(2026, 11, 8, 11, 0, tzinfo=UTC)
+    assert await invalidate(session, "not_found", older) is False
+    await session.commit()
+    await session.refresh(row)
+    assert row.readiness_status == "passed" and "invalidated" not in row.readiness_report
+    assert await reset_events(session, since) == []
+
+
+async def test_no_row_or_no_report_writes_nothing(session: AsyncSession) -> None:
+    since = await last_audit_id(session)
+    assert await invalidate(session, "auth", None) is False
+    await session.commit()
+    assert await reset_events(session, since) == []
+
+
+async def test_concurrent_rejections_write_one_reset(
+    session: AsyncSession, settings: Settings, engine: AsyncEngine
+) -> None:
+    await record(session, settings, report())
+    since = await last_audit_id(session)
+    sessions = make_sessionmaker(engine)
+
+    async def reject() -> bool:
+        async with sessions.begin() as own:
+            return await invalidate(own, "auth", RAN_AT)
+
+    results = await asyncio.gather(*(reject() for _ in range(20)))
+    assert sum(results) == 1
+    assert len(await reset_events(session, since)) == 1
+
+
+async def test_the_next_smoke_clears_the_rejection(session: AsyncSession, settings: Settings) -> None:
+    row = await record(session, settings, report())
+    assert await invalidate(session, "auth", RAN_AT) is True
+    await session.commit()
+    await session.refresh(row)
+    assert "invalidated" in row.readiness_report  # the marker was there before the next smoke
+    row = await record(session, settings, report())
+    assert "invalidated" not in row.readiness_report
+    assert service.provider_ready(row, settings).state == "ready"
+
+
+@pytest.mark.parametrize(
+    ("cause", "reason"),
+    [
+        ("auth", "provider_rejected"),
+        ("not_found", "provider_rejected"),
+        ("pricing_changed", "pricing_changed"),
+    ],
+)
+async def test_the_marker_names_the_reason_for_api_and_worker(
+    session: AsyncSession, settings: Settings, cause: service.ResetCause, reason: str
+) -> None:
+    """Ruling R2 (silent H1): a refused tariff is marked like a refused call, so the api, which loads no
+    tariff, sees it too."""
+    row = await record(session, settings, report())
+    assert await invalidate(session, cause, RAN_AT) is True
+    await session.commit()
+    await session.refresh(row)
+    expected = service.ProviderVerdict("unknown", reason)  # type: ignore[arg-type]
+    assert service.provider_ready(row, settings) == expected
+    held = service.WorkerCredentials(KEY, None, pricing_version="2026-11-08")  # the report's own tariff
+    assert service.provider_ready(row, settings, held=held) == expected
+    assert await service.current_verdict(session, settings) == expected
+
+
+async def test_a_session_that_holds_the_row_still_sees_a_newer_smoke(
+    session: AsyncSession, settings: Settings, engine: AsyncEngine
+) -> None:
+    """AG-13 LOW-2 (PoC test_ag13_poc_identity.py), backend M1: the locked read refreshes a row the
+    caller's session already holds, so a newer smoke recorded meanwhile is never overwritten."""
+    await record(session, settings, report())
+    sessions = make_sessionmaker(engine)
+    newer = dataclasses.replace(report(), ran_at=datetime(2026, 11, 9, 12, 0, tzinfo=UTC))
+    async with sessions() as holder:
+        held = (await holder.scalars(select(ProviderConfig))).one()  # kept by a strong reference
+        await holder.commit()  # expire_on_commit=False: the loaded values stay in the identity map
+        async with sessions() as smoke:
+            await record(smoke, settings, newer)
+        async with holder.begin():
+            wrote = await invalidate(holder, "auth", RAN_AT)
+    assert held.readiness_checked_at == newer.ran_at  # the lock read refreshed the held object too
+    assert wrote is False
+    async with sessions() as fresh:
+        row = (await fresh.scalars(select(ProviderConfig))).one()
+    assert (row.readiness_status, row.readiness_checked_at) == ("passed", newer.ran_at)
+    assert "invalidated" not in row.readiness_report
+
+
+@pytest.mark.parametrize("case", ["no_report_at", "no_row", "newer_report", "already_invalidated"])
+async def test_a_skipped_reset_is_logged_with_its_reason(
+    session: AsyncSession, settings: Settings, case: str
+) -> None:
+    """Silent L1: every no-op says why, at info, with ids only."""
+    if case != "no_row":
+        await record(session, settings, report())
+    if case == "already_invalidated":
+        assert await invalidate(session, "auth", RAN_AT) is True
+        await session.commit()
+    report_at = {"no_report_at": None, "newer_report": datetime(2026, 11, 8, 11, 0, tzinfo=UTC)}.get(
+        case, RAN_AT
+    )
+    project_id = uuid.uuid4()
+    with capture_logs() as logs:
+        wrote = await service.invalidate_report(
+            session,
+            cause="not_found",
+            report_at=report_at,
+            audit=AUDIT,
+            project_id=project_id,
+            correlation_id="agent_run:" + "0" * 8,
+        )
+    assert wrote is False
+    (entry,) = [entry for entry in logs if entry["event"] == "provider_reset_skipped"]
+    assert entry == {
+        "event": "provider_reset_skipped",
+        "log_level": "info",
+        "reason": case,
+        "cause": "not_found",
+        "project_id": str(project_id),
+        "correlation_id": "agent_run:" + "0" * 8,
+    }
+
+
 # --- AG-13 3.1e1 L2, L3 -----------------------------------------------------------------------------------
+
+
+async def test_a_changed_tariff_needs_a_new_smoke(session: AsyncSession) -> None:
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    held = service.WorkerCredentials(
+        KEY, None, pricing_version="2026-11-15"
+    )  # the row was priced "2026-11-08"
+    verdict = service.provider_ready(row, anthropic, held=held)
+    assert verdict == service.ProviderVerdict("unknown", "pricing_changed")
+
+
+async def test_the_api_verdict_ignores_pricing(session: AsyncSession) -> None:
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    assert service.provider_ready(row, anthropic).state == "ready"
+    no_tariff = service.WorkerCredentials(KEY, None)  # a holder that loaded no tariff (pricing_version None)
+    assert service.provider_ready(row, anthropic, held=no_tariff).state == "ready"
+
+
+async def test_the_same_tariff_passes(session: AsyncSession) -> None:
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    same = service.WorkerCredentials(KEY, None, pricing_version="2026-11-08")  # the row's version
+    assert service.provider_ready(row, anthropic, held=same).state == "ready"
+
+
+async def test_a_report_priced_with_no_tariff_cannot_vouch_for_a_held_one(session: AsyncSession) -> None:
+    """Controller ruling R1: a NULL row version against a held version fails closed."""
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    row.pricing_version = None
+    held = service.WorkerCredentials(KEY, None, pricing_version="2026-11-08")
+    assert service.provider_ready(row, anthropic, held=held) == service.ProviderVerdict(
+        "unknown", "pricing_changed"
+    )

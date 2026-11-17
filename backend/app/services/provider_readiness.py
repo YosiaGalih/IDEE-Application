@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import AuditWriter
 from app.core.config import Settings
+from app.core.logging import get_logger
 from app.core.redaction import Redactor
 from app.llm.readiness import ProviderState, ReadinessReport
 from app.models.projects import Project
@@ -52,9 +53,16 @@ VerdictReason = Literal[
     "key_missing",
     "endpoint_changed",
     "report_failed",
+    "provider_rejected",
+    "pricing_changed",
 ]
+# Why a report is marked ``invalidated``: what a real provider call said (the runtime's RejectCause: ``auth``,
+# ``not_found``), or a worker that holds another tariff than the smoke priced (ruling R2).
+ResetCause = Literal["auth", "not_found", "pricing_changed"]
 MAX_BASE_URL = 300  # provider_configs.base_url
 INVALID_BASE_URL = "[invalid base url]"
+
+_log = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +72,7 @@ class WorkerCredentials:
 
     key: str | None
     base_url: str | None
+    pricing_version: str | None = None  # the tariff table the worker loaded at start; None: not checked
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +240,72 @@ async def record_report(
     return row
 
 
+async def invalidate_report(
+    session: AsyncSession,
+    *,
+    cause: ResetCause,
+    report_at: datetime | None,
+    audit: AuditWriter,
+    project_id: uuid.UUID | None,
+    correlation_id: str | None,
+) -> bool:
+    """A real provider call was refused (``auth`` or an unknown model), or a worker refused the report's
+    tariff (``pricing_changed``, ruling R2): drop the report it relied on to ``unknown`` and mark it
+    ``invalidated`` (3.1f2b Keputusan Lead #13). Writes only while the locked row is still the report the
+    caller judged (``readiness_checked_at == report_at``) and not yet marked, so a newer smoke is never
+    overwritten and concurrent callers write one reset and one audit row. The locked read refreshes a row the
+    session already holds (AG-13 LOW-2). The next smoke replaces the whole report, marker included. No error
+    text is stored; the audit row names the caller's project and correlation id (a run: ``agent_run:<id>``;
+    AG-13 LOW-3). A no-op is logged with its reason (silent L1). True if it wrote; the caller commits."""
+
+    def skipped(reason: str) -> bool:
+        _log.info(
+            "provider_reset_skipped",
+            reason=reason,
+            cause=cause,
+            project_id=str(project_id) if project_id is not None else None,
+            correlation_id=correlation_id,
+        )
+        return False
+
+    if report_at is None:
+        return skipped("no_report_at")
+    row = (
+        await session.scalars(
+            select(ProviderConfig)
+            .where(ProviderConfig.provider == PROVIDER)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).one_or_none()
+    if row is None:
+        return skipped("no_row")
+    if row.readiness_checked_at != report_at:
+        return skipped("newer_report")
+    if "invalidated" in (row.readiness_report or {}):
+        return skipped("already_invalidated")
+    now = datetime.now(UTC)
+    row.readiness_status = "unknown"
+    row.readiness_report = {
+        **(row.readiness_report or {}),
+        "invalidated": {"cause": cause, "at": now.isoformat()},
+    }
+    await audit.write(
+        session,
+        actor_type="system",
+        actor_id="worker",
+        action="provider.readiness_reset",
+        result="success",
+        resource_type="provider_config",
+        resource_id=str(row.id),
+        project_id=project_id,
+        metadata={"provider": row.provider, "cause": cause},
+        correlation_id=correlation_id,
+    )
+    await session.flush()
+    return True
+
+
 # --- predicates (enforced by 3.1f) --------------------------------------------------------------------------
 
 
@@ -240,12 +315,21 @@ def provider_ready(
     """Ready only for a passed report of the current ``LLM_PROVIDER`` mode, made with the models in effect
     now, on an enabled provider. ``held`` is what the worker holds now: no key is not ready; another key
     fingerprint (rotated) or another endpoint than the report used is unknown again. The ``api`` process
-    holds nothing and passes nothing: its verdict cannot see a rotation. ``LLM_REQUIRE_READINESS=false``
-    (refused in production) skips the report."""
+    holds nothing and passes nothing: its verdict cannot see a rotation, nor a tariff until a worker marked
+    the report ``pricing_changed`` (ruling R2). A report marked ``invalidated`` is unknown for api and worker
+    alike. ``LLM_REQUIRE_READINESS=false`` (refused in production) skips the report."""
     if row is not None and not row.enabled:
         return ProviderVerdict("disabled", "disabled")
     if not settings.llm_require_readiness:
         return ProviderVerdict("ready", "readiness_not_required")
+    marker = (row.readiness_report or {}).get("invalidated") if row is not None else None
+    if row is not None and row.readiness_status == "unknown" and marker is not None:
+        # A worker marked the report after it (invalidate_report): a tariff it refused (ruling R2), else a
+        # real call the provider refused (``auth``/``not_found``). The api, which holds nothing, sees it too.
+        cause = marker.get("cause") if isinstance(marker, dict) else None
+        if cause == "pricing_changed":
+            return ProviderVerdict("unknown", "pricing_changed")
+        return ProviderVerdict("unknown", "provider_rejected")
     if row is None or row.readiness_status == "unknown" or not row.readiness_report:
         return ProviderVerdict("unknown", "no_report")
     if row.llm_provider_mode != settings.llm_provider:
@@ -259,6 +343,8 @@ def provider_ready(
             return ProviderVerdict("unknown", "key_rotated")
         if row.base_url != public_base_url(held.base_url):
             return ProviderVerdict("unknown", "endpoint_changed")
+        if held.pricing_version is not None and row.pricing_version != held.pricing_version:
+            return ProviderVerdict("unknown", "pricing_changed")  # the smoke priced another tariff file
     if row.readiness_status != "passed":
         return ProviderVerdict("not_ready", "report_failed")
     return ProviderVerdict("ready", "passed")

@@ -244,6 +244,37 @@ async def list_agents(
     return selected, counts
 
 
+async def recent_runs(
+    session: AsyncSession, actor: Actor, *, agent_id: str | None = None, limit: int = RECENT_RUNS
+) -> list[RunSummary]:
+    """The newest runs (``started_at`` desc, then id), running ones included, of tasks in projects the actor
+    can see (AC-01); of one agent when ``agent_id`` is given. ``agent_name`` is ``agent_profiles.name``."""
+    statement = (
+        select(AgentRun, Task.project_id, AgentProfile.name)
+        .join(Task, Task.id == AgentRun.task_id)
+        .join(Project, Project.id == Task.project_id)
+        .join(AgentProfile, AgentProfile.agent_id == AgentRun.agent_id)
+        .where(visible_projects_filter(actor))
+        .order_by(AgentRun.started_at.desc(), AgentRun.id.desc())
+        .limit(limit)
+    )
+    if agent_id is not None:
+        statement = statement.where(AgentRun.agent_id == agent_id)
+    return [
+        RunSummary(
+            id=run.id,
+            task_id=run.task_id,
+            project_id=project_id,
+            agent_id=run.agent_id,
+            agent_name=name,
+            status=run.status,
+            started_at=run.started_at,
+            duration_ms=run.duration_ms,
+        )
+        for run, project_id, name in (await session.execute(statement)).all()
+    ]
+
+
 async def get_agent(
     session: AsyncSession, actor: Actor, agent_id: str, *, provider: ProviderState = "unknown"
 ) -> AgentDetail | None:
@@ -258,15 +289,7 @@ async def get_agent(
         .join(Project, Project.id == Task.project_id)
         .where(AgentRun.agent_id == agent_id, visible_projects_filter(actor))
     )
-    recent = (
-        await session.execute(
-            select(AgentRun, Task.project_id)
-            .join(Task, Task.id == AgentRun.task_id)
-            .where(AgentRun.id.in_(visible))
-            .order_by(AgentRun.started_at.desc(), AgentRun.id.desc())
-            .limit(RECENT_RUNS)
-        )
-    ).all()
+    recent = await recent_runs(session, actor, agent_id=agent_id)
     totals = (
         await session.execute(
             select(
@@ -281,19 +304,7 @@ async def get_agent(
     ).all()
     return AgentDetail(
         agent=_view(profile, provider),
-        recent_runs=[
-            RunSummary(
-                id=run.id,
-                task_id=run.task_id,
-                project_id=project_id,
-                agent_id=run.agent_id,
-                agent_name=profile.name,
-                status=run.status,
-                started_at=run.started_at,
-                duration_ms=run.duration_ms,
-            )
-            for run, project_id in recent
-        ],
+        recent_runs=recent,
         stats=_stats(totals),
     )
 

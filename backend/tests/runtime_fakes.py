@@ -15,6 +15,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,9 @@ from app.agents.runtime import (
     AgentRunRequest,
     AgentRuntime,
     BudgetBreach,
+    GateResult,
     ModelCall,
+    RejectCause,
     RunEnd,
     RunScope,
     RunStart,
@@ -64,6 +67,7 @@ PROMPTS = PromptBook.load()
 MODEL = "claude-haiku-5-5"
 MODELS: Mapping[str, str] = {"fast": MODEL, "default": MODEL, "complex": MODEL}
 SCENARIO = "test"
+REPORT_AT = datetime(2026, 11, 17, 8, 0, tzinfo=UTC)
 
 
 async def no_sleep(_: float) -> None:
@@ -89,10 +93,20 @@ class FakeGate(_Counted):
     def __init__(self, log: list[str], refuse: Mapping[int, BaseException] | None = None) -> None:
         super().__init__(log, "gate", refuse)
         self.models: Mapping[str, str] = MODELS
+        self.report_at: datetime | None = REPORT_AT
+        self.rejects: list[tuple[str, datetime | None]] = []
+        self.scopes: list[RunScope] = []  # the run each reject names (AG-13 LOW-3)
+        self.reject_error: BaseException | None = None
 
-    async def check(self, project_id: uuid.UUID) -> Mapping[str, str]:
+    async def check(self, project_id: uuid.UUID) -> GateResult:
         self.tick()
-        return self.models
+        return GateResult(self.models, self.report_at)
+
+    async def reject(self, cause: RejectCause, *, report_at: datetime | None, scope: RunScope) -> None:
+        if self.reject_error is not None:
+            raise self.reject_error
+        self.rejects.append((cause, report_at))
+        self.scopes.append(scope)
 
 
 class FakeHeartbeat(_Counted):
@@ -635,12 +649,15 @@ def compose(
     from app.workflow.budget import BudgetDefaults, BudgetGuard
 
     redactor = redactor or Redactor(settings.secret_values())
-    runs = AgentRunWriter(sessions, bus, AuditWriter(redactor))
+    audit = AuditWriter(redactor)
+    runs = AgentRunWriter(sessions, bus, audit)
     if events is None:
         events = TaskRunEvents(sessions, bus, redactor) if bus is not None else FakeEvents()
     providers = providers if providers is not None else FakeProviders(provider)
     ports = RuntimePorts(
-        gate=gate if gate is not None else DbProviderGate(sessions, settings),
+        gate=gate
+        if gate is not None
+        else DbProviderGate(sessions, settings, audit=audit, pricing_version=pricing.version),
         budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
         ledger=ledger if ledger is not None else LedgerRecorder(UsageLedger(sessions, pricing)),
         runs=runs,

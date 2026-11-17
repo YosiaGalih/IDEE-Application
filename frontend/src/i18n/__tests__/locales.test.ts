@@ -12,6 +12,17 @@ describe("locales", () => {
     expect(keys(en).sort()).toEqual(keys(id).sort());
   });
 
+  it("name no internal work package to the user", () => {
+    for (const locale of [id, en]) {
+      const internal = keys(locale).filter((key) =>
+        /\bWP-\d/.test(
+          String(key.split(".").reduce<unknown>((o, k) => (o as Record<string, unknown>)[k], locale)),
+        ),
+      );
+      expect(internal).toEqual([]);
+    }
+  });
+
   it("have no empty strings", () => {
     for (const locale of [id, en]) {
       const empty = keys(locale).filter(

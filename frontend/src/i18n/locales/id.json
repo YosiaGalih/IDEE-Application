@@ -696,7 +696,7 @@
     },
     "reasons": {
       "lead": "Belum siap: {{reasons}}",
-      "runtime_unavailable": "runtime belum dibangun",
+      "runtime_unavailable": "belum ada mesin yang menjalankan agent",
       "provider_readiness_unknown": "readiness provider belum diuji",
       "provider_not_ready": "provider belum lulus readiness",
       "provider_disabled": "provider dinonaktifkan admin",
@@ -963,6 +963,8 @@
         "key_missing": "Worker tidak memegang key.",
         "endpoint_changed": "Endpoint berubah sejak laporan terakhir.",
         "report_failed": "Laporan terakhir gagal.",
+        "provider_rejected": "Provider menolak key atau model saat run; jalankan smoke lagi.",
+        "pricing_changed": "Tabel tarif worker berbeda dari laporan; jalankan smoke lagi.",
         "other": "Alasan: {{reason}}"
       },
       "checkedAt": "Diuji {{when}}, mode {{mode}}",
