@@ -67,6 +67,7 @@ class WorkerCredentials:
 
     key: str | None
     base_url: str | None
+    pricing_version: str | None = None  # the tariff table the worker loaded at start; None: not checked
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +307,8 @@ def provider_ready(
             return ProviderVerdict("unknown", "key_rotated")
         if row.base_url != public_base_url(held.base_url):
             return ProviderVerdict("unknown", "endpoint_changed")
+        if held.pricing_version is not None and row.pricing_version != held.pricing_version:
+            return ProviderVerdict("unknown", "pricing_changed")  # the smoke priced another tariff file
     if row.readiness_status != "passed":
         return ProviderVerdict("not_ready", "report_failed")
     return ProviderVerdict("ready", "passed")

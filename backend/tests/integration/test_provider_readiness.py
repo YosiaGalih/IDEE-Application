@@ -332,3 +332,28 @@ async def test_the_next_smoke_clears_the_rejection(session: AsyncSession, settin
 
 
 # --- AG-13 3.1e1 L2, L3 -----------------------------------------------------------------------------------
+
+
+async def test_a_changed_tariff_needs_a_new_smoke(session: AsyncSession) -> None:
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    held = service.WorkerCredentials(
+        KEY, None, pricing_version="2026-11-15"
+    )  # the row was priced "2026-11-08"
+    verdict = service.provider_ready(row, anthropic, held=held)
+    assert verdict == service.ProviderVerdict("unknown", "pricing_changed")
+
+
+async def test_the_api_verdict_ignores_pricing(session: AsyncSession) -> None:
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    assert service.provider_ready(row, anthropic).state == "ready"
+    no_tariff = service.WorkerCredentials(KEY, None)  # a holder that loaded no tariff (pricing_version None)
+    assert service.provider_ready(row, anthropic, held=no_tariff).state == "ready"
+
+
+async def test_the_same_tariff_passes(session: AsyncSession) -> None:
+    anthropic = configured(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY)
+    row = await record(session, anthropic, report("anthropic"))
+    same = service.WorkerCredentials(KEY, None)
+    assert service.provider_ready(row, anthropic, held=same).state == "ready"

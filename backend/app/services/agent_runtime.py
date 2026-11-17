@@ -147,12 +147,17 @@ class DbProviderGate:
         sessions: async_sessionmaker[AsyncSession],
         settings: Settings,
         audit: AuditWriter | None = None,
+        *,
+        pricing_version: str | None = None,
     ) -> None:
-        """Holds WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url): the worker's own
-        key and endpoint, read once (the process env). The api process never imports this module."""
+        """Holds WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url, pricing_version):
+        the worker's own key, endpoint and tariff version, read once (the process env and the table loaded at
+        start). The api process never imports this module."""
         self._sessions = sessions
         self._settings = settings
-        self._held = WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url)
+        self._held = WorkerCredentials(
+            settings.anthropic_api_key, settings.anthropic_base_url, pricing_version
+        )
         self._audit = audit if audit is not None else AuditWriter(Redactor())
 
     async def check(self, project_id: uuid.UUID) -> GateResult:
@@ -587,7 +592,7 @@ def build_agent_runtime(
     (the audit's, with the configured secret literals) for everything the runtime writes or sends."""
     redactor = audit.redactor
     ports = RuntimePorts(
-        gate=DbProviderGate(sessions, settings, audit),
+        gate=DbProviderGate(sessions, settings, audit, pricing_version=pricing.version),
         budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
         ledger=LedgerRecorder(UsageLedger(sessions, pricing)),
         runs=AgentRunWriter(sessions, bus, audit),

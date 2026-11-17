@@ -44,6 +44,8 @@ from tests.conftest import make_test_env, reset_data
 from tests.integration.test_task_schema import make_project, make_task
 from tests.runtime_fakes import (
     OUTPUTS,
+    REGISTRY,
+    WORKER_ID,
     Composition,
     FakeHeartbeat,
     Fakes,
@@ -500,3 +502,30 @@ async def test_a_rejection_of_a_superseded_report_leaves_the_new_one(
     )
     await gate.reject("not_found", report_at=seen)
     assert (await gate.check(scope.project_id)).models  # still ready
+
+
+async def test_the_runtime_gate_refuses_a_changed_tariff(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable
+) -> None:
+    """build_agent_runtime wires pricing.version into the gate: the smoke priced "2026-11-05"."""
+    from app.services.agent_runtime import build_agent_runtime
+
+    settings = worker()
+    await record(session, settings)
+    scope = await a_scope(session)
+    for version, expected in (("2026-11-05", None), ("2026-11-20", "pricing_changed")):
+        runtime = build_agent_runtime(
+            sessions=sessions,
+            settings=settings,
+            registry=REGISTRY,
+            pricing=pricing.model_copy(update={"version": version}),
+            audit=AUDIT,
+            bus=None,
+            worker_id=WORKER_ID,
+        )
+        gate = runtime._ports.gate  # the composed gate, as the worker builds it
+        if expected is None:
+            assert await gate.check(scope.project_id)
+        else:
+            refused = await blocked(gate, scope.project_id)  # type: ignore[arg-type]
+            assert (refused.code, refused.reason) == ("provider_not_ready", "pricing_changed")
