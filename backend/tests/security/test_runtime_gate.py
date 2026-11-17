@@ -63,6 +63,7 @@ from tests.runtime_fakes import (
     tool_turn,
 )
 from tests.tool_fakes import make_run
+from tests.usage_fakes import PRICING
 
 KEY = "sk-ant-" + "gate-" + "w" * 28 + "k9z8"  # built, not written: a test value
 OTHER_KEY = "sk-ant-" + "rotated-" + "v" * 24 + "c3d4"
@@ -84,7 +85,8 @@ def report(mode: str = "scripted", *, failed: str | None = None) -> ReadinessRep
     return ReadinessReport(provider="anthropic", mode=mode, checks=checks, ran_at=datetime.now(UTC))
 
 
-PRICED = "2026-11-05"  # the tariff the recorded smoke priced: config/pricing.yaml's version (compose)
+PRICED = PRICING.version  # the tariff the recorded smoke priced: the repo table, as compose's gate holds
+OTHER_TARIFF = "1999-01-01"  # a tariff no smoke priced
 
 
 async def record(
@@ -523,13 +525,13 @@ async def test_a_rejection_of_a_superseded_report_leaves_the_new_one(
 async def test_the_runtime_gate_refuses_a_changed_tariff(
     session: AsyncSession, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable
 ) -> None:
-    """build_agent_runtime wires pricing.version into the gate: the smoke priced "2026-11-05"."""
+    """build_agent_runtime wires pricing.version into the gate: the smoke priced ``PRICED``."""
     from app.services.agent_runtime import build_agent_runtime
 
     settings = worker()
     await record(session, settings)
     scope = await a_scope(session)
-    for version, expected in (("2026-11-05", None), ("2026-11-20", "pricing_changed")):
+    for version, expected in ((PRICED, None), (OTHER_TARIFF, "pricing_changed")):
         runtime = build_agent_runtime(
             sessions=sessions,
             settings=settings,
@@ -620,7 +622,7 @@ async def test_a_tariff_refusal_is_recorded_once_and_the_api_sees_it(
     scope = await a_scope(session)
     since = await last_audit_id(session)
     assert (await provider_readiness.current_verdict(session, settings)).ready
-    gate = db_gate(sessions, settings, pricing_version="2026-11-20")
+    gate = db_gate(sessions, settings, pricing_version=OTHER_TARIFF)
     for _ in range(2):
         refused = await blocked(gate, scope.project_id)
         assert (refused.code, refused.reason) == ("provider_not_ready", "pricing_changed")
@@ -665,7 +667,7 @@ async def test_a_tariff_refusal_that_cannot_be_recorded_still_refuses(
 
     monkeypatch.setattr("app.services.agent_runtime.invalidate_report", broken)
     with capture_logs() as logs:
-        refused = await blocked(db_gate(sessions, settings, pricing_version="2026-11-20"), scope.project_id)
+        refused = await blocked(db_gate(sessions, settings, pricing_version=OTHER_TARIFF), scope.project_id)
     assert (refused.code, refused.reason) == ("provider_not_ready", "pricing_changed")
     (entry,) = [entry for entry in logs if entry["event"] == "provider_reset_unrecorded"]
     assert entry == {
