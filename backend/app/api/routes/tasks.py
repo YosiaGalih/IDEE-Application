@@ -34,7 +34,8 @@ TaskCreator = Annotated[Actor, Depends(require_project_permission("task:create")
 class TaskCreateIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    prompt: Annotated[str, Field(max_length=PROMPT_MAX)]
+    # Raw cap against abuse only; the service measures the cleaned (CRLF-normalised, stripped) text.
+    prompt: Annotated[str, Field(max_length=2 * PROMPT_MAX)]
     title: Annotated[str | None, Field(max_length=TITLE_MAX)] = None
     workflow_type: WorkflowType | None = None
     priority: Literal["low", "normal", "high"] | None = None

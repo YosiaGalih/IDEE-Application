@@ -333,3 +333,29 @@ async def test_created_is_audited(
     assert event.resource_type == "task" and event.resource_id == task_id
     assert str(event.project_id) == project_id and event.result == "success"
     assert event.metadata_["source"] == "api" and event.metadata_["workflow_type"] == "modify"
+
+
+@pytest.mark.parametrize(
+    ("sent", "stored"), [("a\r\nb", "a\nb"), ("a\rb", "a\nb"), ("  a\r\n\r\nb \n", "a\n\nb")]
+)
+async def test_crlf_is_normalised_and_the_prompt_is_stripped(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+    sent: str,
+    stored: str,
+) -> None:
+    project_id = await project(owner)
+    response = await post_task(owner, project_id, prompt=sent)
+    assert response.status_code == 202, response.text
+    (task,) = await task_rows(engine)
+    assert task.prompt == stored
+    assert response.json()["data"]["prompt"] == stored
+
+
+async def test_the_prompt_limit_is_measured_after_strip(owner: httpx.AsyncClient, open_gate: None) -> None:  # noqa: F811
+    project_id = await project(owner)
+    assert (await post_task(owner, project_id, prompt="x" * PROMPT_MAX + "\r\n")).status_code == 202
+    assert (await post_task(owner, project_id, prompt="x" * (PROMPT_MAX + 1))).status_code == 422
+    assert (await post_task(owner, project_id, prompt="\x00" + "\r\n")).status_code == 422
+    assert (await post_task(owner, project_id, prompt="a\r‮b")).status_code == 422

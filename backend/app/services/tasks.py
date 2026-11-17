@@ -130,17 +130,25 @@ def derive_title(redacted_prompt: str) -> str:
     return ""
 
 
+def clean_prompt_text(text: str, *, field: str) -> str:
+    """Free text the user typed (a prompt, a chat message): CRLF and CR become LF, the ends are stripped, and
+    the result is 1..``PROMPT_MAX`` characters of plain text (LF and tab allowed; NUL, other control and
+    format characters refused). A 422 at ``["body", field]`` otherwise."""
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not 1 <= len(cleaned) <= PROMPT_MAX:
+        raise _invalid(field, f"must be 1-{PROMPT_MAX} characters")
+    if has_hidden_characters(cleaned.replace("\n", "").replace("\t", "")):
+        raise _invalid(field, "must be plain text")
+    return cleaned
+
+
 def _checked_text(body: TaskCreate) -> tuple[str, str | None]:
-    """(prompt, title) as the user sent them, or a 422: the prompt is non-blank text (line breaks and tabs
-    allowed), the title one plain line."""
-    if not body.prompt.strip() or len(body.prompt) > PROMPT_MAX:
-        raise _invalid("prompt", f"must be 1-{PROMPT_MAX} characters")
-    if has_hidden_characters(body.prompt.replace("\n", "").replace("\t", "")):
-        raise _invalid("prompt", "must be plain text")
+    """(prompt, title): the prompt through ``clean_prompt_text``, the title one plain line."""
+    prompt = clean_prompt_text(body.prompt, field="prompt")
     title = body.title.strip() if body.title is not None else None
     if title is not None and (not 1 <= len(title) <= TITLE_MAX or has_hidden_characters(title)):
         raise _invalid("title", f"must be one plain line of 1-{TITLE_MAX} characters")
-    return body.prompt, title
+    return prompt, title
 
 
 async def insert_task(
@@ -273,6 +281,7 @@ __all__ = [
     "TITLE_MAX",
     "TaskCreate",
     "TaskView",
+    "clean_prompt_text",
     "create_task",
     "derive_title",
     "ensure_engine_available",
