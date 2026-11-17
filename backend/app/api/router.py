@@ -7,6 +7,7 @@ from app.api.routes import (
     approvals,
     auth,
     budget,
+    conversations,
     dashboard,
     git,
     health,
@@ -33,4 +34,5 @@ api_router.include_router(repository.router)
 api_router.include_router(budget.router)
 api_router.include_router(settings.router)
 api_router.include_router(tasks.router)
+api_router.include_router(conversations.router)
 api_router.include_router(usage.router)

@@ -54,6 +54,8 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("DELETE", "/api/v1/projects/{id}", None),  # R3: only asks for a project_delete approval
     ("GET", "/api/v1/projects/{id}/tasks", None),
     ("POST", "/api/v1/projects/{id}/tasks", {"prompt": "x"}),  # 404/403 answer before the engine gate
+    ("GET", "/api/v1/projects/{id}/conversations", None),
+    ("POST", "/api/v1/projects/{id}/conversations", {}),
 ]
 FILE = "README.md"  # exists in every blank project
 WRITES = {
@@ -71,6 +73,7 @@ WRITES = {
     ("POST", "/api/v1/projects/{id}/index"),
     ("PATCH", "/api/v1/projects/{id}/budget"),
     ("POST", "/api/v1/projects/{id}/tasks"),
+    ("POST", "/api/v1/projects/{id}/conversations"),
 }
 
 
