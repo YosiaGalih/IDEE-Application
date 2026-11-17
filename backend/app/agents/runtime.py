@@ -996,8 +996,9 @@ class _Run:
 
 
 def _reject_cause(error: LLMError) -> RejectCause | None:
-    """``auth`` (which includes billing and permission errors), or a missing model: HTTP 404 or the vendor's
-    ``not_found_error``, whatever kind the adapter gave it (the exact rule, plan Global Constraints)."""
+    """``auth`` (401/403, and the stream's billing and permission errors; an HTTP 402 is ``bad_request``),
+    or a missing model or path: HTTP 404 or the vendor's ``not_found_error``, whatever kind the adapter gave
+    it (the exact rule, plan Global Constraints)."""
     if error.kind == "auth":
         return "auth"
     if error.status_code == 404 or error.vendor_type == "not_found_error":
