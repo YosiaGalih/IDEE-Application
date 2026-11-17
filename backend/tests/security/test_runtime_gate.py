@@ -13,9 +13,10 @@ The run-level assertions (the run ends ``failed`` with the code) are in the Task
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -471,3 +472,31 @@ async def test_a_switch_flipped_mid_run_stops_the_next_attempt(
     assert (result.status, result.error_code) == ("failed", "PROVIDER_DISABLED")
     assert len(composed.provider.requests) == 1  # no restart of the worker needed
     assert await ledger_rows(session) == 1
+
+
+async def test_the_gate_refuses_after_a_rejection(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    settings = worker()
+    await record(session, settings)
+    scope = await a_scope(session)
+    gate = DbProviderGate(sessions, settings)
+    seen = (await gate.check(scope.project_id)).report_at
+    await gate.reject("auth", report_at=seen)
+    refused = await blocked(gate, scope.project_id)
+    assert (refused.code, refused.reason) == ("provider_not_ready", "provider_rejected")
+
+
+async def test_a_rejection_of_a_superseded_report_leaves_the_new_one(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    settings = worker()
+    await record(session, settings)
+    scope = await a_scope(session)
+    gate = DbProviderGate(sessions, settings)
+    seen = (await gate.check(scope.project_id)).report_at
+    await record(
+        session, settings, dataclasses.replace(report(), ran_at=datetime.now(UTC) + timedelta(seconds=5))
+    )
+    await gate.reject("not_found", report_at=seen)
+    assert (await gate.check(scope.project_id)).models  # still ready

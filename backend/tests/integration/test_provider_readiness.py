@@ -3,17 +3,19 @@ writes, and the predicates 3.1f enforces."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.audit import AuditWriter
 from app.core.config import Settings, load_settings
+from app.core.db import make_sessionmaker
 from app.core.redaction import Redactor
 from app.llm.readiness import CHECK_KEYS, Check, ReadinessReport
 from app.models.audit import AuditEvent
@@ -257,6 +259,76 @@ async def test_a_policy_changed_while_the_smoke_ran_records_unknown(
         )
     ).first()
     assert event is not None and event.metadata_["stale"] is True
+
+
+# --- WP-3.1f2b2: a real rejection resets the report (Keputusan Lead #13, K10) -----------------
+
+
+async def reset_events(session: AsyncSession, since: int = 0) -> list[AuditEvent]:
+    """The reset rows after audit id ``since`` (the audit table is append-only: ``reset_data`` keeps it)."""
+    query = select(AuditEvent).where(AuditEvent.action == "provider.readiness_reset", AuditEvent.id > since)
+    return list((await session.scalars(query)).all())
+
+
+async def last_audit_id(session: AsyncSession) -> int:
+    return (await session.scalar(select(func.coalesce(func.max(AuditEvent.id), 0)))) or 0
+
+
+async def test_a_rejection_resets_the_report_it_judged(session: AsyncSession, settings: Settings) -> None:
+    row = await record(session, settings, report())
+    since = await last_audit_id(session)
+    assert await service.invalidate_report(session, cause="auth", report_at=RAN_AT, audit=AUDIT) is True
+    await session.commit()
+    await session.refresh(row)
+    assert row.readiness_status == "unknown" and row.readiness_report["invalidated"]["cause"] == "auth"
+    assert row.readiness_report["ready"] is True  # the rest of the report is kept
+    assert service.provider_ready(row, settings) == service.ProviderVerdict("unknown", "provider_rejected")
+    (event,) = await reset_events(session, since)
+    assert (event.actor_type, event.actor_id) == ("system", "worker")
+    assert event.metadata_ == {"provider": "anthropic", "cause": "auth"}  # no error text
+
+
+async def test_a_newer_smoke_is_never_overwritten(session: AsyncSession, settings: Settings) -> None:
+    row = await record(session, settings, report())
+    since = await last_audit_id(session)
+    older = datetime(2026, 11, 8, 11, 0, tzinfo=UTC)
+    assert await service.invalidate_report(session, cause="not_found", report_at=older, audit=AUDIT) is False
+    await session.commit()
+    await session.refresh(row)
+    assert row.readiness_status == "passed" and "invalidated" not in row.readiness_report
+    assert await reset_events(session, since) == []
+
+
+async def test_no_row_or_no_report_writes_nothing(session: AsyncSession) -> None:
+    since = await last_audit_id(session)
+    assert await service.invalidate_report(session, cause="auth", report_at=None, audit=AUDIT) is False
+    await session.commit()
+    assert await reset_events(session, since) == []
+
+
+async def test_concurrent_rejections_write_one_reset(
+    session: AsyncSession, settings: Settings, engine: AsyncEngine
+) -> None:
+    await record(session, settings, report())
+    since = await last_audit_id(session)
+    sessions = make_sessionmaker(engine)
+
+    async def reject() -> bool:
+        async with sessions.begin() as own:
+            return await service.invalidate_report(own, cause="auth", report_at=RAN_AT, audit=AUDIT)
+
+    results = await asyncio.gather(*(reject() for _ in range(20)))
+    assert sum(results) == 1
+    assert len(await reset_events(session, since)) == 1
+
+
+async def test_the_next_smoke_clears_the_rejection(session: AsyncSession, settings: Settings) -> None:
+    await record(session, settings, report())
+    await service.invalidate_report(session, cause="auth", report_at=RAN_AT, audit=AUDIT)
+    await session.commit()
+    row = await record(session, settings, report())
+    assert "invalidated" not in row.readiness_report
+    assert service.provider_ready(row, settings).state == "ready"
 
 
 # --- AG-13 3.1e1 L2, L3 -----------------------------------------------------------------------------------

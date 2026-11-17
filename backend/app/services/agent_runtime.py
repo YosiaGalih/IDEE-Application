@@ -61,6 +61,7 @@ from app.services.provider_readiness import (
     PROVIDER,
     WorkerCredentials,
     effective_models,
+    invalidate_report,
     provider_calls_allowed,
     provider_ready,
 )
@@ -141,12 +142,18 @@ class LedgerRecorder:
 class DbProviderGate:
     """``ProviderGate``: the provider readiness gate and the project's kill switch (Keputusan Lead #16)."""
 
-    def __init__(self, sessions: async_sessionmaker[AsyncSession], settings: Settings) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        settings: Settings,
+        audit: AuditWriter | None = None,
+    ) -> None:
         """Holds WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url): the worker's own
         key and endpoint, read once (the process env). The api process never imports this module."""
         self._sessions = sessions
         self._settings = settings
         self._held = WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url)
+        self._audit = audit if audit is not None else AuditWriter(Redactor())
 
     async def check(self, project_id: uuid.UUID) -> GateResult:
         """One short read-only session per call: a switch flipped mid-run counts on the next attempt.
@@ -171,7 +178,11 @@ class DbProviderGate:
         return GateResult(models, row.readiness_checked_at if row is not None else None)
 
     async def reject(self, cause: RejectCause, *, report_at: datetime | None) -> None:
-        raise NotImplementedError  # Task 2 of WP-3.1f2b2
+        """Best-effort (the runtime swallows a failure): reset the report this run judged, in its own
+        transaction, if it is still the current one (``invalidate_report``)."""
+        async with self._sessions.begin() as session:
+            await bound_transaction(session)
+            await invalidate_report(session, cause=cause, report_at=report_at, audit=self._audit)
 
 
 class LeaseHeartbeat:
@@ -576,7 +587,7 @@ def build_agent_runtime(
     (the audit's, with the configured secret literals) for everything the runtime writes or sends."""
     redactor = audit.redactor
     ports = RuntimePorts(
-        gate=DbProviderGate(sessions, settings),
+        gate=DbProviderGate(sessions, settings, audit),
         budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
         ledger=LedgerRecorder(UsageLedger(sessions, pricing)),
         runs=AgentRunWriter(sessions, bus, audit),

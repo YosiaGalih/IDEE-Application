@@ -188,6 +188,7 @@ Format: Konteks → Keputusan → Konsekuensi. Status: `Accepted` (dikunci untuk
 
 ## ADR-032 — Readiness gate yang mengikat
 **Keputusan:** Hasil `claude-smoke`/`POST …/smoke-test` disimpan di `provider_configs.readiness_status/_checked_at/_report`. Dengan `LLM_REQUIRE_READINESS=true` (wajib di production), AgentRuntime menolak panggilan LLM selama status ≠ `passed`; perubahan `model_policy` atau rotasi key mengembalikan status ke `unknown`.
+- Reset oleh runtime pada `auth`/404 (3.1f2b #13), Proposed: laporan yang dinilai gerbang diturunkan ke `unknown` dengan penanda `invalidated`, alasan `provider_rejected`; smoke berikutnya menghapusnya.
 
 ## ADR-033 — Sandbox read-only & disk
 **Keputusan:** `SandboxRunRequest.read_only`; `target: main` selalu read-only dengan tmpfs untuk `/workspace/.kk` dan artefak dibaca lewat archive API (sudah diizinkan `CONTAINERS=1`). Pertumbuhan disk per run dibatasi `SANDBOX_MAX_WORKSPACE_GROWTH_MB`; production memakai kuota XFS project per project.

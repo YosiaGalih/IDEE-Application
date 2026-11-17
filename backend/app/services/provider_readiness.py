@@ -52,7 +52,10 @@ VerdictReason = Literal[
     "key_missing",
     "endpoint_changed",
     "report_failed",
+    "provider_rejected",
+    "pricing_changed",
 ]
+RejectCause = Literal["auth", "not_found"]  # what a real provider call said (the runtime's RejectCause)
 MAX_BASE_URL = 300  # provider_configs.base_url
 INVALID_BASE_URL = "[invalid base url]"
 
@@ -231,6 +234,44 @@ async def record_report(
     return row
 
 
+async def invalidate_report(
+    session: AsyncSession, *, cause: RejectCause, report_at: datetime | None, audit: AuditWriter
+) -> bool:
+    """A real provider call was refused (``auth`` or an unknown model): drop the report it relied on to
+    ``unknown`` and mark it ``invalidated`` (3.1f2b Keputusan Lead #13). Writes only while the locked row is
+    still the report the caller judged (``readiness_checked_at == report_at``) and not yet marked, so a newer
+    smoke is never overwritten and concurrent rejections write one reset and one audit row. The next smoke
+    replaces the whole report, marker included. No error text is stored. True if it wrote; the caller
+    commits."""
+    if report_at is None:
+        return False
+    row = (
+        await session.scalars(
+            select(ProviderConfig).where(ProviderConfig.provider == PROVIDER).with_for_update()
+        )
+    ).one_or_none()
+    if row is None or row.readiness_checked_at != report_at or "invalidated" in (row.readiness_report or {}):
+        return False
+    now = datetime.now(UTC)
+    row.readiness_status = "unknown"
+    row.readiness_report = {
+        **(row.readiness_report or {}),
+        "invalidated": {"cause": cause, "at": now.isoformat()},
+    }
+    await audit.write(
+        session,
+        actor_type="system",
+        actor_id="worker",
+        action="provider.readiness_reset",
+        result="success",
+        resource_type="provider_config",
+        resource_id=str(row.id),
+        metadata={"provider": row.provider, "cause": cause},
+    )
+    await session.flush()
+    return True
+
+
 # --- predicates (enforced by 3.1f) --------------------------------------------------------------------------
 
 
@@ -246,6 +287,12 @@ def provider_ready(
         return ProviderVerdict("disabled", "disabled")
     if not settings.llm_require_readiness:
         return ProviderVerdict("ready", "readiness_not_required")
+    if (
+        row is not None
+        and row.readiness_status == "unknown"
+        and "invalidated" in (row.readiness_report or {})
+    ):
+        return ProviderVerdict("unknown", "provider_rejected")  # a real call was refused after that report
     if row is None or row.readiness_status == "unknown" or not row.readiness_report:
         return ProviderVerdict("unknown", "no_report")
     if row.llm_provider_mode != settings.llm_provider:
