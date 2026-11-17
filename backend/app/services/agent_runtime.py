@@ -8,9 +8,10 @@ worker builds a provider and holds the key: import-linter, tests/security/test_p
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -26,11 +27,13 @@ from app.agents.runtime import (
     AgentRuntime,
     BudgetBreach,
     BudgetRefused,
+    GateResult,
     LeaseLostError,
     LogContext,
     ModelCall,
     ProviderBlocked,
     ProviderFactory,
+    RejectCause,
     RunAlreadyFinished,
     RunEnd,
     RunScope,
@@ -145,11 +148,11 @@ class DbProviderGate:
         self._settings = settings
         self._held = WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url)
 
-    async def check(self, project_id: uuid.UUID) -> Mapping[str, str]:
+    async def check(self, project_id: uuid.UUID) -> GateResult:
         """One short read-only session per call: a switch flipped mid-run counts on the next attempt.
         ``provider_ready`` first ('disabled' -> PROVIDER_DISABLED; 'not_ready'/'unknown' ->
         provider_not_ready), then the kill switch (anything but true -> PROVIDER_DISABLED). A missing project
-        fails closed. Returns the effective model per tier."""
+        fails closed. Returns the effective model per tier and the report's timestamp."""
         async with self._sessions() as session:
             row = (
                 await session.scalars(select(ProviderConfig).where(ProviderConfig.provider == PROVIDER))
@@ -164,7 +167,11 @@ class DbProviderGate:
             raise ProviderBlocked("PROVIDER_DISABLED", "project_missing")
         if not provider_calls_allowed(project):
             raise ProviderBlocked("PROVIDER_DISABLED", "kill_switch")
-        return effective_models(self._settings, (row.model_policy or {}) if row is not None else {})
+        models = effective_models(self._settings, (row.model_policy or {}) if row is not None else {})
+        return GateResult(models, row.readiness_checked_at if row is not None else None)
+
+    async def reject(self, cause: RejectCause, *, report_at: datetime | None) -> None:
+        raise NotImplementedError  # Task 2 of WP-3.1f2b2
 
 
 class LeaseHeartbeat:

@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
@@ -820,9 +821,26 @@ class AgentRunResult:
 # --- ports --------------------------------------------------------------------------------------------------
 
 
+RejectCause = Literal["auth", "not_found"]
+
+
+@dataclass(frozen=True, slots=True)
+class GateResult:
+    """What one gate check judged: the effective model per tier, and the timestamp of the readiness report it
+    read (``None``: no report). ``reject`` is told that timestamp, so it never undoes a newer report."""
+
+    models: Mapping[str, str]
+    report_at: datetime | None
+
+
 class ProviderGate(Protocol):
-    async def check(self, project_id: uuid.UUID) -> Mapping[str, str]:
-        """The effective model per tier, or ``ProviderBlocked``."""
+    async def check(self, project_id: uuid.UUID) -> GateResult:
+        """The effective model per tier and the report judged, or ``ProviderBlocked``."""
+        ...
+
+    async def reject(self, cause: RejectCause, *, report_at: datetime | None) -> None:
+        """The provider itself refused a run (``auth``, or a missing model): readiness drops to unknown,
+        unless a report newer than ``report_at`` exists. The runtime swallows what this raises."""
         ...
 
 
@@ -960,11 +978,20 @@ class _Run:
     )
     stop: _RunStop = field(default_factory=_RunStop)
     tally: _Tally = field(default_factory=_Tally)
+    report_at: datetime | None = None  # the readiness report the last gate check judged
     started: bool = False  # the store acknowledged ``start``
     start_sent: bool = False  # a ``start`` was sent (its ack may be lost): a later one is a retry
     iterations: int = 0
     output: BaseModel | None = None
     pending: PendingTool | None = None
+
+
+def _reject_cause(error: LLMError) -> RejectCause | None:
+    if error.kind == "auth":
+        return "auth"
+    if error.kind == "bad_request" and (error.status_code == 404 or error.vendor_type == "not_found_error"):
+        return "not_found"
+    return None
 
 
 def _id(value: uuid.UUID | None) -> str | None:
@@ -1182,7 +1209,9 @@ class AgentRuntime:
         request = run.request
         try:
             await self._beat(run)
-            models = await self._port(run, self._ports.gate.check(request.project_id))
+            judged = await self._port(run, self._ports.gate.check(request.project_id))
+            run.report_at = judged.report_at
+            models = judged.models
             async with self._ports.providers.open(lambda: _ctx(run)) as provider:
                 model = models[run.spec.model_tier]
                 await self._port(run, self._start(run, self._run_start(run, provider.name, model)))
@@ -1190,8 +1219,25 @@ class AgentRuntime:
                 return await self._loop(run, provider, model)
         except _DeadlineReached:
             return self._timed_out(run)
-        except (ProviderBlocked, LeaseLostError, BudgetRefused, UsageUnrecorded, LLMError) as error:
+        except LLMError as error:
+            await self._reject(run, error)
             return self._end_for(error, run)
+        except (ProviderBlocked, LeaseLostError, BudgetRefused, UsageUnrecorded) as error:
+            return self._end_for(error, run)
+
+    async def _reject(self, run: _Run, error: LLMError) -> None:
+        """A real ``auth`` or a missing model (404 / ``not_found_error``) from the provider tells the gate,
+        once per run, bounded by ``_port``. Not when the run's own stop caused the error. A failure, a
+        deadline included, is logged and never changes the run's end."""
+        cause = _reject_cause(error)
+        if cause is None or run.stop.reason is not None:
+            return
+        try:
+            await self._port(run, self._ports.gate.reject(cause, report_at=run.report_at))
+        except Exception as failure:
+            _log.warning(
+                "provider_reject_unrecorded", **_ctx(run), cause=cause, error_type=type(failure).__name__
+            )
 
     # --- bounded ports (reviews of 42bcb2e: a held lock never stalls a run) ---------------------------------
 
@@ -1560,7 +1606,7 @@ class AgentRuntime:
                 await ports.budget.before_model_attempt(call)
                 return
             await self._beat(run)
-            await self._port(run, ports.gate.check(scope.project_id))
+            run.report_at = (await self._port(run, ports.gate.check(scope.project_id))).report_at
             await self._port(run, ports.budget.before_model_attempt(call))
             run.tally.sent += 1  # the hooks passed: the request goes out, unless its restart stops it
 

@@ -138,8 +138,8 @@ async def test_a_ready_provider_with_the_switch_on_returns_the_models(
     settings = worker(CLAUDE_MODEL_FAST="claude-haiku-5-5")
     await record(session, settings)
     scope = await a_scope(session)
-    models = await DbProviderGate(sessions, settings).check(scope.project_id)
-    assert dict(models) == {
+    judged = await DbProviderGate(sessions, settings).check(scope.project_id)
+    assert dict(judged.models) == {
         "default": "claude-test-model",
         "fast": "claude-haiku-5-5",
         "complex": "claude-test-model",

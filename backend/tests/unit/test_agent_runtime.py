@@ -32,6 +32,7 @@ from app.agents.runtime import (
     AgentRunUnfinished,
     BudgetBreach,
     BudgetRefused,
+    GateResult,
     LeaseLostError,
     PendingTool,
     ProviderBlocked,
@@ -59,6 +60,7 @@ from tests.runtime_fakes import (
     OUTPUTS,
     PROMPTS,
     REGISTRY,
+    REPORT_AT,
     STEP,
     UUID_A,
     FakeClock,
@@ -66,6 +68,7 @@ from tests.runtime_fakes import (
     FakeGate,
     FakeHeartbeat,
     FakeLedger,
+    FakeProviders,
     FakeRuns,
     Fakes,
     a_model_call,
@@ -920,7 +923,7 @@ class HangingGate(FakeGate):
     async def check(self, project_id: uuid.UUID) -> Any:
         self.tick()
         await self.release.wait()
-        return self.models
+        return GateResult(self.models, self.report_at)
 
 
 async def test_a_hanging_port_ends_the_run_at_its_deadline() -> None:
@@ -1915,7 +1918,7 @@ async def test_a_conflicting_id_never_replaces_a_cancel_before_the_first_start()
         async def check(self, project_id: uuid.UUID) -> Any:
             self.tick()
             await asyncio.Event().wait()  # never answers: the run is cancelled here
-            return self.models
+            return GateResult(self.models, self.report_at)
 
     fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
     fakes.gate = SilentGate(fakes.log)
@@ -1972,3 +1975,91 @@ async def test_a_conflict_at_the_close_is_logged_once_with_the_runs_ids() -> Non
         str(request.task_id),
     )
     assert conflict["correlation_id"] == f"agent_run:{request.agent_run_id}"
+
+
+# --- the gate hears a real rejection (WP-3.1f2b2, Keputusan Lead #13) ---------------------------------------
+
+
+class RaisingProvider:
+    """Every request fails with ``error``."""
+
+    name = "scripted"
+
+    def __init__(self, error: LLMError) -> None:
+        self.error = error
+        self.calls = 0
+
+    async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+        self.calls += 1
+        raise self.error
+
+    async def aclose(self) -> None:
+        return None
+
+
+def rejecting(error: LLMError) -> tuple[Fakes, RaisingProvider]:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    provider = RaisingProvider(error)
+    fakes.providers = FakeProviders(provider)  # type: ignore[arg-type]
+    return fakes, provider
+
+
+async def test_an_auth_rejection_resets_readiness_once() -> None:
+    fakes, provider = rejecting(LLMError("auth", status_code=401))
+    result = await run_b14(fakes)
+    assert fakes.gate.rejects == [("auth", REPORT_AT)] and result.error_code == "provider_auth"
+    assert provider.calls == 1
+
+
+async def test_a_missing_model_resets_readiness() -> None:
+    fakes, _ = rejecting(LLMError("bad_request", status_code=404))
+    result = await run_b14(fakes)
+    assert fakes.gate.rejects == [("not_found", REPORT_AT)] and result.error_code == "model_error"
+
+
+async def test_a_vendor_not_found_resets_readiness() -> None:
+    fakes, _ = rejecting(LLMError("bad_request", vendor_type="not_found_error"))
+    await run_b14(fakes)
+    assert fakes.gate.rejects == [("not_found", REPORT_AT)]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMError("rate_limited", status_code=429),
+        LLMError("transient", status_code=500),
+        LLMError("bad_request", status_code=400),
+        LLMError("refusal"),
+    ],
+    ids=repr,
+)
+async def test_other_provider_errors_reset_nothing(error: LLMError) -> None:
+    fakes, _ = rejecting(error)
+    await run_b14(fakes)
+    assert fakes.gate.rejects == []
+
+
+async def test_an_auth_error_during_the_runs_own_cancel_resets_nothing() -> None:
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    request = run_request("B14")
+
+    class CancelsThenAuth(RaisingProvider):
+        async def create_message(self, req: Any, *, on_text_delta: Any = None, cancel: Any = None) -> Any:
+            request.cancel.cancel()
+            await asyncio.sleep(0.05)  # the watcher stops the run before the provider answers
+            raise self.error
+
+    fakes.providers = FakeProviders(CancelsThenAuth(LLMError("auth", status_code=401)))  # type: ignore[arg-type]
+    result = await run_b14(fakes, request=request)
+    assert result.status == "cancelled" and fakes.gate.rejects == []
+
+
+async def test_a_failing_reject_never_changes_the_end() -> None:
+    from structlog.testing import capture_logs
+
+    fakes, _ = rejecting(LLMError("auth", status_code=401))
+    fakes.gate.reject_error = RuntimeError("database down")
+    with capture_logs() as logs:
+        result = await run_b14(fakes)
+    assert result.error_code == "provider_auth"
+    assert "provider_reject_unrecorded" in [entry["event"] for entry in logs]
