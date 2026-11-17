@@ -7,15 +7,20 @@ WP-3.2b, so most task-creating tests open it."""
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import httpx
+import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.db import make_sessionmaker
+from app.core.errors import AppError
 from app.models.audit import AuditEvent
 from app.models.projects import Conversation, Message
 from app.models.tasks import Task
+from app.services import conversations as conversations_service
+from app.services.tasks import PROMPT_MAX, TaskView
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     PROJECTS,
     app,
@@ -28,7 +33,7 @@ from tests.integration.test_projects import (  # noqa: F401 - fixtures shared wi
     signed_in,
     workspace_root,
 )
-from tests.integration.test_tasks_api import open_gate, project, sql  # noqa: F401
+from tests.integration.test_tasks_api import created_audits, open_gate, project, sql  # noqa: F401
 
 
 async def new_conversation(client: httpx.AsyncClient, project_id: str, **body: object) -> str:
@@ -143,12 +148,19 @@ async def test_message_with_task_is_202_and_linked(
         (task,) = await session.scalars(select(Task))
         (row,) = await session.scalars(select(Message))
         conversation = await session.get(Conversation, uuid.UUID(cid))
-        audit = await session.scalars(select(AuditEvent).where(AuditEvent.action == "task.created"))
+        # This task's row only: audit_events is append-only, other tests' rows may be there (AG-13 LOW).
+        audit = await session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "task.created", AuditEvent.resource_id == str(task.id)
+            )
+        )
         events = list(audit)
     assert row.task_id == task.id and task.conversation_id == uuid.UUID(cid)
     assert secret not in task.prompt and task.prompt == row.content
     assert task.context_refs == row.context_refs and len(task.context_refs) == 1
-    assert [e.metadata_["source"] for e in events] == ["chat"]
+    assert [e.metadata_ for e in events] == [
+        {"task_id": str(task.id), "source": "chat", "workflow_type": "debug"}
+    ]
     assert conversation is not None and before is not None and conversation.updated_at > before
 
 
@@ -161,6 +173,7 @@ async def test_gate_closed_writes_nothing(owner: httpx.AsyncClient, engine: Asyn
         assert response.status_code == 503, response.text
         assert response.json()["error"]["details"] == [{"reason": "workflow_engine_unavailable"}]
     assert await count(engine, "messages") == 0 and await count(engine, "tasks") == 0
+    assert await created_audits(engine, project_id) == []
 
 
 async def test_message_and_task_are_one_transaction(
@@ -236,3 +249,176 @@ async def test_message_without_task_needs_an_active_project_but_not_a_ready_repo
     assert response.status_code == 409 and response.json()["error"]["details"] == [
         {"reason": "project_archived"}
     ]
+
+
+# --- final review wave (WP-3.2a F1, F2, F4, F5, F6) ---------------------------------------------------------
+
+
+async def test_a_failed_view_stores_no_message_and_the_retry_stores_one(
+    owner: httpx.AsyncClient,
+    open_gate: None,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BE M1 / SF M1: views are built before the commit; a failure there stores nothing and the retry with the
+    same key (released on 5xx) stores one message and one task."""
+    project_id = await project(owner)
+    cid = await new_conversation(owner, project_id)
+    real = conversations_service.task_view
+    calls: list[int] = []
+
+    async def fails_once(*args: Any, **kwargs: Any) -> TaskView:
+        calls.append(1)
+        if len(calls) == 1:
+            raise AppError("INTERNAL_ERROR", "Internal error", http_status=500)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(conversations_service, "task_view", fails_once)
+    key = str(uuid.uuid4())
+    failed = await post_message(owner, cid, key=key)
+    assert failed.status_code == 500, failed.text
+    assert await count(engine, "messages") == 0 and await count(engine, "tasks") == 0
+    assert await created_audits(engine, project_id) == []
+    retried = await post_message(owner, cid, key=key)
+    assert retried.status_code == 202, retried.text
+    assert await count(engine, "messages") == 1 and await count(engine, "tasks") == 1
+    assert len(await created_audits(engine, project_id)) == 1
+
+
+async def test_path_refs_in_chat_need_a_ready_repository(
+    owner: httpx.AsyncClient,
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    """Ruling R5: without a task, a file or folder ref still needs the repository ``ready`` (409, never a 500
+    for a root an import has not written yet); a message without path refs does not."""
+    project_id = await project(owner)
+    cid = await new_conversation(owner, project_id)
+    task_id = (await post_message(owner, cid)).json()["data"]["task"]["id"]
+    await sql(
+        engine,
+        "UPDATE repositories SET sync_state = 'importing' WHERE project_id = :id",
+        id=uuid.UUID(project_id),
+    )
+    for ref in ({"type": "file", "path": "README.md"}, {"type": "folder", "path": "src"}):
+        refused = await post_message(owner, cid, create_task=False, context_refs=[ref])
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["details"] == [{"reason": "repository_not_ready"}]
+    assert (await post_message(owner, cid, create_task=False)).status_code == 201
+    task_ref = await post_message(
+        owner, cid, create_task=False, context_refs=[{"type": "task", "id": task_id}]
+    )
+    assert task_ref.status_code == 201, task_ref.text
+    assert await count(engine, "messages") == 3
+
+
+@pytest.mark.parametrize("field", ["workflow_type", "budget"])
+async def test_task_fields_without_a_task_are_refused(
+    owner: httpx.AsyncClient,
+    engine: AsyncEngine,
+    field: str,
+) -> None:
+    """Ruling R6: dropping a cost cap silently would fail open."""
+    project_id = await project(owner)
+    cid = await new_conversation(owner, project_id)
+    value = {"workflow_type": "debug", "budget": {"max_tokens": 1000}}[field]
+    response = await post_message(owner, cid, create_task=False, **{field: value})
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert error["details"][0]["loc"] == ["body", field]
+    assert error["details"][0]["reason"] == "only_with_task"
+    assert await count(engine, "messages") == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [("archived", "project_archived"), ("deleting_pending_approval", "project_not_active")],
+)
+async def test_a_conversation_needs_an_active_project(
+    owner: httpx.AsyncClient,
+    engine: AsyncEngine,
+    status: str,
+    reason: str,
+) -> None:
+    """Ruling R8: like a chat message (R1), a new conversation is a write."""
+    project_id = await project(owner)
+    await sql(engine, "UPDATE projects SET status = :s WHERE id = :id", s=status, id=uuid.UUID(project_id))
+    response = await owner.post(f"{PROJECTS}/{project_id}/conversations", json={}, headers=headers(owner))
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["details"] == [{"reason": reason}]
+    assert await count(engine, "conversations") == 0
+
+
+async def test_message_input_is_bounded(
+    owner: httpx.AsyncClient, open_gate: None, engine: AsyncEngine
+) -> None:
+    project_id = await project(owner)
+    cid = await new_conversation(owner, project_id)
+    twenty_one = [{"type": "file", "path": f"f{n}.txt"} for n in range(21)]
+    over = await post_message(owner, cid, context_refs=twenty_one)
+    assert over.status_code == 422 and over.json()["error"]["details"][0]["loc"][:2] == [
+        "body",
+        "context_refs",
+    ]
+    for content in ("   ", "\r\n\t", "x" * (PROMPT_MAX + 1), "a\x00b", "a‮b"):
+        refused = await post_message(owner, cid, content=content, create_task=False)
+        assert refused.status_code == 422, (content[:8], refused.text)
+        assert refused.json()["error"]["details"][0]["loc"] == ["body", "content"]
+    padded = "x" + " " * (2 * PROMPT_MAX - 1)
+    assert (await post_message(owner, cid, content=padded, create_task=False)).status_code == 201
+    assert (await post_message(owner, cid, content=padded + " ", create_task=False)).status_code == 422
+    missing = await post_message(owner, cid, context_refs=[{"type": "file", "path": "nope.py"}])
+    assert missing.status_code == 422
+    assert missing.json()["error"]["details"][0] == {
+        "loc": ["body", "context_refs", 0],
+        "msg": "The referenced item does not exist in this project",
+        "reason": "context_ref_not_found",
+    }
+    assert await count(engine, "messages") == 1 and await count(engine, "tasks") == 0
+
+
+async def test_an_ex_member_loses_their_own_conversation(
+    app,
+    owner: httpx.AsyncClient,
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    """A conversation is its creator's only while they can see the project: after their role is revoked it
+    answers 404, the same as a random id; demoted to readonly they may read it but not post (403)."""
+    project_id = await project(owner)
+    dev_id = await make_user(engine, "dev@example.test")
+    await grant(engine, dev_id, "developer", f"project:{project_id}")
+    dev = await signed_in(app, "dev@example.test", "user-long-passphrase")
+    try:
+        cid = await new_conversation(dev, project_id)
+        assert (await post_message(dev, cid, create_task=False)).status_code == 201
+        await sql(engine, "DELETE FROM user_roles WHERE user_id = :id", id=dev_id)
+        gone = await dev.get(f"/api/v1/conversations/{cid}/messages")
+        random = await dev.get(f"/api/v1/conversations/{uuid.uuid4()}/messages")
+        assert (gone.status_code, gone.json()["error"]) == (404, random.json()["error"])
+        posted = await post_message(dev, cid, create_task=False)
+        assert (posted.status_code, posted.json()["error"]["code"]) == (404, "NOT_FOUND")
+        await grant(engine, dev_id, "readonly", f"project:{project_id}")
+        assert (await dev.get(f"/api/v1/conversations/{cid}/messages")).status_code == 200
+        demoted = await post_message(dev, cid, create_task=False)
+        assert (demoted.status_code, demoted.json()["error"]["code"]) == (403, "FORBIDDEN")
+    finally:
+        await dev.aclose()
+    assert await count(engine, "messages") == 1
+
+
+async def test_idempotent_replay_returns_the_first_message_and_task(
+    owner: httpx.AsyncClient,
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    project_id = await project(owner)
+    cid = await new_conversation(owner, project_id)
+    key = str(uuid.uuid4())
+    first = await post_message(owner, cid, key=key)
+    again = await post_message(owner, cid, key=key)
+    assert first.status_code == again.status_code == 202, again.text
+    assert again.headers.get("idempotent-replay") is not None
+    assert again.json()["data"] == first.json()["data"]
+    assert await count(engine, "messages") == 1 and await count(engine, "tasks") == 1

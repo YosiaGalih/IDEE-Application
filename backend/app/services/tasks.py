@@ -4,6 +4,14 @@
 cannot be created: nothing could ever run it. The gate is read through the module attribute, so a test can
 open it. A task is created ``draft``; no job is enqueued here.
 
+**Two short transactions** (Ruling R11). Creating a task:
+1. checks scope and state in a short session without a lock (404/403, then 409);
+2. checks the input (422), then the context-ref paths on disk, with no session open: a slow disk never holds a
+   pooled connection or the project row;
+3. locks the project and checks it again, checks task refs, inserts the row and its audit event, builds the
+   view and only then commits. A failure anywhere before the commit stores nothing, so a retry with the same
+   idempotency key (released on a 5xx) cannot create a second task.
+
 **Copied, not referenced.** The effective budget (task, then project, then env) is copied into
 ``tasks.budget_limit`` at creation, so a later change of the project default never moves a running task.
 Prompt and title are redacted before they are stored (SECURITY_MODEL §6).
@@ -22,19 +30,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents import readiness
 from app.core.errors import AppError
+from app.core.logging import get_logger
 from app.models.approvals import Approval
 from app.models.identity import User
 from app.models.projects import Project, Repository
 from app.models.tasks import Task
 from app.services import approvals
 from app.services.approvals import ApprovalView
-from app.services.context_refs import ContextRef, validate_refs
+from app.services.context_refs import ContextRef, RefCheck, check_paths, check_task_refs
 from app.services.project_budget import BUDGET_SETTINGS_KEY
 from app.services.projects import (
-    PAGE_SIZE_MAX,
     Actor,
     ProjectEnv,
     authorize,
+    check_page,
     has_hidden_characters,
     not_found,
     permissions_for,
@@ -50,6 +59,8 @@ from app.workflow.budget import (
     parse_budget,
 )
 from app.workspace.fs import Workspace
+
+logger = get_logger(__name__)
 
 PROMPT_MAX: Final = 20_000
 TITLE_MAX: Final = 200
@@ -68,6 +79,17 @@ class TaskCreate:
     priority: str | None
     budget: object | None
     context_refs: Sequence[ContextRef]
+
+
+@dataclass(frozen=True)
+class CheckedTask:
+    """A ``TaskCreate`` past every check that needs no IO: the text cleaned, the requested budget parsed."""
+
+    prompt: str
+    title: str | None
+    workflow_type: str | None
+    priority: str | None
+    budget: BudgetFields
 
 
 @dataclass(frozen=True)
@@ -128,19 +150,37 @@ def ensure_engine_available() -> None:
         )
 
 
-async def lock_project_for_task(session: AsyncSession, actor: Actor, project_id: uuid.UUID) -> Project:
-    """The project, locked, when it can take a task now: ``task:create``, active, repository ready."""
-    project, _ = await authorize(session, actor, project_id, "task:create", lock=True)
+def require_active(project: Project) -> None:
+    """409 unless the project takes writes now: ``project_archived``, else ``project_not_active``."""
     if project.status == "archived":
         raise _conflict("project_archived", "The project is archived")
     if project.status != "active":
         raise _conflict("project_not_active", "The project is not active")
+
+
+async def require_repository_ready(session: AsyncSession, project_id: uuid.UUID) -> None:
     sync_state = await session.scalar(
-        select(Repository.sync_state).where(Repository.project_id == project.id)
+        select(Repository.sync_state).where(Repository.project_id == project_id)
     )
     if sync_state != "ready":
         raise _conflict("repository_not_ready", "The repository is not ready")
+
+
+async def project_for_task(
+    session: AsyncSession, actor: Actor, project_id: uuid.UUID, *, lock: bool
+) -> Project:
+    """The project when it can take a task now: ``task:create``, active, repository ready. With ``lock`` the
+    row is held (``FOR NO KEY UPDATE``) until the transaction ends: the inserting session takes it, the first
+    short session does not."""
+    project, _ = await authorize(session, actor, project_id, "task:create", lock=lock)
+    require_active(project)
+    await require_repository_ready(session, project.id)
     return project
+
+
+async def check_ref_paths(env: ProjectEnv, project_id: uuid.UUID, refs: Sequence[ContextRef]) -> RefCheck:
+    """``check_paths`` against the project's ``repo/``. Call it with no session open (R11)."""
+    return await check_paths(Workspace(repo_path(env.workspace_root, project_id)), project_id, refs)
 
 
 def derive_title(redacted_prompt: str) -> str:
@@ -164,13 +204,18 @@ def clean_prompt_text(text: str, *, field: str) -> str:
     return cleaned
 
 
-def _checked_text(body: TaskCreate) -> tuple[str, str | None]:
-    """(prompt, title): the prompt through ``clean_prompt_text``, the title one plain line."""
+def check_task(body: TaskCreate) -> CheckedTask:
+    """The prompt through ``clean_prompt_text``, the title one plain line, the requested budget parsed: every
+    422 that needs no IO, so it comes before any filesystem work."""
     prompt = clean_prompt_text(body.prompt, field="prompt")
     title = body.title.strip() if body.title is not None else None
     if title is not None and (not 1 <= len(title) <= TITLE_MAX or has_hidden_characters(title)):
         raise _invalid("title", f"must be one plain line of 1-{TITLE_MAX} characters")
-    return prompt, title
+    try:
+        budget = parse_budget(body.budget)
+    except BudgetConfigError as exc:
+        raise _invalid("budget", str(exc)) from None
+    return CheckedTask(prompt, title, body.workflow_type, body.priority, budget)
 
 
 async def insert_task(
@@ -178,42 +223,46 @@ async def insert_task(
     env: ProjectEnv,
     actor: Actor,
     project: Project,
-    body: TaskCreate,
+    checked: CheckedTask,
     *,
     defaults: BudgetDefaults,
     source: Source,
+    refs: list[dict[str, object]],
     conversation_id: uuid.UUID | None = None,
-    refs: list[dict[str, object]] | None = None,
 ) -> Task:
     """The ``draft`` row and its audit event, in the caller's transaction (no commit). ``refs`` are the
-    caller's validated context refs (chat validates them once for the message and the task)."""
-    prompt, title = _checked_text(body)
-    try:
-        requested = parse_budget(body.budget)
-    except BudgetConfigError as exc:
-        raise _invalid("budget", str(exc)) from None
+    caller's checked context refs (chat checks them once for the message and the task)."""
     try:
         project_fields = parse_budget(project.settings.get(BUDGET_SETTINGS_KEY))
     except BudgetConfigError:
+        logger.error("project_budget_invalid", project_id=str(project.id))  # never the settings content
         raise _conflict("project_budget_invalid", "The project's stored budget cannot be read") from None
-    budget = dump_budget(BudgetFields(**asdict(effective_budget(requested, project_fields, defaults))))
+    effective = effective_budget(checked.budget, project_fields, defaults)
+    budget = dump_budget(BudgetFields(**asdict(effective)))
 
     redactor = env.audit.redactor
-    redacted_prompt = redactor.redact(prompt)
-    shown_title = redactor.redact(title)[:TITLE_MAX] if title is not None else derive_title(redacted_prompt)
-    workflow_type = body.workflow_type or DEFAULT_WORKFLOW_TYPE
-    user_set = [name for name, given in (("title", title), ("workflow_type", body.workflow_type)) if given]
+    redacted_prompt = redactor.redact(checked.prompt)
+    # Never empty: a checked title has a visible character, and so has the first line of a checked prompt.
+    title = (
+        redactor.redact(checked.title)[:TITLE_MAX]
+        if checked.title is not None
+        else derive_title(redacted_prompt)
+    )
+    workflow_type = checked.workflow_type or DEFAULT_WORKFLOW_TYPE
+    user_set = [
+        name for name, given in (("title", checked.title), ("workflow_type", checked.workflow_type)) if given
+    ]
     task = Task(
         id=uuid.uuid4(),
         project_id=project.id,
         conversation_id=conversation_id,
-        title=shown_title or "Task",
+        title=title,
         prompt=redacted_prompt,
         workflow_type=workflow_type,
-        priority=body.priority or DEFAULT_PRIORITY,
+        priority=checked.priority or DEFAULT_PRIORITY,
         budget_limit=budget,
         checkpoint={"user_set": user_set},
-        context_refs=refs if refs is not None else [],
+        context_refs=refs,
         created_by=actor.user_id,
     )
     session.add(task)
@@ -227,7 +276,7 @@ async def insert_task(
         resource_type="task",
         resource_id=str(task.id),
         project_id=project.id,
-        metadata={"source": source, "workflow_type": workflow_type},
+        metadata={"task_id": str(task.id), "source": source, "workflow_type": workflow_type},
         correlation_id=f"task:{task.id}",
         ip=actor.ip,
     )
@@ -246,17 +295,18 @@ async def create_task(
 ) -> TaskView:
     ensure_engine_available()
     async with env.sessions() as session:
-        project = await lock_project_for_task(session, actor, project_id)
-        _checked_text(body)  # before any filesystem work
-        refs: list[dict[str, object]] = []
-        if body.context_refs:
-            workspace = Workspace(repo_path(env.workspace_root, project.id))
-            refs = await validate_refs(session, workspace, project.id, body.context_refs)
+        await project_for_task(session, actor, project_id, lock=False)
+    checked = check_task(body)
+    paths = await check_ref_paths(env, project_id, body.context_refs)
+    async with env.sessions() as session:
+        project = await project_for_task(session, actor, project_id, lock=True)
+        refs = await check_task_refs(session, project.id, paths)
         task = await insert_task(
-            session, env, actor, project, body, defaults=defaults, source="api", refs=refs
+            session, env, actor, project, checked, defaults=defaults, source="api", refs=refs
         )
+        view = await task_view(session, task, iteration_max=iteration_max, actor=actor)
         await session.commit()
-        return await task_view(session, task, iteration_max=iteration_max, actor=actor)
+    return view
 
 
 def _escape_like(text: str) -> str:
@@ -274,13 +324,7 @@ async def list_tasks(
     page_size: int,
 ) -> tuple[list[TaskSummary], int]:
     """A project's tasks, newest change first; ``q`` is a literal, case-insensitive title match."""
-    if page < 1 or not 1 <= page_size <= PAGE_SIZE_MAX:
-        raise AppError(
-            "VALIDATION_ERROR",
-            "Input did not pass validation",
-            http_status=422,
-            details=[{"loc": ["query", "page_size"], "msg": f"page >= 1 and page_size 1-{PAGE_SIZE_MAX}"}],
-        )
+    check_page(page, page_size)
     async with env.sessions() as session:
         await authorize(session, actor, project_id, "task:read")
         conditions = [Task.project_id == project_id]
@@ -335,10 +379,8 @@ async def get_task(env: ProjectEnv, actor: Actor, task_id: uuid.UUID, *, iterati
         return await task_view(session, task, iteration_max=iteration_max, actor=actor)
 
 
-async def task_view(
-    session: AsyncSession, task: Task, *, iteration_max: int, actor: Actor | None = None
-) -> TaskView:
-    """The ``Task`` of API §5 + §11 #1; ``actor`` decides ``pending_approval.can_decide`` (none: false)."""
+async def task_view(session: AsyncSession, task: Task, *, iteration_max: int, actor: Actor) -> TaskView:
+    """The ``Task`` of API §5 + §11 #1; ``actor`` decides ``pending_approval.can_decide``."""
     usage = (await task_usage(session, [task.id])).get(task.id, EMPTY_TOTALS)
     creator = await session.get(User, task.created_by)
     pending: ApprovalView | None = None
@@ -351,8 +393,7 @@ async def task_view(
     if approval is not None:
         project = await session.get(Project, task.project_id)
         if project is not None:
-            permissions = permissions_for(actor, project) if actor is not None else frozenset[str]()
-            pending = approvals.view_of(approval, project, permissions)
+            pending = approvals.view_of(approval, project, permissions_for(actor, project))
     checkpoint = task.checkpoint
     return TaskView(
         task=task,
@@ -377,9 +418,12 @@ __all__ = [
     "DEFAULT_WORKFLOW_TYPE",
     "PROMPT_MAX",
     "TITLE_MAX",
+    "CheckedTask",
     "TaskCreate",
     "TaskSummary",
     "TaskView",
+    "check_ref_paths",
+    "check_task",
     "clean_prompt_text",
     "create_task",
     "derive_title",
@@ -387,6 +431,8 @@ __all__ = [
     "get_task",
     "insert_task",
     "list_tasks",
-    "lock_project_for_task",
+    "project_for_task",
+    "require_active",
+    "require_repository_ready",
     "task_view",
 ]

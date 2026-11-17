@@ -6,20 +6,28 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from app.agents import readiness
 from app.core.db import make_sessionmaker
+from app.core.errors import AppError
+from app.core.rbac import ROLE_PERMISSIONS
 from app.models.approvals import Approval
 from app.models.audit import AuditEvent
 from app.models.tasks import Task
+from app.services import tasks as tasks_service
 from app.services.project_budget import BUDGET_MAX_TOKENS
-from app.services.tasks import PROMPT_MAX, TITLE_MAX
+from app.services.tasks import PROMPT_MAX, TITLE_MAX, TaskView
 from app.workflow.budget import BudgetFields, dump_budget
+from app.workspace import fs
+from app.workspace.fs import Workspace
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     PROJECTS,
     app,
@@ -70,6 +78,38 @@ async def sql(engine: AsyncEngine, statement: str, **params: object) -> None:
         await conn.execute(text(statement), params)
 
 
+async def created_audits(engine: AsyncEngine, project_id: str) -> list[AuditEvent]:
+    """This project's ``task.created`` rows (audit_events is append-only: never assume an empty table)."""
+    async with make_sessionmaker(engine)() as session:
+        return list(
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "task.created", AuditEvent.project_id == uuid.UUID(project_id)
+                )
+            )
+        )
+
+
+def spy_disk(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The ``Workspace`` calls a ref check could make, in order (each one touches the disk)."""
+    touched: list[str] = []
+    for name in ("probe", "read_file", "tree"):
+        original = getattr(Workspace, name)
+
+        def spy(
+            self: Workspace, *args: Any, _name: str = name, _original: Any = original, **kwargs: Any
+        ) -> Any:
+            touched.append(_name)
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Workspace, name, spy)
+    return touched
+
+
+def repo_of(root: Path, project_id: str) -> Path:
+    return root / project_id / "repo"
+
+
 async def test_create_returns_202_with_a_draft_task(owner: httpx.AsyncClient, open_gate: None) -> None:  # noqa: F811
     project_id = await project(owner)
     response = await post_task(owner, project_id)
@@ -115,6 +155,7 @@ async def test_gate_closed_is_503_and_writes_nothing(owner: httpx.AsyncClient, e
     assert error["details"] == [{"reason": "workflow_engine_unavailable"}]
     async with engine.connect() as conn:
         assert (await conn.execute(text("SELECT count(*) FROM tasks"))).scalar_one() == 0
+    assert await created_audits(engine, project_id) == []
 
 
 async def test_user_values_are_kept_and_marked(
@@ -202,10 +243,15 @@ async def test_broken_project_budget_is_409(
         b='{"max_tokens": -5}',
         id=uuid.UUID(project_id),
     )
-    response = await post_task(owner, project_id)
+    with capture_logs() as logs:
+        response = await post_task(owner, project_id)
     assert response.status_code == 409, response.text
     assert response.json()["error"]["details"] == [{"reason": "project_budget_invalid"}]
     assert await task_rows(engine) == []
+    # SF L2: a stored budget nobody can read is an operator problem, logged without the settings content.
+    [entry] = [entry for entry in logs if entry["event"] == "project_budget_invalid"]
+    assert (entry["log_level"], entry["project_id"]) == ("error", project_id)
+    assert "max_tokens" not in str(entry)
 
 
 @pytest.mark.parametrize(
@@ -246,7 +292,7 @@ async def test_repository_not_ready_is_409(
 
 async def test_hidden_characters_are_refused(owner: httpx.AsyncClient, open_gate: None) -> None:  # noqa: F811
     project_id = await project(owner)
-    for bad in ("a\x00b", "a‮b"):
+    for bad in ("a\x00b", "a\u202eb"):
         assert (await post_task(owner, project_id, prompt=bad)).status_code == 422
         assert (await post_task(owner, project_id, title=bad)).status_code == 422
     assert (await post_task(owner, project_id, title="satu\ndua")).status_code == 422
@@ -334,7 +380,8 @@ async def test_created_is_audited(
     assert event.correlation_id == f"task:{task_id}"
     assert event.resource_type == "task" and event.resource_id == task_id
     assert str(event.project_id) == project_id and event.result == "success"
-    assert event.metadata_["source"] == "api" and event.metadata_["workflow_type"] == "modify"
+    # spec §12.1.2 step 6
+    assert event.metadata_ == {"task_id": task_id, "source": "api", "workflow_type": "modify"}
 
 
 @pytest.mark.parametrize(
@@ -360,7 +407,7 @@ async def test_the_prompt_limit_is_measured_after_strip(owner: httpx.AsyncClient
     assert (await post_task(owner, project_id, prompt="x" * PROMPT_MAX + "\r\n")).status_code == 202
     assert (await post_task(owner, project_id, prompt="x" * (PROMPT_MAX + 1))).status_code == 422
     assert (await post_task(owner, project_id, prompt="\x00" + "\r\n")).status_code == 422
-    assert (await post_task(owner, project_id, prompt="a\r‮b")).status_code == 422
+    assert (await post_task(owner, project_id, prompt="a\r\u202eb")).status_code == 422
 
 
 TASKS_OF = PROJECTS + "/{}/tasks"
@@ -489,3 +536,154 @@ async def test_detail_out_of_scope_is_404(
         assert (await owner.get(f"/api/v1/tasks/{uuid.uuid4()}")).status_code == 404
     finally:
         await eve.aclose()
+
+
+# --- final review wave (WP-3.2a F1, F4, F9, F13) ------------------------------------------------------------
+
+
+async def test_a_failed_view_stores_nothing_and_the_retry_creates_one_task(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BE M1 / SF M1: the view is built before the commit. A failure there stores no task and no audit row;
+    the 5xx releases the idempotency key, and the retry with the same key creates exactly one task."""
+    project_id = await project(owner)
+    real = tasks_service.task_view
+    calls: list[int] = []
+
+    async def fails_once(*args: Any, **kwargs: Any) -> TaskView:
+        calls.append(1)
+        if len(calls) == 1:
+            raise AppError("INTERNAL_ERROR", "Internal error", http_status=500)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(tasks_service, "task_view", fails_once)
+    key = str(uuid.uuid4())
+    failed = await post_task(owner, project_id, key=key)
+    assert failed.status_code == 500, failed.text
+    assert await task_rows(engine) == []
+    assert await created_audits(engine, project_id) == []
+    retried = await post_task(owner, project_id, key=key)
+    assert retried.status_code == 202, retried.text
+    (task,) = await task_rows(engine)
+    assert retried.json()["data"]["id"] == str(task.id)
+    assert len(await created_audits(engine, project_id)) == 1
+
+
+async def test_the_raw_prompt_cap_refuses_padding_the_service_would_strip(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+) -> None:
+    """The schema caps the raw prompt at 2 x PROMPT_MAX against abuse; under it the cleaned text counts."""
+    project_id = await project(owner)
+    padded = "x" + " " * (2 * PROMPT_MAX - 1)
+    assert (await post_task(owner, project_id, prompt=padded)).status_code == 202  # cleaned: "x"
+    over = await post_task(owner, project_id, prompt=padded + " ")  # 40 001 characters
+    assert over.status_code == 422, over.text
+    assert over.json()["error"]["details"][0]["loc"] == ["body", "prompt"]
+
+
+async def test_a_user_title_is_stored_redacted(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    project_id = await project(owner)
+    secret = "sk-ant-" + "api03-" + "y" * 40
+    response = await post_task(owner, project_id, title=f"Rotasi {secret}")
+    assert response.status_code == 202, response.text
+    (task,) = await task_rows(engine)
+    assert secret not in task.title and task.title.startswith("Rotasi ")
+    assert secret not in response.text
+
+
+async def test_only_task_create_can_be_403(
+    app,  # type: ignore[no-untyped-def]  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    """A role without ``task:create`` gets 403 on POST. List and detail have no 403 case: every project role
+    holds ``task:read``, so a project the user can see is one whose tasks they can read (else 404)."""
+    assert all("task:read" in permissions for permissions in ROLE_PERMISSIONS.values())
+    project_id = await project(owner)
+    [task_id] = await make_tasks(owner, project_id, "lihat saja")
+    await make_user(engine, "rev@example.test", ("reviewer", f"project:{project_id}"))
+    reviewer = await signed_in(app, "rev@example.test", PASSWORD)
+    try:
+        refused = await post_task(reviewer, project_id)
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["error"]["code"] == "FORBIDDEN"
+        assert (await reviewer.get(TASKS_OF.format(project_id))).status_code == 200
+        assert (await reviewer.get(f"/api/v1/tasks/{task_id}")).status_code == 200
+    finally:
+        await reviewer.aclose()
+    assert len(await task_rows(engine)) == 1
+
+
+async def test_detail_shows_the_pending_approval_and_who_may_decide_it(
+    app,  # type: ignore[no-untyped-def]  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    project_id = await project(owner)
+    [task_id] = await make_tasks(owner, project_id, "butuh persetujuan")
+    async with make_sessionmaker(engine)() as session:
+        session.add(
+            Approval(
+                project_id=uuid.UUID(project_id),
+                task_id=uuid.UUID(task_id),
+                action_type="tool_r3",
+                risk_level=3,
+                summary="R3",
+                payload={"tool": "x"},
+                payload_hash="c" * 64,
+                requested_by="system:tool_gateway",
+            )
+        )
+        await session.commit()
+    mine = (await owner.get(f"/api/v1/tasks/{task_id}")).json()["data"]["pending_approval"]
+    assert mine["status"] == "pending" and mine["can_decide"] is True
+    await make_user(engine, "rina@example.test", ("readonly", f"project:{project_id}"))
+    reader = await signed_in(app, "rina@example.test", PASSWORD)
+    try:
+        theirs = (await reader.get(f"/api/v1/tasks/{task_id}")).json()["data"]["pending_approval"]
+    finally:
+        await reader.aclose()
+    assert theirs["id"] == mine["id"] and theirs["can_decide"] is False
+
+
+async def test_a_bad_budget_is_refused_before_any_ref_is_probed(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = await project(owner)
+    touched = spy_disk(monkeypatch)
+    response = await post_task(
+        owner, project_id, budget={"max_gold": 1}, context_refs=[{"type": "file", "path": "README.md"}]
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"][0]["loc"][:2] == ["body", "budget"]
+    assert touched == []
+
+
+async def test_an_invalid_agentignore_hides_every_ref_and_is_logged(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    workspace_root: Path,  # noqa: F811
+) -> None:
+    """SF L3 / BE L1: an oversize ``.agentignore`` fails closed (every path hidden), and the operator learns
+    why from a warning that names the project, not the file's content."""
+    project_id = await project(owner)
+    (repo_of(workspace_root, project_id) / ".agentignore").write_bytes(b"#" * (fs.AGENTIGNORE_LIMIT + 1))
+    with capture_logs() as logs:
+        response = await post_task(owner, project_id, context_refs=[{"type": "file", "path": "README.md"}])
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["details"][0]["reason"] == "context_ref_hidden"
+    [entry] = [entry for entry in logs if entry["event"] == "context_refs_agentignore_invalid"]
+    assert (entry["log_level"], entry["project_id"]) == ("warning", project_id)
+    assert "##" not in str(entry)

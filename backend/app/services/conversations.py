@@ -1,8 +1,13 @@
 """Conversations and chat messages (API_CONTRACTS §5; spec WP-3.2 §8). Framework-free.
 
 A conversation belongs to the user who made it: anybody else, and anybody who can no longer see its project,
-gets 404, the same answer as for a random id. A message may create a task in the same transaction (the chat
-is the task's origin); any failure before the commit stores neither.
+gets 404, the same answer as for a random id. Starting one, or posting to one, is a write: the project must be
+``active`` (Rulings R1, R8).
+
+A message may create a task in the same transaction (the chat is the task's origin), in the same shape as
+``tasks.create_task``: a short checking session, the ref paths on disk with no session open, then one
+transaction that checks again (locking the project when a task is created), stores the message and the task,
+builds both views and commits. Any failure before the commit stores neither.
 """
 
 from __future__ import annotations
@@ -18,27 +23,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError
 from app.models.projects import Conversation, Message, Project
-from app.services.context_refs import ContextRef, validate_refs
+from app.services.context_refs import ContextRef, check_task_refs, has_path_refs
 from app.services.project_budget import BudgetDefaults
 from app.services.projects import (
-    PAGE_SIZE_MAX,
     Actor,
     ProjectEnv,
     authorize,
+    check_page,
     has_hidden_characters,
     not_found,
-    repo_path,
 )
 from app.services.tasks import (
     TaskCreate,
     TaskView,
+    check_ref_paths,
+    check_task,
     clean_prompt_text,
     ensure_engine_available,
     insert_task,
-    lock_project_for_task,
+    project_for_task,
+    require_active,
+    require_repository_ready,
     task_view,
 )
-from app.workspace.fs import Workspace
 
 CONVERSATION_TITLE_MAX: Final = 200
 
@@ -87,32 +94,20 @@ def _message_view(row: Message) -> MessageView:
     )
 
 
-def _invalid(loc: list[str], message: str) -> AppError:
+def _invalid(loc: list[str], message: str, **extra: str) -> AppError:
     return AppError(
         "VALIDATION_ERROR",
         "Input did not pass validation",
         http_status=422,
-        details=[{"loc": loc, "msg": message}],
+        details=[{"loc": loc, "msg": message, **extra}],
     )
 
 
-def _check_page(page: int, page_size: int) -> None:
-    if page < 1 or not 1 <= page_size <= PAGE_SIZE_MAX:
-        raise _invalid(["query", "page_size"], f"page >= 1 and page_size 1-{PAGE_SIZE_MAX}")
-
-
-def _require_active(project: Project) -> None:
-    if project.status == "archived":
-        raise AppError(
-            "CONFLICT", "The project is archived", http_status=409, details=[{"reason": "project_archived"}]
-        )
-    if project.status != "active":
-        raise AppError(
-            "CONFLICT",
-            "The project is not active",
-            http_status=409,
-            details=[{"reason": "project_not_active"}],
-        )
+def _only_with_task(*, workflow_type: str | None, budget: object | None) -> None:
+    """Ruling R6: both shape the task; without one they would be dropped silently (a cost cap fails open)."""
+    for field, value in (("workflow_type", workflow_type), ("budget", budget)):
+        if value is not None:
+            raise _invalid(["body", field], "only with create_task", reason="only_with_task")
 
 
 async def _own_conversation(session: AsyncSession, actor: Actor, conversation_id: uuid.UUID) -> Conversation:
@@ -120,6 +115,29 @@ async def _own_conversation(session: AsyncSession, actor: Actor, conversation_id
     if conversation is None or conversation.user_id != actor.user_id:
         raise not_found()
     return conversation
+
+
+async def _message_target(
+    session: AsyncSession,
+    actor: Actor,
+    conversation_id: uuid.UUID,
+    *,
+    create_task: bool,
+    path_refs: bool,
+    lock: bool,
+) -> tuple[Conversation, Project]:
+    """The actor's conversation and its project, when a message can be posted now: ownership first (404),
+    ``task:create`` and an active project. A message that creates a task also needs the repository ready
+    (``project_for_task``, locked with ``lock``); one with file or folder refs needs it too (Ruling R5)."""
+    conversation = await _own_conversation(session, actor, conversation_id)
+    if create_task:
+        project = await project_for_task(session, actor, conversation.project_id, lock=lock)
+    else:
+        project, _ = await authorize(session, actor, conversation.project_id, "task:create")
+        require_active(project)
+        if path_refs:
+            await require_repository_ready(session, project.id)
+    return conversation, project
 
 
 async def create_conversation(
@@ -134,19 +152,21 @@ async def create_conversation(
             )
         shown = env.audit.redactor.redact(cleaned)[:CONVERSATION_TITLE_MAX]
     async with env.sessions() as session:
-        await authorize(session, actor, project_id, "task:create")
+        project, _ = await authorize(session, actor, project_id, "task:create")
+        require_active(project)
         row = Conversation(id=uuid.uuid4(), project_id=project_id, user_id=actor.user_id, title=shown)
         session.add(row)
         await session.flush()
         await session.refresh(row)
+        view = _conversation_view(row)
         await session.commit()
-        return _conversation_view(row)
+    return view
 
 
 async def list_conversations(
     env: ProjectEnv, actor: Actor, project_id: uuid.UUID, *, page: int, page_size: int
 ) -> tuple[list[ConversationView], int]:
-    _check_page(page, page_size)
+    check_page(page, page_size)
     async with env.sessions() as session:
         await authorize(session, actor, project_id, "project:read")
         where = (Conversation.project_id == project_id, Conversation.user_id == actor.user_id)
@@ -164,7 +184,7 @@ async def list_conversations(
 async def list_messages(
     env: ProjectEnv, actor: Actor, conversation_id: uuid.UUID, *, page: int, page_size: int
 ) -> tuple[list[MessageView], int]:
-    _check_page(page, page_size)
+    check_page(page, page_size)
     async with env.sessions() as session:
         conversation = await _own_conversation(session, actor, conversation_id)
         await authorize(session, actor, conversation.project_id, "project:read")
@@ -196,61 +216,64 @@ async def post_message(
     """The user's message and, with ``create_task``, the ``draft`` task it asks for: one transaction."""
     if create_task:
         ensure_engine_available()
+    path_refs = has_path_refs(context_refs)
     async with env.sessions() as session:
-        conversation = await _own_conversation(session, actor, conversation_id)
-        if create_task:
-            project = await lock_project_for_task(session, actor, conversation.project_id)
-        else:
-            project, _ = await authorize(session, actor, conversation.project_id, "task:create")
-            _require_active(project)
-        cleaned = clean_prompt_text(content, field="content")  # before any filesystem work
-        refs: list[dict[str, object]] = []
-        if context_refs:
-            workspace = Workspace(repo_path(env.workspace_root, project.id))
-            refs = await validate_refs(session, workspace, project.id, context_refs)
-        text = env.audit.redactor.redact(cleaned)
+        _, project = await _message_target(
+            session, actor, conversation_id, create_task=create_task, path_refs=path_refs, lock=False
+        )
+        project_id = project.id
+    if not create_task:
+        _only_with_task(workflow_type=workflow_type, budget=budget)
+    cleaned = clean_prompt_text(content, field="content")
+    checked = None
+    if create_task:
+        request = TaskCreate(
+            prompt=cleaned,
+            title=None,
+            workflow_type=workflow_type,
+            priority=None,
+            budget=budget,
+            context_refs=context_refs,
+        )
+        checked = check_task(request)
+    paths = await check_ref_paths(env, project_id, context_refs)
+    async with env.sessions() as session:
+        conversation, project = await _message_target(
+            session, actor, conversation_id, create_task=create_task, path_refs=path_refs, lock=create_task
+        )
+        refs = await check_task_refs(session, project.id, paths)
         message = Message(
             id=uuid.uuid4(),
             conversation_id=conversation.id,
             project_id=project.id,
             user_id=actor.user_id,
             role="user",
-            content=text,
+            content=env.audit.redactor.redact(cleaned),
             context_refs=refs,
         )
         session.add(message)
         await session.flush()
-        task = None
-        if create_task:
+        task_out = None
+        if checked is not None:
             task = await insert_task(
                 session,
                 env,
                 actor,
                 project,
-                TaskCreate(
-                    prompt=cleaned,
-                    title=None,
-                    workflow_type=workflow_type,
-                    priority=None,
-                    budget=budget,
-                    context_refs=context_refs,
-                ),
+                checked,
                 defaults=defaults,
                 source="chat",
-                conversation_id=conversation.id,
                 refs=refs,
+                conversation_id=conversation.id,
             )
             message.task_id = task.id
+            task_out = await task_view(session, task, iteration_max=iteration_max, actor=actor)
         conversation.updated_at = func.now()
         await session.flush()
         await session.refresh(message)
+        message_out = _message_view(message)
         await session.commit()
-        view = _message_view(message)
-        return view, (
-            await task_view(session, task, iteration_max=iteration_max, actor=actor)
-            if task is not None
-            else None
-        )
+    return message_out, task_out
 
 
 __all__ = [

@@ -1,9 +1,14 @@
 """``context_refs``: what a user attaches to a prompt, checked against the project's scope (WP-3.2a).
 
 A ref names something the agent may later read. It is validated here and stored as a pointer; file contents
-are never read into, returned from or stored by this module. Paths go through the ``Workspace`` public API
-with the agent read policy, so ``.agentignore``, dependency folders and secret names are refused exactly as
-they are for the agent.
+are never read into, returned from or stored by this module. Paths go through ``Workspace.probe`` with the
+agent read policy, so ``.agentignore``, dependency folders and secret names are refused exactly as they are
+for the agent, and nothing is read or hashed.
+
+Two steps, so the disk is never touched while a database transaction is open (Ruling R11):
+1. ``check_paths``, with no session: identical refs are dropped, then kinds and file/folder paths are checked.
+2. ``check_task_refs``, in the inserting transaction: task and diff refs must name a task of the project.
+The 422 always names the first refused index the client sent.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.models.tasks import Task
+from app.services.projects import has_hidden_characters
 from app.workspace.errors import PathViolation, WorkspaceNotFound
 from app.workspace.fs import Workspace
 from app.workspace.paths import split_rel
@@ -88,14 +95,18 @@ ContextRef = Annotated[
 ]
 
 
-def _reason_for(exc: PathViolation | WorkspaceNotFound) -> str:
-    if isinstance(exc, WorkspaceNotFound):
-        return NOT_FOUND
-    if exc.reason in _HIDDEN_REASONS:
-        return HIDDEN
-    if exc.reason in _NOT_FOUND_REASONS:
-        return NOT_FOUND
-    return INVALID
+@dataclass(frozen=True)
+class RefCheck:
+    """What ``check_paths`` found: the unique refs, each with the index the client sent it at, and the first
+    refusal it found (index, reason). A refusal waits for ``check_task_refs`` only when a task or diff ref
+    comes before it; ``unique`` then stops at the refused index."""
+
+    unique: tuple[tuple[int, ContextRef], ...]
+    refused: tuple[int, str] | None = None
+
+
+def has_path_refs(refs: Sequence[ContextRef]) -> bool:
+    return any(isinstance(ref, FileRef | FolderRef) for ref in refs)
 
 
 def _error(index: int, reason: str) -> AppError:
@@ -107,30 +118,77 @@ def _error(index: int, reason: str) -> AppError:
     )
 
 
-async def _check_path(workspace: Workspace, ref: FileRef | FolderRef) -> str | None:
-    """The reason the path is refused, or None."""
+def _unique(refs: Sequence[ContextRef]) -> list[tuple[int, ContextRef]]:
+    """Identical refs dropped (the first index kept), before any IO."""
+    seen: set[str] = set()
+    unique: list[tuple[int, ContextRef]] = []
+    for index, ref in enumerate(refs):
+        key = ref.model_dump_json(exclude_none=True)
+        if key not in seen:
+            seen.add(key)
+            unique.append((index, ref))
+    return unique
+
+
+def _violation_reason(exc: PathViolation) -> str:
+    if exc.reason in _HIDDEN_REASONS:
+        return HIDDEN
+    if exc.reason in _NOT_FOUND_REASONS:
+        return NOT_FOUND
+    return INVALID
+
+
+async def _path_rejection(
+    workspace: Workspace, project_id: uuid.UUID, ref: FileRef | FolderRef
+) -> str | None:
+    """The reason the path is refused, or None. Checks without IO come first; the probe reads no content."""
+    if has_hidden_characters(ref.path):
+        return INVALID  # R12: such a name would reach A04 prompts and the UI
     try:
         parts = split_rel(ref.path)
     except PathViolation:
         return INVALID
     if not parts or "/".join(parts) != ref.path:
         return INVALID  # empty, ".", "a//b", "a/./b", "a/": one spelling per path
+    if isinstance(ref, FileRef) and ref.line_start is not None and ref.line_end is not None:
+        if ref.line_start > ref.line_end:
+            return INVALID
     try:
-        if isinstance(ref, FileRef):
-            if ref.line_start is not None and ref.line_end is not None and ref.line_start > ref.line_end:
-                return INVALID
-            await workspace.read_file(ref.path, Access.AGENT_READ, max_bytes=1)
-        else:
-            await workspace.tree(ref.path, Access.AGENT_READ, depth=1, max_entries=1)
-    except WorkspaceNotFound as exc:
+        kind = await workspace.probe(ref.path, Access.AGENT_READ)
+    except WorkspaceNotFound:
         # The same exception names a missing subpath (the user's mistake) and a missing root (ours).
         if not await asyncio.to_thread(workspace.root.is_dir):
-            logger.error("context_refs_repository_root_missing")
+            logger.error("context_refs_repository_root_missing", project_id=str(project_id))
             raise AppError("INTERNAL_ERROR", "Internal error", http_status=500) from None
-        return _reason_for(exc)
-    except PathViolation as exc:
-        return _reason_for(exc)  # any other AppError is not input: it propagates
-    return None
+        return NOT_FOUND
+    except PathViolation as exc:  # any other AppError is not input: it propagates
+        if exc.reason == "agentignore":  # unreadable, oversize or invalid: every path is hidden (fail closed)
+            logger.warning("context_refs_agentignore_invalid", project_id=str(project_id))
+        return _violation_reason(exc)
+    return None if kind == ("file" if isinstance(ref, FileRef) else "dir") else NOT_FOUND
+
+
+async def check_paths(workspace: Workspace, project_id: uuid.UUID, refs: Sequence[ContextRef]) -> RefCheck:
+    """Everything about the refs that needs no database; call it with no session open (R11).
+
+    Identical refs are dropped first. Then, in order: kinds not available yet, and file/folder paths (one
+    spelling, no hidden characters, present as the kind named, readable by the agent). Stops at the first
+    refusal, which is raised here unless a task or diff ref before it still has to be checked.
+    """
+    unique = _unique(refs)
+    for position, (index, ref) in enumerate(unique):
+        if isinstance(ref, TestRunRef | FindingRef):
+            reason: str | None = UNAVAILABLE
+        elif isinstance(ref, FileRef | FolderRef):
+            reason = await _path_rejection(workspace, project_id, ref)
+        else:
+            continue
+        if reason is not None:
+            before = unique[:position]
+            if not any(isinstance(earlier, TaskRef | DiffRef) for _, earlier in before):
+                raise _error(index, reason)
+            return RefCheck(tuple(before), (index, reason))
+    return RefCheck(tuple(unique))
 
 
 async def _in_project(session: AsyncSession, project_id: uuid.UUID, task_id: uuid.UUID) -> bool:
@@ -138,28 +196,16 @@ async def _in_project(session: AsyncSession, project_id: uuid.UUID, task_id: uui
     return found is not None
 
 
-async def validate_refs(
-    session: AsyncSession, workspace: Workspace, project_id: uuid.UUID, refs: Sequence[ContextRef]
+async def check_task_refs(
+    session: AsyncSession, project_id: uuid.UUID, check: RefCheck
 ) -> list[dict[str, object]]:
-    """The refs in normalised JSON form (identical duplicates dropped, order kept), or a 422 naming the first
-    refused index and why."""
-    normalised: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for index, ref in enumerate(refs):
-        reason: str | None = None
-        if isinstance(ref, TestRunRef | FindingRef):
-            reason = UNAVAILABLE
-        elif isinstance(ref, FileRef | FolderRef):
-            reason = await _check_path(workspace, ref)
-        else:
+    """The refs in normalised JSON form (order kept), or a 422 naming the first refused index: a task or diff
+    ref must name a task of this project; a refusal ``check_paths`` held comes after them."""
+    for index, ref in check.unique:
+        if isinstance(ref, TaskRef | DiffRef):
             task_id = ref.id if isinstance(ref, TaskRef) else ref.task_id
             if not await _in_project(session, project_id, task_id):
-                reason = NOT_FOUND
-        if reason is not None:
-            raise _error(index, reason)
-        dumped = ref.model_dump(mode="json", exclude_none=True)
-        key = ref.model_dump_json(exclude_none=True)
-        if key not in seen:
-            seen.add(key)
-            normalised.append(dumped)
-    return normalised
+                raise _error(index, NOT_FOUND)
+    if check.refused is not None:
+        raise _error(*check.refused)
+    return [ref.model_dump(mode="json", exclude_none=True) for _, ref in check.unique]

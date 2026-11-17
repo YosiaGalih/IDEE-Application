@@ -1,19 +1,21 @@
-"""``validate_refs`` against a real project folder: scope, hiding, kinds and the reason per index."""
+"""``check_paths`` + ``check_task_refs`` against a real project folder: scope, hiding, kinds and the reason
+per index."""
 
 from __future__ import annotations
 
 import os
 import uuid
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal, NoReturn
 
 import pytest
 from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.errors import AppError
-from app.services.context_refs import ContextRef, validate_refs
+from app.services.context_refs import ContextRef, check_paths, check_task_refs
 from app.workspace.fs import Workspace
+from app.workspace.policy import Access
 from tests.conftest import reset_data
 from tests.integration.test_task_schema import make_project, make_task
 
@@ -43,6 +45,13 @@ def repo(tmp_path: Path) -> Path:
 
 def refs(*raw: dict[str, object]) -> list[ContextRef]:
     return [ADAPTER.validate_python(item) for item in raw]
+
+
+async def validate_refs(
+    session: AsyncSession, workspace: Workspace, project_id: uuid.UUID, items: list[ContextRef]
+) -> list[dict[str, object]]:
+    """Both steps, as the services run them (the path step needs no session)."""
+    return await check_task_refs(session, project_id, await check_paths(workspace, project_id, items))
 
 
 def file_ref(path: str, **extra: object) -> dict[str, object]:
@@ -181,7 +190,7 @@ async def test_missing_repo_root_is_internal_not_input(session: AsyncSession, tm
 
 async def test_unrecognised_app_error_from_workspace_propagates(session: AsyncSession, repo: Path) -> None:
     class Broken(Workspace):
-        async def read_file(self, *args: object, **kwargs: object) -> NoReturn:
+        async def probe(self, *args: object, **kwargs: object) -> NoReturn:
             raise AppError("INTERNAL_ERROR", "Internal error", http_status=500)
 
     project = await make_project(session)
@@ -189,3 +198,48 @@ async def test_unrecognised_app_error_from_workspace_propagates(session: AsyncSe
         await validate_refs(session, Broken(repo), project.id, refs(file_ref("src/app.py")))
     assert caught.value.code == "INTERNAL_ERROR"
     assert caught.value.http_status == 500
+
+
+async def test_the_first_refused_index_wins_across_both_steps(session: AsyncSession, repo: Path) -> None:
+    """The path step runs first, with no session, but a task ref before its refusal is still checked first."""
+    project = await make_project(session)
+    foreign = {"type": "task", "id": str(uuid.uuid4())}
+    detail = await reason_of(session, repo, project.id, foreign, file_ref("nope.py"))
+    assert (detail["loc"], detail["reason"]) == (["body", "context_refs", 0], "context_ref_not_found")
+    detail = await reason_of(session, repo, project.id, folder_ref("src"), file_ref(".env"), foreign)
+    assert (detail["loc"], detail["reason"]) == (["body", "context_refs", 1], "context_ref_hidden")
+
+
+async def test_a_path_refusal_with_no_task_ref_before_it_needs_no_session(repo: Path) -> None:
+    with pytest.raises(AppError) as caught:
+        await check_paths(Workspace(repo), uuid.uuid4(), refs(folder_ref("src"), file_ref("nope.py")))
+    assert caught.value.details is not None
+    assert caught.value.details[0]["loc"] == ["body", "context_refs", 1]
+
+
+async def test_identical_refs_are_dropped_before_any_probe(session: AsyncSession, repo: Path) -> None:
+    probed: list[str] = []
+
+    class Counting(Workspace):
+        async def probe(self, rel: str, access: Access) -> Literal["file", "dir"]:
+            probed.append(rel)
+            return await super().probe(rel, access)
+
+    project = await make_project(session)
+    items = refs(*[file_ref("src/app.py")] * 10, *[folder_ref("src")] * 10)
+    out = await validate_refs(session, Counting(repo), project.id, items)
+    assert probed == ["src/app.py", "src"]
+    assert out == [{"type": "file", "path": "src/app.py"}, {"type": "folder", "path": "src"}]
+    # A duplicate keeps the index of its first spelling in a refusal.
+    detail = await reason_of(session, repo, project.id, file_ref("nope.py"), file_ref("nope.py"))
+    assert detail["loc"] == ["body", "context_refs", 0]
+
+
+@pytest.mark.parametrize("path", ["a\nb.py", "src/a\tb.py", "a‮b.py", "a​b.py", "a\x7fb.py"])
+async def test_hidden_characters_are_invalid_even_for_a_real_file(
+    session: AsyncSession, repo: Path, path: str
+) -> None:
+    project = await make_project(session)
+    (repo / path).write_text("x\n")
+    detail = await reason_of(session, repo, project.id, file_ref(path))
+    assert detail["reason"] == "context_ref_invalid"

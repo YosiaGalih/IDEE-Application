@@ -194,6 +194,12 @@ def _invalid(field: str, message: str, *, where: str = "body") -> AppError:
     )
 
 
+def check_page(page: int, page_size: int) -> None:
+    """A list's paging: ``page >= 1``, ``page_size`` 1..``PAGE_SIZE_MAX``; else 422 at ``query.page_size``."""
+    if page < 1 or not 1 <= page_size <= PAGE_SIZE_MAX:
+        raise _invalid("page_size", f"page >= 1 and page_size 1-{PAGE_SIZE_MAX}", where="query")
+
+
 # --- pure helpers -------------------------------------------------------------------------------------------
 
 
@@ -797,8 +803,7 @@ async def list_projects(
     page: int = 1,
     page_size: int = PAGE_SIZE_DEFAULT,
 ) -> ProjectPage:
-    if page < 1 or not 1 <= page_size <= PAGE_SIZE_MAX:
-        raise _invalid("page_size", f"page >= 1 and page_size 1-{PAGE_SIZE_MAX}", where="query")
+    check_page(page, page_size)
     if q is not None and _CONTROL.search(q):
         raise _invalid("q", "must not contain control characters", where="query")
     conditions = [visible_projects_filter(actor)]
