@@ -164,7 +164,8 @@ class DbProviderGate:
         """One short read-only session per call: a switch flipped mid-run counts on the next attempt.
         ``provider_ready`` first ('disabled' -> PROVIDER_DISABLED; 'not_ready'/'unknown' ->
         provider_not_ready), then the kill switch (anything but true -> PROVIDER_DISABLED). A missing project
-        fails closed. Returns the effective model per tier and the report's timestamp."""
+        fails closed. Returns the effective model per tier and the timestamp of the report the verdict relied
+        on: none under ``readiness_not_required`` (silent L2), so a reject resets no report it ignored."""
         async with self._sessions() as session:
             row = (
                 await session.scalars(select(ProviderConfig).where(ProviderConfig.provider == PROVIDER))
@@ -180,14 +181,25 @@ class DbProviderGate:
         if not provider_calls_allowed(project):
             raise ProviderBlocked("PROVIDER_DISABLED", "kill_switch")
         models = effective_models(self._settings, (row.model_policy or {}) if row is not None else {})
-        return GateResult(models, row.readiness_checked_at if row is not None else None)
+        report_at = row.readiness_checked_at if row is not None else None
+        if verdict.reason == "readiness_not_required":
+            report_at = None  # the gate relied on no report: a reject resets none
+        return GateResult(models, report_at)
 
-    async def reject(self, cause: RejectCause, *, report_at: datetime | None) -> None:
+    async def reject(self, cause: RejectCause, *, report_at: datetime | None, scope: RunScope) -> None:
         """Best-effort (the runtime swallows a failure): reset the report this run judged, in its own
-        transaction, if it is still the current one (``invalidate_report``)."""
+        transaction, if it is still the current one (``invalidate_report``). The audit row names the run's
+        project and correlation id (AG-13 LOW-3)."""
         async with self._sessions.begin() as session:
             await bound_transaction(session)
-            await invalidate_report(session, cause=cause, report_at=report_at, audit=self._audit)
+            await invalidate_report(
+                session,
+                cause=cause,
+                report_at=report_at,
+                audit=self._audit,
+                project_id=scope.project_id,
+                correlation_id=f"agent_run:{scope.agent_run_id}",
+            )
 
 
 class LeaseHeartbeat:

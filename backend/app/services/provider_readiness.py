@@ -55,7 +55,8 @@ VerdictReason = Literal[
     "provider_rejected",
     "pricing_changed",
 ]
-RejectCause = Literal["auth", "not_found"]  # what a real provider call said (the runtime's RejectCause)
+# Why a report is marked ``invalidated``: what a real provider call said (the runtime's RejectCause).
+ResetCause = Literal["auth", "not_found"]
 MAX_BASE_URL = 300  # provider_configs.base_url
 INVALID_BASE_URL = "[invalid base url]"
 
@@ -236,13 +237,20 @@ async def record_report(
 
 
 async def invalidate_report(
-    session: AsyncSession, *, cause: RejectCause, report_at: datetime | None, audit: AuditWriter
+    session: AsyncSession,
+    *,
+    cause: ResetCause,
+    report_at: datetime | None,
+    audit: AuditWriter,
+    project_id: uuid.UUID | None,
+    correlation_id: str | None,
 ) -> bool:
     """A real provider call was refused (``auth`` or an unknown model): drop the report it relied on to
     ``unknown`` and mark it ``invalidated`` (3.1f2b Keputusan Lead #13). Writes only while the locked row is
     still the report the caller judged (``readiness_checked_at == report_at``) and not yet marked, so a newer
     smoke is never overwritten and concurrent rejections write one reset and one audit row. The next smoke
-    replaces the whole report, marker included. No error text is stored. True if it wrote; the caller
+    replaces the whole report, marker included. No error text is stored; the audit row names the caller's
+    project and correlation id (a run: ``agent_run:<id>``; AG-13 LOW-3). True if it wrote; the caller
     commits."""
     if report_at is None:
         return False
@@ -267,7 +275,9 @@ async def invalidate_report(
         result="success",
         resource_type="provider_config",
         resource_id=str(row.id),
+        project_id=project_id,
         metadata={"provider": row.provider, "cause": cause},
+        correlation_id=correlation_id,
     )
     await session.flush()
     return True

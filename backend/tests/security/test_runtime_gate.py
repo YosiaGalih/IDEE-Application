@@ -41,6 +41,7 @@ from app.services.projects import KILL_SWITCH_KEY
 from app.services.usage import UsageLedger
 from app.workflow.budget import BudgetDefaults, BudgetGuard
 from tests.conftest import make_test_env, reset_data
+from tests.integration.test_provider_readiness import last_audit_id, reset_events
 from tests.integration.test_task_schema import make_project, make_task
 from tests.runtime_fakes import (
     OUTPUTS,
@@ -484,7 +485,7 @@ async def test_the_gate_refuses_after_a_rejection(
     scope = await a_scope(session)
     gate = DbProviderGate(sessions, settings)
     seen = (await gate.check(scope.project_id)).report_at
-    await gate.reject("auth", report_at=seen)
+    await gate.reject("auth", report_at=seen, scope=scope)
     refused = await blocked(gate, scope.project_id)
     assert (refused.code, refused.reason) == ("provider_not_ready", "provider_rejected")
 
@@ -500,7 +501,7 @@ async def test_a_rejection_of_a_superseded_report_leaves_the_new_one(
     await record(
         session, settings, dataclasses.replace(report(), ran_at=datetime.now(UTC) + timedelta(seconds=5))
     )
-    await gate.reject("not_found", report_at=seen)
+    await gate.reject("not_found", report_at=seen, scope=scope)
     assert (await gate.check(scope.project_id)).models  # still ready
 
 
@@ -529,3 +530,64 @@ async def test_the_runtime_gate_refuses_a_changed_tariff(
         else:
             refused = await blocked(gate, scope.project_id)  # type: ignore[arg-type]
             assert (refused.code, refused.reason) == ("provider_not_ready", "pricing_changed")
+
+
+async def test_a_reset_names_the_run_and_its_project(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """AG-13 LOW-3: the reset's audit row carries the run's project and correlation id; metadata stays
+    ``{provider, cause}``."""
+    settings = worker()
+    await record(session, settings)
+    scope = await a_scope(session)
+    since = await last_audit_id(session)
+    gate = DbProviderGate(sessions, settings)
+    seen = (await gate.check(scope.project_id)).report_at
+    await gate.reject("auth", report_at=seen, scope=scope)
+    (event,) = await reset_events(session, since)
+    assert (event.project_id, event.correlation_id) == (scope.project_id, f"agent_run:{scope.agent_run_id}")
+    assert event.metadata_ == {"provider": "anthropic", "cause": "auth"}
+
+
+async def test_without_required_readiness_no_report_is_judged(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Silent L2: under ``readiness_not_required`` the gate relied on no report, so a reject resets none."""
+    settings = worker(LLM_REQUIRE_READINESS="false")
+    await record(session, settings)
+    scope = await a_scope(session)
+    judged = await DbProviderGate(sessions, settings).check(scope.project_id)
+    assert judged.report_at is None
+
+
+async def test_a_real_auth_rejection_stops_every_project_until_a_new_smoke(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable
+) -> None:
+    """AG-13 probe test_ag13_e2e_reset.py: a composed runtime over the real DB whose provider answers
+    ``auth`` resets the report once, audited with {provider, cause} and the run's ids; the next run, of
+    another project, is refused at the gate with no request sent. No error text reaches marker or audit."""
+    settings = worker()
+    await record(session, settings)
+    since = await last_audit_id(session)
+    project_id, task_id = await run_task(session)
+    first = compose(sessions, settings, pricing, scripted(Fail("auth")), tools=FakeTools([]))
+    rejected = await first.runtime.run(run_request("B14", task_id=task_id, project_id=project_id))
+    other = await make_project(session, slug="other")
+    other_task = await make_task(session, other)
+    await session.commit()
+    await hold_lease(session, other_task.id)
+    second = compose(
+        sessions, settings, pricing, scripted(submit_turn(OUTPUTS["ImplementOutput"])), tools=FakeTools([])
+    )
+    refused = await second.runtime.run(run_request("B14", task_id=other_task.id, project_id=other.id))
+    assert (rejected.status, rejected.error_code) == ("failed", "provider_auth")
+    assert (refused.status, refused.error_code) == ("failed", "provider_not_ready")
+    assert second.provider.requests == []
+    session.expire_all()
+    row = (await session.scalars(select(ProviderConfig))).one()
+    assert row.readiness_status == "unknown"
+    assert set(row.readiness_report["invalidated"]) == {"cause", "at"}
+    assert row.readiness_report["invalidated"]["cause"] == "auth"
+    (event,) = await reset_events(session, since)
+    assert event.metadata_ == {"provider": "anthropic", "cause": "auth"}
+    assert (event.project_id, event.correlation_id) == (project_id, f"agent_run:{rejected.agent_run_id}")

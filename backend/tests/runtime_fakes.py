@@ -95,16 +95,18 @@ class FakeGate(_Counted):
         self.models: Mapping[str, str] = MODELS
         self.report_at: datetime | None = REPORT_AT
         self.rejects: list[tuple[str, datetime | None]] = []
+        self.scopes: list[RunScope] = []  # the run each reject names (AG-13 LOW-3)
         self.reject_error: BaseException | None = None
 
     async def check(self, project_id: uuid.UUID) -> GateResult:
         self.tick()
         return GateResult(self.models, self.report_at)
 
-    async def reject(self, cause: RejectCause, *, report_at: datetime | None) -> None:
+    async def reject(self, cause: RejectCause, *, report_at: datetime | None, scope: RunScope) -> None:
         if self.reject_error is not None:
             raise self.reject_error
         self.rejects.append((cause, report_at))
+        self.scopes.append(scope)
 
 
 class FakeHeartbeat(_Counted):

@@ -274,10 +274,18 @@ async def last_audit_id(session: AsyncSession) -> int:
     return (await session.scalar(select(func.coalesce(func.max(AuditEvent.id), 0)))) or 0
 
 
+async def invalidate(session: AsyncSession, cause: service.ResetCause, report_at: datetime | None) -> bool:
+    """``invalidate_report`` with no run to name (the run's ids are asserted in tests/security/
+    test_runtime_gate.py)."""
+    return await service.invalidate_report(
+        session, cause=cause, report_at=report_at, audit=AUDIT, project_id=None, correlation_id=None
+    )
+
+
 async def test_a_rejection_resets_the_report_it_judged(session: AsyncSession, settings: Settings) -> None:
     row = await record(session, settings, report())
     since = await last_audit_id(session)
-    assert await service.invalidate_report(session, cause="auth", report_at=RAN_AT, audit=AUDIT) is True
+    assert await invalidate(session, "auth", RAN_AT) is True
     await session.commit()
     await session.refresh(row)
     assert row.readiness_status == "unknown" and row.readiness_report["invalidated"]["cause"] == "auth"
@@ -292,7 +300,7 @@ async def test_a_newer_smoke_is_never_overwritten(session: AsyncSession, setting
     row = await record(session, settings, report())
     since = await last_audit_id(session)
     older = datetime(2026, 11, 8, 11, 0, tzinfo=UTC)
-    assert await service.invalidate_report(session, cause="not_found", report_at=older, audit=AUDIT) is False
+    assert await invalidate(session, "not_found", older) is False
     await session.commit()
     await session.refresh(row)
     assert row.readiness_status == "passed" and "invalidated" not in row.readiness_report
@@ -301,7 +309,7 @@ async def test_a_newer_smoke_is_never_overwritten(session: AsyncSession, setting
 
 async def test_no_row_or_no_report_writes_nothing(session: AsyncSession) -> None:
     since = await last_audit_id(session)
-    assert await service.invalidate_report(session, cause="auth", report_at=None, audit=AUDIT) is False
+    assert await invalidate(session, "auth", None) is False
     await session.commit()
     assert await reset_events(session, since) == []
 
@@ -315,7 +323,7 @@ async def test_concurrent_rejections_write_one_reset(
 
     async def reject() -> bool:
         async with sessions.begin() as own:
-            return await service.invalidate_report(own, cause="auth", report_at=RAN_AT, audit=AUDIT)
+            return await invalidate(own, "auth", RAN_AT)
 
     results = await asyncio.gather(*(reject() for _ in range(20)))
     assert sum(results) == 1
@@ -324,7 +332,7 @@ async def test_concurrent_rejections_write_one_reset(
 
 async def test_the_next_smoke_clears_the_rejection(session: AsyncSession, settings: Settings) -> None:
     await record(session, settings, report())
-    await service.invalidate_report(session, cause="auth", report_at=RAN_AT, audit=AUDIT)
+    await invalidate(session, "auth", RAN_AT)
     await session.commit()
     row = await record(session, settings, report())
     assert "invalidated" not in row.readiness_report
