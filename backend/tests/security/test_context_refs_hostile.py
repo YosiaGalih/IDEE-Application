@@ -118,7 +118,7 @@ async def test_paths_are_probed_with_no_transaction_open_and_the_project_unlocke
     assert seen == [(0, False), (0, False)]
 
 
-@pytest.mark.parametrize("path", ["a\nb.py", "a‮b.py", "a​b.py", "src/a\tb"])
+@pytest.mark.parametrize("path", ["a\nb.py", "a\u202eb.py", "a\u200bb.py", "src/a\tb"])
 async def test_paths_with_hidden_characters_are_invalid(
     owner: httpx.AsyncClient,
     open_gate: None,

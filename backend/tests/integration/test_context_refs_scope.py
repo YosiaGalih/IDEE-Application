@@ -235,7 +235,7 @@ async def test_identical_refs_are_dropped_before_any_probe(session: AsyncSession
     assert detail["loc"] == ["body", "context_refs", 0]
 
 
-@pytest.mark.parametrize("path", ["a\nb.py", "src/a\tb.py", "a‮b.py", "a​b.py", "a\x7fb.py"])
+@pytest.mark.parametrize("path", ["a\nb.py", "src/a\tb.py", "a\u202eb.py", "a\u200bb.py", "a\x7fb.py"])
 async def test_hidden_characters_are_invalid_even_for_a_real_file(
     session: AsyncSession, repo: Path, path: str
 ) -> None:

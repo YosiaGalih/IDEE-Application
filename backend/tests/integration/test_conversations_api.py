@@ -361,7 +361,7 @@ async def test_message_input_is_bounded(
         "body",
         "context_refs",
     ]
-    for content in ("   ", "\r\n\t", "x" * (PROMPT_MAX + 1), "a\x00b", "a‮b"):
+    for content in ("   ", "\r\n\t", "x" * (PROMPT_MAX + 1), "a\x00b", "a\u202eb"):
         refused = await post_message(owner, cid, content=content, create_task=False)
         assert refused.status_code == 422, (content[:8], refused.text)
         assert refused.json()["error"]["details"][0]["loc"] == ["body", "content"]
