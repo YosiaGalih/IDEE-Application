@@ -481,8 +481,11 @@ async def test_detail_out_of_scope_is_404(
     await make_user(engine, "eve@example.test")
     eve = await signed_in(app, "eve@example.test", PASSWORD)
     try:
-        assert (await eve.get(f"/api/v1/tasks/{task_id}")).status_code == 404
-        assert (await eve.get(f"/api/v1/tasks/{uuid.uuid4()}")).status_code == 404
+        assert (await owner.get(f"/api/v1/tasks/{task_id}")).status_code == 200  # the route does answer
+        hidden = await eve.get(f"/api/v1/tasks/{task_id}")
+        random = await eve.get(f"/api/v1/tasks/{uuid.uuid4()}")
+        assert hidden.status_code == 404 and random.status_code == 404
+        assert {**hidden.json(), "request_id": None} == {**random.json(), "request_id": None}
         assert (await owner.get(f"/api/v1/tasks/{uuid.uuid4()}")).status_code == 404
     finally:
         await eve.aclose()
