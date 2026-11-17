@@ -87,7 +87,9 @@ describe("AgentsPage", () => {
     renderApp("/agents");
     const analyst = await screen.findByRole("link", { name: /Requirement Analyst/ });
     expect(within(analyst).getByText(id.agents.status.not_ready)).toBeInTheDocument();
-    expect(within(analyst).getByText(new RegExp(id.agents.reasons.runtime_unavailable))).toBeInTheDocument();
+    expect(
+      within(analyst).getByText(/belum ada mesin yang menjalankan agent \(menunggu engine WP-3\.2\)/),
+    ).toBeInTheDocument();
     expect(
       within(analyst).getByText(
         new RegExp(id.agents.reasons.tools_unavailable_other.replace("{{count}}", "2")),

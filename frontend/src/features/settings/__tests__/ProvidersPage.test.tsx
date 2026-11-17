@@ -120,6 +120,20 @@ describe("ProvidersPage: what the worker reported", () => {
     );
   });
 
+  it.each([
+    ["provider_rejected", "Provider menolak key atau model saat run; jalankan smoke lagi."],
+    ["pricing_changed", "Tabel tarif worker berbeda dari laporan; jalankan smoke lagi."],
+  ])("shows its own text for the reason %s, not the fallback", async (reason, text) => {
+    backend(
+      [provider({ readiness_effective: { state: "not_ready", reason } })],
+      readiness({ report_ready: false, effective: { state: "not_ready", reason } }),
+    );
+    renderApp("/settings/providers");
+    const panel = await screen.findByRole("region", { name: id.providers.readiness.title });
+    expect(within(panel).getByText(text)).toBeInTheDocument();
+    expect(within(panel).queryByText(new RegExp(`Alasan: ${reason}`))).not.toBeInTheDocument();
+  });
+
   it("lists every check by its own label and shows a detail as text, never as markup (F6)", async () => {
     const shown = checks("streaming_ok").map((check) =>
       check.key === "streaming_ok" ? { ...check, detail: "<img src=x onerror=alert(1)> no delta" } : check,

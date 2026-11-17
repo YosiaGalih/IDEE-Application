@@ -16,6 +16,8 @@ const KNOWN_REASONS = [
   "key_missing",
   "endpoint_changed",
   "report_failed",
+  "provider_rejected",
+  "pricing_changed",
 ] as const;
 
 function isKnown<T extends string>(list: readonly T[], value: string): value is T {
