@@ -125,8 +125,8 @@ describe("ProvidersPage: what the worker reported", () => {
     ["pricing_changed", "Tabel tarif worker berbeda dari laporan; jalankan smoke lagi."],
   ])("shows its own text for the reason %s, not the fallback", async (reason, text) => {
     backend(
-      [provider({ readiness_effective: { state: "not_ready", reason } })],
-      readiness({ report_ready: false, effective: { state: "not_ready", reason } }),
+      [provider({ readiness_effective: { state: "unknown", reason } })],
+      readiness({ report_ready: false, effective: { state: "unknown", reason } }),
     );
     renderApp("/settings/providers");
     const panel = await screen.findByRole("region", { name: id.providers.readiness.title });

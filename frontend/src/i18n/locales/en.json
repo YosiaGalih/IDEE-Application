@@ -696,7 +696,7 @@
     },
     "reasons": {
       "lead": "Not ready: {{reasons}}",
-      "runtime_unavailable": "no engine runs agents yet (waiting for the WP-3.2 engine)",
+      "runtime_unavailable": "no engine runs agents yet",
       "provider_readiness_unknown": "provider readiness not tested",
       "provider_not_ready": "provider failed readiness",
       "provider_disabled": "provider disabled by an admin",

@@ -696,7 +696,7 @@
     },
     "reasons": {
       "lead": "Belum siap: {{reasons}}",
-      "runtime_unavailable": "belum ada mesin yang menjalankan agent (menunggu engine WP-3.2)",
+      "runtime_unavailable": "belum ada mesin yang menjalankan agent",
       "provider_readiness_unknown": "readiness provider belum diuji",
       "provider_not_ready": "provider belum lulus readiness",
       "provider_disabled": "provider dinonaktifkan admin",

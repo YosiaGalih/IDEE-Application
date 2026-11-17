@@ -88,7 +88,7 @@ describe("AgentsPage", () => {
     const analyst = await screen.findByRole("link", { name: /Requirement Analyst/ });
     expect(within(analyst).getByText(id.agents.status.not_ready)).toBeInTheDocument();
     expect(
-      within(analyst).getByText(/belum ada mesin yang menjalankan agent \(menunggu engine WP-3\.2\)/),
+      within(analyst).getByText(id.agents.reasons.runtime_unavailable, { exact: false }),
     ).toBeInTheDocument();
     expect(
       within(analyst).getByText(
