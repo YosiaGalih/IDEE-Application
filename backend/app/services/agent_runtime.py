@@ -146,32 +146,41 @@ class DbProviderGate:
         self,
         sessions: async_sessionmaker[AsyncSession],
         settings: Settings,
-        audit: AuditWriter | None = None,
         *,
-        pricing_version: str | None = None,
+        audit: AuditWriter,
+        pricing_version: str | None,
     ) -> None:
         """Holds WorkerCredentials(settings.anthropic_api_key, settings.anthropic_base_url, pricing_version):
         the worker's own key, endpoint and tariff version, read once (the process env and the table loaded at
-        start). The api process never imports this module."""
+        start; ``None``: no tariff is checked). ``audit`` is the worker's, with the configured secret literals
+        (backend M2): both are required, so no caller gets a default by forgetting them. The api process never
+        imports this module."""
         self._sessions = sessions
         self._settings = settings
         self._held = WorkerCredentials(
             settings.anthropic_api_key, settings.anthropic_base_url, pricing_version
         )
-        self._audit = audit if audit is not None else AuditWriter(Redactor())
+        self._audit = audit
 
     async def check(self, project_id: uuid.UUID) -> GateResult:
         """One short read-only session per call: a switch flipped mid-run counts on the next attempt.
         ``provider_ready`` first ('disabled' -> PROVIDER_DISABLED; 'not_ready'/'unknown' ->
         provider_not_ready), then the kill switch (anything but true -> PROVIDER_DISABLED). A missing project
-        fails closed. Returns the effective model per tier and the timestamp of the report the verdict relied
-        on: none under ``readiness_not_required`` (silent L2), so a reject resets no report it ignored."""
+        fails closed. A ``pricing_changed`` the worker found itself is recorded on the report first (ruling
+        R2). Returns the effective model per tier and the timestamp of the report the verdict relied on: none
+        under ``readiness_not_required`` (silent L2), so a reject resets no report it ignored."""
         async with self._sessions() as session:
             row = (
                 await session.scalars(select(ProviderConfig).where(ProviderConfig.provider == PROVIDER))
             ).one_or_none()
             project = (await session.scalars(select(Project).where(Project.id == project_id))).one_or_none()
         verdict = provider_ready(row, self._settings, held=self._held)
+        if (
+            verdict.reason == "pricing_changed"
+            and row is not None
+            and "invalidated" not in (row.readiness_report or {})
+        ):
+            await self._record_tariff_refusal(project_id, row.readiness_checked_at)
         if verdict.state == "disabled":
             raise ProviderBlocked("PROVIDER_DISABLED", verdict.reason)
         if not verdict.ready:
@@ -185,6 +194,31 @@ class DbProviderGate:
         if verdict.reason == "readiness_not_required":
             report_at = None  # the gate relied on no report: a reject resets none
         return GateResult(models, report_at)
+
+    async def _record_tariff_refusal(self, project_id: uuid.UUID, report_at: datetime | None) -> None:
+        """Ruling R2 (silent H1): the worker refuses the report's tariff, so the report is marked
+        ``invalidated`` with cause ``pricing_changed`` and the api verdict, which loads no tariff, shows it
+        too. The same compare-and-set, once-per-report guard and audit as a rejection, in its own short
+        transaction, naming the checked project (no run correlation). Best-effort: a failure is logged (ids
+        and type only) and the gate refuses anyway."""
+        try:
+            async with self._sessions.begin() as session:
+                await bound_transaction(session)
+                await invalidate_report(
+                    session,
+                    cause="pricing_changed",
+                    report_at=report_at,
+                    audit=self._audit,
+                    project_id=project_id,
+                    correlation_id=None,
+                )
+        except Exception as error:
+            _log.warning(
+                "provider_reset_unrecorded",
+                project_id=str(project_id),
+                cause="pricing_changed",
+                error_type=type(error).__name__,
+            )
 
     async def reject(self, cause: RejectCause, *, report_at: datetime | None, scope: RunScope) -> None:
         """Best-effort (the runtime swallows a failure): reset the report this run judged, in its own
@@ -604,7 +638,7 @@ def build_agent_runtime(
     (the audit's, with the configured secret literals) for everything the runtime writes or sends."""
     redactor = audit.redactor
     ports = RuntimePorts(
-        gate=DbProviderGate(sessions, settings, audit, pricing_version=pricing.version),
+        gate=DbProviderGate(sessions, settings, audit=audit, pricing_version=pricing.version),
         budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
         ledger=LedgerRecorder(UsageLedger(sessions, pricing)),
         runs=AgentRunWriter(sessions, bus, audit),

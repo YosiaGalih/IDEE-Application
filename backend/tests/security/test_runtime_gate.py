@@ -84,15 +84,23 @@ def report(mode: str = "scripted", *, failed: str | None = None) -> ReadinessRep
     return ReadinessReport(provider="anthropic", mode=mode, checks=checks, ran_at=datetime.now(UTC))
 
 
+PRICED = "2026-11-05"  # the tariff the recorded smoke priced: config/pricing.yaml's version (compose)
+
+
 async def record(
-    session: AsyncSession, settings: Settings, rep: ReadinessReport | None = None, *, key: str | None = KEY
+    session: AsyncSession,
+    settings: Settings,
+    rep: ReadinessReport | None = None,
+    *,
+    key: str | None = KEY,
+    pricing_version: str | None = PRICED,
 ) -> None:
     await provider_readiness.record_report(
         session,
         rep or report(),
         key=key,
         base_url=settings.anthropic_base_url,
-        pricing_version="2026-11-05",
+        pricing_version=pricing_version,
         models=provider_readiness.effective_models(settings, {}),
         settings=settings,
         audit=AUDIT,
@@ -127,6 +135,13 @@ async def ledger_rows(session: AsyncSession) -> int:
     return await session.scalar(select(func.count()).select_from(UsageRecord)) or 0
 
 
+def db_gate(
+    sessions: async_sessionmaker[AsyncSession], settings: Settings, *, pricing_version: str | None = None
+) -> DbProviderGate:
+    """The worker's gate; ``pricing_version`` None: a holder that checks no tariff."""
+    return DbProviderGate(sessions, settings, audit=AUDIT, pricing_version=pricing_version)
+
+
 async def blocked(gate: DbProviderGate, project_id: uuid.UUID) -> ProviderBlocked:
     with pytest.raises(ProviderBlocked) as exc:
         await gate.check(project_id)
@@ -142,7 +157,7 @@ async def test_a_ready_provider_with_the_switch_on_returns_the_models(
     settings = worker(CLAUDE_MODEL_FAST="claude-haiku-5-5")
     await record(session, settings)
     scope = await a_scope(session)
-    judged = await DbProviderGate(sessions, settings).check(scope.project_id)
+    judged = await db_gate(sessions, settings).check(scope.project_id)
     assert dict(judged.models) == {
         "default": "claude-test-model",
         "fast": "claude-haiku-5-5",
@@ -157,7 +172,7 @@ async def test_a_disabled_provider_is_provider_disabled(
     await record(session, settings)
     await set_enabled(session, False)
     scope = await a_scope(session)
-    refused = await blocked(DbProviderGate(sessions, settings), scope.project_id)
+    refused = await blocked(db_gate(sessions, settings), scope.project_id)
     assert (refused.code, refused.reason) == ("PROVIDER_DISABLED", "disabled")
 
 
@@ -169,7 +184,7 @@ async def test_the_kill_switch_is_provider_disabled_unless_true(
     await record(session, settings)
     scope = await a_scope(session)
     await set_kill_switch(session, scope.project_id, value)
-    refused = await blocked(DbProviderGate(sessions, settings), scope.project_id)
+    refused = await blocked(db_gate(sessions, settings), scope.project_id)
     assert (refused.code, refused.reason) == ("PROVIDER_DISABLED", "kill_switch")
 
 
@@ -180,7 +195,7 @@ async def test_an_absent_kill_switch_means_on(
     await record(session, settings)
     scope = await a_scope(session)
     await set_kill_switch(session, scope.project_id, True)
-    assert await DbProviderGate(sessions, settings).check(scope.project_id)
+    assert await db_gate(sessions, settings).check(scope.project_id)
 
 
 NOT_READY: dict[str, tuple[dict[str, Any], str]] = {
@@ -213,7 +228,7 @@ async def test_a_provider_not_ready_is_provider_not_ready(
     arrangement, reason = NOT_READY[case]
     settings = await arrange_not_ready(session, arrangement)
     scope = await a_scope(session)
-    refused = await blocked(DbProviderGate(sessions, settings), scope.project_id)
+    refused = await blocked(db_gate(sessions, settings), scope.project_id)
     assert (refused.code, refused.reason) == ("provider_not_ready", reason)
 
 
@@ -223,10 +238,10 @@ async def test_readiness_order_is_provider_then_kill_switch(
     settings = worker()  # no report: unknown
     scope = await a_scope(session)
     await set_kill_switch(session, scope.project_id, False)
-    refused = await blocked(DbProviderGate(sessions, settings), scope.project_id)
+    refused = await blocked(db_gate(sessions, settings), scope.project_id)
     assert (refused.code, refused.reason) == ("provider_not_ready", "no_report")
     await record(session, settings)
-    refused = await blocked(DbProviderGate(sessions, settings), scope.project_id)
+    refused = await blocked(db_gate(sessions, settings), scope.project_id)
     assert (refused.code, refused.reason) == ("PROVIDER_DISABLED", "kill_switch")
 
 
@@ -238,7 +253,7 @@ async def test_the_gate_reads_the_worker_key_not_the_report_alone(
     row = (await session.scalars(select(ProviderConfig))).one()
     assert provider_readiness.provider_ready(row, rotated).ready  # without the worker's key: no rotation seen
     scope = await a_scope(session)
-    refused = await blocked(DbProviderGate(sessions, rotated), scope.project_id)
+    refused = await blocked(db_gate(sessions, rotated), scope.project_id)
     assert refused.reason == "key_rotated"
 
 
@@ -247,7 +262,7 @@ async def test_a_missing_project_fails_closed(
 ) -> None:
     settings = worker()
     await record(session, settings)
-    refused = await blocked(DbProviderGate(sessions, settings), uuid.uuid4())
+    refused = await blocked(db_gate(sessions, settings), uuid.uuid4())
     assert (refused.code, refused.reason) == ("PROVIDER_DISABLED", "project_missing")
 
 
@@ -257,7 +272,7 @@ async def test_the_gate_reads_afresh_on_every_check(
     settings = worker()
     await record(session, settings)
     scope = await a_scope(session)
-    gate = DbProviderGate(sessions, settings)
+    gate = db_gate(sessions, settings)
     await gate.check(scope.project_id)
     await set_kill_switch(session, scope.project_id, False)
     assert (await blocked(gate, scope.project_id)).reason == "kill_switch"
@@ -273,7 +288,7 @@ async def test_the_gate_reads_afresh_on_every_check(
 def real_ports(
     fakes: Fakes, sessions: async_sessionmaker[AsyncSession], pricing: PricingTable, settings: Settings
 ) -> Fakes:
-    fakes.gate = DbProviderGate(sessions, settings)  # type: ignore[assignment]
+    fakes.gate = db_gate(sessions, settings)  # type: ignore[assignment]
     fakes.budget = GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings)))  # type: ignore[assignment]
     fakes.ledger = LedgerRecorder(UsageLedger(sessions, pricing))  # type: ignore[assignment]
     return fakes
@@ -483,7 +498,7 @@ async def test_the_gate_refuses_after_a_rejection(
     settings = worker()
     await record(session, settings)
     scope = await a_scope(session)
-    gate = DbProviderGate(sessions, settings)
+    gate = db_gate(sessions, settings)
     seen = (await gate.check(scope.project_id)).report_at
     await gate.reject("auth", report_at=seen, scope=scope)
     refused = await blocked(gate, scope.project_id)
@@ -496,7 +511,7 @@ async def test_a_rejection_of_a_superseded_report_leaves_the_new_one(
     settings = worker()
     await record(session, settings)
     scope = await a_scope(session)
-    gate = DbProviderGate(sessions, settings)
+    gate = db_gate(sessions, settings)
     seen = (await gate.check(scope.project_id)).report_at
     await record(
         session, settings, dataclasses.replace(report(), ran_at=datetime.now(UTC) + timedelta(seconds=5))
@@ -541,7 +556,7 @@ async def test_a_reset_names_the_run_and_its_project(
     await record(session, settings)
     scope = await a_scope(session)
     since = await last_audit_id(session)
-    gate = DbProviderGate(sessions, settings)
+    gate = db_gate(sessions, settings)
     seen = (await gate.check(scope.project_id)).report_at
     await gate.reject("auth", report_at=seen, scope=scope)
     (event,) = await reset_events(session, since)
@@ -556,7 +571,7 @@ async def test_without_required_readiness_no_report_is_judged(
     settings = worker(LLM_REQUIRE_READINESS="false")
     await record(session, settings)
     scope = await a_scope(session)
-    judged = await DbProviderGate(sessions, settings).check(scope.project_id)
+    judged = await db_gate(sessions, settings).check(scope.project_id)
     assert judged.report_at is None
 
 
@@ -591,3 +606,72 @@ async def test_a_real_auth_rejection_stops_every_project_until_a_new_smoke(
     (event,) = await reset_events(session, since)
     assert event.metadata_ == {"provider": "anthropic", "cause": "auth"}
     assert (event.project_id, event.correlation_id) == (project_id, f"agent_run:{rejected.agent_run_id}")
+
+
+async def test_a_tariff_refusal_is_recorded_once_and_the_api_sees_it(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Silent H1, ruling R2: the worker gate's ``pricing_changed`` marks the report (cause
+    ``pricing_changed``), audited once with the check's project and no correlation; the api verdict, which
+    loads no tariff, then reads it too. A second refusal writes nothing. Until a new smoke, a worker that
+    holds the smoke's own tariff is refused as well (SECURITY_MODEL §13)."""
+    settings = worker()
+    await record(session, settings)
+    scope = await a_scope(session)
+    since = await last_audit_id(session)
+    assert (await provider_readiness.current_verdict(session, settings)).ready
+    gate = db_gate(sessions, settings, pricing_version="2026-11-20")
+    for _ in range(2):
+        refused = await blocked(gate, scope.project_id)
+        assert (refused.code, refused.reason) == ("provider_not_ready", "pricing_changed")
+    (event,) = await reset_events(session, since)
+    assert event.metadata_ == {"provider": "anthropic", "cause": "pricing_changed"}
+    assert (event.project_id, event.correlation_id) == (scope.project_id, None)
+    session.expire_all()
+    expected = provider_readiness.ProviderVerdict("unknown", "pricing_changed")
+    assert await provider_readiness.current_verdict(session, settings) == expected
+    same = await blocked(db_gate(sessions, settings, pricing_version=PRICED), scope.project_id)
+    assert same.reason == "pricing_changed"
+    await record(session, settings)  # a new smoke clears it
+    assert await db_gate(sessions, settings, pricing_version=PRICED).check(scope.project_id)
+
+
+async def test_a_report_priced_with_no_tariff_is_refused_visibly(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Ruling R1 made visible (R2): a report recorded without a tariff cannot vouch for the held one."""
+    settings = worker()
+    await record(session, settings, pricing_version=None)
+    scope = await a_scope(session)
+    refused = await blocked(db_gate(sessions, settings, pricing_version=PRICED), scope.project_id)
+    assert (refused.code, refused.reason) == ("provider_not_ready", "pricing_changed")
+    session.expire_all()
+    expected = provider_readiness.ProviderVerdict("unknown", "pricing_changed")
+    assert await provider_readiness.current_verdict(session, settings) == expected
+
+
+async def test_a_tariff_refusal_that_cannot_be_recorded_still_refuses(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best-effort: a failed record is logged (ids and type, no error text) and the gate refuses anyway."""
+    from structlog.testing import capture_logs
+
+    settings = worker()
+    await record(session, settings)
+    scope = await a_scope(session)
+
+    async def broken(*args: object, **kwargs: object) -> bool:
+        raise ConnectionError("database " + "down")
+
+    monkeypatch.setattr("app.services.agent_runtime.invalidate_report", broken)
+    with capture_logs() as logs:
+        refused = await blocked(db_gate(sessions, settings, pricing_version="2026-11-20"), scope.project_id)
+    assert (refused.code, refused.reason) == ("provider_not_ready", "pricing_changed")
+    (entry,) = [entry for entry in logs if entry["event"] == "provider_reset_unrecorded"]
+    assert entry == {
+        "event": "provider_reset_unrecorded",
+        "log_level": "warning",
+        "project_id": str(scope.project_id),
+        "cause": "pricing_changed",
+        "error_type": "ConnectionError",
+    }

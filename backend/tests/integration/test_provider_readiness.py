@@ -4,14 +4,17 @@ writes, and the predicates 3.1f enforces."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from structlog.testing import capture_logs
 
 from app.core.audit import AuditWriter
 from app.core.config import Settings, load_settings
@@ -331,12 +334,96 @@ async def test_concurrent_rejections_write_one_reset(
 
 
 async def test_the_next_smoke_clears_the_rejection(session: AsyncSession, settings: Settings) -> None:
-    await record(session, settings, report())
-    await invalidate(session, "auth", RAN_AT)
+    row = await record(session, settings, report())
+    assert await invalidate(session, "auth", RAN_AT) is True
     await session.commit()
+    await session.refresh(row)
+    assert "invalidated" in row.readiness_report  # the marker was there before the next smoke
     row = await record(session, settings, report())
     assert "invalidated" not in row.readiness_report
     assert service.provider_ready(row, settings).state == "ready"
+
+
+@pytest.mark.parametrize(
+    ("cause", "reason"),
+    [
+        ("auth", "provider_rejected"),
+        ("not_found", "provider_rejected"),
+        ("pricing_changed", "pricing_changed"),
+    ],
+)
+async def test_the_marker_names_the_reason_for_api_and_worker(
+    session: AsyncSession, settings: Settings, cause: service.ResetCause, reason: str
+) -> None:
+    """Ruling R2 (silent H1): a refused tariff is marked like a refused call, so the api, which loads no
+    tariff, sees it too."""
+    row = await record(session, settings, report())
+    assert await invalidate(session, cause, RAN_AT) is True
+    await session.commit()
+    await session.refresh(row)
+    expected = service.ProviderVerdict("unknown", reason)  # type: ignore[arg-type]
+    assert service.provider_ready(row, settings) == expected
+    held = service.WorkerCredentials(KEY, None, pricing_version="2026-11-08")  # the report's own tariff
+    assert service.provider_ready(row, settings, held=held) == expected
+    assert await service.current_verdict(session, settings) == expected
+
+
+async def test_a_session_that_holds_the_row_still_sees_a_newer_smoke(
+    session: AsyncSession, settings: Settings, engine: AsyncEngine
+) -> None:
+    """AG-13 LOW-2 (PoC test_ag13_poc_identity.py), backend M1: the locked read refreshes a row the
+    caller's session already holds, so a newer smoke recorded meanwhile is never overwritten."""
+    await record(session, settings, report())
+    sessions = make_sessionmaker(engine)
+    newer = dataclasses.replace(report(), ran_at=datetime(2026, 11, 9, 12, 0, tzinfo=UTC))
+    async with sessions() as holder:
+        held = (await holder.scalars(select(ProviderConfig))).one()  # kept by a strong reference
+        await holder.commit()  # expire_on_commit=False: the loaded values stay in the identity map
+        async with sessions() as smoke:
+            await record(smoke, settings, newer)
+        async with holder.begin():
+            wrote = await invalidate(holder, "auth", RAN_AT)
+    assert held.readiness_checked_at == newer.ran_at  # the lock read refreshed the held object too
+    assert wrote is False
+    async with sessions() as fresh:
+        row = (await fresh.scalars(select(ProviderConfig))).one()
+    assert (row.readiness_status, row.readiness_checked_at) == ("passed", newer.ran_at)
+    assert "invalidated" not in row.readiness_report
+
+
+@pytest.mark.parametrize("case", ["no_report_at", "no_row", "newer_report", "already_invalidated"])
+async def test_a_skipped_reset_is_logged_with_its_reason(
+    session: AsyncSession, settings: Settings, case: str
+) -> None:
+    """Silent L1: every no-op says why, at info, with ids only."""
+    if case != "no_row":
+        await record(session, settings, report())
+    if case == "already_invalidated":
+        assert await invalidate(session, "auth", RAN_AT) is True
+        await session.commit()
+    report_at = {"no_report_at": None, "newer_report": datetime(2026, 11, 8, 11, 0, tzinfo=UTC)}.get(
+        case, RAN_AT
+    )
+    project_id = uuid.uuid4()
+    with capture_logs() as logs:
+        wrote = await service.invalidate_report(
+            session,
+            cause="not_found",
+            report_at=report_at,
+            audit=AUDIT,
+            project_id=project_id,
+            correlation_id="agent_run:" + "0" * 8,
+        )
+    assert wrote is False
+    (entry,) = [entry for entry in logs if entry["event"] == "provider_reset_skipped"]
+    assert entry == {
+        "event": "provider_reset_skipped",
+        "log_level": "info",
+        "reason": case,
+        "cause": "not_found",
+        "project_id": str(project_id),
+        "correlation_id": "agent_run:" + "0" * 8,
+    }
 
 
 # --- AG-13 3.1e1 L2, L3 -----------------------------------------------------------------------------------

@@ -649,12 +649,15 @@ def compose(
     from app.workflow.budget import BudgetDefaults, BudgetGuard
 
     redactor = redactor or Redactor(settings.secret_values())
-    runs = AgentRunWriter(sessions, bus, AuditWriter(redactor))
+    audit = AuditWriter(redactor)
+    runs = AgentRunWriter(sessions, bus, audit)
     if events is None:
         events = TaskRunEvents(sessions, bus, redactor) if bus is not None else FakeEvents()
     providers = providers if providers is not None else FakeProviders(provider)
     ports = RuntimePorts(
-        gate=gate if gate is not None else DbProviderGate(sessions, settings),
+        gate=gate
+        if gate is not None
+        else DbProviderGate(sessions, settings, audit=audit, pricing_version=pricing.version),
         budget=GuardBudget(BudgetGuard(sessions, pricing, BudgetDefaults.from_settings(settings))),
         ledger=ledger if ledger is not None else LedgerRecorder(UsageLedger(sessions, pricing)),
         runs=runs,
