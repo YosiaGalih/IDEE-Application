@@ -72,6 +72,34 @@ Runtime agent yang menilai hasil task per kriteria berdasarkan bukti. Rekomendas
 **Take-over**:
 Pengguna mengambil alih worktree task yang dijeda; task menjadi `interrupted` dan buktinya menjadi stale.
 
+**Tahap (S1–S10)**:
+Langkah workflow engine untuk satu task (ARCHITECTURE §5.2): S1–S3 intake, konteks, dan plan di status `draft`; S4–S6 implementasi, test, dan debug di `running`; S7–S10 review, User Proxy, gate, dan apply di `validating` hingga keputusan.
+
+**Checkpoint**:
+Isi `tasks.checkpoint` (JSONB) yang menyimpan posisi engine dan isian awal user (`user_set`), sehingga task yang terputus dilanjutkan dari tahap terakhir, bukan dari awal.
+
+**Lease**:
+Hak sementara satu worker atas satu task (`lease_owner`, `lease_expires_at`), diperpanjang selama bekerja; lease yang kedaluwarsa membuat sweep recovery mengambil alih task itu, dan jumlah lease hidup membatasi `MAX_ACTIVE_TASKS`.
+
+**Iterasi**:
+Putaran ke-n pengerjaan satu task (`tasks.iteration`, mulai 1), naik pada `request-changes` atau remediation; berbeda dari iterasi tool di dalam satu agent run.
+_Avoid_: mencampurnya dengan `max_tool_iterations`
+
+**Conversation**:
+Riwayat chat satu user di satu project (`conversations`, `messages`); hanya pembuatnya yang melihatnya, sedangkan task yang lahir dari chat terlihat oleh semua pemegang `task:read`.
+
+**Chat→task**:
+Pesan chat dengan `create_task=true` yang membuat task `draft` di transaksi yang sama dengan pesannya, dengan `source="chat"` dan `conversation_id` terisi.
+
+**`interrupted`**:
+Status task yang berhenti di tengah jalan dan dapat dilanjutkan (`POST /resume`): lease habis, worker mati, jeda user, take-over, provider belum siap, atau titik berhenti `validation_unavailable`; berbeda dari `failed` (gagal) dan `cancelled` (dibatalkan user).
+
+**`paused`**:
+Bukan status: jeda atas permintaan user (ADR-031, `pause_requested`) yang berhenti di batas langkah dan tampil sebagai task `interrupted` dengan `status_reason=paused_by_user`; `resume` mengembalikannya ke `queued`.
+
+**Validasi belum tersedia (`validation_unavailable`)**:
+Titik berhenti jujur setelah S4 selama S5 belum ada: perubahan sudah dikomit di branch `kk/task-…`, task menjadi `interrupted` dengan `status_reason=validation_unavailable`, tidak pernah `validating` atau `completed`, dan `POST /resume` menjawab 409 sampai S5 dibangun.
+
 ## Risiko dan persetujuan
 
 **Tingkat risiko (R0–R4)**:

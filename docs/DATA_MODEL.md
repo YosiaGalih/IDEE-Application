@@ -60,7 +60,8 @@ Index `(project_id, kind)`, `(project_id, symbol)`; trigram index pada `path` bi
 | id | project_id fk cascade | user_id fk | title varchar(200) | created_at, updated_at |
 
 ### messages
-| id | conversation_id fk cascade | project_id | user_id null | role check in (`user`,`assistant`,`system`,`agent`) | agent_id varchar(40) null | content text (diredaksi) | context_refs jsonb (`[{type:"file",path,line_start,line_end}|{type:"task",id}|{type:"test_run",id}|{type:"diff",task_id}]`) | task_id null | created_at |
+| id | conversation_id fk cascade | project_id fk projects cascade | user_id fk users on delete set null, null | role check in (`user`,`assistant`,`system`,`agent`) | agent_id varchar(40) null | content text (diredaksi) | context_refs jsonb default `[]` (`[{type:"file",path,line_start,line_end}|{type:"folder",path}|{type:"task",id}|{type:"diff",task_id}]`; `test_run`/`finding` ditolak API sampai tabelnya ada) | task_id fk tasks on delete set null, null | created_at |
+> **WP-3.2a** (migrasi 0012, Keputusan Lead 3.2 #14, #21, #22): index `ix_messages_conversation_id_created_at (conversation_id, created_at, id)` dan `ix_messages_task_id (task_id)`. `context_refs` berisi hasil normalisasi (bukan input mentah); `folder` ditambah untuk scope FR-037 (konflik N10). Pesan `role=user` ditulis `post_message`; baris `role=agent` (narasi chat→task) baru ditulis engine di 3.2c2 dan hanya bila task punya conversation. Conversation milik `conversations.user_id`; hanya pembuatnya yang membaca pesannya.
 
 ## Tasks & workflow (M08)
 
@@ -79,7 +80,8 @@ Index `(project_id, kind)`, `(project_id, symbol)`; trigram index pada `path` bi
 | current_step | varchar(40) null | `intake`,`context`,`plan`,`implement`,`test`,`debug`,`review`,`user_proxy`,`gate`,`apply` |
 | priority | check in (`low`,`normal`,`high`) | |
 | budget_limit | jsonb | `{max_cost_usd, max_tokens, max_tool_iterations, max_duration_minutes}` — WP-3.1f1: setiap kunci opsional; tidak ada atau `null` = mewarisi `projects.settings.budget`, lalu env `TASK_MAX_*` (Keputusan Lead 3.1f #2). `max_cost_usd` string desimal kanonik (≤ 6 desimal; JSONB mengembalikan angka sebagai float), field lain integer; batas yang sama dengan `PATCH /projects/{id}/budget` (`BUDGET_MAX_*`). Nilai yang tidak lolos membuat BudgetGuard gagal tertutup (`BudgetConfigError`); 3.2 menyalin budget efektif ke sini saat task dibuat dan memvalidasi usulan `budget_increase` terhadap batas yang sama |
-| checkpoint | jsonb default `{}` | |
+| checkpoint | jsonb default `{}` | WP-3.2a: `user_set` = daftar field isian user saat pembuatan (`["title"]`, `["workflow_type"]`, keduanya, atau `[]`), supaya A02 tidak menimpanya dan `modify` bawaan dapat dibedakan dari `modify` pilihan user (Keputusan Lead 3.2 #23). Kunci lain (`dispatch`, `plan_approved`, `phase`, ...) menyusul di 3.2b dan seterusnya |
+| context_refs | jsonb NOT NULL default `[]` | WP-3.2a (migrasi 0012; Keputusan Lead 3.2 #22, konflik N17): ref konteks ternormalisasi (bentuk sama dengan `messages.context_refs`); satu-satunya sumber A04 dan scope FR-037. Task dari chat menyalin ref pesan; pesan menyimpan salinannya sendiri |
 | branch_name | varchar(120) null | `kk/task-<8hex>` |
 | base_commit | varchar(64) null | commit default branch saat worktree dibuat |
 | iteration | int default 1 | naik pada remediation / reopen |
