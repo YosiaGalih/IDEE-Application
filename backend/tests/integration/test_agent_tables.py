@@ -267,7 +267,8 @@ def test_error_code_migration_round_trip(migrated_database: str) -> None:
     config = alembic_config(migrated_database)
     assert asyncio.run(_has_error_code(migrated_database))
     task_id = asyncio.run(_a_task_and_a_profile(migrated_database))
-    command.downgrade(config, "-1")
+    # Pinned to the revision under 0011: "-1" stops meaning 0011 once a later migration is head.
+    command.downgrade(config, "0010_usage_records")
     try:
         assert not asyncio.run(_has_error_code(migrated_database))
         # A failed run written before 0011 (none exist in production: no writer yet) gets the recovery code.

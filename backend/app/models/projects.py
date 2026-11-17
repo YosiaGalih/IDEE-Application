@@ -1,4 +1,4 @@
-"""Projects, repositories and conversations (DATA_MODEL M03, M04, M06). Messages land with their WP."""
+"""Projects, repositories, conversations and their messages (DATA_MODEL M03, M04, M06, M07)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -26,6 +27,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, Timestamps, UUIDPrimaryKey, in_values
 from app.models.enums import (
     INDEX_ENTRY_KINDS,
+    MESSAGE_ROLES,
     PROJECT_STATUSES,
     REPOSITORY_PROVIDERS,
     REPOSITORY_SYNC_STATES,
@@ -118,3 +120,37 @@ class Conversation(UUIDPrimaryKey, Timestamps, Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
+
+
+class Message(UUIDPrimaryKey, Base):
+    """One chat message of a conversation (DATA_MODEL M07, WP-3.2a). Append-only: no ``updated_at``.
+    ``context_refs`` are the references the author attached (files, symbols, tasks)."""
+
+    __tablename__ = "messages"
+    __table_args__ = (
+        CheckConstraint(in_values("role", MESSAGE_ROLES), name="role"),
+        Index("ix_messages_conversation_id_created_at", "conversation_id", "created_at", "id"),
+        Index("ix_messages_task_id", "task_id"),
+    )
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    agent_id: Mapped[str | None] = mapped_column(String(40))
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    context_refs: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
