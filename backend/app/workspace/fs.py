@@ -172,9 +172,10 @@ def _require(access: Access, allowed: tuple[Access, ...]) -> Access:
     return access
 
 
-def _open_file(parent_fd: int, name: str) -> int:
+def _open_nofollow(parent_fd: int, name: str) -> int:
+    """``name`` opened read-only, never through a symlink and never blocking (a FIFO opens at once)."""
     try:
-        fd = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+        return os.open(name, _READ_FLAGS, dir_fd=parent_fd)
     except FileNotFoundError:
         raise WorkspaceNotFound() from None
     except OSError as exc:
@@ -183,6 +184,10 @@ def _open_file(parent_fd: int, name: str) -> int:
         if exc.errno in _NOT_A_FILE:
             raise PathViolation("not_regular") from None
         raise
+
+
+def _open_file(parent_fd: int, name: str) -> int:
+    fd = _open_nofollow(parent_fd, name)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise PathViolation("not_regular")
@@ -347,6 +352,17 @@ class Workspace:
         depth = min(max(depth, 1), MAX_TREE_DEPTH)
         max_entries = min(max(max_entries, 1), MAX_TREE_ENTRIES)
         return await asyncio.to_thread(self._tree, rel, access, depth, max_entries)
+
+    async def probe(self, rel: str, access: Access) -> Literal["file", "dir"]:
+        """Whether ``rel`` is a file or a folder that ``access`` may read, without reading or hashing it.
+
+        The path goes through the same resolution, policy (``.agentignore``, denied names, dependency folders)
+        and no-follow open as ``read_file``/``tree``, then ``fstat``; it raises what they raise
+        (``PathViolation``, ``WorkspaceNotFound``). Anything else, a FIFO or a socket, is
+        ``PathViolation("not_regular")``. The root (``"."``) is a ``"dir"``, as ``tree`` lists it.
+        """
+        access = _require(access, _READS)
+        return await asyncio.to_thread(self._probe, rel, access)
 
     async def policy(self, access: Access) -> Policy:
         """The project's access policy (built-in denials + ``.agentignore``), for callers that filter paths
@@ -525,6 +541,26 @@ class Workspace:
             lines = LINE_PATTERN.findall(content)
             content = "".join(lines[(start_line or 1) - 1 : end_line])
         return FileContent("/".join(parts), content, encoding, size, digest, size > limit)
+
+    def _probe(self, rel: str, access: Access) -> Literal["file", "dir"]:
+        with self._opened() as (root_fd, real):
+            parts = resolve(real, rel, access, self._policy(root_fd, access))
+            if not parts:
+                return "dir"
+            parent = open_parent(root_fd, parts, create=False)
+            try:
+                fd = _open_nofollow(parent, parts[-1])
+            finally:
+                os.close(parent)
+            try:
+                mode = os.fstat(fd).st_mode
+            finally:
+                os.close(fd)
+        if stat.S_ISREG(mode):
+            return "file"
+        if stat.S_ISDIR(mode):
+            return "dir"
+        raise PathViolation("not_regular")
 
     def _write_file(
         self, rel: str, content: str, access: Access, expected: str | AnyVersion | None

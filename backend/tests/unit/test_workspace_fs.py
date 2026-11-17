@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import os
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -158,6 +159,89 @@ async def test_unreadable_agentignore_fails_closed(ws: Workspace, root: Path) ->
         await ws.read_file("src/a.py", Access.AGENT_READ)
     assert caught.value.reason == "agentignore"
     assert (await ws.read_file("src/a.py", Access.USER_READ)).size == 19
+
+
+# --- probe (WP-3.2a R7: existence without reading content) --------------------------------------------------
+
+
+async def test_probe_tells_a_file_from_a_folder(ws: Workspace) -> None:
+    for access in (Access.USER_READ, Access.AGENT_READ):
+        assert await ws.probe("src/a.py", access) == "file"
+        assert await ws.probe("src", access) == "dir"
+        assert await ws.probe("src/", access) == "dir"
+        assert await ws.probe(".", access) == "dir"  # the root, as tree(".") lists it
+
+
+async def test_probe_missing_is_not_found(ws: Workspace) -> None:
+    for rel in ("src/missing.py", "nope/missing.py", "nope"):
+        with pytest.raises(WorkspaceNotFound):
+            await ws.probe(rel, Access.AGENT_READ)
+
+
+async def test_probe_obeys_the_read_policy(ws: Workspace, root: Path) -> None:
+    (root / ".env").write_text("TOKEN=synthetic\n")
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "private").mkdir()
+    (root / "private" / "notes.md").write_text("hidden\n")
+    (root / ".agentignore").write_text("private/\n")
+    for rel in (".env", "node_modules", "node_modules/pkg", "private", "private/notes.md", ".git"):
+        with pytest.raises(PathViolation) as caught:
+            await ws.probe(rel, Access.AGENT_READ)
+        assert caught.value.reason == "denied", rel
+    assert await ws.probe(".env", Access.USER_READ) == "file"
+    assert await ws.probe("private/notes.md", Access.USER_READ) == "file"
+
+
+async def test_probe_unreadable_agentignore_fails_closed(ws: Workspace, root: Path) -> None:
+    (root / ".agentignore").mkdir()
+    with pytest.raises(PathViolation) as caught:
+        await ws.probe("src/a.py", Access.AGENT_READ)
+    assert caught.value.reason == "agentignore"
+    assert await ws.probe("src/a.py", Access.USER_READ) == "file"
+
+
+async def test_probe_symlinks_like_a_read(ws: Workspace, root: Path, tmp_path: Path) -> None:
+    (tmp_path / "outside.txt").write_text("o")
+    os.symlink(tmp_path / "outside.txt", root / "out.txt")
+    os.symlink(tmp_path, root / "outdir")
+    os.symlink("src/a.py", root / "alias.py")
+    os.symlink("src", root / "inner")
+    os.symlink("missing-target", root / "dead")
+    for rel in ("out.txt", "outdir", "outdir/outside.txt"):
+        with pytest.raises(PathViolation) as caught:
+            await ws.probe(rel, Access.AGENT_READ)
+        assert caught.value.reason == "outside_root", rel
+    assert await ws.probe("alias.py", Access.AGENT_READ) == "file"  # in-root links resolve, as read_file
+    assert await ws.probe("inner", Access.AGENT_READ) == "dir"  # ... and as tree
+    with pytest.raises(WorkspaceNotFound):
+        await ws.probe("dead", Access.AGENT_READ)
+
+
+async def test_probe_a_fifo_is_not_regular_and_does_not_block(ws: Workspace, root: Path) -> None:
+    os.mkfifo(root / "pipe")
+    with pytest.raises(PathViolation) as caught:
+        await asyncio.wait_for(ws.probe("pipe", Access.AGENT_READ), timeout=5)
+    assert caught.value.reason == "not_regular"
+
+
+async def test_probe_never_reads_or_hashes_content(
+    ws: Workspace, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 64 MiB file (sparse here) is answered from ``fstat`` alone: the read/hash helper is never called."""
+    big = root / "big.bin"
+    with big.open("wb") as handle:
+        handle.truncate(fs.HASH_LIMIT)
+
+    def no_read(*_: object) -> NoReturn:
+        raise AssertionError("probe read file content")
+
+    monkeypatch.setattr(fs, "_read_fd", no_read)
+    assert await ws.probe("big.bin", Access.AGENT_READ) == "file"
+
+
+async def test_probe_takes_only_read_access(ws: Workspace) -> None:
+    with pytest.raises(ValueError, match="not valid"):
+        await ws.probe("src/a.py", Access.AGENT_WRITE)
 
 
 # --- write --------------------------------------------------------------------------------------------------
