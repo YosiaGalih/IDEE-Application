@@ -14,7 +14,8 @@
 **Concurrency.** Rows are claimed with ``FOR UPDATE SKIP LOCKED``, so concurrent sweeps never transition a
 task twice. A skipped row is reported, not hidden.
 
-When the ``agent_runs`` table lands (WP-3.x), a running agent_run is failed here as well.
+Agent runs and tool calls are recovered by ``app.services.run_recovery``, which the sweep job runs after this
+(WP-3.1f2b1): ``app.workflow`` may not import ``app.services``.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import ColumnElement, and_, func, or_, select, update
+from sqlalchemy import ColumnElement, SQLColumnExpression, and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
@@ -67,6 +68,25 @@ def _orphaned() -> ColumnElement[bool]:
             Task.lease_expires_at < now,
             and_(Task.lease_expires_at.is_(None), Task.updated_at < now - NO_LEASE_GRACE),
         ),
+    )
+
+
+# The task side of run recovery (app.services.run_recovery, spec 3.1f2b Keputusan Lead #4, #8): that module
+# writes agent_runs.status, so it never holds the Task model (tests/unit/test_status_writer_guard.py).
+
+
+def lease_dead(task_id: SQLColumnExpression[uuid.UUID]) -> ColumnElement[bool]:
+    """The task ``task_id`` names holds no live lease, on the DB clock: ``tasks.lease_expires_at IS NULL OR
+    tasks.lease_expires_at < clock_timestamp()``. A task already recovered or ended has no lease at all."""
+    expires = Task.lease_expires_at
+    return exists().where(Task.id == task_id, or_(expires.is_(None), expires < func.clock_timestamp()))
+
+
+async def lock_task_row(db: AsyncSession, task_id: uuid.UUID) -> uuid.UUID | None:
+    """``FOR NO KEY UPDATE SKIP LOCKED`` on the task row, the gateway's order (task before tool call). The
+    task's project, or ``None`` when another transaction holds the row (or the task is gone)."""
+    return await db.scalar(
+        select(Task.project_id).where(Task.id == task_id).with_for_update(key_share=True, skip_locked=True)
     )
 
 

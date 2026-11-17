@@ -51,16 +51,23 @@ async def _create_owner(args: argparse.Namespace, password: str) -> int:
 
 def _recover() -> int:
     from app.worker.celery_app import configure_worker_logging
-    from app.worker.jobs import run_recovery_sweep
-    from app.workflow.recovery import RecoveryIncomplete
+    from app.worker.jobs import recovery_counts, sweep_recoveries
 
     configure_worker_logging(load_settings())
-    try:
-        counts = asyncio.run(run_recovery_sweep())
-    except RecoveryIncomplete as exc:
-        counts = dict(exc.result.__dict__)
-    print(", ".join(f"{name}: {counts[name]}" for name in ("candidates", "recovered", "failed", "skipped")))
-    return 0 if counts["failed"] == 0 else 1
+    tasks, runs = asyncio.run(sweep_recoveries())
+    counts = recovery_counts(tasks, runs)
+    names = (
+        "candidates",
+        "recovered",
+        "failed",
+        "skipped",
+        "runs_recovered",
+        "tool_calls_closed",
+        "runs_failed",
+        "runs_skipped",
+    )
+    print(", ".join(f"{name}: {counts[name]}" for name in names))
+    return 0 if counts["failed"] == 0 and counts["runs_failed"] == 0 else 1
 
 
 async def _grant_runtime_role(role: str) -> int:

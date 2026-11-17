@@ -28,10 +28,12 @@ from app.agents.registry import AgentRegistry, AgentSpec, load_registry
 from app.agents.runtime import (
     AgentRunRequest,
     AgentRuntime,
+    BudgetBreach,
     ModelCall,
     RunEnd,
     RunScope,
     RunStart,
+    RunStore,
     RuntimeConfig,
     RuntimePorts,
     RunUsage,
@@ -136,25 +138,40 @@ class FakeLedger:
 ZERO_USAGE = RunUsage(0, 0, 0, 0, Decimal(0), "estimated")
 
 
+async def begin(store: RunStore, run: RunStart) -> uuid.UUID:
+    """``store.start(run, retry=False)``, a first start; the run's id, which the caller holds."""
+    await store.start(run, retry=False)
+    return run.agent_run_id
+
+
 class FakeRuns:
     def __init__(self) -> None:
         self.starts: list[RunStart] = []
         self.finishes: list[tuple[uuid.UUID, RunEnd]] = []
-        self.ids: list[uuid.UUID] = []
-        self.failed_runs: list[uuid.UUID] = []
+        self.ids: list[uuid.UUID] = []  # the id of each start, as the caller sent it
+        self.failed_runs: list[tuple[uuid.UUID, BudgetBreach | None]] = []
+        self.fail_owners: list[tuple[uuid.UUID, str]] = []  # the (task_id, agent_id) each fail names
+        self.retries: list[bool] = []  # the ``retry`` flag of each start
 
-    async def start(self, run: RunStart) -> uuid.UUID:
+    async def start(self, run: RunStart, *, retry: bool) -> None:
         self.starts.append(run)
-        run_id = uuid.uuid4()
-        self.ids.append(run_id)
-        return run_id
+        self.ids.append(run.agent_run_id)
+        self.retries.append(retry)
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
         self.finishes.append((agent_run_id, end))
         return ZERO_USAGE
 
-    async def fail(self, agent_run_id: uuid.UUID) -> None:
-        self.failed_runs.append(agent_run_id)
+    async def fail(
+        self,
+        agent_run_id: uuid.UUID,
+        *,
+        task_id: uuid.UUID,
+        agent_id: str,
+        breach: BudgetBreach | None = None,
+    ) -> None:
+        self.failed_runs.append((agent_run_id, breach))
+        self.fail_owners.append((task_id, agent_id))
 
 
 class FakeEvents:

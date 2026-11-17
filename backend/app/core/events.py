@@ -5,7 +5,8 @@ events are numbered without gaps or duplicates.
 
 Publishing to Redis happens only for events whose transaction committed:
 - session hooks move queued events to a "committed" list on commit;
-- they drop them on rollback, including a rolled-back savepoint;
+- they drop them on rollback: a full rollback drops every queued event, a rolled-back savepoint only the
+  events queued inside it, also when a flush failure inside it rolls it back (WP-3.1f2b1 G3);
 - ``publish_pending`` (or ``commit_and_publish``) then sends only the committed ones. A subscriber can
   therefore never see an event the database does not have.
 
@@ -22,7 +23,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from redis.asyncio import Redis
-from sqlalchemy import event, update
+from sqlalchemy import event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, SessionTransaction
 
@@ -101,6 +102,13 @@ async def emit_task_event(
     return seq
 
 
+async def task_project_id(db: AsyncSession, task_id: uuid.UUID) -> uuid.UUID | None:
+    """The project of the task, read only; ``None`` for an unknown task. For a module that emits a task's
+    events but may not import the task model itself (the runtime's run store, under the "never moves a task"
+    import contract), here the project of a ``budget.exceeded`` audit (WP-3.1f2b1 F6)."""
+    return await db.scalar(select(Task.project_id).where(Task.id == task_id))
+
+
 async def publish_pending(db: AsyncSession, bus: EventBus) -> None:
     """Publish the events of ``db`` whose transaction has committed. Safe to call at any time."""
     committed: list[dict[str, Any]] = db.info.get(_COMMITTED) or []
@@ -162,13 +170,32 @@ def _on_commit(session: Session) -> None:
 
 
 def _on_rollback(session: Session, previous_transaction: SessionTransaction) -> None:
+    """Drop what the database rolled back. That is the boundary ``SessionTransaction.rollback`` rolls back:
+    the nearest savepoint at or above the rolled-back transaction, else the whole transaction. A flush failure
+    rolls back the flush's subtransaction (not nested, with a parent): inside a savepoint its boundary is
+    that savepoint, so only the events queued since the savepoint began are gone (re-review N1). A savepoint
+    without a mark was opened before the session's first event, so every queued event is its own
+    (tests/integration/test_task_events.py, test_task_event_rollbacks.py)."""
     uncommitted = session.info.get(_UNCOMMITTED, [])
-    mark = session.info.get(_SAVEPOINTS, {}).pop(id(previous_transaction), None)
-    if previous_transaction.nested and mark is not None:
-        del uncommitted[mark:]  # only the savepoint's events are gone
-    else:
-        uncommitted.clear()
-        session.info[_SAVEPOINTS] = {}
+    savepoints = session.info.get(_SAVEPOINTS, {})
+    boundary = previous_transaction
+    while not boundary.nested and boundary.parent is not None:
+        boundary = boundary.parent
+    if boundary.nested:
+        # Only the savepoint's own soft rollback forgets its mark (an execute-level failure, a Python error).
+        # On the common flush path, ``async with begin_nested()`` finds the savepoint already DEACTIVE and
+        # closes it instead (sqlalchemy/engine/util.py, TransactionalContext.__exit__): only the
+        # subtransaction's rollback fires here, and the mark stays until the outer commit or a root rollback
+        # resets the dict. Harmless: a closed savepoint's mark is never read again, and a new savepoint
+        # writes its own mark on creation.
+        own = boundary is previous_transaction
+        mark = savepoints.pop(id(boundary), None) if own else savepoints.get(id(boundary))
+        if mark is not None:
+            del uncommitted[mark:]  # only the savepoint's events are gone
+            return
+    # The whole transaction, or a savepoint opened before the first event was queued (all events are its).
+    uncommitted.clear()
+    session.info[_SAVEPOINTS] = {}
 
 
 def _message(task_id: uuid.UUID, seq: int | None, type: str, ts: datetime, payload: Any) -> dict[str, Any]:

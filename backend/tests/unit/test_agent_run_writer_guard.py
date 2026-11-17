@@ -1,8 +1,9 @@
-"""Only ``app/services/agent_runtime.py`` writes ``agent_runs`` (plan WP-3.1f2a Task 7, Keputusan plan #19).
+"""Only ``app/services/agent_runtime.py`` and ``app/services/run_recovery.py`` write ``agent_runs`` (plan
+WP-3.1f2a Task 7, Keputusan plan #19; spec WP-3.1f2b Keputusan Lead #3).
 
 The pattern of tests/unit/test_usage_writer_guard.py: a module that reaches ``AgentRun`` must not build one,
-nor ``insert``/``update``/``delete`` it, and no module holds raw SQL that writes ``agent_runs``. Recovery
-(WP-3.1f2b) becomes the second writer.
+nor ``insert``/``update``/``delete`` it, and no module holds raw SQL that writes ``agent_runs``. Recovery only
+closes runs: it never creates or deletes one.
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ import re
 from pathlib import Path
 
 APP = Path(__file__).resolve().parents[2] / "app"
-ALLOWED_WRITER = APP / "services" / "agent_runtime.py"
+RUNTIME_WRITER = APP / "services" / "agent_runtime.py"
+RECOVERY_WRITER = APP / "services" / "run_recovery.py"
+ALLOWED_WRITERS = {RUNTIME_WRITER, RECOVERY_WRITER}
 MODEL = "AgentRun"
 MODULE = "app.models.agents"
 WRITE_FUNCTIONS = {"insert", "update", "delete", "pg_insert"}
@@ -74,18 +77,22 @@ def run_writes(source: str) -> list[str]:
     return found
 
 
-def test_only_the_runtime_store_writes_agent_runs() -> None:
+def test_only_the_runtime_store_and_recovery_write_agent_runs() -> None:
     violations = {
         str(path.relative_to(APP)): hits
         for path in APP.rglob("*.py")
-        if path != ALLOWED_WRITER and (hits := run_writes(path.read_text()))
+        if path not in ALLOWED_WRITERS and (hits := run_writes(path.read_text()))
     }
     assert violations == {}
 
 
-def test_guard_sees_the_allowed_writer() -> None:
-    hits = run_writes(ALLOWED_WRITER.read_text())
-    assert any("AgentRun(...)" in hit for hit in hits) and any("update(AgentRun)" in hit for hit in hits)
+def test_guard_sees_the_allowed_writers() -> None:
+    hits = run_writes(RUNTIME_WRITER.read_text())
+    assert any("pg_insert(AgentRun)" in hit for hit in hits) and any(
+        "update(AgentRun)" in hit for hit in hits
+    )
+    recovery = run_writes(RECOVERY_WRITER.read_text())
+    assert recovery and all("update(AgentRun)" in hit for hit in recovery)  # it closes runs, nothing else
 
 
 def test_guard_detects_a_second_writer() -> None:
@@ -95,6 +102,8 @@ def test_guard_detects_a_second_writer() -> None:
         "from sqlalchemy import update\nfrom app.models.agents import AgentRun\nq = update(AgentRun)\n",
         "from sqlalchemy import delete\nfrom app.models.agents import AgentRun\n"
         "q = delete(AgentRun.__table__)\n",
+        "from sqlalchemy.dialects.postgresql import insert as pg_insert\n"
+        "from app.models.agents import AgentRun\nq = pg_insert(AgentRun)\n",
         "Q = 'UPDATE agent_runs SET status = :s'\n",
         "Q = 'insert ' + 'into agent_runs (id) values (:id)'\n",
     ):

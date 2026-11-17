@@ -2751,3 +2751,101 @@ $ uv run pytest -q <test itu> + test bukti T5 (delta_redaction, delta_streams, r
   Pola tetap identik sesudah kedua perubahan itu (7/7 `re.Pattern`, diverifikasi ulang). Syarat sign-off:
   1. CI PR hijau di head final, termasuk test bukti T5 dan `security-scan` dengan rule registry `p/*` (errors 0, tanpa finding ERROR);
   2. commit yang di-push berisi diff yang di-review ditambah kedua penutupan LOW di atas.
+
+**Sesudah PR #34 (fakta, 16 Nov 2026) [Pasti]:** PR #34 (perbaikan Semgrep) CI 9/9 di 2503265, di-merge PO 16 Nov 2026 (688e7e5). Push-CI `main` 688e7e5: `security-scan` hijau, kesebelas langkah termasuk Semgrep dan Trivy; frontend, sandbox, infra hijau. Syarat AG-13 perbaikan Semgrep terpenuhi.
+
+### WP-3.1f2b1 (🔒 integritas akhir run) — recovery `agent_runs`/`tool_calls`, sweep run basi, id run dari pemanggil, `start` idempoten, `read_run_outcome`, `fail()` membawa breach (G1–G6 spec 3.1f2b; T10, T4, T5)
+
+**Dokumen kerja:**
+- Spec `docs/superpowers/specs/2026-11-15-wp-3.1f2b-runtime-recovery-design.md`: Keputusan Lead 3.1f2b #1–#15, konflik K1–K10 ke #72, builder check.
+- Plan `docs/superpowers/plans/2026-11-15-wp-3.1f2b1-run-recovery.md` (6 task).
+
+**Cara dikerjakan:** subagent-driven-development. Setiap task punya implementer dan review sendiri; Task 1 dan Task 5 masing-masing butuh satu putaran perbaikan. Sesudah itu ada review akhir, satu fix wave (F1–F15), satu wave terakhir (G1–G7, ruling R9), dan penutupan syarat AG-13 delta-2 (H1–H3).
+
+**Yang dibangun:**
+- **Recovery run per task, satu transaksi** (`app/services/run_recovery.py`, penulis kedua `agent_runs`). Urutan kunci: baris task (`FOR NO KEY UPDATE SKIP LOCKED`), lalu run dan tool call (`SKIP LOCKED`).
+  - Run `running` ditutup bila lease task tidak hidup, atau bila sudah basi: `started_at + timeout_seconds profil (aman: jsonb number, dijepit 0..3600, selain itu 3600) + 60 dtk < clock_timestamp()`.
+  - Run yang ditutup menjadi `failed/interrupted`; usage `partial`/`unavailable`, `duration_ms` dijepit int4; `agent.run_finished` sesudah commit.
+  - Tool call `running` ditutup bila lease task mati, run-nya ikut ditutup, atau run-nya sudah terminal. Penutupnya `close_abandoned_calls` di gateway: `error/outcome_unknown`, audit `tool.executed` R1+ oleh `system/recovery` dengan `error_code` dan `correlation_id`. Guard AST membatasi pemanggilnya.
+  - Baris yang dilewati (task sibuk, baris terkunci) dihitung sebagai `skipped` dan di-log.
+  - Job `recovery_sweep` dan CLI `recover` menjalankan recovery task lalu recovery run, masing-masing dengan anggaran waktu sendiri. Galat dikumpulkan; urutan raise: galat fase task, `RecoveryIncomplete`, galat fase run, `RunRecoveryIncomplete`.
+- **Id run dari pemanggil.** `AgentRunRequest.agent_run_id` (default `uuid4`), dibawa `RunStart`.
+  - `RunStore.start(run, *, retry)`: start pertama yang tidak membuat baris → `AgentRunIdConflict` (tidak ada yang ditulis atau dijalankan). Retry sesudah ack hilang idempoten untuk baris `running` beridentitas sama. Baris yang sudah berakhir → `RunAlreadyFinished` → `AgentRunUnfinished`.
+  - `fail(agent_run_id, *, task_id, agent_id, breach)` terikat identitas.
+  - `read_run_outcome(session, id, *, task_id, agent_id)` → `finished`/`paused`/`running`/`missing`.
+  - Kontrak pemanggil di ARCHITECTURE §6.1: setiap jalan keluar selain hasil membaca baris DB; id baru untuk setiap `run()`, tidak pernah dipakai ulang.
+- **D-I5 (K7 diluruskan).** `fail()` menulis `usage.budget_exceeded` dan audit `budget.exceeded` di SAVEPOINT dalam transaksi akhir minimal. Kegagalan audit di-log `budget_audit_unrecorded` (dengan `breach_kind`) dan tidak membatalkan akhir minimal. Satu resolver project (`task_project_id` di `app/core/events.py`) melayani `finish` dan `fail`. D-I5 kini tertutup; baris "aa7d66b (D-I5)" di atas hanya benar untuk event `agent.run_finished`.
+- **Hook event (`app/core/events.py::_on_rollback`).** Galat flush di dalam savepoint memicu soft rollback SUBTRANSACTION. Hook kini hanya membuang event yang diantrikan sesudah savepoint, padahal sebelumnya seluruh antrean terbuang, termasuk `agent.run_finished`. Ini cacat hook lama yang baru terpicu oleh SAVEPOINT D-I5. Dijaga test properti (100 program savepoint acak; published == stored).
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ f1-pytest.sh -q                                  # suite penuh @ 8d7ea30
+1 failed, 5323 passed   # test_grep_parses_off_the_event_loop (0,52 dtk > 0,5; flaky WP-2.1d) → lulus saat diulang sendiri
+$ f1-pytest.sh -q tests/integration/test_task_events.py tests/integration/test_task_event_rollbacks.py   # @ e7b2d48
+22 passed
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 336 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
+$ mutan predikat (Task 5): drop stale, drop lease_dead (run/call), drop (b), drop (c), fallback 0/10^7, bound 0, usage lengkap, jam worker, tanpa kunci
+semua 10+1 tertangkap; mutan hook mark_none_keeps/old/keep_on_sub tertangkap (stop_at_first_parent ekuivalen pada keadaan yang dapat dicapai)
+```
+
+**Review:**
+
+| Review | Hasil | Ditutup di |
+|---|---|---|
+| Per task (spec + kualitas) | T1 Needs fixes (konflik id menutup run task lain), T5 Needs fixes (overflow `duration_ms`), lainnya Approved | 430de6d, 0cba553 |
+| `kk-backend-reviewer` @ 89e018b | APPROVE WITH NOTES; 4 MEDIUM (project audit di `finish`, isolasi sweep, margin test ±1 dtk, aktor literal) | F6, F7, F8, F9 |
+| `kk-silent-failure-hunter` @ 89e018b | 0 CRITICAL/HIGH; 4 MEDIUM (lewatan tak terhitung, id terpakai dijalankan ulang, konflik menelan cancel, audit breach membatalkan akhir minimal), 6 LOW | F1–F7, F13, F14 |
+| AG-13 @ 89e018b | SIGNED OFF WITH CONDITIONS; MEDIUM-1 (id terpakai menjalankan run baru di bawah baris terminal, PoC), LOW-1 (id asing sampai ke `fail`, PoC), LOW-2 (tracker), INFO-1..5 | F1, F2, F11, F15 |
+| Re-review fix wave @ efb0903 | F1–F15 ADDRESSED; N1 Important (antrean event terbuang saat flush gagal di savepoint, probe) | G3 |
+| AG-13 delta @ efb0903 | SIGNED OFF WITH CONDITIONS; MEDIUM-2 (start pertama mengambil alih baris `running` beridentitas sama, PoC V1/V2), LOW-2 (`read_run_outcome` tanpa agent) | G1, G2, G4, G7 |
+| Re-review wave terakhir @ 8d7ea30 | G1–G7 ADDRESSED; deviasi G3 terverifikasi terhadap SQLAlchemy 2.1.4; N-1 (klaim dokumen terlalu mutlak) | H1, H3 |
+| AG-13 delta 2 @ 8d7ea30 | **SIGNED OFF WITH CONDITIONS 🔒**; tanpa CRITICAL/HIGH; MEDIUM-2, LOW-2, N1 tertutup (fuzz 400 program); LOW sisa jendela retry; LOW cabang savepoint tanpa mark tak terpatok | H1, H2 (e7b2d48) |
+
+`/code-review` @ e7b2d48:
+- **Standards:** tanpa pelanggaran keras. Lokasi test baru kini terdaftar di TEST_STRATEGY. Smell yang dicatat dan ditunda: duplikasi `_close_run`/`finish` serta predikat `_held`, data clump `(agent_run_id, task_id, agent_id)`, flag `retry`/`start_sent`, tangga raise sweep.
+- **Spec:** tidak ada yang memblokir. Tracker dan HANDOFF masuk di commit ini, dan docstring serta baris ADR-075 yang basi sudah diluruskan. Spec #3 diselaraskan dengan R8.
+
+**Status sign-off AG-13 WP-3.1f2b1: SIGNED OFF WITH CONDITIONS 🔒** (89e018b; delta efb0903; delta 2 8d7ea30). AG-13 menyatakan tidak perlu review delta lagi. Syarat-syaratnya:
+1. Koreksi klaim [Pasti] dan baris residu §13 untuk jendela retry. Terpenuhi di e7b2d48.
+2. Test regresi savepoint tanpa mark. Terpenuhi di e7b2d48.
+3. Tracker ini. Terpenuhi.
+4. CI 9/9 hijau di head final.
+
+**Keputusan Lead selama eksekusi (ruling, dari ledger SDD):**
+- **R1.** Kasus "profil tanpa timeout" diuji lewat `limits` tanpa kunci, karena ada FK `agent_runs → agent_profiles`.
+- **R2.** `AgentRunIdConflict` tidak pernah memanggil `fail`. Ini mengesampingkan baris plan "fail setiap kali akhir tidak tertulis".
+- **R3.** Pembacaan `timeout_seconds` dibuat aman, mengesampingkan cast `::int` di plan.
+- **R4.** Recovery (c) menuntut WP-3.2 memegang run tetap `running` dan lease tetap hidup selama tool berjalan.
+- **R5/R5'.** Id terpakai pada start pertama menjadi konflik; start pertama vs retry ditentukan oleh `start_sent`.
+- **R6.** `fail` dan `read_run_outcome` terikat identitas.
+- **R7.** Audit breach ditulis di SAVEPOINT.
+- **R8.** Fase sweep berjalan terpisah, dengan urutan raise yang tetap.
+- **R9.** Wave kode kedua sesudah fix wave akhir. Ini sengaja menyimpang dari aturan satu wave SDD, karena syarat AG-13 wajib tertutup sebelum merge.
+- **R10.** `start(run, *, retry)`.
+- **R11.** `read_run_outcome` terikat agent, ditambah syarat id baru per `run()`.
+- **R12.** N1 diperbaiki di akar hook.
+- **R13.** Syarat delta-2 ditutup dalam satu commit dokumen dan test.
+
+**Syarat yang dibawa:**
+- **WP-3.2 (engine, pemanggil produksi pertama):**
+  - id `agent_run_id` baru untuk setiap `run()`, tidak dipakai ulang lintas retry atau redelivery;
+  - jalur "reopen" yang ditinjau AG-13 untuk melanjutkan `tool_r3` yang disetujui di bawah id yang sama; run tetap `running` dan lease tetap hidup selama tool berjalan (R4, ARCHITECTURE §5.3);
+  - token start per `_Run` untuk menutup jendela retry (SECURITY_MODEL §13);
+  - pemicu tinjau ulang LOW-3 bila ada resume atau retry otomatis task `interrupted` (3.1f2b #7);
+  - K6 (run fase `draft` tanpa lease) belum diputuskan.
+- **Ditunda (bukan blocker):**
+  - helper bersama `_close_run`/`finish`, dibuat sebelum WP-3.2 menambah jalur penulis ketiga;
+  - COUNT `skipped` di dalam transaksi yang memegang kunci (N4);
+  - alias di dalam gateway lolos dari guard pemanggil (INFO-3);
+  - `FOR NO KEY UPDATE` untuk `agent_runs`;
+  - letak `lease_dead`, dan cakupan test AST jam DB;
+  - CLI belum mencetak tipe exception, dan galat fase (bukan `RecoveryIncomplete`) di CLI `recover` menghasilkan traceback tanpa hitungan (`/code-review` Spec); log recovery tanpa `correlation_id`;
+  - waktu recovery task turun dari 25 dtk ke 12,5 dtk per sweep karena R8; `finished_at` run yang dipulihkan memakai `now()` (awal transaksi), sedangkan predikat memakai `clock_timestamp()`;
+  - ORDER BY dan backoff untuk task beracun (INFO-5);
+  - pengetikan `RunOutcome` yang lebih ketat;
+  - nit Task 1;
+  - `Session.close()` dengan transaksi terbuka meninggalkan antrean event (sudah ada sebelumnya, tidak berbahaya untuk sesi per unit kerja).
+- **Test flaky di luar WP:** `tests/integration/test_git_adapter.py::test_grep_parses_off_the_event_loop`.
+- **3.1f2b2 (berikutnya):** G7–G10 spec 3.1f2b, yaitu reset readiness `auth`/404, `pricing_version`, `agent_activity`, dan teks `RUNTIMES_AVAILABLE`.
