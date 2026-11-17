@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.api.deps import CurrentActor
+from app.api.routes.agents import RunSummaryOut
 from app.api.routes.projects import EnvDep, ProjectOut, _respond
 from app.api.routes.usage_out import CostStatus
 from app.core.money import Money
@@ -103,7 +104,7 @@ class DashboardOut(BaseModel):
     recent_projects: list[ProjectOut]
     recent_tasks: list[TaskSummaryOut]
     failed_queue: list[TaskSummaryOut]
-    agent_activity: list[dict[str, object]]  # AgentRunSummary; empty until agent runs are recorded
+    agent_activity: list[RunSummaryOut]  # AgentRunSummary: the newest runs of the visible projects
     usage: DashboardUsageOut
 
     @classmethod
@@ -118,7 +119,7 @@ class DashboardOut(BaseModel):
             recent_projects=[ProjectOut.of(view) for view in board.recent_projects],
             recent_tasks=[summary(view) for view in board.recent_tasks],
             failed_queue=[summary(view) for view in board.failed_queue],
-            agent_activity=[],
+            agent_activity=[RunSummaryOut.of(run) for run in board.agent_activity],
             usage=DashboardUsageOut.of(board.usage, period=PeriodOut(start=start, end=end)),
         )
 

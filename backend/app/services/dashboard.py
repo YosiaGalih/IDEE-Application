@@ -5,7 +5,8 @@ projects and tasks, in the user's scope (AC-01). Scope = ``visible_projects_filt
 Read only: this module never writes ``tasks.status`` (CLAUDE.md #4; tests/unit/test_status_writer_guard.py).
 Usage comes from the ledger (WP-3.1f1): the month's totals over the visible projects and each listed task's
 totals, read in the same snapshot as the counts. What the platform does not record yet (agent runs) is
-reported as unavailable, never as 0 (AC-16).
+reported as unavailable, never as 0 (AC-16). Agent runs come from ``agent_runs`` (WP-3.1f2b2): the newest
+ones of the visible projects.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.projects import Project, Repository
 from app.models.tasks import Task
+from app.services.agents import RunSummary, recent_runs
 from app.services.projects import Actor, ProjectEnv, ProjectView, project_views, visible_projects_filter
 from app.services.usage import UsageTotals, period_usage, task_usage
 
@@ -30,8 +32,9 @@ FAILED_QUEUE = 10
 RUNNING_STATUSES = ("running", "validating")
 # The attention queue of FR-010.
 ATTENTION_STATUSES = ("failed", "interrupted", "needs_changes", "waiting_approval")
-# No source yet: agent runs come with the runtime (WP-3.1f2). The screen says "tidak tersedia".
-UNAVAILABLE = ("agent_activity",)
+# Every section has a source now (usage: WP-3.1f1; agent runs: WP-3.1f2b2). A future gap is named here and
+# the screen says "tidak tersedia".
+UNAVAILABLE: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,7 @@ class Dashboard:
     period: tuple[datetime, datetime]
     usage: UsageTotals  # the period's ledger over the visible projects
     task_usage: Mapping[uuid.UUID, UsageTotals]  # per listed task; a task without rows is absent
+    agent_activity: list[RunSummary]  # the newest runs of the visible projects
 
 
 def current_period(now: datetime) -> tuple[datetime, datetime]:
@@ -143,6 +147,7 @@ async def load_dashboard(env: ProjectEnv, actor: Actor, *, now: datetime | None 
         usage = await period_usage(session, visible, *period)
         listed = list(dict.fromkeys(summary.id for summary in (*recent_tasks, *failed_queue)))
         usage_by_task = await task_usage(session, listed)
+        activity = await recent_runs(session, actor)
     # The look at the disk (missing repository, stalled import) needs no transaction.
     recent_projects = await project_views(
         env, actor, [(project, repository) for project, repository in project_rows]
@@ -163,4 +168,5 @@ async def load_dashboard(env: ProjectEnv, actor: Actor, *, now: datetime | None 
         period=period,
         usage=usage,
         task_usage=usage_by_task,
+        agent_activity=activity,
     )

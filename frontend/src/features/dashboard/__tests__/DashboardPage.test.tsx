@@ -82,7 +82,7 @@ describe("DashboardPage", () => {
   });
 
   it("says not available for the parts the server lists, never a number", async () => {
-    backend();
+    backend(() => answer(dashboardData(), dashboardMeta({ unavailable: ["agent_activity", "usage"] })));
     renderApp("/");
     const agents = await screen.findByRole("region", { name: id.dashboard.agents.title });
     expect(within(agents).getByText(id.dashboard.agents.body)).toBeInTheDocument();
@@ -217,7 +217,7 @@ describe("DashboardPage", () => {
   it("lists agent runs once they are recorded, and says when there are none", async () => {
     const data = dashboardData();
     data.agent_activity = [agentRun()];
-    backend(() => answer(data, dashboardMeta({ unavailable: ["usage"] })));
+    backend(() => answer(data, dashboardMeta()));
     const { unmount } = renderApp("/");
     const agents = await screen.findByRole("region", { name: id.dashboard.agents.title });
     expect(within(agents).getByRole("link", { name: "General Code Implementation Agent" })).toHaveAttribute(

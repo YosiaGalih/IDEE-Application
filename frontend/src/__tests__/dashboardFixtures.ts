@@ -98,5 +98,6 @@ export function dashboardData() {
 }
 
 export function dashboardMeta(overrides: Record<string, unknown> = {}) {
-  return { unavailable: ["agent_activity", "usage"], failed_queue_total: 1, ...overrides };
+  // The server reports every section since WP-3.1f2b2; a test that needs a gap lists it.
+  return { unavailable: [], failed_queue_total: 1, ...overrides };
 }

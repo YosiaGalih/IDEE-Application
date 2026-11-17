@@ -22,7 +22,7 @@ from app.gitops.adapter import GitAdapter
 from app.llm.base import Usage
 from app.models.projects import Project
 from app.services import projects
-from tests.integration.test_dashboard_api import DASHBOARD, add_project, add_task
+from tests.integration.test_dashboard_api import DASHBOARD, add_project, add_runs, add_task
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     app,
     clean_state,
@@ -115,7 +115,7 @@ async def people(app: FastAPI, engine: AsyncEngine) -> AsyncIterator[dict[str, A
         "bob_main": await add_task(engine, projects_of["bob_main"], ids["bob"], "failed", "B gagal"),
     }
     clients: dict[str, httpx.AsyncClient] = {}
-    world = {"ids": ids, "projects": projects_of, "tasks": tasks, "clients": clients}
+    world = {"engine": engine, "ids": ids, "projects": projects_of, "tasks": tasks, "clients": clients}
 
     async def client(name: str) -> httpx.AsyncClient:
         if name not in clients:  # signed in on first use (grants are read on every request)
@@ -255,3 +255,30 @@ async def test_dashboard_usage_counts_only_visible_projects(
         "cost_status": "estimated",
         "period": None,
     }
+
+
+async def test_dashboard_runs_stay_in_visible_projects(people: dict[str, Any]) -> None:
+    mine = await add_runs(people["engine"], people["tasks"]["alice_main"], 2)
+    side = await add_runs(people["engine"], people["tasks"]["alice_side"], 1, agent_id="A03")
+    other = await add_runs(people["engine"], people["tasks"]["bob_main"], 3)
+
+    async def activity(name: str) -> list[dict[str, Any]]:
+        response = await (await people["client"](name)).get(DASHBOARD)
+        assert response.status_code == 200, response.text
+        return response.json()["data"]["agent_activity"]
+
+    alice = await activity("alice")
+    assert {r["id"] for r in alice} == {str(i) for i in (*mine, *side)}
+    assert {r["project_id"] for r in alice} <= {
+        str(people["projects"]["alice_main"]),
+        str(people["projects"]["alice_side"]),
+    }
+    bob = await activity("bob")
+    assert {r["id"] for r in bob} == {str(i) for i in other}
+    assert await activity("carl") == []  # a global role sees no project, so no run
+    await grant(
+        people["engine"], people["ids"]["carl"], "readonly", f"project:{people['projects']['bob_main']}"
+    )
+    assert {r["id"] for r in await activity("carl")} == {
+        str(i) for i in other
+    }  # a project grant adds its runs
