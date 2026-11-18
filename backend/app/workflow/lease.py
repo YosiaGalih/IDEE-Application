@@ -54,6 +54,11 @@ class LeaseLost(Exception):
     """The worker no longer holds the task's lease and must stop working on it."""
 
 
+def lease_duration() -> timedelta:
+    """The lease length ``claim_lease`` and ``renew_lease`` grant; a holder's own deadlines derive from it."""
+    return _LEASE
+
+
 def _check_worker(worker_id: str) -> None:
     if not 1 <= len(worker_id) <= _WORKER_ID_LENGTH:
         raise ValueError(f"worker id must be 1-{_WORKER_ID_LENGTH} characters")

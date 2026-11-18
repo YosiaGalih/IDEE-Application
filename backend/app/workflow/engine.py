@@ -14,24 +14,26 @@ recovery sweep owns the task), and a status changed from outside only releases t
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, NoReturn
 
-from sqlalchemy import ColumnElement, Integer, Text, func, literal, select, update
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
 from app.core.events import EventBus, commit_and_publish, emit_task_event
 from app.core.logging import get_logger
 from app.models.tasks import Task
+from app.workflow.checkpoint import add_completed_step, count_planning_attempt
 from app.workflow.lease import (
     HEARTBEAT_SECONDS,
     ClaimResult,
     LeaseLost,
     claim_lease,
+    lease_duration,
     release_lease,
     renew_lease,
 )
@@ -115,10 +117,6 @@ class _StatusChanged(Exception):
     """The task left the status its pipeline runs for; the lease has been released."""
 
 
-def _path(key: str) -> ColumnElement[Any]:
-    return literal([key], ARRAY(Text))
-
-
 class TaskEngine:
     def __init__(self, ports: WorkflowPorts) -> None:
         self._ports = ports
@@ -158,15 +156,9 @@ class TaskEngine:
             if task.status == TaskStatus.QUEUED:
                 await transition(db, task, TaskStatus.RUNNING, reason=None, actor=ACTOR, audit=ports.audit)
                 status = TaskStatus.RUNNING.value
-            elif await self._count_planning_attempt(db, task_id) > MAX_PLANNING_ATTEMPTS:
-                await fail_task(
-                    db,
-                    task,
-                    error_code="planning_interrupted",
-                    message=f"Planning was interrupted {MAX_PLANNING_ATTEMPTS} times without finishing",
-                    actor=ACTOR,
-                    audit=ports.audit,
-                )
+            elif await count_planning_attempt(db, task_id) > MAX_PLANNING_ATTEMPTS:
+                interrupted = f"Planning was interrupted {MAX_PLANNING_ATTEMPTS} times without finishing"
+                await self._fail(db, task, "planning_interrupted", interrupted)
                 await release_lease(db, task_id, ports.worker_id)
                 status = None
             else:
@@ -175,37 +167,20 @@ class TaskEngine:
         todo = tuple(step for step in PIPELINE.get(status or "", ()) if step not in completed)
         return _Claim(result, status, todo)
 
-    async def _count_planning_attempt(self, db: AsyncSession, task_id: uuid.UUID) -> int:
-        attempts = func.jsonb_extract_path_text(Task.checkpoint, "dispatch", "planning_attempts").cast(
-            Integer
-        )
-        # jsonb_set does not create a missing parent: build dispatch first (drafts made before 3.2d lack it).
-        dispatch = func.coalesce(Task.checkpoint["dispatch"], literal({}, JSONB)).op("||")(
-            func.jsonb_build_object(literal("planning_attempts", Text), func.coalesce(attempts, 0) + 1)
-        )
-        counted = await db.scalar(
-            update(Task)
-            .where(Task.id == task_id)
-            .values(checkpoint=func.jsonb_set(Task.checkpoint, _path("dispatch"), dispatch))
-            .returning(attempts)
-            .execution_options(synchronize_session=False)
-        )
-        assert counted is not None
-        return counted
-
     async def _drive(self, task_id: uuid.UUID, status: str, todo: tuple[str, ...], ran: list[str]) -> Stopped:
         for step in todo:
+            renewed_at = time.monotonic()  # before _start's renewal, so the heartbeat deadline errs early
             context = await self._start(task_id, status, step)
             if context is None:
                 return "step_unavailable"
             ran.append(step)
-            result = await self._run_step(task_id, self._ports.steps[step], context)
+            result = await self._run_step(task_id, self._ports.steps[step], context, renewed_at)
             stopped = await self._finish(task_id, status, step, result)
             if stopped is not None:
                 return stopped
         async with self._ports.sessions() as db:
             await release_lease(db, task_id, self._ports.worker_id)
-            await db.commit()
+            await commit_and_publish(db, self._ports.bus)
         logger.warning("pipeline_exhausted", task_id=str(task_id), status=status)
         return "pipeline_exhausted"
 
@@ -219,7 +194,7 @@ class TaskEngine:
         assert task is not None  # the renewal found the row
         if task.status != status:
             await release_lease(db, task_id, self._ports.worker_id)
-            await db.commit()
+            await commit_and_publish(db, self._ports.bus)
             logger.info(
                 "task_status_changed_outside", task_id=str(task_id), expected=status, found=task.status
             )
@@ -231,14 +206,7 @@ class TaskEngine:
         async with ports.sessions() as db:
             task = await self._locked(db, task_id, status)
             if step not in ports.steps:
-                await fail_task(
-                    db,
-                    task,
-                    error_code="step_unavailable",
-                    message=f"No step is registered as {step}",
-                    actor=ACTOR,
-                    audit=ports.audit,
-                )
+                await self._fail(db, task, "step_unavailable", f"No step is registered as {step}")
                 await release_lease(db, task_id, ports.worker_id)
                 await commit_and_publish(db, ports.bus)
                 return None
@@ -255,31 +223,56 @@ class TaskEngine:
             await commit_and_publish(db, ports.bus)
         return context
 
-    async def _run_step(self, task_id: uuid.UUID, step: Step, context: StepContext) -> StepResult:
+    async def _run_step(
+        self, task_id: uuid.UUID, step: Step, context: StepContext, renewed_at: float
+    ) -> StepResult:
         work = asyncio.ensure_future(step(context))
-        beat = asyncio.create_task(self._heartbeat(task_id))
+        beat = asyncio.create_task(self._heartbeat(task_id, renewed_at))
+        beat_won = True  # also on an outer cancel: the step's own outcome is then dropped too
         try:
             await asyncio.wait((work, beat), return_when=asyncio.FIRST_COMPLETED)
-            if beat.done():
-                beat.result()  # the heartbeat only ends by raising, LeaseLost above all
-            return work.result()
+            beat_won = beat.done()
         finally:
             work.cancel()
             beat.cancel()
             await asyncio.gather(work, beat, return_exceptions=True)
+            if beat_won and work.done() and not work.cancelled() and (error := work.exception()):
+                # Its type only: the text of a step's error may carry secrets.
+                logger.error(
+                    "step_error_dropped",
+                    task_id=str(task_id),
+                    step=context.step,
+                    error_type=type(error).__name__,
+                )
+        if beat_won:
+            beat.result()  # the heartbeat only ends by raising LeaseLost
+        return work.result()
 
-    async def _heartbeat(self, task_id: uuid.UUID) -> NoReturn:
+    async def _heartbeat(self, task_id: uuid.UUID, last_ok: float) -> NoReturn:
+        """Renew the lease every ``heartbeat_s`` (ruling R-T3h).
+
+        A failed or hung renewal is retried until ``last_ok + lease - heartbeat_s``; past it, ``LeaseLost``.
+        No wait runs past that deadline, so the last try ends (``asyncio.timeout``) by ``last_ok + lease``.
+        ``last_ok`` is taken before its renewal, so the database lease cannot have run out before then.
+        """
+        beat = self._ports.heartbeat_s
         while True:
-            await asyncio.sleep(self._ports.heartbeat_s)
+            deadline = last_ok + lease_duration().total_seconds() - beat
+            await asyncio.sleep(min(beat, max(0.0, deadline - time.monotonic())))
+            attempt = time.monotonic()
             try:
-                async with self._ports.sessions() as db:
-                    await renew_lease(db, task_id, self._ports.worker_id)
-                    await db.commit()
+                async with asyncio.timeout(beat):
+                    async with self._ports.sessions() as db:
+                        await renew_lease(db, task_id, self._ports.worker_id)
+                        await commit_and_publish(db, self._ports.bus)
             except LeaseLost:
                 raise
-            except Exception:
-                # A missed beat is survivable: the lease outlasts several, and a real loss raises LeaseLost.
-                logger.warning("lease_heartbeat_failed", task_id=str(task_id), exc_info=True)
+            except Exception as exc:
+                if time.monotonic() >= deadline:
+                    raise LeaseLost(f"the lease of task {task_id} could not be renewed in time") from exc
+                logger.warning("lease_heartbeat_failed", task_id=str(task_id), error_type=type(exc).__name__)
+            else:
+                last_ok = attempt
 
     async def _finish(self, task_id: uuid.UUID, status: str, step: str, result: StepResult) -> Stopped | None:
         ports = self._ports
@@ -293,14 +286,7 @@ class TaskEngine:
                         await self._step_finished(db, task_id, step, "done")
                     case "fail":
                         await self._step_finished(db, task_id, step, "failed")
-                        await fail_task(
-                            db,
-                            task,
-                            error_code=result.error_code,
-                            message=result.message,
-                            actor=ACTOR,
-                            audit=ports.audit,
-                        )
+                        await self._fail(db, task, result.error_code, result.message)
                         stopped = "failed"
                     case "transition":
                         assert result.to is not None
@@ -314,23 +300,18 @@ class TaskEngine:
             await commit_and_publish(db, ports.bus)
         return stopped
 
+    async def _fail(self, db: AsyncSession, task: Task, error_code: str, message: str) -> None:
+        await fail_task(
+            db, task, error_code=error_code, message=message, actor=ACTOR, audit=self._ports.audit
+        )
+
     async def _step_finished(
         self, db: AsyncSession, task_id: uuid.UUID, step: str, outcome: Literal["done", "failed"]
     ) -> None:
         """Emit ``task.step_finished``. Only a done step joins ``completed_steps``: a failed one runs again on
         retry."""
         if outcome == "done":
-            completed = func.coalesce(Task.checkpoint["completed_steps"], literal([], JSONB))
-            await db.execute(
-                update(Task)
-                .where(Task.id == task_id, ~Task.checkpoint.contains({"completed_steps": [step]}))
-                .values(
-                    checkpoint=func.jsonb_set(
-                        Task.checkpoint, _path("completed_steps"), completed.op("||")(literal([step], JSONB))
-                    )
-                )
-                .execution_options(synchronize_session=False)
-            )
+            await add_completed_step(db, task_id, step)
         await emit_task_event(
             db,
             None,
@@ -345,6 +326,6 @@ class TaskEngine:
         try:
             async with self._ports.sessions() as db:
                 await release_lease(db, task_id, self._ports.worker_id)
-                await db.commit()
+                await commit_and_publish(db, self._ports.bus)
         except Exception:
             logger.error("lease_release_failed", task_id=str(task_id), exc_info=True)
