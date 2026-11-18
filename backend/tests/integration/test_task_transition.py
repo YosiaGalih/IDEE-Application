@@ -19,7 +19,7 @@ from app.models.audit import AuditEvent
 from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task, TaskEvent
-from app.workflow.states import Actor, TaskStatus, transition
+from app.workflow.states import Actor, TaskStatus, fail_task, transition
 from tests.conftest import reset_data
 
 ACTOR = Actor("system", "orchestrator")
@@ -359,3 +359,56 @@ async def test_expired_task_object_is_refused_clearly(session: AsyncSession, tas
     session.expire(task)
     with pytest.raises(ValueError, match="reload"):
         await transition(session, task, TaskStatus.PLANNED, reason=None, actor=ACTOR, audit=AUDIT)
+
+
+async def test_fail_task_writes_code_and_status(session: AsyncSession, task_id: uuid.UUID) -> None:
+    task = await load(session, task_id)
+    await fail_task(session, task, error_code="STEP_FAILED", message="boom", actor=ACTOR, audit=AUDIT)
+    await session.commit()
+    fresh = await load(session, task_id)
+    assert (fresh.status, fresh.error_code, fresh.error_message) == ("failed", "STEP_FAILED", "boom")
+    assert fresh.status_reason == "STEP_FAILED"
+    event = await session.scalar(select(TaskEvent).where(TaskEvent.task_id == task_id))
+    assert event is not None and event.type == "task.status_changed"
+    assert event.payload == {"from": "draft", "to": "failed", "reason": "STEP_FAILED"}
+    audit = await session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action == "task.status_changed", AuditEvent.resource_id == str(task_id)
+        )
+    )
+    assert audit is not None and audit.metadata_["to"] == "failed"
+
+
+async def test_fail_task_redacts_and_truncates_message(session: AsyncSession, task_id: uuid.UUID) -> None:
+    audit = AuditWriter(Redactor(["s3cr3t-literal-value"]))
+    task = await load(session, task_id)
+    message = "token s3cr3t-literal-value " + "x" * 2000
+    await fail_task(session, task, error_code="E", message=message, actor=ACTOR, audit=audit)
+    await session.commit()
+    fresh = await load(session, task_id)
+    assert fresh.error_message is not None
+    assert "s3cr3t-literal-value" not in fresh.error_message
+    assert len(fresh.error_message) == 1000
+
+
+async def test_fail_task_rejects_overlong_code(session: AsyncSession, task_id: uuid.UUID) -> None:
+    task = await load(session, task_id)
+    with pytest.raises(ValueError, match="error_code"):
+        await fail_task(session, task, error_code="E" * 65, message="m", actor=ACTOR, audit=AUDIT)
+
+
+async def test_fail_task_rolls_back_together(engine: AsyncEngine, task_id: uuid.UUID) -> None:
+    sessions = make_sessionmaker(engine)
+    async with sessions() as session:
+        stale = await load(session, task_id)
+    async with sessions() as other:
+        await walk(other, task_id, TaskStatus.PLANNED)
+    async with sessions() as session:
+        session.add(stale)
+        with pytest.raises(AppError) as caught:
+            await fail_task(session, stale, error_code="E", message="m", actor=ACTOR, audit=AUDIT)
+        assert caught.value.code == "VERSION_CONFLICT"
+        await session.rollback()
+    async with sessions() as check:
+        row = await load(check, task_id)
+        assert (row.status, row.error_code, row.error_message) == ("planned", None, None)

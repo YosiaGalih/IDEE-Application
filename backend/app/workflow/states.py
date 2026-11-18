@@ -73,6 +73,8 @@ class Actor:
 
 _REASON_COLUMN_LENGTH = 200
 _ACTOR_ID_LENGTH = 80
+_ERROR_CODE_LENGTH = 64  # tasks.error_code
+_ERROR_MESSAGE_LENGTH = 1000
 
 
 def _check_inputs(db: AsyncSession, task: Task, actor: Actor) -> None:
@@ -175,6 +177,35 @@ async def transition(
     for name, value in row._mapping.items():
         set_committed_value(task, name, value)
     set_committed_value(task, "event_seq", seq)
+
+
+async def fail_task(
+    db: AsyncSession,
+    task: Task,
+    *,
+    error_code: str,
+    message: str,
+    actor: Actor,
+    audit: AuditWriter,
+) -> None:
+    """Record why a task failed and move it to ``failed``, in the caller's transaction (no commit).
+
+    The message is redacted here too (idempotent) so no caller can store a secret by forgetting to.
+    """
+    if not 1 <= len(error_code) <= _ERROR_CODE_LENGTH:
+        raise ValueError(f"error_code must be 1-{_ERROR_CODE_LENGTH} characters")
+    safe_message = audit.redactor.redact(message)[:_ERROR_MESSAGE_LENGTH]
+    # Savepoint: if the transition is refused, the error columns are undone with it.
+    async with db.begin_nested():
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(error_code=error_code, error_message=safe_message)
+            .execution_options(synchronize_session=False)
+        )
+        await transition(db, task, TaskStatus.FAILED, reason=error_code, actor=actor, audit=audit)
+    set_committed_value(task, "error_code", error_code)
+    set_committed_value(task, "error_message", safe_message)
 
 
 async def _raise_conflict(db: AsyncSession, task: Task) -> NoReturn:
