@@ -600,7 +600,7 @@ describe("useTaskEvents", () => {
     const endpoint = fakeEndpoint();
     const { result, rerender } = renderHook(
       ({ id }: { id: string | null }) => useTaskEvents(id, { fetchImpl: endpoint.fetchImpl, ...fast }),
-      { initialProps: { id: TASK as string | null } },
+      { initialProps: { id: TASK } },
     );
     await waitFor(() => expect(result.current.status).toBe("open"));
     act(() => endpoint.send(event(1) + event(2) + event(3) + event(4) + event(5)));
