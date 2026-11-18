@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,10 +18,12 @@ from typing import Any, Final
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
 from sqlalchemy import select
 
-from app.core.events import event_message
+from app.core.events import event_message, task_channel
 from app.core.logging import get_logger
 from app.models.tasks import Task, TaskEvent
 from app.services.projects import Actor, ProjectEnv, authorize, not_found
@@ -82,7 +85,8 @@ class TaskEventHub:
     """One Redis pubsub connection per api process, ``kk:task:*``, routed to the listeners of each task.
 
     Own client without ``socket_timeout`` (an idle subscription is normal) and with ``health_check_interval``.
-    Never raises into streams: trouble (a lost connection, a full queue) shows as ``listener.lagged``.
+    Never raises into streams and its reader never dies: trouble (a lost connection, a full queue, a message
+    that is not an event) shows as ``listener.lagged`` or is logged and dropped.
     """
 
     def __init__(self, redis_url: str, *, queue_max: int = HUB_QUEUE_MAX) -> None:
@@ -91,24 +95,52 @@ class TaskEventHub:
         self._listeners: dict[uuid.UUID, set[TaskListener]] = {}
         self._redis: Redis | None = None
         self._task: asyncio.Task[None] | None = None
+        self._subscribed = asyncio.Event()
+        # Unique per hub so a test (or an operator) can find and kill exactly this connection.
+        self.client_name = f"kk-task-event-hub-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    @property
+    def subscribed(self) -> bool:
+        """True only while the pattern subscription is live; False while connecting, retrying or stopped."""
+        return self._subscribed.is_set()
+
+    async def wait_subscribed(self, timeout: float) -> None:  # noqa: ASYNC109 - the caller's bound, as asked
+        """Wait until the subscription is live; ``TimeoutError`` when it is not within ``timeout`` seconds."""
+        await asyncio.wait_for(self._subscribed.wait(), timeout)
+
     async def start(self) -> None:
         if self.running:
             return
-        self._redis = Redis.from_url(self._redis_url, health_check_interval=30)
+        await self._close_client()  # a crashed run leaves its client behind
+        # No retry on the hub's own connection: redis-py would otherwise reconnect silently inside
+        # ``get_message`` and the gap would never be reported as ``lagged``.
+        self._redis = Redis.from_url(
+            self._redis_url,
+            health_check_interval=30,
+            socket_keepalive=True,
+            client_name=self.client_name,
+            retry=Retry(NoBackoff(), 0),
+        )
         self._task = asyncio.create_task(self._run(self._redis), name="task-event-hub")
 
     async def stop(self) -> None:
-        task, redis = self._task, self._redis
-        self._task = self._redis = None
-        if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        task, self._task = self._task, None
+        self._subscribed.clear()
+        try:
+            if task is not None:
+                task.cancel()
+                await asyncio.wait({task})  # a cancellation of our caller is not swallowed here
+                if not task.cancelled() and (exc := task.exception()) is not None:
+                    logger.error("task_event_hub_failed", error=type(exc).__name__)
+        finally:
+            await self._close_client()
+
+    async def _close_client(self) -> None:
+        redis, self._redis = self._redis, None
         if redis is not None:
             with contextlib.suppress(Exception):
                 await redis.aclose()
@@ -131,12 +163,29 @@ class TaskEventHub:
             for listener in group:
                 listener.lagged = True
 
-    def _route(self, data: Any) -> None:
+    def _route(self, item: dict[str, Any]) -> None:
+        """Deliver one pubsub item; anything that is not a well-formed event of its channel is dropped."""
         try:
-            message = json.loads(data)
-            task_id = uuid.UUID(message["task_id"])
-        except (ValueError, TypeError, KeyError):
-            logger.warning("task_event_hub_bad_message")  # never the payload
+            message = json.loads(item.get("data", b""))
+            raw_id = message.get("task_id") if isinstance(message, dict) else None
+            if not isinstance(raw_id, str):
+                logger.warning("task_event_hub_bad_message", reason="no_task_id")  # never the payload
+                return
+            task_id = uuid.UUID(raw_id)
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            logger.warning("task_event_hub_bad_message", reason="not_json")
+            return
+        if item.get("channel") != task_channel(task_id).encode():
+            logger.warning("task_event_hub_bad_message", reason="channel_mismatch")
+            return
+        seq = message.get("seq")
+        if (
+            not (seq is None or (isinstance(seq, int) and not isinstance(seq, bool) and seq >= 1))
+            or not isinstance(message.get("type"), str)
+            or not isinstance(message.get("ts"), str)
+            or not isinstance(message.get("payload"), dict)
+        ):
+            logger.warning("task_event_hub_bad_message", reason="shape")
             return
         for listener in tuple(self._listeners.get(task_id, ())):
             listener.put(message)
@@ -149,16 +198,22 @@ class TaskEventHub:
                 await pubsub.psubscribe(HUB_PATTERN)
                 # Events published while the subscription was down are gone: streams must re-read the history.
                 self._mark_all_lagged()
+                self._subscribed.set()
                 delay = HUB_BACKOFF_FIRST
                 while True:
                     item = await pubsub.get_message(ignore_subscribe_messages=True, timeout=HUB_POLL_SECONDS)
                     if item is not None:
-                        self._route(item.get("data"))
+                        self._route(item)
             except (TimeoutError, ConnectionError, RedisError, OSError) as exc:
-                # A timeout while reading is normal on a quiet channel; any of these resubscribes.
+                self._subscribed.clear()
                 self._mark_all_lagged()
                 logger.warning("task_event_hub_reconnecting", error=type(exc).__name__, backoff=delay)
+            except Exception as exc:  # the reader must never die: report through lagged and start over
+                self._subscribed.clear()
+                self._mark_all_lagged()
+                logger.error("task_event_hub_failed", error=type(exc).__name__, backoff=delay)
             finally:
+                self._subscribed.clear()
                 with contextlib.suppress(Exception):
                     await pubsub.aclose()
             await asyncio.sleep(delay)

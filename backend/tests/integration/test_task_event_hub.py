@@ -33,6 +33,7 @@ async def redis() -> AsyncIterator[Redis]:
 async def hub() -> AsyncIterator[TaskEventHub]:
     hub = TaskEventHub(REDIS_URL, queue_max=2)
     await hub.start()
+    await hub.wait_subscribed(WAIT)
     yield hub
     await hub.stop()
 
@@ -45,11 +46,12 @@ async def publish(redis: Redis, task_id: uuid.UUID, seq: int) -> None:
     await redis.publish(task_channel(task_id), json.dumps(message(task_id, seq)))
 
 
-async def subscribed(redis: Redis) -> None:
-    """Wait until the hub's pattern subscription is live (it shows as a pattern on the server)."""
-    async with asyncio.timeout(WAIT):
-        while (await redis.pubsub_numpat()) < 1:  # noqa: ASYNC110 - polling another process's state
-            await asyncio.sleep(0.02)
+async def kill_hub_connection(redis: Redis, hub: TaskEventHub) -> None:
+    """Kill only this hub's own pubsub connection (other suites share the Redis server)."""
+    mine = [c for c in await redis.client_list() if c.get("name") == hub.client_name]
+    assert mine
+    for client in mine:
+        await redis.client_kill_filter(_id=client["id"])
 
 
 async def lagged(listener: TaskListener) -> None:
@@ -60,7 +62,6 @@ async def lagged(listener: TaskListener) -> None:
 
 async def test_hub_routes_only_to_its_task(hub: TaskEventHub, redis: Redis) -> None:
     a, b = uuid.uuid4(), uuid.uuid4()
-    await subscribed(redis)
     with hub.listen(a) as la, hub.listen(b) as lb:
         await publish(redis, a, 1)
         got = await asyncio.wait_for(la.queue.get(), WAIT)
@@ -73,7 +74,6 @@ async def test_hub_routes_only_to_its_task(hub: TaskEventHub, redis: Redis) -> N
 
 async def test_full_queue_marks_lagged(hub: TaskEventHub, redis: Redis) -> None:
     a = uuid.uuid4()
-    await subscribed(redis)
     with hub.listen(a) as listener:
         for seq in (1, 2, 3):
             await publish(redis, a, seq)
@@ -85,7 +85,6 @@ async def test_full_queue_marks_lagged(hub: TaskEventHub, redis: Redis) -> None:
 
 async def test_listener_leaves_on_exit(hub: TaskEventHub, redis: Redis) -> None:
     a, b = uuid.uuid4(), uuid.uuid4()
-    await subscribed(redis)
     with hub.listen(a) as gone:
         pass
     with hub.listen(b) as marker:
@@ -98,26 +97,20 @@ async def test_listener_leaves_on_exit(hub: TaskEventHub, redis: Redis) -> None:
 
 async def test_hub_resubscribes_after_connection_loss(hub: TaskEventHub, redis: Redis) -> None:
     a = uuid.uuid4()
-    await subscribed(redis)
     with hub.listen(a) as listener:
-        await redis.execute_command("CLIENT", "KILL", "TYPE", "pubsub")
+        await kill_hub_connection(redis, hub)
         await lagged(listener)
+        assert not hub.subscribed
         assert listener.take_lagged() is True
-        await subscribed(redis)
-        async with asyncio.timeout(WAIT):
-            while True:
-                await publish(redis, a, 9)
-                try:
-                    got = await asyncio.wait_for(listener.queue.get(), 0.3)
-                except TimeoutError:
-                    continue
-                break
+        await hub.wait_subscribed(WAIT)
+        assert hub.subscribed
+        await publish(redis, a, 9)
+        got = await asyncio.wait_for(listener.queue.get(), WAIT)
         assert got["seq"] == 9
 
 
 async def test_malformed_json_is_ignored(hub: TaskEventHub, redis: Redis) -> None:
     a = uuid.uuid4()
-    await subscribed(redis)
     with hub.listen(a) as listener:
         await redis.publish(task_channel(a), "not json {")
         await publish(redis, a, 1)
@@ -143,3 +136,102 @@ async def test_lifespan_starts_and_stops_hub() -> None:
     async with app.router.lifespan_context(app):
         assert hub.running
     assert not hub.running
+
+
+async def deliver_marker(redis: Redis, listener: TaskListener, task_id: uuid.UUID, seq: int) -> None:
+    await publish(redis, task_id, seq)
+    assert (await asyncio.wait_for(listener.queue.get(), WAIT))["seq"] == seq
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"task_id": 5}',
+        '{"task_id": true}',
+        '{"task_id": ["x"]}',
+        '{"task_id": {"a": 1}}',
+        "[1, 2]",
+        "7",
+        "null",
+        "[" * 100000,
+    ],
+)
+async def test_odd_messages_never_kill_the_hub(hub: TaskEventHub, redis: Redis, raw: str) -> None:
+    a = uuid.uuid4()
+    with hub.listen(a) as listener:
+        await redis.publish(task_channel(a), raw)
+        await deliver_marker(redis, listener, a, 1)
+    assert hub.running
+
+
+async def test_message_on_another_channel_is_dropped(hub: TaskEventHub, redis: Redis) -> None:
+    a, b = uuid.uuid4(), uuid.uuid4()
+    with hub.listen(a) as listener:
+        await redis.publish(task_channel(b), json.dumps(message(a, 1)))  # claims a, sent on b's channel
+        await deliver_marker(redis, listener, a, 2)
+        assert listener.queue.empty()
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [{"seq": 0}, {"seq": "1"}, {"seq": True}, {"seq": 1.5}, {"type": 3}, {"ts": None}, {"payload": []}],
+)
+async def test_wrong_shape_is_dropped(hub: TaskEventHub, redis: Redis, patch: dict[str, Any]) -> None:
+    a = uuid.uuid4()
+    with hub.listen(a) as listener:
+        await redis.publish(task_channel(a), json.dumps({**message(a, 5), **patch}))
+        await deliver_marker(redis, listener, a, 2)
+        assert listener.queue.empty()
+
+
+async def test_ephemeral_message_with_null_seq_is_delivered(hub: TaskEventHub, redis: Redis) -> None:
+    a = uuid.uuid4()
+    with hub.listen(a) as listener:
+        await redis.publish(task_channel(a), json.dumps({**message(a, 1), "seq": None}))
+        assert (await asyncio.wait_for(listener.queue.get(), WAIT))["seq"] is None
+
+
+async def test_stop_does_not_swallow_cancellation_of_its_caller(redis: Redis) -> None:
+    hub = TaskEventHub(REDIS_URL)
+    await hub.start()
+    await hub.wait_subscribed(WAIT)
+    stopping = asyncio.create_task(hub.stop())
+    await asyncio.sleep(0)
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    await hub.stop()
+    assert not hub.running
+
+
+async def test_start_after_a_dead_task_closes_the_old_client() -> None:
+    hub = TaskEventHub(REDIS_URL)
+    old = Redis.from_url(REDIS_URL)
+    closed: list[bool] = []
+    real_aclose = old.aclose
+
+    async def spy_aclose(*args: Any, **kwargs: Any) -> None:
+        closed.append(True)
+        await real_aclose(*args, **kwargs)
+
+    old.aclose = spy_aclose  # type: ignore[method-assign]
+    dead = asyncio.create_task(asyncio.sleep(0))
+    await dead
+    hub._redis = old  # pyright: ignore[reportPrivateUsage]
+    hub._task = dead  # pyright: ignore[reportPrivateUsage]
+    await hub.start()
+    try:
+        assert closed == [True]
+        assert hub.running
+    finally:
+        await hub.stop()
+
+
+async def test_subscribed_is_false_until_the_subscription_is_live() -> None:
+    hub = TaskEventHub(REDIS_URL)
+    assert not hub.subscribed
+    await hub.start()
+    await hub.wait_subscribed(WAIT)
+    assert hub.subscribed
+    await hub.stop()
+    assert not hub.subscribed

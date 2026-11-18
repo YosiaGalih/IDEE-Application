@@ -56,7 +56,8 @@ class Dependencies:
     jobs: JobQueue | None = None
     # Provider smoke tests run in the worker, which holds the key (spec 3.1e Lead decision #3).
     smoke_jobs: SmokeQueue | None = None
-    # Live task events (SSE). None until started: routes must work without a running hub.
+    # Live task events (SSE). Built here, started by the app lifespan; None or not started in tests,
+    # and routes must work without a running hub.
     hub: TaskEventHub | None = None
 
     @classmethod
