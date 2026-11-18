@@ -18,6 +18,7 @@ from structlog.testing import capture_logs
 
 from app.core.audit import AuditWriter
 from app.core.db import make_sessionmaker
+from app.core.errors import AppError
 from app.core.redaction import Redactor
 from app.core.security import hash_password
 from app.models.audit import AuditEvent
@@ -160,8 +161,8 @@ def started(step: str) -> tuple[str, dict[str, Any]]:
     return ("task.step_started", {"step": step})
 
 
-def finished(step: str) -> tuple[str, dict[str, Any]]:
-    return ("task.step_finished", {"step": step, "status": "done"})
+def finished(step: str, status: str = "done") -> tuple[str, dict[str, Any]]:
+    return ("task.step_finished", {"step": step, "status": status})
 
 
 def changed(source: str, target: str, reason: str | None) -> tuple[str, dict[str, Any]]:
@@ -216,7 +217,7 @@ async def test_runs_planning_steps_in_order_and_records_them(engine: AsyncEngine
     assert after.checkpoint == {
         "user_set": ["title"],
         "dispatch": {"planning_attempts": 1},  # created although the draft had no dispatch yet
-        "completed_steps": ["intake", "context"],
+        "completed_steps": ["intake", "context", "plan"],  # plan decided the next status: it is done
     }
     assert (after.lease_owner, after.lease_expires_at) == (None, None)
     stored = await events(engine, task_id)
@@ -226,10 +227,11 @@ async def test_runs_planning_steps_in_order_and_records_them(engine: AsyncEngine
         started("context"),
         finished("context"),
         started("plan"),
+        finished("plan"),  # same transaction as the status change, just before it
         changed("draft", "planned", "plan ready"),
     ]
-    assert [seq for seq, _, _ in stored] == [1, 2, 3, 4, 5, 6]
-    assert [m["seq"] for m in bus.messages] == [1, 2, 3, 4, 5, 6]
+    assert [seq for seq, _, _ in stored] == [1, 2, 3, 4, 5, 6, 7]
+    assert [m["seq"] for m in bus.messages] == [1, 2, 3, 4, 5, 6, 7]
     assert bus.unseen == []  # every event was published after its commit
     async with make_sessionmaker(engine)() as session:
         actors = (
@@ -255,13 +257,14 @@ async def test_resume_skips_completed_steps(engine: AsyncEngine, make_task) -> N
     after = await row(engine, task_id)
     assert after.status == "planned"
     assert after.checkpoint == {
-        "completed_steps": ["intake", "context"],
+        "completed_steps": ["intake", "context", "plan"],
         "dispatch": {**DISPATCHED, "planning_attempts": 3},  # the third attempt still plans
     }
     assert await kinds(engine, task_id) == [
         started("context"),
         finished("context"),
         started("plan"),
+        finished("plan"),
         changed("draft", "planned", "plan ready"),
     ]
 
@@ -321,6 +324,7 @@ async def test_queued_claim_moves_to_running_atomically(
     assert await kinds(engine, task_id) == [
         changed("queued", "running", None),
         started("implement"),
+        finished("implement"),
         changed("running", "interrupted", "validation_unavailable"),
     ]
     assert bus.unseen == []
@@ -380,8 +384,12 @@ async def test_step_fail_and_transition(engine: AsyncEngine, make_task) -> None:
         "The request names no repository",
         None,
     )
-    assert "completed_steps" not in after.checkpoint
-    assert await kinds(engine, failing) == [started("intake"), changed("draft", "failed", "intake_rejected")]
+    assert "completed_steps" not in after.checkpoint  # a retry runs intake again
+    assert await kinds(engine, failing) == [
+        started("intake"),
+        finished("intake", "failed"),
+        changed("draft", "failed", "intake_rejected"),
+    ]
 
     async def asks(_: StepContext) -> StepResult:
         return StepResult.transition(TaskStatus.NEEDS_CLARIFICATION, "questions")
@@ -398,7 +406,11 @@ async def test_step_fail_and_transition(engine: AsyncEngine, make_task) -> None:
         "questions",
         None,
     )
-    assert after.checkpoint["completed_steps"] == ["intake"]
+    assert after.checkpoint["completed_steps"] == ["intake", "context"]
+    assert (await kinds(engine, unclear))[-2:] == [
+        finished("context"),
+        changed("draft", "needs_clarification", "questions"),
+    ]
 
 
 async def test_unknown_step_is_unavailable(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
@@ -614,4 +626,36 @@ async def test_completed_steps_never_duplicates(engine: AsyncEngine, make_task) 
     steps = Steps(intake=recorded_elsewhere, plan=to_planned)
     await make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id)
 
-    assert (await row(engine, task_id)).checkpoint["completed_steps"] == ["intake", "context"]
+    assert (await row(engine, task_id)).checkpoint["completed_steps"] == ["intake", "context", "plan"]
+
+
+@pytest.mark.parametrize("how", ["transition", "fail"])
+async def test_refused_result_leaves_no_step_finish(engine: AsyncEngine, make_task, how: str) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("draft")
+
+    async def refused(_: StepContext) -> StepResult:
+        if how == "transition":
+            return StepResult.transition(TaskStatus.COMPLETED, "skip")  # draft -> completed is not allowed
+        return StepResult.fail("", "an empty error code is refused")
+
+    steps = Steps(intake=refused)
+    bus = RecordingBus(engine)
+    with pytest.raises((AppError, ValueError)) as caught:
+        await make_engine(engine, bus, steps.registry(*PLANNING)).run(task_id)
+
+    if how == "transition":
+        assert isinstance(caught.value, AppError) and caught.value.code == "INVALID_TRANSITION"
+    else:
+        assert isinstance(caught.value, ValueError) and "error_code" in str(caught.value)
+    assert steps.names == ["intake"]  # the engine stops: nothing after the refused step runs
+    after = await row(engine, task_id)
+    # R-T3c: the error goes up, the lease is released, no status or error code is written.
+    assert (after.status, after.error_code, after.current_step, after.lease_owner) == (
+        "draft",
+        None,
+        "intake",
+        None,
+    )
+    assert "completed_steps" not in after.checkpoint
+    assert await kinds(engine, task_id) == [started("intake")]
+    assert [m["type"] for m in bus.messages] == ["task.step_started"]  # no step_finished was published

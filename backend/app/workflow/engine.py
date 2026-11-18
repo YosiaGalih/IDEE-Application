@@ -286,48 +286,57 @@ class TaskEngine:
         async with ports.sessions() as db:
             task = await self._locked(db, task_id, status)
             stopped: Stopped | None = None
-            match result.kind:
-                case "done":
-                    await self._record_done(db, task_id, step)
-                case "fail":
-                    await fail_task(
-                        db,
-                        task,
-                        error_code=result.error_code,
-                        message=result.message,
-                        actor=ACTOR,
-                        audit=ports.audit,
-                    )
-                    stopped = "failed"
-                case "transition":
-                    assert result.to is not None
-                    await transition(
-                        db, task, result.to, reason=result.reason, actor=ACTOR, audit=ports.audit
-                    )
-                    stopped = "transitioned"
+            # One savepoint: a refused transition or fail_task also undoes the step's finish (ruling R-T3f).
+            async with db.begin_nested():
+                match result.kind:
+                    case "done":
+                        await self._step_finished(db, task_id, step, "done")
+                    case "fail":
+                        await self._step_finished(db, task_id, step, "failed")
+                        await fail_task(
+                            db,
+                            task,
+                            error_code=result.error_code,
+                            message=result.message,
+                            actor=ACTOR,
+                            audit=ports.audit,
+                        )
+                        stopped = "failed"
+                    case "transition":
+                        assert result.to is not None
+                        await self._step_finished(db, task_id, step, "done")
+                        await transition(
+                            db, task, result.to, reason=result.reason, actor=ACTOR, audit=ports.audit
+                        )
+                        stopped = "transitioned"
             if stopped is not None:
                 await release_lease(db, task_id, ports.worker_id)
             await commit_and_publish(db, ports.bus)
         return stopped
 
-    async def _record_done(self, db: AsyncSession, task_id: uuid.UUID, step: str) -> None:
-        completed = func.coalesce(Task.checkpoint["completed_steps"], literal([], JSONB))
-        await db.execute(
-            update(Task)
-            .where(Task.id == task_id, ~Task.checkpoint.contains({"completed_steps": [step]}))
-            .values(
-                checkpoint=func.jsonb_set(
-                    Task.checkpoint, _path("completed_steps"), completed.op("||")(literal([step], JSONB))
+    async def _step_finished(
+        self, db: AsyncSession, task_id: uuid.UUID, step: str, outcome: Literal["done", "failed"]
+    ) -> None:
+        """Emit ``task.step_finished``. Only a done step joins ``completed_steps``: a failed one runs again on
+        retry."""
+        if outcome == "done":
+            completed = func.coalesce(Task.checkpoint["completed_steps"], literal([], JSONB))
+            await db.execute(
+                update(Task)
+                .where(Task.id == task_id, ~Task.checkpoint.contains({"completed_steps": [step]}))
+                .values(
+                    checkpoint=func.jsonb_set(
+                        Task.checkpoint, _path("completed_steps"), completed.op("||")(literal([step], JSONB))
+                    )
                 )
+                .execution_options(synchronize_session=False)
             )
-            .execution_options(synchronize_session=False)
-        )
         await emit_task_event(
             db,
             None,
             task_id,
             "task.step_finished",
-            {"step": step, "status": "done"},
+            {"step": step, "status": outcome},
             redactor=self._ports.audit.redactor,
         )
 
