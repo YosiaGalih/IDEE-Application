@@ -125,7 +125,9 @@ def run_task(task_id: str) -> dict[str, object]:
         return {"status": "invalid_task_id"}
     try:
         outcome = asyncio.run(execute_task(parsed))
-    except Exception as exc:  # the engine logged it (task_engine_failed); not again here
+    except Exception as exc:
+        # Covers setup and claim failures too, which the engine never logs; a step crash is logged twice.
+        logger.error("run_task_failed", task_id=str(parsed), error_type=type(exc).__name__)
         raise RunTaskFailed(type(exc).__name__) from None
     if outcome.claim in (ClaimResult.AT_CAPACITY, ClaimResult.BUSY):
         # No retry or countdown: the dispatch sweep sends the task again after its grace period.

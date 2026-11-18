@@ -149,6 +149,7 @@ def test_an_invalid_task_id_is_logged_and_not_raised(monkeypatch: pytest.MonkeyP
 def test_engine_exceptions_propagate_to_celery_as_run_task_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Celery logs the failure itself; the raw message (it may carry a secret) must not reach that line."""
     secret = "sk-test-" + "engine-0123"
+    task_id = uuid.uuid4()
 
     class Boom:
         async def run(self, task_id: uuid.UUID) -> EngineOutcome:
@@ -156,13 +157,36 @@ def test_engine_exceptions_propagate_to_celery_as_run_task_failed(monkeypatch: p
 
     monkeypatch.setattr(jobs, "build_orchestrator", lambda **_: Boom())
     with capture_logs() as logs:
-        task = jobs.run_task.apply(args=[str(uuid.uuid4())])
+        task = jobs.run_task.apply(args=[str(task_id)])
     assert task.failed()
     assert isinstance(task.result, jobs.RunTaskFailed)
     assert str(task.result) == "RuntimeError"
     assert secret not in str(task.result) and secret not in task.traceback
     assert task.result.__suppress_context__  # `from None`: no chained traceback with the original text
-    assert logs == []  # the engine logged already; run_task does not log a second time
+    failed = [e for e in logs if e["event"] == "run_task_failed"]
+    assert [(e["log_level"], e["task_id"], e["error_type"]) for e in failed] == [
+        ("error", str(task_id), "RuntimeError")
+    ]
+    assert secret not in repr(logs) and "exc_info" not in failed[0]
+
+
+def test_a_failure_before_any_step_is_logged_by_run_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Setup or claim failures (a database outage) never reach the engine's own log: run_task covers them."""
+    task_id = uuid.uuid4()
+    secret = "sk-test-" + "setup-0123"
+
+    def broken(**_: Any) -> None:
+        raise OSError("database down " + secret)
+
+    monkeypatch.setattr(jobs, "build_orchestrator", broken)
+    with capture_logs() as logs:
+        task = jobs.run_task.apply(args=[str(task_id)])
+    assert task.failed() and str(task.result) == "OSError"
+    assert [(e["task_id"], e["error_type"]) for e in logs if e["event"] == "run_task_failed"] == [
+        (str(task_id), "OSError")
+    ]
+    assert [e for e in logs if e["event"] == "task_engine_failed"] == []
+    assert secret not in repr(logs) and secret not in task.traceback
 
 
 def test_run_task_failed_survives_pickling() -> None:
