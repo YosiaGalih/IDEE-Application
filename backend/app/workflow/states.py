@@ -88,6 +88,12 @@ def _check_inputs(db: AsyncSession, task: Task, actor: Actor) -> None:
         raise ValueError("task.status was modified outside transition")
 
 
+def _check_not_expired(task: Task) -> None:
+    expired = inspect(task).expired_attributes
+    if "status" in expired or "version" in expired:
+        raise ValueError("task object is expired (e.g. after a rollback); reload it before transitioning")
+
+
 async def transition(
     db: AsyncSession,
     task: Task,
@@ -101,9 +107,7 @@ async def transition(
 
     ``audit`` carries the redactor with the configured secret literals; ``reason`` is redacted with it.
     """
-    expired = inspect(task).expired_attributes
-    if "status" in expired or "version" in expired:
-        raise ValueError("task object is expired (e.g. after a rollback); reload it before transitioning")
+    _check_not_expired(task)
     source = TaskStatus(task.status)
     target = TaskStatus(to)
     if target not in ALLOWED[source]:
@@ -192,6 +196,9 @@ async def fail_task(
 
     The message is redacted here too (idempotent) so no caller can store a secret by forgetting to.
     """
+    # Before any attribute read: an expired object would lazy-load (MissingGreenlet), not fail clearly.
+    _check_not_expired(task)
+    _check_inputs(db, task, actor)
     if not 1 <= len(error_code) <= _ERROR_CODE_LENGTH:
         raise ValueError(f"error_code must be 1-{_ERROR_CODE_LENGTH} characters")
     safe_message = audit.redactor.redact(message)[:_ERROR_MESSAGE_LENGTH]

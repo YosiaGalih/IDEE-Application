@@ -6,7 +6,7 @@ import uuid
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -408,7 +408,20 @@ async def test_fail_task_rolls_back_together(engine: AsyncEngine, task_id: uuid.
         with pytest.raises(AppError) as caught:
             await fail_task(session, stale, error_code="E", message="m", actor=ACTOR, audit=AUDIT)
         assert caught.value.code == "VERSION_CONFLICT"
+        # Same transaction, no rollback: the savepoint alone must have undone the error columns.
+        assert await session.scalar(select(Task.error_code).where(Task.id == task_id)) is None
+        assert stale.error_code is None and stale.error_message is None
+        assert not inspect(stale).expired_attributes
+        await session.refresh(stale)
+        assert (stale.status, stale.version) == ("planned", 2)
         await session.rollback()
-    async with sessions() as check:
-        row = await load(check, task_id)
-        assert (row.status, row.error_code, row.error_message) == ("planned", None, None)
+
+
+async def test_fail_task_refuses_expired_task(session: AsyncSession, task_id: uuid.UUID) -> None:
+    task = await load(session, task_id)
+    session.expire(task)
+    with pytest.raises(ValueError, match="reload"):
+        await fail_task(session, task, error_code="E", message="m", actor=ACTOR, audit=AUDIT)
+    await session.rollback()
+    fresh = await load(session, task_id)
+    assert (fresh.status, fresh.error_code, fresh.error_message, fresh.version) == ("draft", None, None, 1)
