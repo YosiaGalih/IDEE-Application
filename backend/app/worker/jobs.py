@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import asdict
 
 from celery import shared_task
@@ -14,12 +15,20 @@ from app.core.db import make_engine, make_sessionmaker
 from app.core.events import RedisEventBus
 from app.core.logging import get_logger
 from app.core.redaction import Redactor
+from app.services.job_queue import CeleryJobQueue
+from app.services.orchestrator import build_orchestrator
 from app.services.run_recovery import RunRecoveryIncomplete, RunRecoveryResult, recover_runs
+from app.worker.identity import worker_id
+from app.workflow.dispatch import Dispatcher, DispatchResult, redispatch_orphans
+from app.workflow.engine import EngineOutcome
+from app.workflow.lease import ClaimResult
 from app.workflow.recovery import RecoveryIncomplete, RecoveryResult, recover_expired
 
 # Shorter than the 30 s beat interval: a hung database must not pin a worker slot (review WP-1.1f). Each of
 # the two phases has half of it (ruling R8), so a slow task phase never eats the run phase's time.
 SWEEP_TIMEOUT_SECONDS = 25.0
+DISPATCH_SWEEP_TIMEOUT_SECONDS = 25.0
+_MAX_LOGGED_ID = 80
 
 logger = get_logger(__name__)
 
@@ -91,3 +100,55 @@ def recovery_counts(tasks: RecoveryResult, runs: RunRecoveryResult) -> dict[str,
         "runs_failed": runs.failed,
         "runs_skipped": runs.skipped,
     }
+
+
+@shared_task(name="app.worker.jobs.run_task")
+def run_task(task_id: str) -> dict[str, object]:
+    """One delivery of the task engine. Engine exceptions propagate to Celery (ruling R-T3c)."""
+    try:
+        parsed = uuid.UUID(task_id)
+    except (ValueError, AttributeError, TypeError):
+        # Not retried: redelivering an unparseable id would only poison the queue (ruling R-T5a).
+        logger.error("run_task_invalid_id", value=repr(task_id)[:_MAX_LOGGED_ID])
+        return {"status": "invalid_task_id"}
+    outcome = asyncio.run(execute_task(parsed))
+    if outcome.claim in (ClaimResult.AT_CAPACITY, ClaimResult.BUSY):
+        # No retry or countdown: the dispatch sweep sends the task again after its grace period.
+        logger.info("task_claim_deferred", task_id=str(parsed), reason=outcome.claim.value)
+    return {"claim": outcome.claim.value, "ran": list(outcome.ran), "stopped": outcome.stopped}
+
+
+async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
+    settings = load_settings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(settings.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0)
+    try:
+        orchestrator = build_orchestrator(
+            sessions=make_sessionmaker(engine),
+            bus=RedisEventBus(redis),
+            audit=AuditWriter(Redactor(settings.secret_values())),
+            settings=settings,
+            worker_id=worker_id(),
+        )
+        return await orchestrator.run(task_id)
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="app.worker.jobs.dispatch_sweep")
+def dispatch_sweep() -> dict[str, int]:
+    """Separate from ``recovery_sweep``: an error in one never blocks the other."""
+    return asdict(asyncio.run(sweep_dispatch()))
+
+
+async def sweep_dispatch(*, dispatcher: Dispatcher | None = None) -> DispatchResult:
+    settings = load_settings()
+    engine = make_engine(settings.database_url)
+    try:
+        if dispatcher is None:
+            dispatcher = CeleryJobQueue(settings.redis_url)
+        async with asyncio.timeout(DISPATCH_SWEEP_TIMEOUT_SECONDS):
+            return await redispatch_orphans(make_sessionmaker(engine), dispatcher)
+    finally:
+        await engine.dispose()
