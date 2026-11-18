@@ -2946,3 +2946,111 @@ PoC AG-13 (LOW-1 stop saat reject, LOW-2 identity map basi, LOW-3 audit tak tert
 - tampilan audit platform vs project (INFO-B);
 - 402 `billing_error` ke `auth` bila PO menghendaki (§13 baris b);
 - syarat WP-3.1f2b1 tetap berlaku.
+
+**Sesudah PR #36 (fakta, 17 Nov 2026) [Pasti]:**
+- PR #36 (WP-3.1f2b2) mencapai CI 9/9 di 6abcf73, sehingga syarat AG-13 terakhir (`security-scan` hijau) terpenuhi.
+- PO me-merge-nya pada 17 Nov 2026 06:50 UTC (a75c612).
+- Push-CI `main` a75c612 hijau di kelima workflow (backend, frontend, sandbox, infra, security).
+
+### WP-3.2a (API task & chat) — conversations/messages, buat/daftar/detail task di belakang gerbang engine, validasi `context_refs` (sub-WP pertama WP-3.2; AC-04 sebagian; FR-033/034/037/038)
+
+**Dokumen kerja:**
+- Spec induk `docs/superpowers/specs/2026-11-17-wp-3.2-workflow-engine-design.md`. Isinya:
+  - pembagian 10 sub-WP (§7.2);
+  - Keputusan Lead 3.2 #1–#26 (§8);
+  - syarat warisan beserta pemiliknya (§9);
+  - konflik N1–N18 (§10, dilaporkan di #72 bullet "3.2");
+  - rancangan rinci 3.2a (§12) dan builder check (§12.4).
+- Plan `docs/superpowers/plans/2026-11-17-wp-3.2a-task-chat-api.md` (6 task).
+
+**Cara dikerjakan:** subagent-driven-development, dengan implementer dan review per task.
+- Task 2 (refs) butuh satu putaran perbaikan: galat internal tampil sebagai galat input.
+- Task 3 (buat task) butuh satu putaran: CRLF ditolak, panjang diukur sebelum `strip()`.
+- Task 4 (daftar/detail) butuh satu putaran: test 404 vakum.
+
+Review akhir datang dari lima reviewer: kk-backend-reviewer (APPROVE WITH CONDITIONS), kk-silent-failure-hunter (0C/0H/2M/5L), AG-13 (SIGNED OFF WITH CONDITIONS), serta `/code-review` sumbu Standards dan Spec. Sesudahnya ada satu fix wave (F1–F14), re-review terlingkup (Approved), dan delta AG-13 (**SIGNED OFF 🔒**).
+
+**Yang dibangun:**
+- **Migrasi 0012:**
+  - tabel `messages`: role CHECK; FK conversation/project CASCADE, user/task SET NULL;
+  - index `(conversation_id, created_at, id)`, `task_id`, `project_id`, `user_id`;
+  - kolom `tasks.context_refs jsonb` (Keputusan #22).
+- **`POST /projects/{id}/tasks`** (202) membuat task `draft`.
+  - **Gerbang:** 503 `workflow_engine_unavailable` sebelum menulis apa pun, sampai `RUNTIMES_AVAILABLE["workflow_engine"]` dibuka di 3.2d (#7).
+  - **Teks:** CRLF/CR → LF lalu `strip()`, panjang 1..20 000 diukur pada teks itu, karakter tersembunyi ditolak, lalu teks diredaksi sebelum disimpan (R3/R4).
+  - **Default:** judul turunan dari baris pertama prompt yang sudah diredaksi; `modify`/`normal` dengan `checkpoint.user_set` (#17/#23).
+  - **Budget efektif disalin** lewat `dump_budget`. Request di luar `BUDGET_MAX_*` → 422; budget project rusak → 409 `project_budget_invalid` + log.
+  - **Status project:** project `archived`/bukan `active` → 409; repo belum `ready` → 409 (#25).
+  - **Audit:** `task.created` `{task_id, source, workflow_type}` di transaksi yang sama.
+- **`GET /projects/{id}/tasks`** (filter `status` dipisah koma, `q` literal, paginasi, usage dan pending approval per halaman tanpa N+1) dan **`GET /tasks/{id}`** (bentuk `Task` §5 + §11 #1; 404 identik dengan id acak).
+- **Conversations dan messages:**
+  - conversation milik pembuatnya; selain pembuat → 404 (#21);
+  - membuat conversation butuh project `active` (R8);
+  - pesan dengan task: 202, pesan dan task dalam satu transaksi;
+  - pesan tanpa task: 201 `completed` (#26);
+  - `workflow_type`/`budget` tanpa task → 422 `only_with_task` (R6);
+  - ref path pada repo yang belum siap → 409 (R5).
+- **`context_refs`** (#13):
+  - tipe `file`/`folder`/`task`/`diff`; `test_run`/`finding` → `context_ref_unavailable`;
+  - path dicek oleh `Workspace.probe` baru: resolusi, policy, dan no-follow yang sama dengan read, tanpa membaca isi (R7);
+  - ref identik dibuang sebelum IO; probe berjalan di luar transaksi DB, lalu project dikunci dan dicek ulang (R11);
+  - path berkarakter tersembunyi ditolak (R12);
+  - yang disembunyikan policy → 422 `context_ref_hidden`, tidak pernah dibuang diam-diam (#25);
+  - root repo yang hilang → 500, bukan galat input.
+- **Ketahanan:** view dibangun sebelum commit, sehingga 5xx tidak meninggalkan task dan retry dengan `Idempotency-Key` yang sama tidak menggandakan task (F1).
+- **Matriks T6/CSRF** memuat route ber-ID (`/tasks/{task_id}`, `/conversations/{conversation_id}/messages`), dengan guard.
+- **Dokumen:** API §5 (catatan WP-3.2a), DATA_MODEL `messages` dan `tasks.context_refs`, GLOSSARY (istilah engine), #72 bullet "3.2".
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ p32-pytest.sh -q                                   # suite penuh @ e7dcd04 (kode = head d7ebd06 kecuali escape test)
+5535 passed, 1 failed  (test_git_adapter::test_grep_parses_off_the_event_loop 0.506 s > 0.5 s; flaky yang sudah tercatat, lulus sendiri)
+$ p32-pytest.sh -q -p no:randomly tests/integration/test_tasks_api.py tests/integration/test_conversations_api.py tests/integration/test_message_tables.py
+63 passed
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 349 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
+```
+
+AG-13 PoC (scratchpad `ag13poc-3.2a`):
+
+| Pengukuran | Sebelum perbaikan | Sesudah |
+|---|---|---|
+| GET tak terkait selama 16 POST paralel (20 ref ke file 64 MiB) | melambat ~385× | 1,3×–24× (absolut ≤ 214 ms) |
+| 20× cek ref 64 MiB (`probe` vs `read_file`) | 893 ms | 4,2 ms |
+
+Selama fase probe tidak ada transaksi idle maupun baris project terkunci.
+
+**Keputusan Lead selama eksekusi (ruling, dari ledger SDD):**
+- **R1:** pesan tanpa task butuh project `active`, tidak butuh repo `ready`.
+- **R2:** assert budget lewat `dump_budget`.
+- **R3:** CRLF dinormalisasi.
+- **R4:** prompt disimpan sesudah normalisasi + strip; batas mentah route 2 × `PROMPT_MAX`.
+- **R5:** ref path di repo yang belum siap → 409 `repository_not_ready`.
+- **R6:** `workflow_type`/`budget` tanpa task → 422.
+- **R7:** `Workspace.probe` tanpa baca.
+- **R8:** membuat conversation butuh project `active`.
+- **R9:** index FK `messages` (migrasi 0012 diedit di tempat, belum dirilis).
+- **R10:** ref folder `"."` tetap ditolak.
+- **R11:** dedup sebelum IO, probe di luar transaksi, kunci + cek ulang.
+- **R12:** path ref berkarakter tersembunyi ditolak.
+
+**Ditunda (bukan blocker):**
+- 503 mendahului 404 untuk chat saat gerbang tertutup (yang bocor hanya status gerbang);
+- isi pesan dibersihkan dua kali di jalur chat + task (idempoten);
+- test R5 tanpa spy disk;
+- `EACCES` → 500 mentah (sama dengan `read_file`);
+- test tie-breaker urutan;
+- *data clump* `workflow_type/budget/priority/title`;
+- salinan field view/Out;
+- `services/tasks.py` dipecah;
+- rantai `env.audit.redactor`;
+- rate limit per user untuk POST pesan/task (AG-13, opsional);
+- guard matriks berbasis nama parameter (INFO-F);
+- Zs/U+3164 di nama path diterima (INFO-C).
+
+**Syarat yang dibawa:**
+- **Backlog hardening (AG-13 LOW):** `paths.resolve` mengikuti link yang keluar lalu masuk lagi ke root, sehingga ada oracle "apakah komponen host berupa symlink" lewat `..` leksikal. Perbaikannya resolusi di bawah root fd (`openat2` `RESOLVE_IN_ROOT` atau walk `readlinkat`). Perilaku ini sudah ada sebelumnya; tidak ada akses ke luar root.
+- **3.2d (konsumen A04, AG-13 INFO-B):** baca ulang setiap ref dengan `AGENT_READ`, karena ref tersimpan bukan otorisasi (ada jendela antara probe dan insert). Nama target alias dan isi listing folder dibungkus dan disaring sebelum masuk prompt (T1). Syarat ini masuk spec dan test 3.2d.
+- **PR ini (Merge Danger):** DB lokal yang sudah menjalankan 0012 versi lama (tanpa index `project_id`/`user_id`) gagal `downgrade base`. Buat ulang DB, atau tambahkan kedua index secara manual. CI dan DB baru tidak terdampak.
+- Syarat WP-3.1f2b1/3.1f2b2 dan spec induk §9 tetap berlaku untuk 3.2b–3.2h.

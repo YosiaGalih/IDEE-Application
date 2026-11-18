@@ -52,6 +52,10 @@ ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("GET", "/api/v1/projects/{id}/budget", None),
     ("PATCH", "/api/v1/projects/{id}/budget", {"max_tokens": 1000}),
     ("DELETE", "/api/v1/projects/{id}", None),  # R3: only asks for a project_delete approval
+    ("GET", "/api/v1/projects/{id}/tasks", None),
+    ("POST", "/api/v1/projects/{id}/tasks", {"prompt": "x"}),  # 404/403 answer before the engine gate
+    ("GET", "/api/v1/projects/{id}/conversations", None),
+    ("POST", "/api/v1/projects/{id}/conversations", {}),
 ]
 FILE = "README.md"  # exists in every blank project
 WRITES = {
@@ -68,6 +72,8 @@ WRITES = {
     ("POST", "/api/v1/projects/{id}/git/commit"),
     ("POST", "/api/v1/projects/{id}/index"),
     ("PATCH", "/api/v1/projects/{id}/budget"),
+    ("POST", "/api/v1/projects/{id}/tasks"),
+    ("POST", "/api/v1/projects/{id}/conversations"),
 }
 
 
@@ -309,3 +315,144 @@ async def test_approvals_of_other_projects_do_not_exist(world: dict[str, object]
         )
         assert decision.status_code == 404
         assert (await client.get("/api/v1/approvals", params={"status": "all"})).json()["data"] == []
+
+
+# --- routes addressed by a task or conversation id (AG-13 WP-3.2a LOW) --------------------------------------
+
+# Their project comes from the row, so the door is in the service (no ``require_project_permission``); these
+# tests pin the same answers as for the project routes. ``{task_id}``/``{conversation_id}`` are filled in.
+ID_ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
+    ("GET", "/api/v1/tasks/{task_id}", None),
+    ("GET", "/api/v1/conversations/{conversation_id}/messages", None),
+    ("POST", "/api/v1/conversations/{conversation_id}/messages", {"content": "x", "create_task": False}),
+]
+ID_WRITES = {("POST", "/api/v1/conversations/{conversation_id}/messages")}
+
+
+def id_routes(app: FastAPI) -> set[tuple[str, str]]:
+    return {
+        (method, path)
+        for path, route in all_routes(app.router.routes)
+        if "{task_id}" in path or "{conversation_id}" in path
+        for method in (route.methods or set()) - {"HEAD"}
+    }
+
+
+def test_every_task_and_conversation_route_is_in_the_matrix(app: FastAPI) -> None:
+    assert id_routes(app) == {(method, path) for method, path, _ in ID_ENDPOINTS}
+
+
+@pytest.fixture
+async def addressed(world: dict[str, object], monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """A task and a conversation of the owner's project (the engine gate opened to create the task)."""
+    from app.agents import readiness
+
+    monkeypatch.setattr(readiness, "RUNTIMES_AVAILABLE", {"agent_runtime": False, "workflow_engine": True})
+    project, owner = world["project"], world["owner"]
+    assert isinstance(project, dict) and isinstance(owner, httpx.AsyncClient)
+    task = await call(owner, "POST", f"/api/v1/projects/{project['id']}/tasks", {"prompt": "Rencana rahasia"})
+    assert task.status_code == 202, task.text
+    conversation = await call(owner, "POST", f"/api/v1/projects/{project['id']}/conversations", {})
+    assert conversation.status_code == 201, conversation.text
+    return {"task_id": task.json()["data"]["id"], "conversation_id": conversation.json()["data"]["id"]}
+
+
+def fill(path: str, ids: dict[str, str]) -> str:
+    return path.format(task_id=ids["task_id"], conversation_id=ids["conversation_id"])
+
+
+def random_ids() -> dict[str, str]:
+    return {"task_id": str(uuid.uuid4()), "conversation_id": str(uuid.uuid4())}
+
+
+@pytest.mark.parametrize(("method", "path", "body"), ID_ENDPOINTS)
+@pytest.mark.parametrize("who", ["stranger", "admin"])
+async def test_id_routes_deny_other_users(
+    world: dict[str, object],
+    addressed: dict[str, str],
+    method: str,
+    path: str,
+    body: dict[str, object] | None,
+    who: str,
+) -> None:
+    owner, client = world["owner"], world[who]
+    assert isinstance(owner, httpx.AsyncClient) and isinstance(client, httpx.AsyncClient)
+    assert (await call(owner, method, fill(path, addressed), body)).status_code in (200, 201)  # it answers
+    response = await call(client, method, fill(path, addressed), body)
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+    assert "Secret Plan" not in response.text and "rahasia" not in response.text
+    missing = await call(client, method, fill(path, random_ids()), body)
+    assert (missing.status_code, missing.json()["error"]) == (404, response.json()["error"])
+
+
+@pytest.mark.parametrize(("method", "path", "body"), ID_ENDPOINTS)
+async def test_id_routes_are_gone_with_a_deleted_project(
+    world: dict[str, object],
+    addressed: dict[str, str],
+    engine: AsyncEngine,
+    method: str,
+    path: str,
+    body: dict[str, object] | None,
+) -> None:
+    project, owner = world["project"], world["owner"]
+    assert isinstance(project, dict) and isinstance(owner, httpx.AsyncClient)
+    async with make_sessionmaker(engine)() as session:
+        await session.execute(
+            update(Project).where(Project.id == project["id"]).values(status="deleted", deleted_at=func.now())
+        )
+        await session.commit()
+    response = await call(owner, method, fill(path, addressed), body)
+    assert response.status_code == 404, response.text
+    missing = await call(owner, method, fill(path, random_ids()), body)
+    assert response.json()["error"] == missing.json()["error"]
+
+
+@pytest.mark.parametrize(("method", "path", "body"), ID_ENDPOINTS)
+async def test_id_routes_deny_an_ex_member(
+    world: dict[str, object],
+    addressed: dict[str, str],
+    app: FastAPI,
+    engine: AsyncEngine,
+    method: str,
+    path: str,
+    body: dict[str, object] | None,
+) -> None:
+    """A former developer of the project: its task and even the conversation they started answer 404."""
+    project = world["project"]
+    assert isinstance(project, dict)
+    dev_id = await make_user(engine, "dev@example.test")
+    await grant(engine, dev_id, "developer", f"project:{project['id']}")
+    dev = await signed_in(app, "dev@example.test", "user-long-passphrase")
+    try:
+        own = await call(dev, "POST", f"/api/v1/projects/{project['id']}/conversations", {})
+        assert own.status_code == 201, own.text
+        ids = {**addressed, "conversation_id": own.json()["data"]["id"]}
+        assert (await call(dev, method, fill(path, ids), body)).status_code in (200, 201)  # while a member
+        async with engine.begin() as conn:
+            await conn.execute(text("DELETE FROM user_roles WHERE user_id = :id"), {"id": dev_id})
+        response = await call(dev, method, fill(path, ids), body)
+        assert response.status_code == 404, response.text
+        missing = await call(dev, method, fill(path, random_ids()), body)
+        assert response.json()["error"] == missing.json()["error"]
+    finally:
+        await dev.aclose()
+
+
+@pytest.mark.parametrize(("method", "path", "body"), [e for e in ID_ENDPOINTS if (e[0], e[1]) in ID_WRITES])
+async def test_an_id_route_write_without_the_csrf_token_is_refused(
+    world: dict[str, object],
+    addressed: dict[str, str],
+    engine: AsyncEngine,
+    method: str,
+    path: str,
+    body: dict[str, object] | None,
+) -> None:
+    owner = world["owner"]
+    assert isinstance(owner, httpx.AsyncClient)
+    sent = {"Idempotency-Key": str(uuid.uuid4())}
+    response = await owner.request(method, fill(path, addressed), json=body, headers=sent)
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "CSRF_FAILED"
+    async with engine.connect() as conn:
+        assert (await conn.execute(text("SELECT count(*) FROM messages"))).scalar_one() == 0

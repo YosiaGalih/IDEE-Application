@@ -65,6 +65,10 @@ class Task(UUIDPrimaryKey, Timestamps, Base):
     priority: Mapped[str] = mapped_column(String(8), nullable=False, server_default=text("'normal'"))
     budget_limit: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=_EMPTY_JSON)
     checkpoint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=_EMPTY_JSON)
+    # References the creator attached (files, symbols, tasks); WP-3.2a.
+    context_refs: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     branch_name: Mapped[str | None] = mapped_column(String(120))
     base_commit: Mapped[str | None] = mapped_column(String(64))
     iteration: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
