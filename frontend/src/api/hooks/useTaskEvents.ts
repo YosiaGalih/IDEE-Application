@@ -45,7 +45,7 @@ type Inner = {
 export type TaskEventsState = Omit<Inner, "taskId"> & {
   /** The screen state to show for the stream, null while it is connecting or open. */
   uxState: UxState | null;
-  /** Opens the stream again from the last delivered seq (after `failed`, or to retry now). */
+  /** Opens the stream again from the last delivered seq (after `failed` or `ended`, or to retry now). */
   reconnect: () => void;
 };
 
@@ -72,7 +72,9 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
   const [state, setState] = useState<Inner>(() => initial(taskId, options.afterSeq ?? null));
   const [generation, setGeneration] = useState(0);
   const optionsRef = useRef(options);
+  /** The resume point of `lastSeqTaskRef`'s task: written only by that task's active stream. */
   const lastSeqRef = useRef<number | null>(options.afterSeq ?? null);
+  const lastSeqTaskRef = useRef<string | null>(taskId);
   useLayoutEffect(() => {
     optionsRef.current = options; // the latest callbacks, without reopening the stream
   });
@@ -87,7 +89,17 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
   useEffect(() => {
     if (!taskId) return;
     const opts = optionsRef.current;
-    const update = (change: (s: Inner) => Inner) => setState((s) => (s.taskId === taskId ? change(s) : s));
+    // Another task resumes from its own afterSeq. Reset here, where its stream opens: until this effect runs
+    // the previous task's stream is still open and may write the ref (React runs layout effects earlier).
+    if (lastSeqTaskRef.current !== taskId) {
+      lastSeqTaskRef.current = taskId;
+      lastSeqRef.current = opts.afterSeq ?? null;
+    }
+    /** False once this effect is cleaned up: a late callback of its stream then changes nothing. */
+    let live = true;
+    const update = (change: (s: Inner) => Inner) => {
+      if (live) setState((s) => (s.taskId === taskId ? change(s) : s));
+    };
     const invalid = (seq: number | null, reason: string) =>
       update((s) => ({
         ...s,
@@ -107,6 +119,7 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
       onStatus: (status, error) => update((s) => ({ ...s, status, error: status === "open" ? null : error })),
       onProtocolError: (message) => invalid(null, message),
       onFrame: (frame) => {
+        if (!live) return;
         let parsed: unknown;
         try {
           parsed = JSON.parse(frame.data);
@@ -148,13 +161,11 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
         }
       },
     });
-    return () => stream.close();
+    return () => {
+      live = false;
+      stream.close();
+    };
   }, [taskId, generation]);
-
-  // A new task id resets the resume point too.
-  useLayoutEffect(() => {
-    lastSeqRef.current = optionsRef.current.afterSeq ?? null;
-  }, [taskId]);
 
   const reconnect = useCallback(() => setGeneration((g) => g + 1), []);
   return {

@@ -33,7 +33,7 @@ export type StreamOptions = {
 
 export type EventStream = {
   close(): void;
-  /** Starts again after `failed` or `ended` (resuming from lastSeq); no effect otherwise. */
+  /** Starts again after `failed` or `ended` (resuming from lastSeq, reported as `connecting`); no effect otherwise. */
   retry(): void;
   lastSeq(): number | null;
 };
@@ -215,12 +215,7 @@ export function openEventStream(options: StreamOptions): EventStream {
           // A new frame proves the stream works; an accepted handshake or a replayed duplicate does not.
           if (outcome === "new") failures = 0;
         }
-        if (ended) {
-          attempt.abort();
-          reader.cancel().catch(() => {});
-          break;
-        }
-        if (gap) {
+        if (ended || gap) {
           attempt.abort();
           reader.cancel().catch(() => {});
           break;
@@ -276,6 +271,7 @@ export function openEventStream(options: StreamOptions): EventStream {
       if (closed || !stopped) return;
       stopped = false;
       failures = 0;
+      status = null; // a fresh start the caller asked for: connecting, not reconnecting
       void run();
     },
     lastSeq: () => lastSeq,
