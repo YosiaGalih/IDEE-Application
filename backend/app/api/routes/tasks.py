@@ -22,10 +22,11 @@ from app.api.routes.dashboard import UsageOut
 from app.api.routes.projects import EnvDep, _respond
 from app.core.errors import AppError
 from app.models.enums import TASK_STATUSES
-from app.services import tasks
+from app.services import task_events, tasks
 from app.services.context_refs import MAX_CONTEXT_REFS, ContextRef
 from app.services.project_budget import BudgetDefaults
 from app.services.projects import PAGE_SIZE_MAX, Actor
+from app.services.task_events import HISTORY_LIMIT_MAX
 from app.services.tasks import PROMPT_MAX, TITLE_MAX, TaskCreate, TaskSummary, TaskView
 
 router = APIRouter(tags=["tasks"])
@@ -219,6 +220,21 @@ async def get_task(request: Request, task_id: uuid.UUID, actor: CurrentActor, en
         env, actor, task_id, iteration_max=request.app.state.settings.task_max_iterations
     )
     return _respond(request, TaskOut.of(view).model_dump(mode="json"))
+
+
+@router.get("/tasks/{task_id}/events/history")
+async def task_event_history(
+    request: Request,
+    task_id: uuid.UUID,
+    actor: CurrentActor,
+    env: EnvDep,
+    after_seq: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
+    limit: Annotated[int, Query(ge=1, le=HISTORY_LIMIT_MAX)] = 100,
+) -> JSONResponse:
+    messages, next_after_seq = await task_events.history(
+        env, actor, task_id, after_seq=after_seq, limit=limit
+    )
+    return _respond(request, messages, meta={"next_after_seq": next_after_seq})
 
 
 @router.post("/projects/{project_id}/tasks")

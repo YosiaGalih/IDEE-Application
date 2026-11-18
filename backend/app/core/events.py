@@ -81,7 +81,7 @@ async def emit_task_event(
         if bus is None:
             raise ValueError("an ephemeral event needs a bus: it is never stored")
         # Ephemeral events are lossy by design (deltas, output chunks): a Redis blip must not abort a run.
-        await _publish(bus, _message(task_id, None, type, now, safe_payload))
+        await _publish(bus, event_message(task_id, None, type, now, safe_payload))
         return None
 
     seq = (
@@ -98,7 +98,7 @@ async def emit_task_event(
     db.add(TaskEvent(task_id=task_id, seq=seq, type=type, payload=safe_payload, created_at=now))
     await db.flush()
     _hook(db.sync_session)
-    db.info.setdefault(_UNCOMMITTED, []).append(_message(task_id, seq, type, now, safe_payload))
+    db.info.setdefault(_UNCOMMITTED, []).append(event_message(task_id, seq, type, now, safe_payload))
     return seq
 
 
@@ -198,5 +198,7 @@ def _on_rollback(session: Session, previous_transaction: SessionTransaction) -> 
     session.info[_SAVEPOINTS] = {}
 
 
-def _message(task_id: uuid.UUID, seq: int | None, type: str, ts: datetime, payload: Any) -> dict[str, Any]:
+def event_message(
+    task_id: uuid.UUID, seq: int | None, type: str, ts: datetime, payload: Any
+) -> dict[str, Any]:
     return {"task_id": str(task_id), "seq": seq, "type": type, "ts": ts.isoformat(), "payload": payload}

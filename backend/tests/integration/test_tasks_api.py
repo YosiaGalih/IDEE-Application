@@ -18,10 +18,12 @@ from structlog.testing import capture_logs
 from app.agents import readiness
 from app.core.db import make_sessionmaker
 from app.core.errors import AppError
+from app.core.events import emit_task_event, event_message
 from app.core.rbac import ROLE_PERMISSIONS
+from app.core.redaction import Redactor
 from app.models.approvals import Approval
 from app.models.audit import AuditEvent
-from app.models.tasks import Task
+from app.models.tasks import Task, TaskEvent
 from app.services import tasks as tasks_service
 from app.services.project_budget import BUDGET_MAX_TOKENS
 from app.services.tasks import PROMPT_MAX, TITLE_MAX, TaskView
@@ -687,3 +689,74 @@ async def test_an_invalid_agentignore_hides_every_ref_and_is_logged(
     [entry] = [entry for entry in logs if entry["event"] == "context_refs_agentignore_invalid"]
     assert (entry["log_level"], entry["project_id"]) == ("warning", project_id)
     assert "##" not in str(entry)
+
+
+# --- task event history (WP-3.2b Task 1) --------------------------------------------------------------------
+
+
+async def add_events(engine: AsyncEngine, task_id: str, count: int) -> None:
+    async with make_sessionmaker(engine)() as session:
+        for i in range(count):
+            await emit_task_event(
+                session,
+                None,
+                uuid.UUID(task_id),
+                "task.log",
+                {"level": "info", "message": str(i)},
+                redactor=Redactor(),
+            )
+        await session.commit()
+
+
+async def test_history_pages_in_seq_order(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    project_id = await project(owner)
+    [task_id] = await make_tasks(owner, project_id, "riwayat")
+    await add_events(engine, task_id, 5)
+    first = await owner.get(f"/api/v1/tasks/{task_id}/events/history", params={"after_seq": 0, "limit": 2})
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert [m["seq"] for m in body["data"]] == [1, 2]
+    assert body["meta"]["next_after_seq"] == 2
+    async with make_sessionmaker(engine)() as session:
+        row = (await session.scalars(select(TaskEvent).where(TaskEvent.seq == 1))).one()
+        assert body["data"][0] == event_message(row.task_id, row.seq, row.type, row.created_at, row.payload)
+    last = await owner.get(f"/api/v1/tasks/{task_id}/events/history", params={"after_seq": 4, "limit": 2})
+    assert [m["seq"] for m in last.json()["data"]] == [5]
+    assert last.json()["meta"]["next_after_seq"] is None
+    empty = await owner.get(f"/api/v1/tasks/{task_id}/events/history")
+    assert len(empty.json()["data"]) == 5 and empty.json()["meta"]["next_after_seq"] is None
+
+
+@pytest.mark.parametrize("query", ["limit=0", "limit=501", "after_seq=-1"])
+async def test_history_validates_query(
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    query: str,
+) -> None:
+    project_id = await project(owner)
+    [task_id] = await make_tasks(owner, project_id, "riwayat")
+    assert (await owner.get(f"/api/v1/tasks/{task_id}/events/history?{query}")).status_code == 422
+
+
+async def test_history_out_of_scope_is_404(
+    app,  # type: ignore[no-untyped-def]  # noqa: F811
+    owner: httpx.AsyncClient,  # noqa: F811
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    project_id = await project(owner)
+    [task_id] = await make_tasks(owner, project_id, "rahasia")
+    await make_user(engine, "eve@example.test")
+    eve = await signed_in(app, "eve@example.test", PASSWORD)
+    try:
+        assert (await owner.get(f"/api/v1/tasks/{task_id}/events/history")).status_code == 200
+        hidden = await eve.get(f"/api/v1/tasks/{task_id}/events/history")
+        random = await eve.get(f"/api/v1/tasks/{uuid.uuid4()}/events/history")
+        assert hidden.status_code == 404 and random.status_code == 404
+        assert {**hidden.json(), "request_id": None} == {**random.json(), "request_id": None}
+    finally:
+        await eve.aclose()

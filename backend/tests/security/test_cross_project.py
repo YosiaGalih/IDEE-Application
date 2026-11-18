@@ -323,6 +323,7 @@ async def test_approvals_of_other_projects_do_not_exist(world: dict[str, object]
 # tests pin the same answers as for the project routes. ``{task_id}``/``{conversation_id}`` are filled in.
 ID_ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("GET", "/api/v1/tasks/{task_id}", None),
+    ("GET", "/api/v1/tasks/{task_id}/events/history", None),
     ("GET", "/api/v1/conversations/{conversation_id}/messages", None),
     ("POST", "/api/v1/conversations/{conversation_id}/messages", {"content": "x", "create_task": False}),
 ]
