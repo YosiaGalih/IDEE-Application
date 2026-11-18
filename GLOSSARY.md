@@ -81,6 +81,9 @@ Isi `tasks.checkpoint` (JSONB) yang menyimpan posisi engine dan isian awal user 
 **Lease**:
 Hak sementara satu worker atas satu task (`lease_owner`, `lease_expires_at`), diperpanjang selama bekerja; lease yang kedaluwarsa membuat sweep recovery mengambil alih task itu, dan jumlah lease hidup membatasi `MAX_ACTIVE_TASKS`.
 
+**Sweep dispatch**:
+Job beat (`dispatch_sweep`, tiap 30 dtk) yang mengirim ulang task `draft|queued` yang pernah di-dispatch (`checkpoint.dispatch.at`) tetapi lease-nya mati dan sudah lewat masa tunggu 60 dtk, karena job `run_task`-nya hilang; berbeda dari sweep recovery, yang memulihkan task `running|validating` yang lease-nya kedaluwarsa.
+
 **Iterasi**:
 Putaran ke-n pengerjaan satu task (`tasks.iteration`, mulai 1), naik pada `request-changes` atau remediation; berbeda dari iterasi tool di dalam satu agent run.
 _Avoid_: mencampurnya dengan `max_tool_iterations`
