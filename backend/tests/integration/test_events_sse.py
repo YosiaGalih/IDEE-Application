@@ -213,16 +213,13 @@ async def next_raw(stream: AsyncGenerator[str, None]) -> str:
         return await anext(stream)
 
 
-async def next_event(stream: AsyncGenerator[str, None], pings: list[str] | None = None) -> Frame:
-    """The next frame that is not a ping (pings seen on the way are appended to ``pings``)."""
+async def next_event(stream: AsyncGenerator[str, None]) -> Frame:
+    """The next frame that is not a ping."""
     async with asyncio.timeout(WAIT):
         while True:
-            raw = await anext(stream)
-            frame = parse(raw)
+            frame = parse(await anext(stream))
             if frame is not None:
                 return frame
-            if pings is not None:
-                pings.append(raw)
 
 
 async def ids_until(stream: AsyncGenerator[str, None], last: int) -> list[int | None]:
@@ -376,10 +373,9 @@ async def test_unpublished_last_event_arrives_on_ping(world: World, hub: TaskEve
     await add_events(world, 2)
     stream = streams(hub, ping_s=0.05)
     assert await ids_until(stream, 2) == [1, 2]
+    assert await next_raw(stream) == PING  # the replay and the check after it are done
     await add_events(world, 1)  # the last event, committed without publish (tool_r3, project_delete)
-    pings: list[str] = []
-    assert (await next_event(stream, pings)).id == 3
-    assert pings  # found by the check that follows a ping
+    assert (await next_event(stream)).id == 3  # found by the check that follows a ping
 
 
 async def test_lagged_listener_recovers_from_db(
@@ -407,10 +403,9 @@ async def test_without_hub_delivers_on_ping(
     with capture_logs() as logs:
         stream = streams(hub, ping_s=0.05)
         assert (await next_event(stream)).id == 1
-        await add_events(world, 1, bus=bus)
-        pings: list[str] = []
-        assert (await next_event(stream, pings)).id == 2
-        assert pings
+        assert await next_raw(stream) == PING  # the check after the replay is done
+        await add_events(world, 1, bus=bus)  # published, but this stream hears nothing live
+        assert (await next_event(stream)).id == 2  # found by the check that follows a ping
     assert [entry["event"] for entry in logs].count("task_stream_without_hub") == 1
 
 
@@ -486,6 +481,45 @@ async def test_end_after_live_terminal_transition(
         "cancelled",
     )
     assert [raw for raw in await rest(stream) if raw != PING] == [end_frame(world, "cancelled")]
+
+
+async def test_live_terminal_transition_ends_without_waiting_for_a_ping(
+    world: World, hub: TaskEventHub, bus: EventBus, streams: Any
+) -> None:
+    S = states.TaskStatus
+    await move(world, S.PLANNED, S.QUEUED, S.RUNNING)
+    stream = streams(hub)  # no ping can fire: a delivered status change is checked at once
+    assert await ids_until(stream, 3) == [1, 2, 3]
+    await move(world, S.CANCELLED, bus=bus)
+    assert (await next_event(stream)).id == 4
+    assert await rest(stream) == [end_frame(world, "cancelled")]
+
+
+async def test_no_end_for_a_task_reopened_after_its_status_was_read(
+    world: World, hub: TaskEventHub, bus: EventBus, streams: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``stream.end`` follows a fresh read only: a task reopened after a finished read keeps its stream."""
+    S = states.TaskStatus
+    await move(world, S.PLANNED, S.QUEUED, S.RUNNING)
+    real = service._task_row  # pyright: ignore[reportPrivateUsage]
+    reopened: list[bool] = []
+
+    async def reopen_after_the_read(env: ProjectEnv, task_id: uuid.UUID) -> Any:
+        row = await real(env, task_id)
+        if row is not None and row.status == S.FAILED and not reopened:
+            reopened.append(True)
+            await move(world, S.QUEUED)  # 5: committed before the stream reads the events after its cursor
+        return row
+
+    monkeypatch.setattr(service, "_task_row", reopen_after_the_read)
+    stream = streams(hub, ping_s=0.05)
+    assert await ids_until(stream, 3) == [1, 2, 3]
+    await move(world, S.FAILED)  # 4: unpublished, found by the check after a ping
+    failed, queued = await next_event(stream), await next_event(stream)
+    assert [(f.id, f.data["payload"]["to"]) for f in (failed, queued)] == [(4, "failed"), (5, "queued")]
+    assert reopened
+    await add_events(world, 1, bus=bus)
+    assert (await next_event(stream)).id == 6  # still open: no stream.end with the old status
 
 
 async def test_end_when_task_disappears(world: World, hub: TaskEventHub, streams: Any) -> None:
@@ -767,6 +801,8 @@ async def test_published_messages_cannot_end_or_fake_the_stream(
     assert (await next_event(stream)).id == 1
     channel = task_channel(world.task_id)
     base = {"task_id": str(world.task_id), "seq": None, "ts": "2026-11-18T00:00:00Z", "payload": {}}
+    await redis.publish(channel, json.dumps({**base, "type": "agent.delta"}))
+    assert (await next_event(stream)).event == "agent.delta"  # past the check after the replay: all live now
     with capture_logs() as logs:
         for type_ in (STREAM_END, EVENT_INVALID, "Bad Type", "x" * 5000):
             await redis.publish(channel, json.dumps({**base, "type": type_}))

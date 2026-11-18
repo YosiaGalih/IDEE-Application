@@ -43,7 +43,8 @@ HUB_PATTERN: Final = "kk:task:*"  # matches task_channel(task_id)
 HUB_BACKOFF_FIRST: Final = 0.5
 HUB_BACKOFF_MAX: Final = 10.0
 HUB_POLL_SECONDS: Final = 1.0
-# The stream (spec §13.2 #28, #31). Module attributes, read at call time, so tests can make them small.
+# The stream (spec §13.2 #28, #31). The intervals are ``StreamTimings`` defaults, bound when that class is
+# defined: a test passes its own ``StreamTimings``. ``REPLAY_PAGE`` is read at call time (tests patch it).
 REPLAY_PAGE: Final = 500
 PING_INTERVAL_S: Final = 15.0
 AUTH_RECHECK_S: Final = 60.0
@@ -51,6 +52,7 @@ MAX_STREAM_S: Final = 3300.0  # 55 minutes, under Caddy's read_timeout of one ho
 MAX_STREAMS_PER_USER: Final = 8  # spec §13.2 #32
 MAX_STREAMS_TOTAL: Final = 256
 PING_FRAME: Final = ": ping\n\n"
+STATUS_CHANGED: Final = "task.status_changed"  # workflow.states.transition's event: the status may be final
 LOG_VALUE_MAX: Final = 80  # an untrusted string in a log line: its repr, cut to this length
 
 logger = get_logger(__name__)
@@ -436,21 +438,27 @@ async def stream_frames(
     """SSE frames of one task's events after ``after_seq``: each stored event exactly once, in ``seq`` order.
 
     The listener is registered before the replay, so nothing published meanwhile is missed. State:
-    ``cursor`` is the last stored seq sent (or skipped); ``behind`` means the database may hold events after
-    it; ``finished`` is ``(status, event_seq)`` from the last check of a finished task. Each pass does the
-    first that applies:
+    ``cursor`` is the last stored seq sent (as itself or as ``event.invalid``); ``db_may_have_more`` means
+    the database may hold events after it; ``status_check_due`` means the task row must be read now;
+    ``recheck_at_seq`` is the ``event_seq`` of a finished task whose last events were still unsent, so its
+    row is read again once they are. Each pass does the first that applies:
 
     1. lifetime over -> return (no ``stream.end``: the client reconnects with ``Last-Event-ID``);
-    2. check due (first pass, then after each ``: ping``): read ``status``/``event_seq``; task gone ->
-       ``stream.end`` with ``status`` null; ``event_seq > cursor`` -> behind;
+    2. ``: ping`` due -> sent; the status check becomes due (it also finds events committed unpublished);
     3. access recheck due (read only) -> task gone -> ``stream.end`` null; session or ``task:read`` lost ->
        return (no ``stream.end``: the reconnect gets 401/404);
-    4. behind -> one page of ``seq > cursor`` (own short session), sent in order; behind while pages are full;
-    5. finished and ``cursor >= event_seq`` -> ``stream.end`` (after the terminal ``task.status_changed``);
-    6. listener lagged -> behind;
-    7. wait for a live message until the next deadline: ``seq`` null -> sent without ``id``;
-       ``seq <= cursor`` -> dropped; ``cursor + 1`` -> sent; beyond -> behind (the database has it and the
-       gap before it: commit precedes publish).
+    4. ``db_may_have_more`` -> one page of ``seq > cursor`` (own short session), sent in order; more while
+       pages are full; a ``task.status_changed`` among them makes the status check due;
+    5. status check due (first pass after the replay, after a ping, after a ``task.status_changed`` is sent,
+       or once ``cursor`` reaches ``recheck_at_seq``) -> one fresh read of ``status``/``event_seq``: task
+       gone -> ``stream.end`` null; finished and ``cursor >= event_seq`` -> ``stream.end`` with that status;
+       ``event_seq > cursor`` -> ``db_may_have_more``. ``stream.end`` is only ever sent from a read made in
+       that same pass, so a task reopened since an older read never gets one;
+    6. listener lagged -> ``db_may_have_more``;
+    7. wait for a live message until the next deadline: ``seq`` null -> sent without ``id``; ``seq <=
+       cursor`` -> dropped; ``cursor + 1`` -> sent (a ``task.status_changed`` makes the status check due);
+       beyond, or not sendable as it is -> ``db_may_have_more`` (the database has it, and any gap before
+       it: commit precedes publish).
 
     No database session is open while a frame is out or while waiting.
     """
@@ -459,26 +467,19 @@ async def stream_frames(
     next_ping = started + timings.ping_s
     next_auth = started + timings.auth_recheck_s
     cursor = after_seq
-    behind = True  # the replay
-    check = True  # once before the replay: a finished task ends after it without waiting for a ping
-    finished: tuple[str, int] | None = None
+    db_may_have_more = True  # the replay
+    status_check_due = True  # right after the replay: a finished task ends without waiting for a ping
+    recheck_at_seq: int | None = None
     with _listen(hub, task_id) as listener:
         while True:
             now = clock()
             if now >= deadline:
                 logger.info("task_stream_closed", task_id=str(task_id), reason="max_lifetime")
                 return
-            if check or now >= next_ping:
-                if not check:
-                    next_ping = now + timings.ping_s
-                    yield PING_FRAME
-                check = False
-                row = await _task_row(env, task_id)
-                if row is None:
-                    yield _end_frame(task_id, None)
-                    return
-                behind = behind or row.event_seq > cursor
-                finished = (row.status, row.event_seq) if row.status in FINISHED else None
+            if now >= next_ping:
+                next_ping = now + timings.ping_s
+                status_check_due = True
+                yield PING_FRAME
                 continue
             if now >= next_auth:  # before the replay pages: a long backlog never postpones it
                 next_auth = now + timings.auth_recheck_s
@@ -489,18 +490,33 @@ async def stream_frames(
                 if not await _may_still_read(env, settings, session_token, actor, row, task_id):
                     return
                 continue
-            if behind:
+            if db_may_have_more:
                 page = await _read_page(env, task_id, cursor)
-                behind = len(page) == REPLAY_PAGE
+                db_may_have_more = len(page) == REPLAY_PAGE
                 for message in page:
                     cursor = message["seq"]
+                    status_check_due = status_check_due or message["type"] == STATUS_CHANGED
                     yield _stored_frame(task_id, message)
                 continue
-            if finished is not None and cursor >= finished[1]:
-                yield _end_frame(task_id, finished[0])
-                return
+            if recheck_at_seq is not None and cursor >= recheck_at_seq:
+                recheck_at_seq = None
+                status_check_due = True
+            if status_check_due:
+                status_check_due = False
+                row = await _task_row(env, task_id)
+                if row is None:
+                    yield _end_frame(task_id, None)
+                    return
+                finished = row.status in FINISHED
+                if finished and cursor >= row.event_seq:
+                    yield _end_frame(task_id, row.status)
+                    return
+                if row.event_seq > cursor:
+                    db_may_have_more = True
+                    recheck_at_seq = row.event_seq if finished else None
+                continue
             if listener is not None and listener.take_lagged():
-                behind = True
+                db_may_have_more = True
                 continue
             message = await _next_message(listener, min(next_ping, next_auth, deadline) - now)
             if message is None:
@@ -512,9 +528,11 @@ async def stream_frames(
             elif seq > cursor:
                 frame = _live_frame(task_id, message) if seq == cursor + 1 else None
                 if frame is None:  # a gap before it, or not sendable as it is: the database has the event
-                    behind = True
+                    db_may_have_more = True
                     continue
                 cursor = seq
+                if message["type"] == STATUS_CHANGED:
+                    status_check_due = True
                 yield frame
 
 
