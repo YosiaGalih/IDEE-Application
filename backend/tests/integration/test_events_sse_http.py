@@ -1,28 +1,61 @@
-"""``GET /tasks/{id}/events`` over HTTP and the stream slots (WP-3.2b Task 4).
+"""``GET /tasks/{id}/events`` over HTTP, its response's lifecycle and the stream slots (WP-3.2b Task 4).
 
 ``ASGITransport`` buffers the whole body, so only streams that end (a ``FINISHED`` task) and errors before
-the stream are driven over HTTP; the slot logic is driven directly (spec WP-3.2 §13.3).
+the stream are driven over HTTP (spec WP-3.2 §13.3); ``TaskEventResponse`` is driven as an ASGI app with a
+hand-written ``send``/``receive`` for the rest: a client gone before or during the body, one that stops
+reading.
 """
 
 # ruff: noqa: F811  # the shared fixtures are imported by name and redefined as test arguments
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 import uuid
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx
 import pytest
+import structlog
+from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
-from starlette.responses import StreamingResponse
+from starlette.types import Message
+from structlog.testing import capture_logs
 
-from app.api.routes.tasks import stream_response
+from app.api.routes import tasks as tasks_route
+from app.api.routes.tasks import TaskEventResponse
 from app.core.db import make_sessionmaker
 from app.core.errors import AppError
 from app.core.events import emit_task_event
 from app.core.redaction import Redactor
-from app.services.task_events import STREAM_END, StreamSlots
+from app.services.task_events import (
+    AUTH_RECHECK_S,
+    MAX_STREAM_S,
+    MAX_STREAMS_PER_USER,
+    PING_INTERVAL_S,
+    STREAM_END,
+    StreamSlots,
+    StreamTimings,
+    TaskEventHub,
+    jittered_timings,
+    stream_frames,
+)
+from app.workflow import states
+from tests.integration.test_events_sse import (  # noqa: F401 - fixtures shared with the generator tests
+    SLOW,
+    WAIT,
+    World,
+    add_events,
+    hub,
+    move,
+    start_hub,
+    stream_engine,
+    world,
+)
 from tests.integration.test_projects import (  # noqa: F401 - fixtures shared with the projects tests
     app,
     clean_state,
@@ -102,6 +135,10 @@ async def test_last_event_id_wins_over_after_seq(
         (None, "abc", ["query", "after_seq"]),
         (None, "-1", ["query", "after_seq"]),
         (None, str(2**63), ["query", "after_seq"]),
+        ("1" * 41, None, ["header", "Last-Event-ID"]),  # longer than any seq: still our own 422 shape
+        (None, "1" * 41, ["query", "after_seq"]),
+        ("0" * 20, None, ["header", "Last-Event-ID"]),  # 0..2**63-1 is at most 19 digits
+        (None, "", ["query", "after_seq"]),
     ],
 )
 async def test_bad_resume_point_is_422(
@@ -120,8 +157,81 @@ async def test_bad_resume_point_is_422(
     )
     assert response.status_code == 422, response.text
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
-    assert response.json()["error"]["details"][0]["loc"] == loc
+    assert response.json()["error"]["details"] == [  # one shape for every bad value: _resume_point's own
+        {"loc": loc, "msg": "must be an integer from 0 to 9223372036854775807"}
+    ]
     assert response.headers["content-type"].startswith("application/json")
+
+
+async def test_empty_last_event_id_counts_as_absent(
+    owner: httpx.AsyncClient,
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    """Ruling R6: a client may send the header empty on its first connect; ``after_seq`` then applies."""
+    task_id = await finished_task(owner, engine, events=4)
+    response = await owner.get(
+        f"/api/v1/tasks/{task_id}/events", params={"after_seq": 2}, headers={"Last-Event-ID": ""}
+    )
+    assert response.status_code == 200, response.text
+    assert ids(response.text) == [3, 4]
+    bare = await owner.get(f"/api/v1/tasks/{task_id}/events", headers={"Last-Event-ID": ""})
+    assert ids(bare.text) == [1, 2, 3, 4]
+
+
+async def test_too_many_streams_over_http(
+    app: FastAPI,
+    owner: httpx.AsyncClient,
+    owner_id: uuid.UUID,
+    open_gate: None,
+    engine: AsyncEngine,
+) -> None:
+    task_id = await finished_task(owner, engine)
+    slots: StreamSlots = app.state.dependencies.stream_slots
+    held = [slots.acquire(owner_id) for _ in range(MAX_STREAMS_PER_USER)]
+    try:
+        refused = await owner.get(f"/api/v1/tasks/{task_id}/events")
+        unknown = await owner.get(f"/api/v1/tasks/{uuid.uuid4()}/events")  # 404 comes first
+        bad = await owner.get(f"/api/v1/tasks/{task_id}/events", headers={"Last-Event-ID": "x"})  # then 422
+    finally:
+        for slot in held:
+            slot.release()
+    assert refused.status_code == 429, refused.text
+    assert refused.headers["content-type"].startswith("application/json")
+    assert refused.headers["retry-after"] == "5"
+    error = refused.json()["error"]
+    assert error["code"] == "RATE_LIMITED" and error["details"][0]["reason"] == "too_many_streams"
+    assert (unknown.status_code, bad.status_code) == (404, 422)
+    assert (await owner.get(f"/api/v1/tasks/{task_id}/events")).status_code == 200  # nothing leaked
+
+
+async def test_route_jitters_the_lifetime(
+    owner: httpx.AsyncClient,
+    open_gate: None,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = await finished_task(owner, engine)
+    seen: list[StreamTimings] = []
+    real = tasks_route.stream_frames
+
+    def spy(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+        seen.append(kwargs["timings"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tasks_route, "stream_frames", spy)
+    for _ in range(3):
+        assert (await owner.get(f"/api/v1/tasks/{task_id}/events")).status_code == 200
+    assert all(0.9 * MAX_STREAM_S <= t.max_stream_s <= 1.1 * MAX_STREAM_S for t in seen) and len(seen) == 3
+
+
+def test_lifetime_jitter_is_ten_percent() -> None:
+    assert jittered_timings(lambda: 0.0).max_stream_s == pytest.approx(0.9 * MAX_STREAM_S)
+    assert jittered_timings(lambda: 0.5).max_stream_s == pytest.approx(MAX_STREAM_S)
+    assert jittered_timings(lambda: 1.0).max_stream_s == pytest.approx(1.1 * MAX_STREAM_S)
+    timings = jittered_timings()
+    assert 0.9 * MAX_STREAM_S <= timings.max_stream_s <= 1.1 * MAX_STREAM_S
+    assert (timings.ping_s, timings.auth_recheck_s) == (PING_INTERVAL_S, AUTH_RECHECK_S)
 
 
 async def test_stream_requires_session_and_scope(
@@ -189,6 +299,7 @@ def test_too_many_streams_is_429() -> None:
     first, _ = slots.acquire(me), slots.acquire(me)
     error = too_many(slots, me)
     assert (error.code, error.http_status) == ("RATE_LIMITED", 429)
+    assert error.headers == {"Retry-After": "5"}
     assert error.details is not None and error.details[0]["reason"] == "too_many_streams"
     slots.acquire(other)  # another user is not affected by the per-user limit ...
     assert too_many(slots, other).details[0]["reason"] == "too_many_streams"  # type: ignore[index]  # ... but the total cap
@@ -209,43 +320,207 @@ def test_release_is_idempotent() -> None:
     slots.acquire(me)
 
 
-async def test_slot_released_when_client_never_reads() -> None:
-    slots = StreamSlots(per_user=1, total=1)
+async def no_disconnect() -> Message:
+    await asyncio.Event().wait()  # an ASGI 2.4 server never needs receive() for a streaming response
+    raise AssertionError("unreachable")
+
+
+def asgi(spec: str) -> dict[str, Any]:
+    return {"type": "http", "asgi": {"version": "3.0", "spec_version": spec}}
+
+
+def response_of(
+    frames: AsyncGenerator[str, None], slots: StreamSlots, *, deadline_s: float = WAIT
+) -> tuple[TaskEventResponse, uuid.UUID]:
     me = uuid.uuid4()
-
-    async def never() -> None:
-        raise AssertionError("never iterated")
-        yield ""  # pragma: no cover
-
-    response = stream_response(slots.acquire(me), never(), request_id="r")
-    too_many(slots, me)
-    assert isinstance(response, StreamingResponse) and response.background is not None
-    await response.background()  # what Starlette runs after the response, read or not
-    slots.acquire(me)
+    task_id = uuid.uuid4()
+    slot = slots.acquire(me)
+    return TaskEventResponse(
+        frames, slot, task_id=task_id, request_id="req_test1234", deadline_s=deadline_s
+    ), me
 
 
 async def test_slot_released_when_stream_ends() -> None:
     slots = StreamSlots(per_user=1, total=1)
-    me = uuid.uuid4()
 
-    async def two():  # type: ignore[no-untyped-def]
+    async def two() -> AsyncGenerator[str, None]:
         yield "a"
         yield "b"
 
-    response = stream_response(slots.acquire(me), two(), request_id="r")
-    assert [chunk async for chunk in response.body_iterator] == ["a", "b"]
-    slots.acquire(me)  # free before the background task even ran
+    response, me = response_of(two(), slots)
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    await response(asgi("2.4"), no_disconnect, send)
+    assert [m.get("body") for m in sent[1:]] == [b"a", b"b", b""]
+    assert dict(sent[0]["headers"])[b"cache-control"] == b"no-store"
+    slots.acquire(me)  # free
 
 
 async def test_slot_released_when_stream_fails_midway() -> None:
     slots = StreamSlots(per_user=1, total=1)
-    me = uuid.uuid4()
 
-    async def boom():  # type: ignore[no-untyped-def]
+    async def boom() -> AsyncGenerator[str, None]:
         yield "a"
         raise RuntimeError("x")
 
-    response = stream_response(slots.acquire(me), boom(), request_id="r")
+    response, me = response_of(boom(), slots)
+
+    async def send(message: Message) -> None:
+        pass
+
     with pytest.raises(RuntimeError):
-        [chunk async for chunk in response.body_iterator]
+        await response(asgi("2.4"), no_disconnect, send)
     slots.acquire(me)
+
+
+# --- the response's lifecycle with a real stream and hub (spec §13.5 #6; AG-13 LOW-1, LOW-2) ------------
+
+
+def real_stream(world: World, hub: TaskEventHub, **timings: float) -> AsyncGenerator[str, None]:
+    return stream_frames(
+        world.env,
+        world.settings,
+        hub,
+        session_token="not-checked",  # no recheck fires
+        actor=world.owner,
+        task_id=world.task_id,
+        after_seq=0,
+        timings=StreamTimings(**{"ping_s": SLOW, "auth_recheck_s": SLOW, "max_stream_s": SLOW, **timings}),
+    )
+
+
+def listening(hub: TaskEventHub, task_id: uuid.UUID) -> bool:
+    return task_id in hub._listeners  # pyright: ignore[reportPrivateUsage]
+
+
+def lifecycle(world: World, hub: TaskEventHub, *, deadline_s: float = WAIT, **timings: float) -> Any:
+    slots = StreamSlots(per_user=1, total=1)
+    frames = real_stream(world, hub, **timings)
+    slot = slots.acquire(world.owner.user_id)
+    response = TaskEventResponse(
+        frames, slot, task_id=world.task_id, request_id="req_test1234", deadline_s=deadline_s
+    )
+    return response, frames, slots
+
+
+async def assert_released(world: World, hub: TaskEventHub, frames: Any, slots: StreamSlots) -> None:
+    slots.acquire(world.owner.user_id)  # the slot is free
+    assert not listening(hub, world.task_id)  # the generator is closed: its listener left the hub
+    with pytest.raises(StopAsyncIteration):
+        await anext(frames)
+
+
+@pytest.mark.parametrize("gone_at", ["http.response.start", "http.response.body"])
+async def test_client_gone_under_asgi_2_4_frees_slot_and_listener(
+    world: World, hub: TaskEventHub, gone_at: str
+) -> None:
+    """ASGI 2.4: a failed send raises ClientDisconnect in Starlette, which then skips any background task.
+    For an event stream that is the normal end: logged, not raised as an unhandled error."""
+    await add_events(world, 1)
+    response, frames, slots = lifecycle(world, hub)
+    seen: list[str] = []
+
+    async def send(message: Message) -> None:
+        if message["type"] == gone_at:
+            seen.append(gone_at)
+            if gone_at == "http.response.body":
+                assert listening(hub, world.task_id)  # the stream is running when the client goes
+            raise OSError("client gone")
+
+    with capture_logs(processors=[structlog.contextvars.merge_contextvars]) as logs:
+        async with asyncio.timeout(WAIT):
+            await response(asgi("2.4"), no_disconnect, send)
+    assert seen == [gone_at]
+    await assert_released(world, hub, frames, slots)
+    closed = [entry for entry in logs if entry["event"] == "task_stream_closed"]
+    assert [(e["reason"], e["task_id"], e["request_id"]) for e in closed] == [
+        ("client_gone", str(world.task_id), "req_test1234")
+    ]
+
+
+async def test_client_that_stops_reading_is_released_after_the_deadline(
+    world: World, hub: TaskEventHub
+) -> None:
+    await add_events(world, 1)
+    response, frames, slots = lifecycle(world, hub, deadline_s=0.3, max_stream_s=0.2)
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            await asyncio.Event().wait()  # the TCP buffer is full and the client never reads
+
+    with capture_logs(processors=[structlog.contextvars.merge_contextvars]) as logs:
+        async with asyncio.timeout(WAIT):
+            await response(asgi("2.4"), no_disconnect, send)
+    await assert_released(world, hub, frames, slots)
+    closed = [entry for entry in logs if entry["event"] == "task_stream_closed"]
+    assert [(e["reason"], e["task_id"], e["request_id"]) for e in closed] == [
+        ("send_timeout", str(world.task_id), "req_test1234")
+    ]
+
+
+async def test_normal_end_frees_slot_and_listener(world: World, hub: TaskEventHub) -> None:
+    await add_events(world, 1)
+    await move(world, states.TaskStatus.CANCELLED)
+    response, frames, slots = lifecycle(world, hub)
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async with asyncio.timeout(WAIT):
+        await response(asgi("2.4"), no_disconnect, send)
+    bodies = b"".join(m.get("body", b"") for m in sent[1:]).decode()
+    assert bodies.endswith(
+        f'event: {STREAM_END}\ndata: {{"task_id":"{world.task_id}","status":"cancelled"}}\n\n'
+    )
+    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    await assert_released(world, hub, frames, slots)
+
+
+async def test_drop_mid_stream_frees_slot_and_listener(world: World, hub: TaskEventHub) -> None:
+    """ASGI 2.0-2.3: Starlette listens for http.disconnect and cancels the body."""
+    await add_events(world, 1)
+    response, frames, slots = lifecycle(world, hub)
+    first_body = asyncio.Event()
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            first_body.set()
+
+    async def receive() -> Message:
+        await first_body.wait()
+        return {"type": "http.disconnect"}
+
+    async with asyncio.timeout(WAIT):
+        await response(asgi("2.3"), receive, send)
+    await assert_released(world, hub, frames, slots)
+
+
+async def test_failure_is_logged_with_the_request_id(world: World, hub: TaskEventHub) -> None:
+    calls: list[int] = []
+
+    def sessions() -> Any:
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("database gone")
+        return world.env.sessions()
+
+    world = dataclasses.replace(world, env=dataclasses.replace(world.env, sessions=sessions))  # type: ignore[arg-type]
+    await add_events(world, 1)
+    response, frames, slots = lifecycle(world, hub)
+
+    async def send(message: Message) -> None:
+        pass
+
+    with capture_logs(processors=[structlog.contextvars.merge_contextvars]) as logs:
+        with pytest.raises(RuntimeError):
+            async with asyncio.timeout(WAIT):
+                await response(asgi("2.4"), no_disconnect, send)
+    failed = [entry for entry in logs if entry["event"] == "task_stream_failed"]
+    assert [(e["task_id"], e["request_id"], e["error"]) for e in failed] == [
+        (str(world.task_id), "req_test1234", "RuntimeError")
+    ]
+    await assert_released(world, hub, frames, slots)

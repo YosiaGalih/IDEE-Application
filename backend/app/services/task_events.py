@@ -14,6 +14,7 @@ import dataclasses
 import json
 import math
 import os
+import random
 import time
 import uuid
 from collections.abc import AsyncGenerator, Callable, Iterator
@@ -48,7 +49,10 @@ HUB_POLL_SECONDS: Final = 1.0
 REPLAY_PAGE: Final = 500
 PING_INTERVAL_S: Final = 15.0
 AUTH_RECHECK_S: Final = 60.0
-MAX_STREAM_S: Final = 3300.0  # 55 minutes, under Caddy's read_timeout of one hour
+MAX_STREAM_S: Final = 3300.0  # 55 minutes; each stream's own lifetime is jittered (``jittered_timings``)
+LIFETIME_JITTER: Final = 0.1  # +-10 %: streams opened together (after a deploy) do not reconnect together
+STREAM_CLOSE_GRACE_S: Final = 30.0  # past its lifetime a response is cut: a client that stopped reading
+STREAMS_RETRY_AFTER_S: Final = 5  # the 429 for too many streams
 MAX_STREAMS_PER_USER: Final = 8  # spec §13.2 #32
 MAX_STREAMS_TOTAL: Final = 256
 PING_FRAME: Final = ": ping\n\n"
@@ -292,6 +296,13 @@ class StreamTimings:
             value = getattr(self, field.name)
             if not (isinstance(value, int | float) and math.isfinite(value) and value > 0):
                 raise ValueError(f"{field.name} must be a positive number of seconds")
+
+
+def jittered_timings(rand: Callable[[], float] = random.random) -> StreamTimings:
+    """The route's timings: the default intervals, the lifetime moved by up to ``LIFETIME_JITTER`` either way
+    (``rand`` in [0, 1]), so streams that started together do not all reconnect together."""
+    factor = 1 + LIFETIME_JITTER * (2 * rand() - 1)
+    return StreamTimings(max_stream_s=MAX_STREAM_S * factor)
 
 
 class _TaskRow(NamedTuple):
@@ -565,8 +576,8 @@ async def stream_frames(
 
 
 class StreamSlot:
-    """One open stream's place. ``release`` is idempotent: the generator's ``finally`` and the response's
-    background task both call it, and a second call must never free someone else's place."""
+    """One open stream's place. ``release`` is idempotent: the response's ``finally`` calls it, and so does
+    the route when it fails before the response exists; a second call must never free someone else's place."""
 
     def __init__(self, slots: StreamSlots, user_id: uuid.UUID) -> None:
         self._slots: StreamSlots | None = slots
@@ -597,6 +608,7 @@ class StreamSlots:
                 "Too many open event streams",
                 http_status=429,
                 details=[{"reason": "too_many_streams"}],
+                headers={"Retry-After": str(STREAMS_RETRY_AFTER_S)},
             )
         self._open[user_id] = self._open.get(user_id, 0) + 1
         return StreamSlot(self, user_id)

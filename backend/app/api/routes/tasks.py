@@ -7,18 +7,20 @@ scope, 403 without ``task:create``); the service authorises again under a row lo
 
 from __future__ import annotations
 
-import contextlib
+import asyncio
 import re
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from app.agents.contracts import WorkflowType  # == WORKFLOW_TYPES
 from app.api.deps import CurrentActor, StreamActor, dependencies, require_project_permission
@@ -28,15 +30,17 @@ from app.api.routes.projects import EnvDep, _respond
 from app.core.context import REQUEST_ID_HEADER
 from app.core.csrf import SESSION_COOKIE
 from app.core.errors import AppError, request_id_of
+from app.core.logging import get_logger
 from app.models.enums import TASK_STATUSES
 from app.services import task_events, tasks
 from app.services.context_refs import MAX_CONTEXT_REFS, ContextRef
 from app.services.project_budget import BudgetDefaults
 from app.services.projects import PAGE_SIZE_MAX, Actor
-from app.services.task_events import HISTORY_LIMIT_MAX, StreamSlot, StreamTimings, stream_frames
+from app.services.task_events import HISTORY_LIMIT_MAX, STREAM_CLOSE_GRACE_S, StreamSlot, stream_frames
 from app.services.tasks import PROMPT_MAX, TITLE_MAX, TaskCreate, TaskSummary, TaskView
 
 router = APIRouter(tags=["tasks"])
+logger = get_logger(__name__)
 
 TaskCreator = Annotated[Actor, Depends(require_project_permission("task:create"))]
 TaskReader = Annotated[Actor, Depends(require_project_permission("task:read"))]
@@ -249,7 +253,10 @@ _DIGITS = re.compile(r"[0-9]{1,19}")
 
 
 def _resume_point(last_event_id: str | None, after_seq: str | None) -> int:
-    """``Last-Event-ID`` wins over ``?after_seq=`` (#29); each is an integer 0..2**63-1, else 422."""
+    """``Last-Event-ID`` wins over ``?after_seq=`` (#29); each is an integer 0..2**63-1, else 422 here, for
+    any length (no framework limit answers first). An empty header counts as absent (ruling R6)."""
+    if last_event_id == "":
+        last_event_id = None
     where, raw = ("header", last_event_id) if last_event_id is not None else ("query", after_seq)
     if raw is None:
         return 0
@@ -265,26 +272,52 @@ def _resume_point(last_event_id: str | None, after_seq: str | None) -> int:
     return value
 
 
-def stream_response(
-    slot: StreamSlot, frames: AsyncGenerator[str, None], *, request_id: str
-) -> StreamingResponse:
-    """The SSE response. The slot is freed when the stream ends, fails or is closed (``finally``) and, if the
-    body is never iterated, by the background task; ``release`` is idempotent."""
+class TaskEventResponse(StreamingResponse):
+    """The SSE response of one task stream (API §5.1); it owns the stream's slot and frame generator.
 
-    async def body() -> AsyncIterator[str]:
-        try:
-            async with contextlib.aclosing(frames):
-                async for frame in frames:
-                    yield frame
-        finally:
-            slot.release()
+    Whatever ends the response (the stream's own end, a client gone before or during the body, ASGI 2.4
+    ``ClientDisconnect``, a client that stops reading, a failure), ``__call__``'s ``finally`` frees the slot
+    and closes the generator, so its hub listener leaves at once; both are idempotent (spec §13.5 #6). A
+    background task would not do: Starlette skips it when the response fails. ``deadline_s`` bounds the whole
+    response: the generator ends itself at its lifetime, and a client whose ``send`` never returns is cut
+    ``STREAM_CLOSE_GRACE_S`` later. The body's log lines carry the request id.
+    """
 
-    return StreamingResponse(
-        body(),
-        media_type="text/event-stream; charset=utf-8",
-        headers={REQUEST_ID_HEADER: request_id, "Cache-Control": "no-store", "X-Accel-Buffering": "no"},
-        background=BackgroundTask(slot.release),
-    )
+    def __init__(
+        self,
+        frames: AsyncGenerator[str, None],
+        slot: StreamSlot,
+        *,
+        task_id: uuid.UUID,
+        request_id: str,
+        deadline_s: float,
+    ) -> None:
+        super().__init__(
+            frames,
+            media_type="text/event-stream; charset=utf-8",
+            headers={REQUEST_ID_HEADER: request_id, "Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+        self._frames = frames
+        self._slot = slot
+        self._task_id = task_id
+        self._request_id = request_id
+        self._deadline_s = deadline_s
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        deadline = asyncio.timeout(self._deadline_s)
+        with structlog.contextvars.bound_contextvars(request_id=self._request_id):
+            try:
+                async with deadline:
+                    await super().__call__(scope, receive, send)
+            except ClientDisconnect:  # ASGI 2.4: a client that left is how an event stream normally ends
+                logger.info("task_stream_closed", task_id=str(self._task_id), reason="client_gone")
+            except TimeoutError:
+                if not deadline.expired():
+                    raise
+                logger.info("task_stream_closed", task_id=str(self._task_id), reason="send_timeout")
+            finally:
+                self._slot.release()
+                await self._frames.aclose()
 
 
 @router.get("/tasks/{task_id}/events")
@@ -293,14 +326,16 @@ async def task_event_stream(
     task_id: uuid.UUID,
     actor: StreamActor,
     env: EnvDep,
-    after_seq: Annotated[str | None, Query(max_length=40)] = None,
-    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID", max_length=40)] = None,
+    # No length limit here: _resume_point answers every bad value with one 422 shape.
+    after_seq: str | None = None,
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
     resume = _resume_point(last_event_id, after_seq)
     await task_events.open_stream(env, actor, task_id)  # 404 before any byte
     deps = dependencies(request)
     slot = deps.stream_slots.acquire(actor.user_id)  # 429 before any byte
     try:
+        timings = task_events.jittered_timings()
         frames = stream_frames(
             env,
             request.app.state.settings,
@@ -309,9 +344,15 @@ async def task_event_stream(
             actor=actor,
             task_id=task_id,
             after_seq=resume,
-            timings=StreamTimings(),
+            timings=timings,
         )
-        return stream_response(slot, frames, request_id=request_id_of(request))
+        return TaskEventResponse(
+            frames,
+            slot,
+            task_id=task_id,
+            request_id=request_id_of(request),
+            deadline_s=timings.max_stream_s + STREAM_CLOSE_GRACE_S,
+        )
     except BaseException:
         slot.release()
         raise
