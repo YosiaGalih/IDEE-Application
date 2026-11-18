@@ -62,6 +62,9 @@ function fakeEndpoint(statuses: number[] = [], { abortErrorsBody = true } = {}) 
 const frame = (seq: number | null, type = "task.log", extra = "") =>
   `${seq === null ? "" : `id: ${seq}\n`}event: ${type}\ndata: {"task_id":"${TASK}","seq":${seq ?? "null"},"type":"${type}","ts":"2026-10-31T01:00:00Z","payload":{${extra}}}\n\n`;
 
+const END = (status: string | null) =>
+  `event: stream.end\ndata: {"task_id":"${TASK}","status":${status === null ? "null" : `"${status}"`}}\n\n`;
+
 const fast = { initialBackoffMs: 5, maxBackoffMs: 20, heartbeatTimeoutMs: 1000, jitter: () => 0 };
 const streams: { close(): void }[] = [];
 afterEach(() => streams.splice(0).forEach((s) => s.close()));
@@ -109,6 +112,36 @@ describe("openEventStream", () => {
     expect(endpoint.requests[1]?.headers.get("Last-Event-ID")).toBe("5");
     endpoint.send(frame(5) + frame(6)); // the server replays from its side too
     await waitFor(() => expect(seqs).toEqual([5, 6]));
+  });
+
+  it("stops on stream.end without reconnecting", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const endpoint = fakeEndpoint();
+      const { seqs, statuses } = open(endpoint);
+      await waitFor(() => expect(endpoint.connections()).toBe(1));
+      endpoint.send(frame(1) + frame(2) + END("completed"));
+      endpoint.end();
+      await waitFor(() => expect(statuses).toContain("ended"));
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(endpoint.fetchImpl).toHaveBeenCalledTimes(1);
+      expect(seqs).toEqual([1, 2]); // stream.end is not a task event
+      expect(statuses.at(-1)).toBe("ended");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retry after ended resumes from lastSeq", async () => {
+    const endpoint = fakeEndpoint();
+    const { statuses, stream } = open(endpoint);
+    await waitFor(() => expect(endpoint.connections()).toBe(1));
+    endpoint.send(frame(1) + frame(2) + END("failed"));
+    await waitFor(() => expect(statuses).toContain("ended"));
+    stream.retry();
+    await waitFor(() => expect(endpoint.connections()).toBe(2));
+    expect(endpoint.requests[1]?.headers.get("Last-Event-ID")).toBe("2");
+    expect(endpoint.requests[1]?.url.searchParams.get("after_seq")).toBe("2");
   });
 
   it("passes ephemeral events (no id) without moving the resume point", async () => {
@@ -389,6 +422,50 @@ describe("useTaskEvents", () => {
     await waitFor(() => expect(seen).toEqual([1, null, 2]));
     expect(result.current.events.map((e) => e.seq)).toEqual([1, 2]);
     expect(result.current.lastInvalid.map((f) => f.reason)[0]).toMatch(/onEvent threw/);
+  });
+
+  it("keeps the last 500 events and counts dropped", async () => {
+    const endpoint = fakeEndpoint();
+    const { result } = renderHook(() => useTaskEvents(TASK, { fetchImpl: endpoint.fetchImpl, ...fast }));
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => {
+      let text = "";
+      for (let i = 1; i <= 520; i++) text += event(i);
+      endpoint.send(text);
+    });
+    await waitFor(() => expect(result.current.lastSeq).toBe(520));
+    expect(result.current.events).toHaveLength(500);
+    expect(result.current.events[0]?.seq).toBe(21);
+    expect(result.current.dropped).toBe(20);
+  });
+
+  it("resets dropped when switching task", async () => {
+    const endpoint = fakeEndpoint();
+    const { result, rerender } = renderHook(
+      ({ id }) => useTaskEvents(id, { fetchImpl: endpoint.fetchImpl, ...fast }),
+      { initialProps: { id: TASK } },
+    );
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => {
+      let text = "";
+      for (let i = 1; i <= 505; i++) text += event(i);
+      endpoint.send(text);
+    });
+    await waitFor(() => expect(result.current.dropped).toBe(5));
+    rerender({ id: OTHER });
+    expect(result.current.dropped).toBe(0);
+  });
+
+  it("ended is not an error state", async () => {
+    const endpoint = fakeEndpoint();
+    const { result } = renderHook(() => useTaskEvents(TASK, { fetchImpl: endpoint.fetchImpl, ...fast }));
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => endpoint.send(event(1) + END(null)));
+    await waitFor(() => expect(result.current.status).toBe("ended"));
+    expect(result.current.uxState).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.invalidFrames).toBe(0);
+    expect(endpoint.connections()).toBe(1);
   });
 
   it("exposes the screen state of a refused stream and reconnects on request", async () => {

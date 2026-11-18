@@ -18,6 +18,8 @@ export type TaskEvent = z.infer<typeof TaskEventSchema>;
 /** A frame that was not a valid event of this task: kept with its reason, never silently dropped. */
 export type InvalidFrame = { seq: number | null; reason: string };
 const MAX_INVALID_KEPT = 50;
+/** Persistent events kept in memory: the newest ones; older ones are counted in `dropped`. */
+export const MAX_EVENTS_KEPT = 500;
 
 type Options = Pick<
   StreamOptions,
@@ -34,6 +36,8 @@ type Inner = {
   status: StreamStatus;
   error: ApiError | null;
   lastSeq: number | null;
+  /** Events discarded from the front to stay within MAX_EVENTS_KEPT. */
+  dropped: number;
   invalidFrames: number;
   lastInvalid: InvalidFrame[];
 };
@@ -52,6 +56,7 @@ function initial(taskId: string | null, afterSeq: number | null): Inner {
     status: "closed",
     error: null,
     lastSeq: afterSeq,
+    dropped: 0,
     invalidFrames: 0,
     lastInvalid: [],
   };
@@ -125,7 +130,16 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
         }
         if (frame.seq !== null) {
           lastSeqRef.current = frame.seq;
-          update((s) => ({ ...s, events: [...s.events, event], lastSeq: frame.seq }));
+          update((s) => {
+            const all = [...s.events, event];
+            const over = Math.max(0, all.length - MAX_EVENTS_KEPT);
+            return {
+              ...s,
+              events: over > 0 ? all.slice(over) : all,
+              dropped: s.dropped + over,
+              lastSeq: frame.seq,
+            };
+          });
         }
         try {
           optionsRef.current.onEvent?.(event); // after the event is kept: a throwing handler loses nothing
@@ -148,6 +162,7 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
     status: current.status,
     error: current.error,
     lastSeq: current.lastSeq,
+    dropped: current.dropped,
     invalidFrames: current.invalidFrames,
     lastInvalid: current.lastInvalid,
     uxState: streamUxState(current.status, current.error),

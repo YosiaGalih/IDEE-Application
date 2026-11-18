@@ -4,9 +4,11 @@ import { SseParser, type SseFrame } from "./parser";
 
 /**
  * connecting → open; on a drop reconnecting, then disconnected after `disconnectedAfter` failures (retries go
- * on); failed = stopped for good (a status reconnecting cannot fix: call retry()); closed = closed by the caller.
+ * on); failed = stopped for good (a status reconnecting cannot fix: call retry()); ended = the server ended the
+ * stream (`stream.end`, the task is final): a normal stop, no reconnect, retry() resumes; closed = closed by the caller.
  */
-export type StreamStatus = "connecting" | "open" | "reconnecting" | "disconnected" | "failed" | "closed";
+export type StreamStatus =
+  "connecting" | "open" | "reconnecting" | "disconnected" | "failed" | "ended" | "closed";
 export type StreamFrame = SseFrame & { seq: number | null };
 
 export type StreamOptions = {
@@ -31,7 +33,7 @@ export type StreamOptions = {
 
 export type EventStream = {
   close(): void;
-  /** Starts again after `failed` (e.g. after signing in again); no effect otherwise. */
+  /** Starts again after `failed` or `ended` (resuming from lastSeq); no effect otherwise. */
   retry(): void;
   lastSeq(): number | null;
 };
@@ -160,6 +162,7 @@ export function openEventStream(options: StreamOptions): EventStream {
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     let silent = false;
     let gap = false;
+    let ended = false;
     let openedAt: number | null = null;
     /** A connection that stayed up a while was healthy even with heartbeats only (an idle wait). */
     const wasHealthy = () => openedAt !== null && Date.now() - openedAt >= healthyAfterMs;
@@ -200,6 +203,10 @@ export function openEventStream(options: StreamOptions): EventStream {
         if (done) break;
         arm(); // any bytes, heartbeat comments included, prove the connection is alive
         for (const frame of parser.push(value)) {
+          if (frame.event === "stream.end" && frame.id === null) {
+            ended = true; // not a task event: never delivered, never counted
+            break;
+          }
           const outcome = deliver(frame);
           if (outcome === "gap") {
             gap = true;
@@ -207,6 +214,11 @@ export function openEventStream(options: StreamOptions): EventStream {
           }
           // A new frame proves the stream works; an accepted handshake or a replayed duplicate does not.
           if (outcome === "new") failures = 0;
+        }
+        if (ended) {
+          attempt.abort();
+          reader.cancel().catch(() => {});
+          break;
         }
         if (gap) {
           attempt.abort();
@@ -216,6 +228,12 @@ export function openEventStream(options: StreamOptions): EventStream {
       }
       if (watchdog) clearTimeout(watchdog);
       if (closed) return;
+      if (ended) {
+        stopped = true;
+        failures = 0;
+        report("ended");
+        return;
+      }
       if (!gap && wasHealthy()) failures = 0;
       if (gap)
         scheduleRetry(new ApiError({ kind: "bad_response", message: "events missing from the stream" }));
