@@ -92,7 +92,7 @@ Index `(project_id, kind)`, `(project_id, symbol)`; trigram index pada `path` bi
 | lease_expires_at | timestamptz null | |
 | event_seq | bigint default 0 | counter event |
 | version | int default 1 | optimistic lock |
-| error_code / error_message | varchar(64) / text null | |
+| error_code / error_message | varchar(64) / text null | Ditulis hanya oleh `workflow/states.py::fail_task` bersama transisi ke `failed` dalam satu savepoint (`transition()` sendiri tidak menulisnya); pesan diredaksi. WP-3.2c1: `planning_interrupted` (planning `draft` terputus tiga kali) dan `step_unavailable` (langkah pipeline tidak terdaftar); langkah `fail` memakai kodenya sendiri. Arti kode: API_CONTRACTS §5 |
 | created_by | fk users | |
 | created_at, updated_at, started_at, completed_at | timestamptz | |
 Index `(project_id, status)`, `(status, lease_expires_at)`.
@@ -320,7 +320,7 @@ Index `(owner_id, last_message_at desc)`, `(space_id)`.
 | model | varchar(100) null | |
 | agent_id | varchar(40) null | |
 | usage | jsonb not null default '{}' | ringkasan (sumber kebenaran: `usage_records`/`capability_usage`) |
-| error_code | varchar(64) null | Ditulis `workflow/states.py::fail_task` bersama `error_message` dan transisi ke `failed` dalam satu savepoint (`transition()` sendiri tidak menulisnya); pesan diredaksi. WP-3.2c1: `planning_interrupted` (planning `draft` terputus tiga kali), `step_unavailable` (langkah pipeline tidak terdaftar); langkah `fail` memakai kodenya sendiri. Arti kode: API_CONTRACTS §5 |
+| error_code | varchar(64) null | |
 | error_message | text null | |
 | lease_owner | varchar(120) null | klaim worker (recovery sweep) |
 | lease_expires_at | timestamptz null | |
