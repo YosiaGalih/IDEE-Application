@@ -598,9 +598,10 @@ describe("useTaskEvents", () => {
 
   it("starts the same task again from nothing after it went away (A, null, A)", async () => {
     const endpoint = fakeEndpoint();
+    const initialProps: { id: string | null } = { id: TASK };
     const { result, rerender } = renderHook(
       ({ id }: { id: string | null }) => useTaskEvents(id, { fetchImpl: endpoint.fetchImpl, ...fast }),
-      { initialProps: { id: TASK } },
+      { initialProps },
     );
     await waitFor(() => expect(result.current.status).toBe("open"));
     act(() => endpoint.send(event(1) + event(2) + event(3) + event(4) + event(5)));
