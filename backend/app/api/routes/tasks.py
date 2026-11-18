@@ -7,26 +7,33 @@ scope, 403 without ``task:create``); the service authorises again under a row lo
 
 from __future__ import annotations
 
+import contextlib
+import re
 import uuid
+from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
+from starlette.responses import StreamingResponse
 
 from app.agents.contracts import WorkflowType  # == WORKFLOW_TYPES
-from app.api.deps import CurrentActor, require_project_permission
+from app.api.deps import CurrentActor, StreamActor, dependencies, require_project_permission
 from app.api.routes.approval_out import ApprovalOut
 from app.api.routes.dashboard import UsageOut
 from app.api.routes.projects import EnvDep, _respond
-from app.core.errors import AppError
+from app.core.context import REQUEST_ID_HEADER
+from app.core.csrf import SESSION_COOKIE
+from app.core.errors import AppError, request_id_of
 from app.models.enums import TASK_STATUSES
 from app.services import task_events, tasks
 from app.services.context_refs import MAX_CONTEXT_REFS, ContextRef
 from app.services.project_budget import BudgetDefaults
 from app.services.projects import PAGE_SIZE_MAX, Actor
-from app.services.task_events import HISTORY_LIMIT_MAX
+from app.services.task_events import HISTORY_LIMIT_MAX, StreamSlot, StreamTimings, stream_frames
 from app.services.tasks import PROMPT_MAX, TITLE_MAX, TaskCreate, TaskSummary, TaskView
 
 router = APIRouter(tags=["tasks"])
@@ -235,6 +242,79 @@ async def task_event_history(
         env, actor, task_id, after_seq=after_seq, limit=limit
     )
     return _respond(request, messages, meta={"next_after_seq": next_after_seq})
+
+
+_SEQ_MAX = 2**63 - 1
+_DIGITS = re.compile(r"[0-9]{1,19}")
+
+
+def _resume_point(last_event_id: str | None, after_seq: str | None) -> int:
+    """``Last-Event-ID`` wins over ``?after_seq=`` (#29); each is an integer 0..2**63-1, else 422."""
+    where, raw = ("header", last_event_id) if last_event_id is not None else ("query", after_seq)
+    if raw is None:
+        return 0
+    value = int(raw) if _DIGITS.fullmatch(raw) else -1
+    if not 0 <= value <= _SEQ_MAX:
+        loc = ["header", "Last-Event-ID"] if where == "header" else ["query", "after_seq"]
+        raise AppError(
+            "VALIDATION_ERROR",
+            "Input did not pass validation",
+            http_status=422,
+            details=[{"loc": loc, "msg": "must be an integer from 0 to 9223372036854775807"}],
+        )
+    return value
+
+
+def stream_response(
+    slot: StreamSlot, frames: AsyncGenerator[str, None], *, request_id: str
+) -> StreamingResponse:
+    """The SSE response. The slot is freed when the stream ends, fails or is closed (``finally``) and, if the
+    body is never iterated, by the background task; ``release`` is idempotent."""
+
+    async def body() -> AsyncIterator[str]:
+        try:
+            async with contextlib.aclosing(frames):
+                async for frame in frames:
+                    yield frame
+        finally:
+            slot.release()
+
+    return StreamingResponse(
+        body(),
+        media_type="text/event-stream; charset=utf-8",
+        headers={REQUEST_ID_HEADER: request_id, "Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        background=BackgroundTask(slot.release),
+    )
+
+
+@router.get("/tasks/{task_id}/events")
+async def task_event_stream(
+    request: Request,
+    task_id: uuid.UUID,
+    actor: StreamActor,
+    env: EnvDep,
+    after_seq: Annotated[str | None, Query(max_length=40)] = None,
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID", max_length=40)] = None,
+) -> StreamingResponse:
+    resume = _resume_point(last_event_id, after_seq)
+    await task_events.open_stream(env, actor, task_id)  # 404 before any byte
+    deps = dependencies(request)
+    slot = deps.stream_slots.acquire(actor.user_id)  # 429 before any byte
+    try:
+        frames = stream_frames(
+            env,
+            request.app.state.settings,
+            deps.hub,
+            session_token=request.cookies.get(SESSION_COOKIE, ""),
+            actor=actor,
+            task_id=task_id,
+            after_seq=resume,
+            timings=StreamTimings(),
+        )
+        return stream_response(slot, frames, request_id=request_id_of(request))
+    except BaseException:
+        slot.release()
+        raise
 
 
 @router.post("/projects/{project_id}/tasks")

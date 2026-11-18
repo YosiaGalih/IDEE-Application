@@ -24,7 +24,7 @@ from app.gitops.adapter import GitAdapter
 from app.sandbox.client import HttpSandboxClient
 from app.services.job_queue import CeleryJobQueue, JobQueue, SmokeQueue
 from app.services.projects import CreateGate
-from app.services.task_events import TaskEventHub
+from app.services.task_events import StreamSlots, TaskEventHub
 
 ReadinessCheck = Callable[[], Awaitable[bool]]
 
@@ -59,6 +59,8 @@ class Dependencies:
     # Live task events (SSE). Built here, started by the app lifespan; None or not started in tests,
     # and routes must work without a running hub.
     hub: TaskEventHub | None = None
+    # Open event streams of this process (spec WP-3.2 §13.2 #32).
+    stream_slots: StreamSlots = field(default_factory=StreamSlots)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Dependencies:

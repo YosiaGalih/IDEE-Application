@@ -78,6 +78,22 @@ def current_actor(ctx: CurrentUser, ip: ClientIp) -> Actor:
 CurrentActor = Annotated[Actor, Depends(current_actor)]
 
 
+async def current_actor_readonly(request: Request, sessions: SessionsDep, ip: ClientIp) -> Actor:
+    """``current_actor`` for the event stream: the session is validated but never touched (ruling R3).
+
+    A stream reconnects by itself at least every 55 minutes; that is not user activity and must not keep an
+    idle session alive. GET: no CSRF check.
+    """
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        raise AppError("UNAUTHENTICATED", "Authentication required", http_status=401)
+    user, _, grants = await resolve_session(sessions, request.app.state.settings, token, touch=False)
+    return Actor(user.id, user.email, user.display_name, tuple(grants), ip=ip)
+
+
+StreamActor = Annotated[Actor, Depends(current_actor_readonly)]
+
+
 def require_project_permission(permission: str) -> Callable[..., Awaitable[Actor]]:
     """First door of a ``/projects/{project_id}`` route (SECURITY_MODEL §8, T6).
 

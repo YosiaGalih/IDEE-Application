@@ -309,7 +309,7 @@ async def test_replay_after_last_event_id(
     for seq in (3, 4, 5):
         raw = await next_raw(stream)
         message = await stored_message(world, seq)
-        data = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+        data = json.dumps(message, ensure_ascii=True, separators=(",", ":"))
         assert raw == f"id: {seq}\nevent: task.log\ndata: {data}\n\n"
     # Live (no ping can fire): the published message is the stored one, byte for byte.
     await add_events(world, 1, bus=bus)
@@ -765,3 +765,23 @@ async def test_no_db_session_held_between_pings(
     for _ in range(4):
         assert await next_raw(pinging) == PING
         assert await busy_stream_backends(engine) == []
+
+
+async def test_lone_surrogate_in_an_ephemeral_payload_streams_as_ascii(
+    world: World, hub: TaskEventHub, redis: Redis, streams: Any
+) -> None:
+    """Ruling R4: ``\\ud800`` in a published payload must not break the UTF-8 encoding of the response."""
+    stream = streams(hub)
+    await add_events(world, 1)
+    assert (await next_event(stream)).id == 1
+    bare = {
+        "task_id": str(world.task_id),
+        "type": "agent.delta",
+        "ts": "2026-11-18T00:00:00Z",
+        "payload": {"text": "a\ud800b \u00e9"},
+    }
+    await redis.publish(task_channel(world.task_id), json.dumps(bare))
+    raw = await next_raw(stream)
+    assert raw.isascii()
+    raw.encode("utf-8")
+    assert parse(raw).data["payload"]["text"] == "a\ud800b \u00e9"  # type: ignore[union-attr]

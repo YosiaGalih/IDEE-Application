@@ -17,7 +17,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, Final, NamedTuple
 
@@ -49,6 +49,8 @@ REPLAY_PAGE: Final = 500
 PING_INTERVAL_S: Final = 15.0
 AUTH_RECHECK_S: Final = 60.0
 MAX_STREAM_S: Final = 3300.0  # 55 minutes, under Caddy's read_timeout of one hour
+MAX_STREAMS_PER_USER: Final = 8  # spec §13.2 #32
+MAX_STREAMS_TOTAL: Final = 256
 STREAM_END: Final = "stream.end"
 PING_FRAME: Final = ": ping\n\n"
 # The ``event:`` line names a type only when it matches (#33); a type that does not is never sent.
@@ -284,7 +286,8 @@ def format_frame(message: dict[str, Any]) -> str | None:
 
     ``id:`` only for a stored event (an int ``seq``). ``data`` is the whole message as one line of JSON:
     ``json.dumps`` escapes ``\\n`` and ``\\r`` inside strings, so a payload can neither end the frame nor add
-    an ``id:``/``event:`` line. ``event:`` carries ``type`` only when it matches ``EVENT_TYPE``.
+    an ``id:``/``event:`` line; ASCII only (ruling R4), so a lone surrogate cannot break the UTF-8
+    response. ``event:`` carries ``type`` only when it matches ``EVENT_TYPE``.
     """
     type_ = message.get("type")
     seq = message.get("seq")
@@ -292,14 +295,14 @@ def format_frame(message: dict[str, Any]) -> str | None:
         return None
     if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool)):
         return None
-    data = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+    data = json.dumps(message, ensure_ascii=True, separators=(",", ":"))
     head = "" if seq is None else f"id: {seq}\n"
     return f"{head}event: {type_}\ndata: {data}\n\n"
 
 
 def _end_frame(task_id: uuid.UUID, status: str | None) -> str:
     """``stream.end`` (no ``id``): the task is finished and fully sent, or gone (``status`` null)."""
-    data = json.dumps({"task_id": str(task_id), "status": status}, ensure_ascii=False, separators=(",", ":"))
+    data = json.dumps({"task_id": str(task_id), "status": status}, ensure_ascii=True, separators=(",", ":"))
     return f"event: {STREAM_END}\ndata: {data}\n\n"
 
 
@@ -396,7 +399,7 @@ async def stream_frames(
     after_seq: int,
     timings: StreamTimings = StreamTimings(),  # noqa: B008 - frozen value
     clock: Callable[[], float] = time.monotonic,
-) -> AsyncIterator[str]:
+) -> AsyncGenerator[str, None]:
     """SSE frames of one task's events after ``after_seq``: each stored event exactly once, in ``seq`` order.
 
     The listener is registered before the replay, so nothing published meanwhile is missed. State:
@@ -480,3 +483,48 @@ async def stream_frames(
                     yield frame
             elif seq > cursor:
                 behind = True
+
+
+class StreamSlot:
+    """One open stream's place. ``release`` is idempotent: the generator's ``finally`` and the response's
+    background task both call it, and a second call must never free someone else's place."""
+
+    def __init__(self, slots: StreamSlots, user_id: uuid.UUID) -> None:
+        self._slots: StreamSlots | None = slots
+        self._user_id = user_id
+
+    def release(self) -> None:
+        slots, self._slots = self._slots, None
+        if slots is not None:
+            slots._free(self._user_id)
+
+
+class StreamSlots:
+    """Open streams counted in memory: ``per_user`` for one user, ``total`` for the process (spec §13.2 #32).
+
+    Right for one process (tier S); higher tiers move the counter to Redis. Synchronous and without awaits,
+    so the check and the count are one step on the event loop.
+    """
+
+    def __init__(self, per_user: int = MAX_STREAMS_PER_USER, total: int = MAX_STREAMS_TOTAL) -> None:
+        self._per_user = per_user
+        self._total = total
+        self._open: dict[uuid.UUID, int] = {}
+
+    def acquire(self, user_id: uuid.UUID) -> StreamSlot:
+        if self._open.get(user_id, 0) >= self._per_user or sum(self._open.values()) >= self._total:
+            raise AppError(
+                "RATE_LIMITED",
+                "Too many open event streams",
+                http_status=429,
+                details=[{"reason": "too_many_streams"}],
+            )
+        self._open[user_id] = self._open.get(user_id, 0) + 1
+        return StreamSlot(self, user_id)
+
+    def _free(self, user_id: uuid.UUID) -> None:
+        count = self._open.get(user_id, 0) - 1
+        if count > 0:
+            self._open[user_id] = count
+        else:
+            self._open.pop(user_id, None)
