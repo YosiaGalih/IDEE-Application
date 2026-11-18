@@ -8,6 +8,7 @@ event that arrives anyway took the path the test is about (live, lagged re-read,
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import time
@@ -59,6 +60,7 @@ from app.services.task_events import (
 )
 from app.workflow import states
 from tests.conftest import reset_data
+from tests.integration.test_task_event_hub import kill_hub_connection
 
 REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 WAIT = 5.0
@@ -406,7 +408,72 @@ async def test_without_hub_delivers_on_ping(
         assert await next_raw(stream) == PING  # the check after the replay is done
         await add_events(world, 1, bus=bus)  # published, but this stream hears nothing live
         assert (await next_event(stream)).id == 2  # found by the check that follows a ping
-    assert [entry["event"] for entry in logs].count("task_stream_without_hub") == 1
+    without = [entry for entry in logs if entry["event"] == "task_stream_without_hub"]
+    assert [entry["hub"] for entry in without] == ["absent" if hub_state == "none" else "stopped"]
+
+
+async def test_running_hub_without_its_connection(
+    world: World,
+    start_hub: Any,
+    bus: EventBus,
+    redis: Redis,
+    streams: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hub that runs but lost Redis (its backoff not over) still gives correct streams: lagged and pings."""
+    monkeypatch.setattr(service, "HUB_BACKOFF_FIRST", SLOW)  # no resubscribe during the test
+    hub = await start_hub()
+    await add_events(world, 1)
+    before = streams(hub, ping_s=0.05)
+    assert (await next_event(before)).id == 1
+    await kill_hub_connection(redis, hub)
+    await until(lambda: not hub.subscribed)
+    assert hub.running
+    with capture_logs() as logs:
+        after = streams(hub, ping_s=0.05)
+        assert (await next_event(after)).id == 1
+        await add_events(world, 2, bus=bus)  # 2, 3: published while nothing is subscribed
+        assert await ids_until(after, 3) == [2, 3]
+        assert await ids_until(before, 3) == [2, 3]
+    without = [entry for entry in logs if entry["event"] == "task_stream_without_hub"]
+    assert [(entry["task_id"], entry["hub"]) for entry in without] == [(str(world.task_id), "disconnected")]
+
+
+async def test_unexpected_failure_is_logged_and_raised(world: World, hub: TaskEventHub) -> None:
+    calls: list[int] = []
+
+    def sessions() -> Any:
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("never in a log: " + "postgresql://kodekantor:pw@db")
+        return world.env.sessions()
+
+    env = dataclasses.replace(world.env, sessions=sessions)  # pyright: ignore[reportArgumentType]
+    await add_events(world, 1)
+    stream = stream_frames(
+        env,
+        world.settings,
+        hub,
+        session_token="not-checked",  # no recheck fires
+        actor=world.owner,
+        task_id=world.task_id,
+        after_seq=0,
+        timings=StreamTimings(ping_s=SLOW, auth_recheck_s=SLOW, max_stream_s=SLOW),
+    )
+    with capture_logs() as logs:
+        assert (await next_event(stream)).id == 1  # the replay page: the first session
+        with pytest.raises(RuntimeError):
+            await next_raw(stream)  # the status check after it: the second session fails
+    assert [entry for entry in logs if entry["event"] == "task_stream_failed"] == [
+        {
+            "event": "task_stream_failed",
+            "task_id": str(world.task_id),
+            "user_id": str(world.owner.user_id),
+            "error": "RuntimeError",
+            "log_level": "error",
+        }
+    ]
+    assert "pw@" not in repr(logs)
 
 
 async def test_ephemeral_has_no_id_and_is_not_stored(

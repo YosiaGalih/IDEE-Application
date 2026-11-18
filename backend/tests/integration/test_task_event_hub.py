@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from redis.asyncio import Redis
+from structlog.testing import capture_logs
 
 from app.core.config import load_settings
 from app.core.events import task_channel
@@ -247,3 +248,53 @@ async def test_subscribed_is_false_until_the_subscription_is_live() -> None:
     assert hub.subscribed
     await hub.stop()
     assert not hub.subscribed
+
+
+async def test_an_unexpected_stop_of_the_hub_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    hub = TaskEventHub(REDIS_URL)
+
+    async def broken(redis: Redis) -> None:
+        raise RuntimeError("never in a log: " + "redis://user:pw@host")
+
+    monkeypatch.setattr(hub, "_run", broken)
+    with capture_logs() as logs:
+        await hub.start()
+        async with asyncio.timeout(WAIT):
+            while not any(entry["event"] == "task_event_hub_stopped" for entry in logs):  # noqa: ASYNC110
+                await asyncio.sleep(0.01)
+        assert not hub.running
+        await hub.stop()
+    assert [entry for entry in logs if entry["event"].startswith("task_event_hub")] == [
+        {"event": "task_event_hub_stopped", "error": "RuntimeError", "log_level": "error"}
+    ]
+
+
+async def test_stop_is_not_an_unexpected_stop() -> None:
+    hub = TaskEventHub(REDIS_URL)
+    with capture_logs() as logs:
+        await hub.start()
+        await hub.wait_subscribed(WAIT)
+        await hub.stop()
+        await asyncio.sleep(0)  # done callbacks have run
+    assert [entry["event"] for entry in logs if entry["event"].startswith("task_event_hub")] == []
+
+
+async def test_a_full_queue_is_logged_once_per_episode(hub: TaskEventHub, redis: Redis) -> None:
+    a, b = uuid.uuid4(), uuid.uuid4()
+    with capture_logs() as logs, hub.listen(a) as listener, hub.listen(b) as marker:
+        for seq in (1, 2, 3, 4, 5):  # the queue holds 2
+            await publish(redis, a, seq)
+        await deliver_marker(redis, marker, b, 1)  # the hub has routed all five
+        assert listener.lagged
+        listener.take_lagged()  # the stream noticed: the next loss is a new episode
+        for seq in (6, 7):
+            await publish(redis, a, seq)
+        await deliver_marker(redis, marker, b, 2)
+    lagged = [entry for entry in logs if entry["event"] == "task_stream_lagged"]
+    assert (
+        lagged
+        == [
+            {"event": "task_stream_lagged", "task_id": str(a), "reason": "queue_full", "log_level": "warning"}
+        ]
+        * 2
+    )

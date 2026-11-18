@@ -97,20 +97,26 @@ async def history(
 
 class TaskListener:
     """One stream's bounded queue. A message that does not fit is dropped and ``lagged`` is set: the stream
-    then re-reads from the database instead of trusting the queue (spec §13.2)."""
+    then re-reads from the database instead of trusting the queue (spec §13.2). The first drop of an episode
+    (until the stream takes the flag) is logged, without the message."""
 
-    def __init__(self, queue_max: int) -> None:
+    def __init__(self, task_id: uuid.UUID, queue_max: int) -> None:
+        self.task_id = task_id
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=queue_max)
         self.lagged = False
+        self._dropping = False
 
     def put(self, message: dict[str, Any]) -> None:
         try:
             self.queue.put_nowait(message)
         except asyncio.QueueFull:
             self.lagged = True
+            if not self._dropping:
+                self._dropping = True
+                logger.warning("task_stream_lagged", task_id=str(self.task_id), reason="queue_full")
 
     def take_lagged(self) -> bool:
-        lagged, self.lagged = self.lagged, False
+        lagged, self.lagged, self._dropping = self.lagged, False, False
         return lagged
 
 
@@ -119,7 +125,9 @@ class TaskEventHub:
 
     Own client without ``socket_timeout`` (an idle subscription is normal) and with ``health_check_interval``.
     Never raises into streams and its reader never dies: trouble (a lost connection, a full queue, a message
-    that is not an event) shows as ``listener.lagged`` or is logged and dropped.
+    that is not an event) shows as ``listener.lagged`` or is logged and dropped. Should the reader stop all
+    the same, other than by ``stop()``, that is logged (``task_event_hub_stopped``) and ``running`` turns
+    false.
     """
 
     def __init__(self, redis_url: str, *, queue_max: int = HUB_QUEUE_MAX) -> None:
@@ -158,7 +166,17 @@ class TaskEventHub:
             client_name=self.client_name,
             retry=Retry(NoBackoff(), 0),
         )
-        self._task = asyncio.create_task(self._run(self._redis), name="task-event-hub")
+        task = asyncio.create_task(self._run(self._redis), name="task-event-hub")
+        task.add_done_callback(self._on_reader_done)
+        self._task = task
+
+    def _on_reader_done(self, task: asyncio.Task[None]) -> None:
+        if task is not self._task:  # stop() let it go, or a later start() replaced it
+            return
+        self._task = None
+        self._subscribed.clear()
+        error = "CancelledError" if task.cancelled() else type(task.exception()).__name__
+        logger.error("task_event_hub_stopped", error=error)  # the type only: never a message or URL
 
     async def stop(self) -> None:
         task, self._task = self._task, None
@@ -180,7 +198,7 @@ class TaskEventHub:
 
     @contextmanager
     def listen(self, task_id: uuid.UUID) -> Iterator[TaskListener]:
-        listener = TaskListener(self._queue_max)
+        listener = TaskListener(task_id, self._queue_max)
         self._listeners.setdefault(task_id, set()).add(listener)
         try:
             yield listener
@@ -363,14 +381,17 @@ async def open_stream(env: ProjectEnv, actor: Actor, task_id: uuid.UUID) -> None
 
 @contextmanager
 def _listen(hub: TaskEventHub | None, task_id: uuid.UUID) -> Iterator[TaskListener | None]:
-    if hub is not None and hub.running:
-        with hub.listen(task_id) as listener:
-            yield listener
+    """The hub's listener while the hub runs, else ``None``. Without a live subscription now (no hub, a hub
+    not started, or one whose Redis is down or not reached yet) the per-ping database check still delivers
+    every stored event, only later (spec §13.5 #2); that is logged once per stream."""
+    if hub is None or not hub.subscribed:
+        state = "absent" if hub is None else "disconnected" if hub.running else "stopped"
+        logger.warning("task_stream_without_hub", task_id=str(task_id), hub=state)
+    if hub is None or not hub.running:
+        yield None
         return
-    # No live channel (no lifespan, or Redis was down at start): the per-ping database check still delivers
-    # every stored event, only later (spec §13.5 #2).
-    logger.warning("task_stream_without_hub", task_id=str(task_id))
-    yield None
+    with hub.listen(task_id) as listener:  # a disconnected hub marks it lagged when it subscribes again
+        yield listener
 
 
 async def _task_row(env: ProjectEnv, task_id: uuid.UUID) -> _TaskRow | None:
@@ -460,7 +481,8 @@ async def stream_frames(
        beyond, or not sendable as it is -> ``db_may_have_more`` (the database has it, and any gap before
        it: commit precedes publish).
 
-    No database session is open while a frame is out or while waiting.
+    No database session is open while a frame is out or while waiting. An unexpected error is logged
+    (``task_stream_failed``: task, user, error type) and raised.
     """
     started = clock()
     deadline = started + timings.max_stream_s
@@ -470,70 +492,76 @@ async def stream_frames(
     db_may_have_more = True  # the replay
     status_check_due = True  # right after the replay: a finished task ends without waiting for a ping
     recheck_at_seq: int | None = None
-    with _listen(hub, task_id) as listener:
-        while True:
-            now = clock()
-            if now >= deadline:
-                logger.info("task_stream_closed", task_id=str(task_id), reason="max_lifetime")
-                return
-            if now >= next_ping:
-                next_ping = now + timings.ping_s
-                status_check_due = True
-                yield PING_FRAME
-                continue
-            if now >= next_auth:  # before the replay pages: a long backlog never postpones it
-                next_auth = now + timings.auth_recheck_s
-                row = await _task_row(env, task_id)
-                if row is None:  # spec §13.5 #7: a missing task ends the stream before access is judged
-                    yield _end_frame(task_id, None)
+    try:
+        with _listen(hub, task_id) as listener:
+            while True:
+                now = clock()
+                if now >= deadline:
+                    logger.info("task_stream_closed", task_id=str(task_id), reason="max_lifetime")
                     return
-                if not await _may_still_read(env, settings, session_token, actor, row, task_id):
-                    return
-                continue
-            if db_may_have_more:
-                page = await _read_page(env, task_id, cursor)
-                db_may_have_more = len(page) == REPLAY_PAGE
-                for message in page:
-                    cursor = message["seq"]
-                    status_check_due = status_check_due or message["type"] == STATUS_CHANGED
-                    yield _stored_frame(task_id, message)
-                continue
-            if recheck_at_seq is not None and cursor >= recheck_at_seq:
-                recheck_at_seq = None
-                status_check_due = True
-            if status_check_due:
-                status_check_due = False
-                row = await _task_row(env, task_id)
-                if row is None:
-                    yield _end_frame(task_id, None)
-                    return
-                finished = row.status in FINISHED
-                if finished and cursor >= row.event_seq:
-                    yield _end_frame(task_id, row.status)
-                    return
-                if row.event_seq > cursor:
-                    db_may_have_more = True
-                    recheck_at_seq = row.event_seq if finished else None
-                continue
-            if listener is not None and listener.take_lagged():
-                db_may_have_more = True
-                continue
-            message = await _next_message(listener, min(next_ping, next_auth, deadline) - now)
-            if message is None:
-                continue
-            seq = message["seq"]
-            if seq is None:
-                if (frame := _live_frame(task_id, message)) is not None:
-                    yield frame
-            elif seq > cursor:
-                frame = _live_frame(task_id, message) if seq == cursor + 1 else None
-                if frame is None:  # a gap before it, or not sendable as it is: the database has the event
+                if now >= next_ping:
+                    next_ping = now + timings.ping_s
+                    status_check_due = True
+                    yield PING_FRAME
+                    continue
+                if now >= next_auth:  # before the replay pages: a long backlog never postpones it
+                    next_auth = now + timings.auth_recheck_s
+                    row = await _task_row(env, task_id)
+                    if row is None:  # spec §13.5 #7: a missing task ends the stream before access is judged
+                        yield _end_frame(task_id, None)
+                        return
+                    if not await _may_still_read(env, settings, session_token, actor, row, task_id):
+                        return
+                    continue
+                if db_may_have_more:
+                    page = await _read_page(env, task_id, cursor)
+                    db_may_have_more = len(page) == REPLAY_PAGE
+                    for message in page:
+                        cursor = message["seq"]
+                        status_check_due = status_check_due or message["type"] == STATUS_CHANGED
+                        yield _stored_frame(task_id, message)
+                    continue
+                if recheck_at_seq is not None and cursor >= recheck_at_seq:
+                    recheck_at_seq = None
+                    status_check_due = True
+                if status_check_due:
+                    status_check_due = False
+                    row = await _task_row(env, task_id)
+                    if row is None:
+                        yield _end_frame(task_id, None)
+                        return
+                    finished = row.status in FINISHED
+                    if finished and cursor >= row.event_seq:
+                        yield _end_frame(task_id, row.status)
+                        return
+                    if row.event_seq > cursor:
+                        db_may_have_more = True
+                        recheck_at_seq = row.event_seq if finished else None
+                    continue
+                if listener is not None and listener.take_lagged():
                     db_may_have_more = True
                     continue
-                cursor = seq
-                if message["type"] == STATUS_CHANGED:
-                    status_check_due = True
-                yield frame
+                message = await _next_message(listener, min(next_ping, next_auth, deadline) - now)
+                if message is None:
+                    continue
+                seq = message["seq"]
+                if seq is None:
+                    if (frame := _live_frame(task_id, message)) is not None:
+                        yield frame
+                elif seq > cursor:
+                    frame = _live_frame(task_id, message) if seq == cursor + 1 else None
+                    if frame is None:  # a gap before it, or not sendable as it is: the database has the event
+                        db_may_have_more = True
+                        continue
+                    cursor = seq
+                    if message["type"] == STATUS_CHANGED:
+                        status_check_due = True
+                    yield frame
+    except Exception as exc:  # the type only: a message may carry a URL or a query
+        logger.error(
+            "task_stream_failed", task_id=str(task_id), user_id=str(actor.user_id), error=type(exc).__name__
+        )
+        raise
 
 
 class StreamSlot:
