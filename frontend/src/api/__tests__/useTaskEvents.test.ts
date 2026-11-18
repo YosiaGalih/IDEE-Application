@@ -596,6 +596,28 @@ describe("useTaskEvents", () => {
     expect(endpoint.requests[2]?.url.searchParams.get("after_seq")).toBe("1"); // OTHER's own seq
   });
 
+  it("starts the same task again from nothing after it went away (A, null, A)", async () => {
+    const endpoint = fakeEndpoint();
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string | null }) => useTaskEvents(id, { fetchImpl: endpoint.fetchImpl, ...fast }),
+      { initialProps: { id: TASK as string | null } },
+    );
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => endpoint.send(event(1) + event(2) + event(3) + event(4) + event(5)));
+    await waitFor(() => expect(result.current.lastSeq).toBe(5));
+    rerender({ id: null });
+    expect(result.current.status).toBe("closed");
+    rerender({ id: TASK });
+    expect(result.current.events).toEqual([]);
+    await waitFor(() => expect(endpoint.connections()).toBe(2));
+    // The state starts from nothing, so the stream must too: never resume where the hidden events end.
+    expect(endpoint.requests[1]?.url.searchParams.get("after_seq")).toBeNull();
+    expect(endpoint.requests[1]?.headers.get("Last-Event-ID")).toBeNull();
+    act(() => endpoint.send(event(1) + event(2) + event(3) + event(4) + event(5)));
+    await waitFor(() => expect(result.current.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]));
+    expect(result.current.dropped).toBe(0);
+  });
+
   it("resumes after ended on reconnect(): no duplicates, dropped consistent, connecting first", async () => {
     const endpoint = fakeEndpoint();
     const seen: string[] = [];

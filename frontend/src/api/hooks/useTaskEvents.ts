@@ -87,14 +87,16 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
   }
 
   useEffect(() => {
-    if (!taskId) return;
-    const opts = optionsRef.current;
-    // Another task resumes from its own afterSeq. Reset here, where its stream opens: until this effect runs
-    // the previous task's stream is still open and may write the ref (React runs layout effects earlier).
+    // Another task, or no task (which also clears the state), resumes from its own afterSeq: a task that
+    // comes back after null starts from nothing, like its state. Reset here, before the early return and
+    // where the stream opens: until this effect runs the previous stream is still open and may write the
+    // ref (React runs layout effects earlier).
     if (lastSeqTaskRef.current !== taskId) {
       lastSeqTaskRef.current = taskId;
-      lastSeqRef.current = opts.afterSeq ?? null;
+      lastSeqRef.current = optionsRef.current.afterSeq ?? null;
     }
+    if (!taskId) return;
+    const opts = optionsRef.current;
     /** False once this effect is cleaned up: a late callback of its stream then changes nothing. */
     let live = true;
     const update = (change: (s: Inner) => Inner) => {

@@ -325,7 +325,7 @@ def test_release_is_idempotent() -> None:
 
 
 async def no_disconnect() -> Message:
-    await asyncio.Event().wait()  # an ASGI 2.4 server never needs receive() for a streaming response
+    await asyncio.Event().wait()  # a client that neither reads nor disconnects (2.4 never calls it)
     raise AssertionError("unreachable")
 
 
@@ -445,9 +445,11 @@ async def test_client_gone_under_asgi_2_4_frees_slot_and_listener(
     ]
 
 
+@pytest.mark.parametrize("spec", ["2.3", "2.4"])  # 2.3: what uvicorn reports in production
 async def test_client_that_stops_reading_is_released_after_the_deadline(
-    world: World, hub: TaskEventHub
+    world: World, hub: TaskEventHub, spec: str
 ) -> None:
+    """The client keeps the connection open but never reads (and never sends http.disconnect)."""
     await add_events(world, 1)
     response, frames, slots = lifecycle(world, hub, deadline_s=0.3, max_stream_s=0.2)
 
@@ -457,7 +459,7 @@ async def test_client_that_stops_reading_is_released_after_the_deadline(
 
     with capture_logs(processors=[structlog.contextvars.merge_contextvars]) as logs:
         async with asyncio.timeout(WAIT):
-            await response(asgi("2.4"), no_disconnect, send)
+            await response(asgi(spec), no_disconnect, send)  # receive() never returns
     await assert_released(world, hub, frames, slots)
     closed = [entry for entry in logs if entry["event"] == "task_stream_closed"]
     assert [(e["reason"], e["task_id"], e["request_id"]) for e in closed] == [
