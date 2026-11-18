@@ -159,6 +159,7 @@ async def streams(world: World) -> AsyncIterator[Callable[..., AsyncGenerator[st
         max_stream_s: float = SLOW,
         token: str = "not-checked-within-auth-recheck-s",  # noqa: S107 - no recheck fires
         actor: Actor | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> AsyncGenerator[str, None]:
         generator = stream_frames(
             world.env,
@@ -169,6 +170,7 @@ async def streams(world: World) -> AsyncIterator[Callable[..., AsyncGenerator[st
             task_id=world.task_id,
             after_seq=after_seq,
             timings=StreamTimings(ping_s=ping_s, auth_recheck_s=auth_recheck_s, max_stream_s=max_stream_s),
+            clock=clock,
         )
         assert isinstance(generator, AsyncGenerator)
         opened.append(generator)
@@ -570,6 +572,121 @@ async def test_missing_task_ends_before_the_access_check(
     async with asyncio.timeout(WAIT):
         first = await step
     assert [first, *await rest(stream)] == [end_frame(world, None)]
+
+
+async def session_row(world: World, session_id: uuid.UUID) -> tuple[Any, ...]:
+    async with world.writer() as session:
+        row = (
+            await session.execute(
+                text("SELECT last_seen_at, revoked_at, expires_at FROM sessions WHERE id = :id"),
+                {"id": session_id},
+            )
+        ).one()
+        return tuple(row)
+
+
+async def test_recheck_leaves_the_session_untouched(
+    world: World, hub: TaskEventHub, redis: Redis, streams: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling R2: an open stream never extends its session (no last_seen_at write, no revoke commit)."""
+    await add_events(world, 1)
+    token, actor, session_id = await sign_in(world, redis, "owner@example.test")
+    async with world.writer() as session:  # older than LAST_SEEN_RESOLUTION: a touching check would write it
+        await session.execute(
+            text("UPDATE sessions SET last_seen_at = now() - interval '5 minutes' WHERE id = :id"),
+            {"id": session_id},
+        )
+        await session.commit()
+    before = await session_row(world, session_id)
+    rechecks = count_rechecks(monkeypatch)
+    stream = streams(hub, auth_recheck_s=0.05, token=token, actor=actor)
+    assert (await next_event(stream)).id == 1
+    step = asyncio.create_task(anext(stream))
+    await until(lambda: len(rechecks) >= 2)
+    assert not step.done()  # the rechecks passed
+    assert await session_row(world, session_id) == before
+    step.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await step
+
+
+async def test_recheck_of_an_idle_expired_session_closes_without_revoking(
+    world: World, hub: TaskEventHub, redis: Redis, streams: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await add_events(world, 1)
+    token, actor, session_id = await sign_in(world, redis, "owner@example.test")
+    rechecks = count_rechecks(monkeypatch)
+    stream = streams(hub, auth_recheck_s=0.05, token=token, actor=actor)
+    assert (await next_event(stream)).id == 1
+    step = asyncio.create_task(anext(stream))
+    await until(lambda: len(rechecks) >= 1)
+    assert not step.done()
+    idle = world.settings.session_ttl_hours + 1
+    async with world.writer() as session:
+        await session.execute(
+            text("UPDATE sessions SET last_seen_at = now() - make_interval(hours => :h) WHERE id = :id"),
+            {"h": idle, "id": session_id},
+        )
+        await session.commit()
+    async with asyncio.timeout(WAIT):
+        with pytest.raises(StopAsyncIteration):  # closed without stream.end
+            await step
+    assert (await session_row(world, session_id))[
+        1
+    ] is None  # the next HTTP request revokes it, not the stream
+
+
+async def test_recheck_is_not_starved_by_a_long_replay(
+    world: World, hub: TaskEventHub, redis: Redis, streams: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service, "REPLAY_PAGE", 2)
+    await add_events(world, 20)
+    token, actor, session_id = await sign_in(world, redis, "owner@example.test")
+    now = [0.0]  # the stream's clock, moved by hand: no recheck is due until the test says so
+    stream = streams(hub, auth_recheck_s=0.05, token=token, actor=actor, clock=lambda: now[0])
+    assert (await next_event(stream)).id == 1  # page 1 (seq 1, 2) read; 18 events still to replay
+    await auth.logout(world.env.sessions, AUDIT, session_id=session_id, user_id=actor.user_id, ip=None)
+    now[0] = 1.0
+    remaining = [frame for frame in (parse(raw) for raw in await rest(stream)) if frame is not None]
+    assert [frame.id for frame in remaining] == [2]  # the page in hand, then the recheck closed the stream
+
+
+@pytest.mark.parametrize("stop", ["aclose", "cancel"])
+async def test_listener_leaves_the_hub_when_the_stream_stops(
+    world: World, hub: TaskEventHub, redis: Redis, streams: Any, monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    await add_events(world, 1)
+    with spy_listeners(hub, monkeypatch) as listeners:
+        stream = streams(hub)
+        assert (await next_event(stream)).id == 1
+        [listener] = listeners
+        if stop == "aclose":
+            await stream.aclose()
+        else:
+            step = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)  # one turn: the step runs into its wait for a live message
+            step.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await step
+        other = uuid.uuid4()
+        with hub.listen(other) as marker:
+            message = {"task_id": str(world.task_id), "seq": 2, "type": "t", "ts": "x", "payload": {}}
+            await redis.publish(task_channel(world.task_id), json.dumps(message))
+            await redis.publish(task_channel(other), json.dumps({**message, "task_id": str(other)}))
+            async with asyncio.timeout(WAIT):
+                await marker.queue.get()  # after the stream's message: the hub has routed both
+    assert listener.queue.empty() and not listener.lagged
+
+
+@pytest.mark.parametrize("field", ["ping_s", "auth_recheck_s", "max_stream_s"])
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_stream_timings_must_be_positive(field: str, value: float) -> None:
+    with pytest.raises(ValueError, match=field):
+        StreamTimings(**{field: value})
+
+
+def test_default_stream_timings() -> None:
+    assert StreamTimings() == StreamTimings(ping_s=15, auth_recheck_s=60, max_stream_s=3300)
 
 
 async def test_open_stream_checks_scope(world: World) -> None:

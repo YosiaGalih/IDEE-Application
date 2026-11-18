@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -559,6 +560,53 @@ async def test_last_seen_written_at_most_once_per_minute(
             )
         ).scalar()
     assert moved is True
+
+
+async def session_state(engine: AsyncEngine, token: str) -> tuple[datetime, datetime | None]:
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT last_seen_at, revoked_at FROM sessions WHERE token_hash = :h"),
+                {"h": hash_token(token)},
+            )
+        ).one()
+    return row[0], row[1]
+
+
+async def age_session(engine: AsyncEngine, token: str, age: timedelta) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE sessions SET last_seen_at = now() - CAST(:age AS interval) WHERE token_hash = :h"),
+            {"age": age, "h": hash_token(token)},
+        )
+
+
+@pytest.mark.parametrize("touch", [True, False])
+async def test_resolve_session_touches_only_when_asked(
+    app: FastAPI, client: httpx.AsyncClient, owner_id: uuid.UUID, engine: AsyncEngine, touch: bool
+) -> None:
+    """``touch=True`` (the default, every request) slides last_seen_at and revokes an expired session;
+    ``touch=False`` (the SSE recheck, ruling R2 of WP-3.2b) validates the same way and writes nothing."""
+    await login(client)
+    token = client.cookies["kk_session"]
+    sessions, settings = make_sessionmaker(engine), app.state.settings
+    resolve = auth.resolve_session if touch else functools.partial(auth.resolve_session, touch=False)
+    await age_session(engine, token, timedelta(minutes=5))
+    before = await session_state(engine, token)
+    user, _, grants = await resolve(sessions, settings, token)
+    assert (user.id, [g.role for g in grants]) == (owner_id, ["owner"])
+    seen, revoked = await session_state(engine, token)
+    assert (seen > before[0]) is touch and revoked is None
+    await age_session(engine, token, timedelta(hours=settings.session_ttl_hours + 1))
+    with pytest.raises(AppError) as caught:
+        await resolve(sessions, settings, token)
+    assert caught.value.code == "SESSION_EXPIRED"
+    assert ((await session_state(engine, token))[1] is not None) is touch
+    if not touch:  # still refused on every later check, and the next request revokes it
+        with pytest.raises(AppError):
+            await resolve(sessions, settings, token)
+        assert (await client.get(ME)).status_code == 401
+        assert (await session_state(engine, token))[1] is not None
 
 
 async def test_auth_responses_are_not_cached(client: httpx.AsyncClient, owner_id: uuid.UUID) -> None:

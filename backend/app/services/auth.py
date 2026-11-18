@@ -239,8 +239,12 @@ async def _deny(
 
 
 async def resolve_session(
-    sessions: Sessions, settings: Settings, token: str
+    sessions: Sessions, settings: Settings, token: str, *, touch: bool = True
 ) -> tuple[User, Session, list[RoleGrant]]:
+    """The session's user and grants, or 401. A request (``touch``) slides ``last_seen_at`` and revokes an
+    expired session. ``touch=False`` validates the same way but writes nothing: an open event stream rechecks
+    its access with it and so never keeps an idle session alive (WP-3.2b ruling R2); an expired session is
+    refused there and revoked by the next request."""
     now = datetime.now(UTC)
     async with sessions() as db:
         row = (
@@ -257,10 +261,11 @@ async def resolve_session(
             raise unauthenticated()
         idle_limit = session.last_seen_at + timedelta(hours=settings.session_ttl_hours)
         if now >= session.expires_at or now >= idle_limit:
-            session.revoked_at = now
-            await db.commit()
+            if touch:
+                session.revoked_at = now
+                await db.commit()
             raise AppError("SESSION_EXPIRED", "Session expired", http_status=401)
-        if now - session.last_seen_at >= LAST_SEEN_RESOLUTION:
+        if touch and now - session.last_seen_at >= LAST_SEEN_RESOLUTION:
             session.last_seen_at = now
             await db.commit()
         roles = await db.scalars(select(UserRole).where(UserRole.user_id == user.id))

@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import math
 import os
 import re
 import time
@@ -256,11 +257,20 @@ class TaskEventHub:
 
 @dataclasses.dataclass(frozen=True)
 class StreamTimings:
-    """A stream's intervals in seconds: ping and database check, access recheck, connection lifetime."""
+    """A stream's intervals in seconds: ping and database check, access recheck, connection lifetime.
+
+    Each is a positive finite number: zero or less would ping, recheck or close on every pass.
+    """
 
     ping_s: float = PING_INTERVAL_S
     auth_recheck_s: float = AUTH_RECHECK_S
     max_stream_s: float = MAX_STREAM_S
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if not (isinstance(value, int | float) and math.isfinite(value) and value > 0):
+                raise ValueError(f"{field.name} must be a positive number of seconds")
 
 
 class _TaskRow(NamedTuple):
@@ -343,9 +353,13 @@ async def _read_page(env: ProjectEnv, task_id: uuid.UUID, after_seq: int) -> lis
 async def _may_still_read(
     env: ProjectEnv, settings: Settings, session_token: str, actor: Actor, task: _TaskRow, task_id: uuid.UUID
 ) -> bool:
-    """Reload the actor from its session, as ``current_actor`` does, and check ``task:read`` again (#31)."""
+    """Reload the actor from its session, as ``current_actor`` does, and check ``task:read`` again (#31).
+
+    Read only (ruling R2): ``touch=False`` never slides ``last_seen_at`` nor revokes, so an open stream
+    does not keep an idle session alive; an idle-expired session closes the stream.
+    """
     try:
-        user, _, grants = await resolve_session(env.sessions, settings, session_token)
+        user, _, grants = await resolve_session(env.sessions, settings, session_token, touch=False)
         if user.id != actor.user_id:  # one token is one user; never judge another user's grants
             raise not_found()
         reloaded = dataclasses.replace(actor, grants=tuple(grants))
@@ -393,9 +407,10 @@ async def stream_frames(
     1. lifetime over -> return (no ``stream.end``: the client reconnects with ``Last-Event-ID``);
     2. check due (first pass, then after each ``: ping``): read ``status``/``event_seq``; task gone ->
        ``stream.end`` with ``status`` null; ``event_seq > cursor`` -> behind;
-    3. behind -> one page of ``seq > cursor`` (own short session), sent in order; behind while pages are full;
-    4. finished and ``cursor >= event_seq`` -> ``stream.end`` (after the terminal ``task.status_changed``);
-    5. access recheck due -> task gone -> ``stream.end`` null; session or ``task:read`` lost -> return;
+    3. access recheck due (read only) -> task gone -> ``stream.end`` null; session or ``task:read`` lost ->
+       return (no ``stream.end``: the reconnect gets 401/404);
+    4. behind -> one page of ``seq > cursor`` (own short session), sent in order; behind while pages are full;
+    5. finished and ``cursor >= event_seq`` -> ``stream.end`` (after the terminal ``task.status_changed``);
     6. listener lagged -> behind;
     7. wait for a live message until the next deadline: ``seq`` null -> sent without ``id``;
        ``seq <= cursor`` -> dropped; ``cursor + 1`` -> sent; beyond -> behind (the database has it and the
@@ -429,6 +444,15 @@ async def stream_frames(
                 behind = behind or row.event_seq > cursor
                 finished = (row.status, row.event_seq) if row.status in FINISHED else None
                 continue
+            if now >= next_auth:  # before the replay pages: a long backlog never postpones it
+                next_auth = now + timings.auth_recheck_s
+                row = await _task_row(env, task_id)
+                if row is None:  # spec §13.5 #7: a missing task ends the stream before access is judged
+                    yield _end_frame(task_id, None)
+                    return
+                if not await _may_still_read(env, settings, session_token, actor, row, task_id):
+                    return
+                continue
             if behind:
                 page = await _read_page(env, task_id, cursor)
                 behind = len(page) == REPLAY_PAGE
@@ -440,15 +464,6 @@ async def stream_frames(
             if finished is not None and cursor >= finished[1]:
                 yield _end_frame(task_id, finished[0])
                 return
-            if now >= next_auth:
-                next_auth = now + timings.auth_recheck_s
-                row = await _task_row(env, task_id)
-                if row is None:  # spec §13.5 #7: a missing task ends the stream before access is judged
-                    yield _end_frame(task_id, None)
-                    return
-                if not await _may_still_read(env, settings, session_token, actor, row, task_id):
-                    return
-                continue
             if listener is not None and listener.take_lagged():
                 behind = True
                 continue
