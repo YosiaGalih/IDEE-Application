@@ -49,8 +49,8 @@ HUB_POLL_SECONDS: Final = 1.0
 REPLAY_PAGE: Final = 500
 PING_INTERVAL_S: Final = 15.0
 AUTH_RECHECK_S: Final = 60.0
-MAX_STREAM_S: Final = 3300.0  # 55 minutes; each stream's own lifetime is jittered (``jittered_timings``)
-LIFETIME_JITTER: Final = 0.1  # +-10 %: streams opened together (after a deploy) do not reconnect together
+MAX_STREAM_S: Final = 3300.0  # 55 minutes at most, under Caddy's read_timeout of one hour (spec #31)
+LIFETIME_JITTER: Final = 0.1  # up to 10 % shorter (ruling R7): streams opened together reconnect apart
 STREAM_CLOSE_GRACE_S: Final = 30.0  # past its lifetime a response is cut: a client that stopped reading
 STREAMS_RETRY_AFTER_S: Final = 5  # the 429 for too many streams
 MAX_STREAMS_PER_USER: Final = 8  # spec §13.2 #32
@@ -299,9 +299,11 @@ class StreamTimings:
 
 
 def jittered_timings(rand: Callable[[], float] = random.random) -> StreamTimings:
-    """The route's timings: the default intervals, the lifetime moved by up to ``LIFETIME_JITTER`` either way
-    (``rand`` in [0, 1]), so streams that started together do not all reconnect together."""
-    factor = 1 + LIFETIME_JITTER * (2 * rand() - 1)
+    """The route's timings: the default intervals and a lifetime uniformly in
+    ``[(1 - LIFETIME_JITTER) * MAX_STREAM_S, MAX_STREAM_S]`` (``rand`` in [0, 1]), so streams that started
+    together (after a deploy) do not all reconnect together. Only ever shorter (ruling R7): the spec's
+    55-minute bound (#31) and Caddy's one-hour read_timeout always hold."""
+    factor = 1 - LIFETIME_JITTER * (1 - rand())
     return StreamTimings(max_stream_s=MAX_STREAM_S * factor)
 
 

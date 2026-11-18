@@ -88,7 +88,7 @@ CurrentActor = Annotated[Actor, Depends(current_actor)]
 async def current_actor_readonly(request: Request, sessions: SessionsDep, ip: ClientIp) -> Actor:
     """``current_actor`` for the event stream: the session is validated but never touched (ruling R3).
 
-    A stream reconnects by itself about every 55 minutes; that is not user activity and must not keep an
+    A stream reconnects by itself every 49.5-55 minutes; that is not user activity and must not keep an
     idle session alive. It checks no CSRF token, so it serves GET only: on any other method it fails as a
     server error (a wiring bug, never the client's), before any session is read
     (tests/security/test_auth_hardening.py).

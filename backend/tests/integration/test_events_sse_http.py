@@ -222,15 +222,19 @@ async def test_route_jitters_the_lifetime(
     monkeypatch.setattr(tasks_route, "stream_frames", spy)
     for _ in range(3):
         assert (await owner.get(f"/api/v1/tasks/{task_id}/events")).status_code == 200
-    assert all(0.9 * MAX_STREAM_S <= t.max_stream_s <= 1.1 * MAX_STREAM_S for t in seen) and len(seen) == 3
+    assert all(0.9 * MAX_STREAM_S <= t.max_stream_s <= MAX_STREAM_S for t in seen) and len(seen) == 3
 
 
-def test_lifetime_jitter_is_ten_percent() -> None:
+def test_lifetime_jitter_only_shortens_a_stream() -> None:
+    """Ruling R7: up to 10 % shorter, never longer (spec #31: at most 55 minutes, under Caddy's hour)."""
     assert jittered_timings(lambda: 0.0).max_stream_s == pytest.approx(0.9 * MAX_STREAM_S)
-    assert jittered_timings(lambda: 0.5).max_stream_s == pytest.approx(MAX_STREAM_S)
-    assert jittered_timings(lambda: 1.0).max_stream_s == pytest.approx(1.1 * MAX_STREAM_S)
+    assert jittered_timings(lambda: 0.5).max_stream_s == pytest.approx(0.95 * MAX_STREAM_S)
+    assert jittered_timings(lambda: 1.0).max_stream_s == pytest.approx(MAX_STREAM_S)
+    lifetimes = [jittered_timings().max_stream_s for _ in range(200)]
+    assert all(0.9 * MAX_STREAM_S <= lifetime <= MAX_STREAM_S for lifetime in lifetimes)
+    assert len(set(lifetimes)) > 1  # spread: streams opened together do not reconnect together
+    assert MAX_STREAM_S <= 3300  # 55 minutes: with the grace the response stays under the hour
     timings = jittered_timings()
-    assert 0.9 * MAX_STREAM_S <= timings.max_stream_s <= 1.1 * MAX_STREAM_S
     assert (timings.ping_s, timings.auth_recheck_s) == (PING_INTERVAL_S, AUTH_RECHECK_S)
 
 
