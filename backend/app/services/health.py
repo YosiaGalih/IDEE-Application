@@ -24,6 +24,7 @@ from app.gitops.adapter import GitAdapter
 from app.sandbox.client import HttpSandboxClient
 from app.services.job_queue import CeleryJobQueue, JobQueue, SmokeQueue
 from app.services.projects import CreateGate
+from app.services.task_events import StreamSlots, TaskEventHub
 
 ReadinessCheck = Callable[[], Awaitable[bool]]
 
@@ -55,6 +56,11 @@ class Dependencies:
     jobs: JobQueue | None = None
     # Provider smoke tests run in the worker, which holds the key (spec 3.1e Lead decision #3).
     smoke_jobs: SmokeQueue | None = None
+    # Live task events (SSE). Built here, started by the app lifespan; None or not started in tests,
+    # and routes must work without a running hub.
+    hub: TaskEventHub | None = None
+    # Open event streams of this process (spec WP-3.2 §13.2 #32).
+    stream_slots: StreamSlots = field(default_factory=StreamSlots)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Dependencies:
@@ -78,10 +84,13 @@ class Dependencies:
             sessions=make_sessionmaker(engine),
             jobs=(queue := CeleryJobQueue(settings.redis_url)),
             smoke_jobs=queue,
+            hub=TaskEventHub(settings.redis_url),
         )
 
     async def aclose(self) -> None:
         try:
+            if self.hub is not None:
+                await self.hub.stop()
             await self.sandbox.aclose()
         finally:
             try:

@@ -54,11 +54,18 @@ LimiterDep = Annotated[FixedWindowLimiter, Depends(rate_limiter)]
 ClientIp = Annotated[str | None, Depends(client_ip)]
 
 
-async def current_user(request: Request, sessions: SessionsDep) -> AuthContext:
+async def _signed_in(
+    request: Request, sessions: Sessions, *, touch: bool
+) -> tuple[User, Session, list[RoleGrant]]:
+    """The session cookie's user, session and grants, or 401; ``touch`` as in ``resolve_session``."""
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         raise AppError("UNAUTHENTICATED", "Authentication required", http_status=401)
-    user, session, grants = await resolve_session(sessions, request.app.state.settings, token)
+    return await resolve_session(sessions, request.app.state.settings, token, touch=touch)
+
+
+async def current_user(request: Request, sessions: SessionsDep) -> AuthContext:
+    user, session, grants = await _signed_in(request, sessions, touch=True)
     # The middleware already checked header == cookie; a pre-session cookie must not authorise a session.
     if request.method in MUTATING_METHODS and not tokens_match(
         session.csrf_token, request.headers.get(CSRF_HEADER)
@@ -76,6 +83,23 @@ def current_actor(ctx: CurrentUser, ip: ClientIp) -> Actor:
 
 
 CurrentActor = Annotated[Actor, Depends(current_actor)]
+
+
+async def current_actor_readonly(request: Request, sessions: SessionsDep, ip: ClientIp) -> Actor:
+    """``current_actor`` for the event stream: the session is validated but never touched (ruling R3).
+
+    A stream reconnects by itself every 49.5-55 minutes; that is not user activity and must not keep an
+    idle session alive. It checks no CSRF token, so it serves GET only: on any other method it fails as a
+    server error (a wiring bug, never the client's), before any session is read
+    (tests/security/test_auth_hardening.py).
+    """
+    if request.method != "GET":
+        raise RuntimeError(f"current_actor_readonly serves GET routes only, not {request.method[:16]}")
+    user, _, grants = await _signed_in(request, sessions, touch=False)
+    return Actor(user.id, user.email, user.display_name, tuple(grants), ip=ip)
+
+
+StreamActor = Annotated[Actor, Depends(current_actor_readonly)]
 
 
 def require_project_permission(permission: str) -> Callable[..., Awaitable[Actor]]:

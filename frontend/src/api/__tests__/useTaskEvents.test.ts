@@ -1,4 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
+import { useLayoutEffect, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openEventStream, type StreamStatus } from "@/api/sse/eventStream";
 import { useTaskEvents } from "@/api/hooks/useTaskEvents";
@@ -62,6 +63,13 @@ function fakeEndpoint(statuses: number[] = [], { abortErrorsBody = true } = {}) 
 const frame = (seq: number | null, type = "task.log", extra = "") =>
   `${seq === null ? "" : `id: ${seq}\n`}event: ${type}\ndata: {"task_id":"${TASK}","seq":${seq ?? "null"},"type":"${type}","ts":"2026-10-31T01:00:00Z","payload":{${extra}}}\n\n`;
 
+const END = (status: string | null) =>
+  `event: stream.end\ndata: {"task_id":"${TASK}","status":${status === null ? "null" : `"${status}"`}}\n\n`;
+
+/** The server's stand-in for a stored event it cannot send as it is (API §5.1 `event.invalid`). */
+const PLACEHOLDER = (seq: number) =>
+  `id: ${seq}\nevent: event.invalid\ndata: {"task_id":"${TASK}","seq":${seq},"type":"event.invalid","ts":"2026-10-31T01:00:00Z","payload":{}}\n\n`;
+
 const fast = { initialBackoffMs: 5, maxBackoffMs: 20, heartbeatTimeoutMs: 1000, jitter: () => 0 };
 const streams: { close(): void }[] = [];
 afterEach(() => streams.splice(0).forEach((s) => s.close()));
@@ -109,6 +117,96 @@ describe("openEventStream", () => {
     expect(endpoint.requests[1]?.headers.get("Last-Event-ID")).toBe("5");
     endpoint.send(frame(5) + frame(6)); // the server replays from its side too
     await waitFor(() => expect(seqs).toEqual([5, 6]));
+  });
+
+  it("stops on stream.end without reconnecting", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const endpoint = fakeEndpoint();
+      const { seqs, statuses } = open(endpoint);
+      await waitFor(() => expect(endpoint.connections()).toBe(1));
+      endpoint.send(frame(1) + frame(2) + END("completed"));
+      endpoint.end();
+      await waitFor(() => expect(statuses).toContain("ended"));
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(endpoint.fetchImpl).toHaveBeenCalledTimes(1);
+      expect(seqs).toEqual([1, 2]); // stream.end is not a task event
+      expect(statuses.at(-1)).toBe("ended");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("delivers nothing after stream.end, even in the same chunk", async () => {
+    const endpoint = fakeEndpoint();
+    const { seqs, statuses } = open(endpoint);
+    await waitFor(() => expect(endpoint.connections()).toBe(1));
+    endpoint.send(frame(1) + frame(2) + END("completed") + frame(3) + frame(null, "agent.delta"));
+    await waitFor(() => expect(statuses).toContain("ended"));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(seqs).toEqual([1, 2]);
+    expect(endpoint.connections()).toBe(1);
+  });
+
+  it("leaves no timer behind once ended", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const endpoint = fakeEndpoint();
+      const { statuses } = open(endpoint);
+      await waitFor(() => expect(endpoint.connections()).toBe(1));
+      endpoint.send(frame(1) + END("cancelled"));
+      await waitFor(() => expect(statuses).toContain("ended"));
+      expect(vi.getTimerCount()).toBe(0); // no heartbeat watchdog, no retry
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries 429 (too many streams) with backoff instead of failing", async () => {
+    const endpoint = fakeEndpoint([429]);
+    const { seqs, statuses } = open(endpoint);
+    await waitFor(() => expect(endpoint.connections()).toBe(1)); // the second request got a stream
+    expect(endpoint.requests).toHaveLength(2);
+    expect(statuses).toContain("reconnecting");
+    expect(statuses).not.toContain("failed");
+    endpoint.send(frame(1));
+    await waitFor(() => expect(seqs).toEqual([1]));
+  });
+
+  it("keeps lastSeq contiguous across an event.invalid placeholder", async () => {
+    const endpoint = fakeEndpoint();
+    const errors: string[] = [];
+    const { seqs, stream } = open(endpoint, { onProtocolError: (m) => errors.push(m) });
+    await waitFor(() => expect(endpoint.connections()).toBe(1));
+    endpoint.send(frame(1) + PLACEHOLDER(2) + frame(3));
+    await waitFor(() => expect(seqs).toEqual([1, 2, 3]));
+    expect(stream.lastSeq()).toBe(3);
+    expect(errors).toEqual([]); // no gap: no reconnect
+    expect(endpoint.connections()).toBe(1);
+  });
+
+  it("reports connecting, not reconnecting, when retry() starts again after ended", async () => {
+    const endpoint = fakeEndpoint();
+    const { statuses, stream } = open(endpoint);
+    await waitFor(() => expect(endpoint.connections()).toBe(1));
+    endpoint.send(frame(1) + END("completed"));
+    await waitFor(() => expect(statuses).toContain("ended"));
+    const before = statuses.length;
+    stream.retry();
+    await waitFor(() => expect(statuses.at(-1)).toBe("open"));
+    expect(statuses.slice(before)).toEqual(["connecting", "open"]);
+  });
+
+  it("retry after ended resumes from lastSeq", async () => {
+    const endpoint = fakeEndpoint();
+    const { statuses, stream } = open(endpoint);
+    await waitFor(() => expect(endpoint.connections()).toBe(1));
+    endpoint.send(frame(1) + frame(2) + END("failed"));
+    await waitFor(() => expect(statuses).toContain("ended"));
+    stream.retry();
+    await waitFor(() => expect(endpoint.connections()).toBe(2));
+    expect(endpoint.requests[1]?.headers.get("Last-Event-ID")).toBe("2");
+    expect(endpoint.requests[1]?.url.searchParams.get("after_seq")).toBe("2");
   });
 
   it("passes ephemeral events (no id) without moving the resume point", async () => {
@@ -391,6 +489,50 @@ describe("useTaskEvents", () => {
     expect(result.current.lastInvalid.map((f) => f.reason)[0]).toMatch(/onEvent threw/);
   });
 
+  it("keeps the last 500 events and counts dropped", async () => {
+    const endpoint = fakeEndpoint();
+    const { result } = renderHook(() => useTaskEvents(TASK, { fetchImpl: endpoint.fetchImpl, ...fast }));
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => {
+      let text = "";
+      for (let i = 1; i <= 520; i++) text += event(i);
+      endpoint.send(text);
+    });
+    await waitFor(() => expect(result.current.lastSeq).toBe(520));
+    expect(result.current.events).toHaveLength(500);
+    expect(result.current.events[0]?.seq).toBe(21);
+    expect(result.current.dropped).toBe(20);
+  });
+
+  it("resets dropped when switching task", async () => {
+    const endpoint = fakeEndpoint();
+    const { result, rerender } = renderHook(
+      ({ id }) => useTaskEvents(id, { fetchImpl: endpoint.fetchImpl, ...fast }),
+      { initialProps: { id: TASK } },
+    );
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => {
+      let text = "";
+      for (let i = 1; i <= 505; i++) text += event(i);
+      endpoint.send(text);
+    });
+    await waitFor(() => expect(result.current.dropped).toBe(5));
+    rerender({ id: OTHER });
+    expect(result.current.dropped).toBe(0);
+  });
+
+  it("ended is not an error state", async () => {
+    const endpoint = fakeEndpoint();
+    const { result } = renderHook(() => useTaskEvents(TASK, { fetchImpl: endpoint.fetchImpl, ...fast }));
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => endpoint.send(event(1) + END(null)));
+    await waitFor(() => expect(result.current.status).toBe("ended"));
+    expect(result.current.uxState).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.invalidFrames).toBe(0);
+    expect(endpoint.connections()).toBe(1);
+  });
+
   it("exposes the screen state of a refused stream and reconnects on request", async () => {
     const endpoint = fakeEndpoint([401]);
     const { result } = renderHook(() => useTaskEvents(TASK, { fetchImpl: endpoint.fetchImpl, ...fast }));
@@ -401,6 +543,109 @@ describe("useTaskEvents", () => {
     await waitFor(() => expect(result.current.status).toBe("open"));
     expect(result.current.uxState).toBeNull();
     expect(result.current.error).toBeNull();
+  });
+
+  it("keeps the placeholder of an invalid stored event in place", async () => {
+    const endpoint = fakeEndpoint();
+    const { result } = renderHook(() => useTaskEvents(TASK, { fetchImpl: endpoint.fetchImpl, ...fast }));
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => endpoint.send(event(1) + PLACEHOLDER(2) + event(3)));
+    await waitFor(() => expect(result.current.lastSeq).toBe(3));
+    expect(result.current.events.map((e) => [e.seq, e.type])).toEqual([
+      [1, "task.log"],
+      [2, "event.invalid"],
+      [3, "task.log"],
+    ]);
+    expect(result.current.invalidFrames).toBe(0);
+    expect(endpoint.connections()).toBe(1);
+  });
+
+  it("opens the next task's stream from that task's resume point, whatever the previous one still sends", async () => {
+    const endpoint = fakeEndpoint();
+    let switchTo: (id: string) => void = () => {};
+    const { result } = renderHook(() => {
+      const [id, setId] = useState(TASK);
+      switchTo = setId;
+      const state = useTaskEvents(id, { fetchImpl: endpoint.fetchImpl, ...fast });
+      useLayoutEffect(() => {
+        // The previous task's stream is still open until the passive effects run: it gets one more frame.
+        if (id === OTHER) endpoint.send(event(6), 0);
+      }, [id]);
+      return state;
+    });
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => endpoint.send(event(1) + event(2) + event(3) + event(4) + event(5)));
+    await waitFor(() => expect(result.current.lastSeq).toBe(5));
+    // Outside act, as in a browser: React runs the passive effects (close the old stream, open the new one)
+    // in a later task than the layout effects, so the old stream's frame lands in between.
+    const reactGlobal = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean | undefined };
+    const actEnvironment = reactGlobal.IS_REACT_ACT_ENVIRONMENT;
+    reactGlobal.IS_REACT_ACT_ENVIRONMENT = false;
+    try {
+      switchTo(OTHER);
+      await waitFor(() => expect(endpoint.connections()).toBe(2));
+    } finally {
+      reactGlobal.IS_REACT_ACT_ENVIRONMENT = actEnvironment;
+    }
+    expect(endpoint.requests[1]?.url.pathname).toContain(OTHER);
+    expect(endpoint.requests[1]?.url.searchParams.get("after_seq")).toBeNull();
+    act(() => endpoint.send(event(1, OTHER)));
+    await waitFor(() => expect(result.current.lastSeq).toBe(1));
+    act(() => result.current.reconnect());
+    await waitFor(() => expect(endpoint.connections()).toBe(3));
+    expect(endpoint.requests[2]?.url.searchParams.get("after_seq")).toBe("1"); // OTHER's own seq
+  });
+
+  it("starts the same task again from nothing after it went away (A, null, A)", async () => {
+    const endpoint = fakeEndpoint();
+    const initialProps: { id: string | null } = { id: TASK };
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string | null }) => useTaskEvents(id, { fetchImpl: endpoint.fetchImpl, ...fast }),
+      { initialProps },
+    );
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => endpoint.send(event(1) + event(2) + event(3) + event(4) + event(5)));
+    await waitFor(() => expect(result.current.lastSeq).toBe(5));
+    rerender({ id: null });
+    expect(result.current.status).toBe("closed");
+    rerender({ id: TASK });
+    expect(result.current.events).toEqual([]);
+    await waitFor(() => expect(endpoint.connections()).toBe(2));
+    // The state starts from nothing, so the stream must too: never resume where the hidden events end.
+    expect(endpoint.requests[1]?.url.searchParams.get("after_seq")).toBeNull();
+    expect(endpoint.requests[1]?.headers.get("Last-Event-ID")).toBeNull();
+    act(() => endpoint.send(event(1) + event(2) + event(3) + event(4) + event(5)));
+    await waitFor(() => expect(result.current.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]));
+    expect(result.current.dropped).toBe(0);
+  });
+
+  it("resumes after ended on reconnect(): no duplicates, dropped consistent, connecting first", async () => {
+    const endpoint = fakeEndpoint();
+    const seen: string[] = [];
+    const { result } = renderHook(() => {
+      const state = useTaskEvents(TASK, { fetchImpl: endpoint.fetchImpl, ...fast });
+      if (seen.at(-1) !== state.status) seen.push(state.status);
+      return state;
+    });
+    await waitFor(() => expect(result.current.status).toBe("open"));
+    act(() => {
+      let text = "";
+      for (let i = 1; i <= 505; i++) text += event(i);
+      endpoint.send(text + END("completed"));
+    });
+    await waitFor(() => expect(result.current.status).toBe("ended"));
+    expect([result.current.events.length, result.current.dropped]).toEqual([500, 5]);
+    const before = seen.length;
+    act(() => result.current.reconnect()); // e.g. the screen saw the task reopened
+    await waitFor(() => expect(endpoint.connections()).toBe(2));
+    expect(endpoint.requests[1]?.url.searchParams.get("after_seq")).toBe("505");
+    act(() => endpoint.send(event(504) + event(505) + event(506) + event(507))); // the replay overlaps
+    await waitFor(() => expect(result.current.lastSeq).toBe(507));
+    const seqs = result.current.events.map((e) => e.seq);
+    expect(new Set(seqs).size).toBe(seqs.length);
+    expect([seqs.length, seqs[0], seqs.at(-1), result.current.dropped]).toEqual([500, 8, 507, 7]);
+    expect(seen.slice(before)).toEqual(["connecting", "open"]);
+    expect(result.current.uxState).toBeNull();
   });
 
   it("does nothing without a task id", () => {

@@ -98,6 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         await load_templates()  # read once, off the event loop; requests then use the cached catalog
         await _sync_agents(settings, dependencies, redactor)  # an invalid registry fails the start (FR-041)
+        if dependencies.hub is not None:
+            await dependencies.hub.start()
         yield
         await drain_cleanups()  # cleanups of failed creates still running: no orphan folders
         await drain_writes()  # writes that outlived their request still owe their audit event (T10)

@@ -10,10 +10,13 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.dependencies.models import Dependant
 from redis.asyncio import Redis
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.requests import Request
 
+from app.api.deps import current_actor_readonly
 from app.core.audit import AuditWriter
 from app.core.config import load_settings
 from app.core.db import make_sessionmaker
@@ -26,6 +29,7 @@ from app.models.identity import User
 from app.services import auth
 from app.services.users import create_owner
 from tests.conftest import make_test_env
+from tests.security.test_cross_project import all_routes
 
 EMAIL = "owner@example.test"
 PASSWORD = "owner-long-passphrase"
@@ -360,3 +364,36 @@ async def test_login_rejects_non_json_bodies(
     """The login CSRF exemption is safe only because a cross-site form cannot send JSON."""
     response = await client.post(LOGIN, content=content, headers={"Content-Type": content_type})
     assert response.status_code == 422
+
+
+def calls_in(dependant: Dependant) -> set[object]:
+    """Every dependency callable under a route, sub-dependencies included."""
+    found: set[object] = set()
+    for dependency in dependant.dependencies:
+        found.add(dependency.call)
+        found |= calls_in(dependency)
+    return found
+
+
+def test_the_read_only_session_dependency_serves_only_get_routes() -> None:
+    """``current_actor_readonly`` neither touches the session nor checks CSRF: a mutating route must never
+    take it (WP-3.2b AG-13 LOW-5)."""
+    app = create_app(load_settings(make_test_env(COOKIE_SECURE="false")))
+    readonly = {
+        (path, frozenset(route.methods or ()))
+        for path, route in all_routes(app.router.routes)
+        if current_actor_readonly in calls_in(route.dependant)
+    }
+    assert readonly == {("/api/v1/tasks/{task_id}/events", frozenset({"GET"}))}
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "HEAD"])
+async def test_the_read_only_session_dependency_refuses_other_methods(method: str) -> None:
+    """Attached to a mutating route by mistake, it fails as a server error before reading any session."""
+
+    def no_sessions() -> None:
+        raise AssertionError("the session must not be read")
+
+    request = Request({"type": "http", "method": method, "headers": [], "path": "/x", "query_string": b""})
+    with pytest.raises(RuntimeError, match="GET"):
+        await current_actor_readonly(request, no_sessions, None)  # type: ignore[arg-type]

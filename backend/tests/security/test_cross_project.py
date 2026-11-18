@@ -323,6 +323,8 @@ async def test_approvals_of_other_projects_do_not_exist(world: dict[str, object]
 # tests pin the same answers as for the project routes. ``{task_id}``/``{conversation_id}`` are filled in.
 ID_ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("GET", "/api/v1/tasks/{task_id}", None),
+    ("GET", "/api/v1/tasks/{task_id}/events/history", None),
+    ("GET", "/api/v1/tasks/{task_id}/events", None),  # the owner's task is finished (see ``addressed``)
     ("GET", "/api/v1/conversations/{conversation_id}/messages", None),
     ("POST", "/api/v1/conversations/{conversation_id}/messages", {"content": "x", "create_task": False}),
 ]
@@ -343,7 +345,9 @@ def test_every_task_and_conversation_route_is_in_the_matrix(app: FastAPI) -> Non
 
 
 @pytest.fixture
-async def addressed(world: dict[str, object], monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+async def addressed(
+    world: dict[str, object], engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, str]:
     """A task and a conversation of the owner's project (the engine gate opened to create the task)."""
     from app.agents import readiness
 
@@ -352,6 +356,13 @@ async def addressed(world: dict[str, object], monkeypatch: pytest.MonkeyPatch) -
     assert isinstance(project, dict) and isinstance(owner, httpx.AsyncClient)
     task = await call(owner, "POST", f"/api/v1/projects/{project['id']}/tasks", {"prompt": "Rencana rahasia"})
     assert task.status_code == 202, task.text
+    async with make_sessionmaker(engine)() as session:  # finished, so the event stream ends on its own
+        await session.execute(text("SELECT set_config('kk.status_writer', 'transition', true)"))
+        await session.execute(
+            text("UPDATE tasks SET status = 'cancelled' WHERE id = :id"),
+            {"id": uuid.UUID(task.json()["data"]["id"])},
+        )
+        await session.commit()
     conversation = await call(owner, "POST", f"/api/v1/projects/{project['id']}/conversations", {})
     assert conversation.status_code == 201, conversation.text
     return {"task_id": task.json()["data"]["id"], "conversation_id": conversation.json()["data"]["id"]}

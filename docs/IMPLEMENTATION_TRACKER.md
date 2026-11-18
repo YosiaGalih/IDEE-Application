@@ -3054,3 +3054,101 @@ Selama fase probe tidak ada transaksi idle maupun baris project terkunci.
 - **3.2d (konsumen A04, AG-13 INFO-B):** baca ulang setiap ref dengan `AGENT_READ`, karena ref tersimpan bukan otorisasi (ada jendela antara probe dan insert). Nama target alias dan isi listing folder dibungkus dan disaring sebelum masuk prompt (T1). Syarat ini masuk spec dan test 3.2d.
 - **PR ini (Merge Danger):** DB lokal yang sudah menjalankan 0012 versi lama (tanpa index `project_id`/`user_id`) gagal `downgrade base`. Buat ulang DB, atau tambahkan kedua index secara manual. CI dan DB baru tidak terdampak.
 - Syarat WP-3.1f2b1/3.1f2b2 dan spec induk §9 tetap berlaku untuk 3.2b–3.2h.
+
+**Sesudah PR #37 (fakta, 18 Nov 2026) [Pasti]:**
+- PR #37 (WP-3.2a) mencapai CI 9/9 di 830027c. PO me-merge-nya pada 18 Nov 2026 01:00 UTC (baf29a4).
+
+### WP-3.2b (SSE + riwayat event) — `GET /tasks/{id}/events`, `/events/history`, `TaskEventHub` per proses, klien `ended` + batas memori (sub-WP kedua WP-3.2; AC-05; FR-035/083/145; LOW-14; utang WP-1.4a/b)
+
+**Dokumen kerja:**
+- Spec induk §13: rancangan rinci 3.2b, Keputusan Lead #27–#36, dan builder check §13.5.
+- Plan `docs/superpowers/plans/2026-11-18-wp-3.2b-task-event-stream.md` (6 task).
+
+**Cara dikerjakan:** subagent-driven-development, dengan implementer dan review per task. Task 2 (hub), Task 3 (generator), dan Task 4 (route) masing-masing butuh satu putaran perbaikan.
+
+Review akhir datang dari enam reviewer:
+- kk-backend-reviewer: APPROVE WITH CONDITIONS;
+- kk-frontend-reviewer: APPROVE;
+- kk-silent-failure-hunter: 1H/3M;
+- AG-13: SIGNED OFF WITH CONDITIONS;
+- `/code-review` Standards dan Spec.
+
+Sesudahnya ada satu fix wave (F1–F13, + R7), re-review terlingkup (satu regresi hook ditemukan), satu putaran mikro R8, dan delta AG-13 (**SIGNED OFF**).
+
+**Yang dibangun:**
+- **`GET /tasks/{id}/events` (SSE):**
+  - Titik lanjut: `Last-Event-ID` menang atas `after_seq`; header kosong dianggap tidak ada. Nilai harus 0..2^63−1, selain itu 422 dengan loc yang terdokumentasi.
+  - Urutan galat pra-stream: 401 → 422 → 404 (identik dengan id acak) → 429 `too_many_streams` + `Retry-After: 5` (8 stream per user, 256 per proses).
+  - Listener hub didaftarkan sebelum replay. Replay DB per halaman 500, setiap halaman di sesi pendek; tidak ada sesi yang terbuka saat menunggu.
+  - Live: pesan lama dibuang, `cursor+1` dikirim, celah diisi dari DB. Ping 15 dtk membaca `event_seq`/status, sehingga event dari penulis yang commit tanpa publish ikut sampai (LOW-14).
+  - `stream.end` (tanpa `id`) hanya dari pembacaan status yang segar: task `FINISHED` dengan semua event terkirim, atau task hilang (`status: null`). `task.status_changed` memicu cek segera.
+  - Umur 49,5–55 menit (jitter hanya memendekkan). Akses diperiksa ulang setiap 60 dtk secara **read-only** (`resolve_session(touch=False)`); route juga memakai `current_actor_readonly`, yang hanya untuk GET. Stream dan reconnect otomatisnya tidak memperpanjang sesi idle.
+  - `TaskEventResponse` melepas slot dan menutup generator di setiap jalur, termasuk klien yang pergi sebelum respons, ASGI 2.4, dan klien yang berhenti membaca (tenggat umur + 30 dtk).
+  - Frame:
+    - `data` JSON satu baris, ASCII saja, `allow_nan=False`;
+    - `type` dicek regex, dan `stream.end`/`event.invalid` dicadangkan;
+    - event tersimpan bertipe tidak sah dikirim sebagai placeholder `event.invalid` dengan `id` miliknya;
+    - `emit_task_event` menolak type yang tidak sah saat tulis.
+  - Galat tak terduga di generator di-log `task_stream_failed` beserta `request_id`.
+- **`GET /tasks/{id}/events/history`:** `limit` 1..500, urut `seq` naik, `meta.next_after_seq`.
+- **`TaskEventHub`:**
+  - satu koneksi `psubscribe kk:task:*` per proses dengan klien Redis sendiri (retry dipin 0, keepalive);
+  - pesan dicek kanal dan bentuknya, lalu dibangun ulang dari lima field;
+  - antrean 1000 per stream, dengan `lagged` yang memicu baca DB;
+  - pembacanya tidak pernah mati karena pesan apa pun; berhentinya di-log;
+  - `subscribed` terpisah dari `running`;
+  - dimulai di lifespan.
+- **Frontend:**
+  - `openEventStream` mengenal `stream.end` → `ended` (tanpa reconnect); `retry()` dari `ended`/`failed` melapor `connecting`; 429 tetap dicoba ulang.
+  - `useTaskEvents` menyimpan 500 event terakhir dan menghitung `dropped`. Titik lanjut terikat ke task-nya, termasuk A→null→A.
+- **Dokumen:** API §5/§5.1 (catatan WP-3.2b; baris `stream.end`/`event.invalid`), ARCHITECTURE §9, SECURITY_MODEL T4/T6/§8 (kontrol SSE dan asumsi kepercayaan Redis), spec §13.
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ p32-pytest.sh -q                      # suite backend penuh @ 1cbf89e (+ commit dokumen)
+1 failed, 5670 passed  (test_git_adapter::test_grep_parses_off_the_event_loop: flaky waktu yang sudah tercatat; dijalankan sendiri: 1 passed)
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 0 errors · Contracts: 10 kept, 0 broken
+$ cd frontend && npm run format:check && npm run lint && npm run lint:guards && npm run typecheck && npm test
+617 passed
+```
+
+AG-13 PoC (scratchpad `ag13poc-3.2b`):
+- Slot dan listener dilepas tanpa GC di ASGI 2.3 dan 2.4. Skenario yang diuji: putus di tengah, pergi sebelum mulai, `send` macet (dilepas tepat di tenggat), dibatalkan, generator gagal. Pembanding di e8307a3: ASGI 2.4 "pergi sebelum mulai" membocorkan slot.
+- Pesan Redis berisi key tambahan, NaN, atau `stream.end` palsu tidak pernah sampai ke klien.
+- Event tersimpan bertipe tidak sah: 1 koneksi dengan seqs `[1,2,3]`. Sebelum perbaikan: 21 koneksi dalam 400 ms.
+
+**Keputusan Lead selama eksekusi (ruling, dari ledger SDD):**
+- **R1:** pengerasan hub ikut putaran perbaikan Task 2.
+- **R2:** cek ulang akses read-only.
+- **R3:** route SSE me-resolve sesi read-only.
+- **R4:** `data` ASCII saja.
+- **R5:** placeholder `event.invalid` dan validasi type saat tulis.
+- **R6:** `Last-Event-ID` kosong dianggap tidak ada.
+- **R7:** jitter umur hanya memendekkan.
+- **R8:** putaran mikro untuk regresi hook A→null→A dan kalimat kepercayaan.
+
+**Ditunda (bukan blocker):**
+- memecah `services/task_events.py` menjadi modul hub dan stream;
+- kolom readiness hub di `/health`;
+- cek `task_id` di sisi klien pada `stream.end` (server kini mencadangkan type itu);
+- Caddy `encode` untuk `text/event-stream` belum diverifikasi dengan Caddy sungguhan (AG-13 INFO-3) → verifikasi deploy/E2E;
+- fixture `addressed` lintas project dipersempit;
+- audit untuk sesi yang kedaluwarsa saat stream terbuka (SF L3);
+- riwayat (`/events/history`) mengembalikan type tersimpan apa adanya, tanpa placeholder;
+- batas ukuran payload dan validasi `ts` ISO-8601 di hub (AG-13 INFO-B);
+- `OSError` dari server di ASGI 2.4 berlabel `client_gone` (INFO-C);
+- uvicorn mencatat satu baris error pada `send_timeout`;
+- `_on_reader_done` akan menulis "NoneType" bila `_run` kembali normal;
+- test catch-all hub langsung;
+- salinan array O(500) per event.
+
+**Syarat yang dibawa:**
+- **3.2h1 (layar task):**
+  - panggil `reconnect()` saat status task keluar dari `FINISHED`;
+  - tampilkan `dropped` ("N event lama disembunyikan") dan muat sisanya lewat `/events/history`;
+  - konsumsi `invalidFrames`;
+  - tangani `event.invalid` sebagai event yang tidak ditampilkan.
+- **Tier di atas S:** penghitung slot pindah ke Redis.
+- **Syarat 3.2a/3.1f2b dan spec induk §9** tetap berlaku untuk 3.2c–3.2h.

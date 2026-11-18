@@ -18,6 +18,8 @@ export type TaskEvent = z.infer<typeof TaskEventSchema>;
 /** A frame that was not a valid event of this task: kept with its reason, never silently dropped. */
 export type InvalidFrame = { seq: number | null; reason: string };
 const MAX_INVALID_KEPT = 50;
+/** Persistent events kept in memory: the newest ones; older ones are counted in `dropped`. */
+export const MAX_EVENTS_KEPT = 500;
 
 type Options = Pick<
   StreamOptions,
@@ -34,6 +36,8 @@ type Inner = {
   status: StreamStatus;
   error: ApiError | null;
   lastSeq: number | null;
+  /** Events discarded from the front to stay within MAX_EVENTS_KEPT. */
+  dropped: number;
   invalidFrames: number;
   lastInvalid: InvalidFrame[];
 };
@@ -41,7 +45,7 @@ type Inner = {
 export type TaskEventsState = Omit<Inner, "taskId"> & {
   /** The screen state to show for the stream, null while it is connecting or open. */
   uxState: UxState | null;
-  /** Opens the stream again from the last delivered seq (after `failed`, or to retry now). */
+  /** Opens the stream again from the last delivered seq (after `failed` or `ended`, or to retry now). */
   reconnect: () => void;
 };
 
@@ -52,6 +56,7 @@ function initial(taskId: string | null, afterSeq: number | null): Inner {
     status: "closed",
     error: null,
     lastSeq: afterSeq,
+    dropped: 0,
     invalidFrames: 0,
     lastInvalid: [],
   };
@@ -67,7 +72,9 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
   const [state, setState] = useState<Inner>(() => initial(taskId, options.afterSeq ?? null));
   const [generation, setGeneration] = useState(0);
   const optionsRef = useRef(options);
+  /** The resume point of `lastSeqTaskRef`'s task: written only by that task's active stream. */
   const lastSeqRef = useRef<number | null>(options.afterSeq ?? null);
+  const lastSeqTaskRef = useRef<string | null>(taskId);
   useLayoutEffect(() => {
     optionsRef.current = options; // the latest callbacks, without reopening the stream
   });
@@ -80,9 +87,21 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
   }
 
   useEffect(() => {
+    // Another task, or no task (which also clears the state), resumes from its own afterSeq: a task that
+    // comes back after null starts from nothing, like its state. Reset here, before the early return and
+    // where the stream opens: until this effect runs the previous stream is still open and may write the
+    // ref (React runs layout effects earlier).
+    if (lastSeqTaskRef.current !== taskId) {
+      lastSeqTaskRef.current = taskId;
+      lastSeqRef.current = optionsRef.current.afterSeq ?? null;
+    }
     if (!taskId) return;
     const opts = optionsRef.current;
-    const update = (change: (s: Inner) => Inner) => setState((s) => (s.taskId === taskId ? change(s) : s));
+    /** False once this effect is cleaned up: a late callback of its stream then changes nothing. */
+    let live = true;
+    const update = (change: (s: Inner) => Inner) => {
+      if (live) setState((s) => (s.taskId === taskId ? change(s) : s));
+    };
     const invalid = (seq: number | null, reason: string) =>
       update((s) => ({
         ...s,
@@ -102,6 +121,7 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
       onStatus: (status, error) => update((s) => ({ ...s, status, error: status === "open" ? null : error })),
       onProtocolError: (message) => invalid(null, message),
       onFrame: (frame) => {
+        if (!live) return;
         let parsed: unknown;
         try {
           parsed = JSON.parse(frame.data);
@@ -125,7 +145,16 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
         }
         if (frame.seq !== null) {
           lastSeqRef.current = frame.seq;
-          update((s) => ({ ...s, events: [...s.events, event], lastSeq: frame.seq }));
+          update((s) => {
+            const all = [...s.events, event];
+            const over = Math.max(0, all.length - MAX_EVENTS_KEPT);
+            return {
+              ...s,
+              events: over > 0 ? all.slice(over) : all,
+              dropped: s.dropped + over,
+              lastSeq: frame.seq,
+            };
+          });
         }
         try {
           optionsRef.current.onEvent?.(event); // after the event is kept: a throwing handler loses nothing
@@ -134,13 +163,11 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
         }
       },
     });
-    return () => stream.close();
+    return () => {
+      live = false;
+      stream.close();
+    };
   }, [taskId, generation]);
-
-  // A new task id resets the resume point too.
-  useLayoutEffect(() => {
-    lastSeqRef.current = optionsRef.current.afterSeq ?? null;
-  }, [taskId]);
 
   const reconnect = useCallback(() => setGeneration((g) => g + 1), []);
   return {
@@ -148,6 +175,7 @@ export function useTaskEvents(taskId: string | null, options: Options = {}): Tas
     status: current.status,
     error: current.error,
     lastSeq: current.lastSeq,
+    dropped: current.dropped,
     invalidFrames: current.invalidFrames,
     lastInvalid: current.lastInvalid,
     uxState: streamUxState(current.status, current.error),

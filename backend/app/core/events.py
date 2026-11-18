@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from redis.asyncio import Redis
 from sqlalchemy import event, select, update
@@ -32,7 +33,13 @@ from app.core.logging import get_logger
 from app.core.redaction import Redactor
 from app.models.tasks import Task, TaskEvent
 
-MAX_TYPE_LENGTH = 60
+# A type is what the stream writes on its ``event:`` line (API_CONTRACTS §5.1), so it must fit there: a
+# lower-case ASCII letter first, then letters, digits, ``_`` or ``.``, 60 characters at most (the column).
+EVENT_TYPE: Final = re.compile(r"[a-z][a-z0-9_.]{0,59}")
+# The stream's own frames (WP-3.2b ruling R5): no stored or published event may take these types.
+STREAM_END: Final = "stream.end"
+EVENT_INVALID: Final = "event.invalid"
+RESERVED_TYPES: Final = frozenset({STREAM_END, EVENT_INVALID})
 PUBLISH_TIMEOUT_SECONDS = 2.0
 _UNCOMMITTED = "kk.task_events.uncommitted"
 _COMMITTED = "kk.task_events.committed"
@@ -58,6 +65,11 @@ def task_channel(task_id: uuid.UUID) -> str:
     return f"kk:task:{task_id}"
 
 
+def is_event_type(value: object) -> bool:
+    """Whether ``value`` may be an event's type: it matches ``EVENT_TYPE`` and is not the stream's own."""
+    return isinstance(value, str) and EVENT_TYPE.fullmatch(value) is not None and value not in RESERVED_TYPES
+
+
 async def emit_task_event(
     db: AsyncSession,
     bus: EventBus | None,
@@ -72,8 +84,8 @@ async def emit_task_event(
 
     ``redactor`` is required so callers pass the one that knows the configured secret literals.
     """
-    if not type or len(type) > MAX_TYPE_LENGTH:
-        raise ValueError(f"event type must be 1-{MAX_TYPE_LENGTH} characters")
+    if not is_event_type(type):
+        raise ValueError(f"event type {repr(type)[:80]} must match {EVENT_TYPE.pattern} and not be reserved")
     # Redacted, then made JSON-safe (NaN, sets, non-str keys) before it reaches the database or Redis.
     safe_payload = json_safe(redactor.redact_obj(payload, stringify=True))
     now = datetime.now(UTC)
@@ -81,7 +93,7 @@ async def emit_task_event(
         if bus is None:
             raise ValueError("an ephemeral event needs a bus: it is never stored")
         # Ephemeral events are lossy by design (deltas, output chunks): a Redis blip must not abort a run.
-        await _publish(bus, _message(task_id, None, type, now, safe_payload))
+        await _publish(bus, event_message(task_id, None, type, now, safe_payload))
         return None
 
     seq = (
@@ -98,7 +110,7 @@ async def emit_task_event(
     db.add(TaskEvent(task_id=task_id, seq=seq, type=type, payload=safe_payload, created_at=now))
     await db.flush()
     _hook(db.sync_session)
-    db.info.setdefault(_UNCOMMITTED, []).append(_message(task_id, seq, type, now, safe_payload))
+    db.info.setdefault(_UNCOMMITTED, []).append(event_message(task_id, seq, type, now, safe_payload))
     return seq
 
 
@@ -198,5 +210,7 @@ def _on_rollback(session: Session, previous_transaction: SessionTransaction) -> 
     session.info[_SAVEPOINTS] = {}
 
 
-def _message(task_id: uuid.UUID, seq: int | None, type: str, ts: datetime, payload: Any) -> dict[str, Any]:
+def event_message(
+    task_id: uuid.UUID, seq: int | None, type: str, ts: datetime, payload: Any
+) -> dict[str, Any]:
     return {"task_id": str(task_id), "seq": seq, "type": type, "ts": ts.isoformat(), "payload": payload}
