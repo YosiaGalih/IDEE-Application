@@ -1,20 +1,24 @@
-"""Task event history and live fan-out (API_CONTRACTS §5.1; spec WP-3.2 §13, Lead decisions #27, #34).
+"""Task event history, live fan-out and the event stream (API_CONTRACTS §5.1; spec WP-3.2 §13, #27-#35).
 
 Framework-free. ``history`` returns the stored events of a task in ``seq`` order, in the message shape the
 live stream publishes. ``TaskEventHub`` is the live side: one Redis pattern subscription per api process,
-fanned out to bounded per-stream queues.
+fanned out to bounded per-stream queues. ``stream_frames`` merges both into SSE frames without gaps or
+duplicates; the route wraps it (``open_stream`` first, before the response starts).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
+import re
+import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
@@ -22,11 +26,16 @@ from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
+from app.core.errors import AppError
 from app.core.events import event_message, task_channel
 from app.core.logging import get_logger
 from app.models.tasks import Task, TaskEvent
+from app.services.auth import resolve_session
 from app.services.projects import Actor, ProjectEnv, authorize, not_found
+from app.workflow.states import FINISHED
 
 HISTORY_LIMIT_MAX: Final = 500
 HUB_QUEUE_MAX: Final = 1000
@@ -34,8 +43,41 @@ HUB_PATTERN: Final = "kk:task:*"  # matches task_channel(task_id)
 HUB_BACKOFF_FIRST: Final = 0.5
 HUB_BACKOFF_MAX: Final = 10.0
 HUB_POLL_SECONDS: Final = 1.0
+# The stream (spec §13.2 #28, #31). Module attributes, read at call time, so tests can make them small.
+REPLAY_PAGE: Final = 500
+PING_INTERVAL_S: Final = 15.0
+AUTH_RECHECK_S: Final = 60.0
+MAX_STREAM_S: Final = 3300.0  # 55 minutes, under Caddy's read_timeout of one hour
+STREAM_END: Final = "stream.end"
+PING_FRAME: Final = ": ping\n\n"
+# The ``event:`` line names a type only when it matches (#33); a type that does not is never sent.
+EVENT_TYPE: Final = re.compile(r"[a-z][a-z0-9_.]{0,59}")
 
 logger = get_logger(__name__)
+
+
+async def _authorize_read(session: AsyncSession, actor: Actor, task_id: uuid.UUID) -> uuid.UUID:
+    """The task's project after ``task:read`` there; ``not_found()`` for a missing or out-of-scope task."""
+    project_id = await session.scalar(select(Task.project_id).where(Task.id == task_id))
+    if project_id is None:
+        raise not_found()
+    await authorize(session, actor, project_id, "task:read")
+    return project_id
+
+
+async def _event_page(
+    session: AsyncSession, task_id: uuid.UUID, after_seq: int, limit: int
+) -> list[dict[str, Any]]:
+    """Stored events with ``seq > after_seq`` in ``seq`` order, as messages: history, replay and gap fill."""
+    rows = (
+        await session.scalars(
+            select(TaskEvent)
+            .where(TaskEvent.task_id == task_id, TaskEvent.seq > after_seq)
+            .order_by(TaskEvent.seq)
+            .limit(limit)
+        )
+    ).all()
+    return [event_message(row.task_id, row.seq, row.type, row.created_at, row.payload) for row in rows]
 
 
 async def history(
@@ -46,20 +88,9 @@ async def history(
     ``not_found()`` when the task does not exist or its project is out of the actor's scope.
     """
     async with env.sessions() as session:
-        task = await session.get(Task, task_id)
-        if task is None:
-            raise not_found()
-        await authorize(session, actor, task.project_id, "task:read")
-        rows = (
-            await session.scalars(
-                select(TaskEvent)
-                .where(TaskEvent.task_id == task_id, TaskEvent.seq > after_seq)
-                .order_by(TaskEvent.seq)
-                .limit(limit)
-            )
-        ).all()
-    messages = [event_message(row.task_id, row.seq, row.type, row.created_at, row.payload) for row in rows]
-    return messages, (rows[-1].seq if len(rows) == limit else None)
+        await _authorize_read(session, actor, task_id)
+        messages = await _event_page(session, task_id, after_seq, limit)
+    return messages, (messages[-1]["seq"] if len(messages) == limit else None)
 
 
 class TaskListener:
@@ -218,3 +249,219 @@ class TaskEventHub:
                     await pubsub.aclose()
             await asyncio.sleep(delay)
             delay = min(delay * 2, HUB_BACKOFF_MAX)
+
+
+# --- the stream (spec §13.2 #28-#31, #33; §13.5 #2, #3, #7) -----------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamTimings:
+    """A stream's intervals in seconds: ping and database check, access recheck, connection lifetime."""
+
+    ping_s: float = PING_INTERVAL_S
+    auth_recheck_s: float = AUTH_RECHECK_S
+    max_stream_s: float = MAX_STREAM_S
+
+
+class _TaskRow(NamedTuple):
+    project_id: uuid.UUID
+    status: str
+    event_seq: int
+
+
+def format_frame(message: dict[str, Any]) -> str | None:
+    """One SSE frame for a stored or published event message; ``None`` when it may not be sent.
+
+    ``id:`` only for a stored event (an int ``seq``). ``data`` is the whole message as one line of JSON:
+    ``json.dumps`` escapes ``\\n`` and ``\\r`` inside strings, so a payload can neither end the frame nor add
+    an ``id:``/``event:`` line. ``event:`` carries ``type`` only when it matches ``EVENT_TYPE``.
+    """
+    type_ = message.get("type")
+    seq = message.get("seq")
+    if not isinstance(type_, str) or not EVENT_TYPE.fullmatch(type_):
+        return None
+    if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool)):
+        return None
+    data = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+    head = "" if seq is None else f"id: {seq}\n"
+    return f"{head}event: {type_}\ndata: {data}\n\n"
+
+
+def _end_frame(task_id: uuid.UUID, status: str | None) -> str:
+    """``stream.end`` (no ``id``): the task is finished and fully sent, or gone (``status`` null)."""
+    data = json.dumps({"task_id": str(task_id), "status": status}, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {STREAM_END}\ndata: {data}\n\n"
+
+
+def _sendable(task_id: uuid.UUID, message: dict[str, Any]) -> str | None:
+    frame = format_frame(message)
+    if frame is None:
+        # Logged, never sent; a stored one still moves the cursor, or every check would read it again.
+        logger.warning(
+            "task_stream_event_skipped",
+            task_id=str(task_id),
+            seq=message.get("seq"),
+            type=message.get("type"),
+        )
+    return frame
+
+
+async def open_stream(env: ProjectEnv, actor: Actor, task_id: uuid.UUID) -> None:
+    """The check before a stream starts (the route runs it before the response): ``task:read``, else
+    ``not_found()`` for a missing or out-of-scope task, as ``history``."""
+    async with env.sessions() as session:
+        await _authorize_read(session, actor, task_id)
+
+
+@contextmanager
+def _listen(hub: TaskEventHub | None, task_id: uuid.UUID) -> Iterator[TaskListener | None]:
+    if hub is not None and hub.running:
+        with hub.listen(task_id) as listener:
+            yield listener
+        return
+    # No live channel (no lifespan, or Redis was down at start): the per-ping database check still delivers
+    # every stored event, only later (spec §13.5 #2).
+    logger.warning("task_stream_without_hub", task_id=str(task_id))
+    yield None
+
+
+async def _task_row(env: ProjectEnv, task_id: uuid.UUID) -> _TaskRow | None:
+    async with env.sessions() as session:
+        row = (
+            await session.execute(
+                select(Task.project_id, Task.status, Task.event_seq).where(Task.id == task_id)
+            )
+        ).one_or_none()
+    return None if row is None else _TaskRow(*row)
+
+
+async def _read_page(env: ProjectEnv, task_id: uuid.UUID, after_seq: int) -> list[dict[str, Any]]:
+    async with env.sessions() as session:  # one short session per page; none is held while frames go out
+        return await _event_page(session, task_id, after_seq, REPLAY_PAGE)
+
+
+async def _may_still_read(
+    env: ProjectEnv, settings: Settings, session_token: str, actor: Actor, task: _TaskRow, task_id: uuid.UUID
+) -> bool:
+    """Reload the actor from its session, as ``current_actor`` does, and check ``task:read`` again (#31)."""
+    try:
+        user, _, grants = await resolve_session(env.sessions, settings, session_token)
+        if user.id != actor.user_id:  # one token is one user; never judge another user's grants
+            raise not_found()
+        reloaded = dataclasses.replace(actor, grants=tuple(grants))
+        async with env.sessions() as session:
+            await authorize(session, reloaded, task.project_id, "task:read")
+    except AppError as exc:
+        logger.info("task_stream_closed", task_id=str(task_id), reason="access", code=exc.code)
+        return False
+    return True
+
+
+async def _next_message(listener: TaskListener | None, wait_s: float) -> dict[str, Any] | None:
+    """The next live message, or ``None`` after ``wait_s`` seconds; without a live channel it only waits."""
+    if wait_s <= 0:
+        return None
+    if listener is None:
+        await asyncio.sleep(wait_s)
+        return None
+    try:
+        async with asyncio.timeout(wait_s):
+            return await listener.queue.get()
+    except TimeoutError:
+        return None
+
+
+async def stream_frames(
+    env: ProjectEnv,
+    settings: Settings,
+    hub: TaskEventHub | None,
+    *,
+    session_token: str,
+    actor: Actor,
+    task_id: uuid.UUID,
+    after_seq: int,
+    timings: StreamTimings = StreamTimings(),  # noqa: B008 - frozen value
+    clock: Callable[[], float] = time.monotonic,
+) -> AsyncIterator[str]:
+    """SSE frames of one task's events after ``after_seq``: each stored event exactly once, in ``seq`` order.
+
+    The listener is registered before the replay, so nothing published meanwhile is missed. State:
+    ``cursor`` is the last stored seq sent (or skipped); ``behind`` means the database may hold events after
+    it; ``finished`` is ``(status, event_seq)`` from the last check of a finished task. Each pass does the
+    first that applies:
+
+    1. lifetime over -> return (no ``stream.end``: the client reconnects with ``Last-Event-ID``);
+    2. check due (first pass, then after each ``: ping``): read ``status``/``event_seq``; task gone ->
+       ``stream.end`` with ``status`` null; ``event_seq > cursor`` -> behind;
+    3. behind -> one page of ``seq > cursor`` (own short session), sent in order; behind while pages are full;
+    4. finished and ``cursor >= event_seq`` -> ``stream.end`` (after the terminal ``task.status_changed``);
+    5. access recheck due -> task gone -> ``stream.end`` null; session or ``task:read`` lost -> return;
+    6. listener lagged -> behind;
+    7. wait for a live message until the next deadline: ``seq`` null -> sent without ``id``;
+       ``seq <= cursor`` -> dropped; ``cursor + 1`` -> sent; beyond -> behind (the database has it and the
+       gap before it: commit precedes publish).
+
+    No database session is open while a frame is out or while waiting.
+    """
+    started = clock()
+    deadline = started + timings.max_stream_s
+    next_ping = started + timings.ping_s
+    next_auth = started + timings.auth_recheck_s
+    cursor = after_seq
+    behind = True  # the replay
+    check = True  # once before the replay: a finished task ends after it without waiting for a ping
+    finished: tuple[str, int] | None = None
+    with _listen(hub, task_id) as listener:
+        while True:
+            now = clock()
+            if now >= deadline:
+                logger.info("task_stream_closed", task_id=str(task_id), reason="max_lifetime")
+                return
+            if check or now >= next_ping:
+                if not check:
+                    next_ping = now + timings.ping_s
+                    yield PING_FRAME
+                check = False
+                row = await _task_row(env, task_id)
+                if row is None:
+                    yield _end_frame(task_id, None)
+                    return
+                behind = behind or row.event_seq > cursor
+                finished = (row.status, row.event_seq) if row.status in FINISHED else None
+                continue
+            if behind:
+                page = await _read_page(env, task_id, cursor)
+                behind = len(page) == REPLAY_PAGE
+                for message in page:
+                    cursor = message["seq"]
+                    if (frame := _sendable(task_id, message)) is not None:
+                        yield frame
+                continue
+            if finished is not None and cursor >= finished[1]:
+                yield _end_frame(task_id, finished[0])
+                return
+            if now >= next_auth:
+                next_auth = now + timings.auth_recheck_s
+                row = await _task_row(env, task_id)
+                if row is None:  # spec §13.5 #7: a missing task ends the stream before access is judged
+                    yield _end_frame(task_id, None)
+                    return
+                if not await _may_still_read(env, settings, session_token, actor, row, task_id):
+                    return
+                continue
+            if listener is not None and listener.take_lagged():
+                behind = True
+                continue
+            message = await _next_message(listener, min(next_ping, next_auth, deadline) - now)
+            if message is None:
+                continue
+            seq = message.get("seq")  # the hub passes a message without "seq" as ephemeral
+            if seq is None:
+                if (frame := _sendable(task_id, message)) is not None:
+                    yield frame
+            elif seq == cursor + 1:
+                cursor = seq
+                if (frame := _sendable(task_id, message)) is not None:
+                    yield frame
+            elif seq > cursor:
+                behind = True
