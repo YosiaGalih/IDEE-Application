@@ -176,6 +176,9 @@ Catatan: `Diff` juga memiliki `truncated: bool`; `head` bernilai `null` bila dib
   - `done`: langkah selesai, atau hasilnya `transition`. Langkah ditambahkan ke `checkpoint.completed_steps` di transaksi yang sama dengan event dan perubahan status.
   - `failed`: langkah mengembalikan `fail`. Langkah tidak masuk `completed_steps`, jadi dijalankan lagi pada percobaan berikutnya. Event ini ditulis di transaksi yang sama dengan `task.status_changed` ke `failed`.
   - Langkah yang melempar exception tak terduga, atau lease yang hilang, tidak meng-emit event akhir; recovery menutup task.
+  - `step_unavailable` tidak meng-emit `task.step_started` maupun `task.step_finished`: kegagalan terjadi sebelum langkah dimulai.
+- `tasks.current_step` tidak dikosongkan saat pipeline berakhir atau gagal; nilainya tetap langkah terakhir yang dimulai.
+- `tasks.error_code` divalidasi `fail_task` dengan pola `^[a-z][a-z0-9_]{0,63}$` (snake_case, paling panjang 64); nilai lain ditolak dengan `ValueError` sebelum SQL apa pun.
 - Cancel, pause, resume, dan endpoint kendali lain tetap belum ada (3.2f).
 
 ### 5.1 SSE events (`TaskEvent`)
