@@ -156,6 +156,10 @@ async def test_enqueue_error_does_not_stop_the_others(engine: AsyncEngine, make_
     assert entry["error_type"] == "RuntimeError"
     assert "exc_info" not in entry
     assert "secret-host" not in str(entry)
+    summary = [e for e in logs if e["event"] == "task_redispatch_sweep"]
+    assert [
+        (e["log_level"], e["candidates"], e["dispatched"], e["failed"], e["skipped"]) for e in summary
+    ] == [("warning", 2, 1, 1, 0)]
     # The write committed before the enqueue: the task waits one more grace, not a busy loop.
     assert (await checkpoint_of(engine, bad))["dispatch"]["count"] == 1
     assert (await redispatch_orphans(make_sessionmaker(engine), dispatcher)).candidates == 0

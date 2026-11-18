@@ -770,6 +770,111 @@ async def test_step_error_releases_the_lease_and_reraises(engine: AsyncEngine, m
     assert other_tasks() == []  # the heartbeat stopped
 
 
+async def test_unexpected_step_error_is_logged_with_its_type_only(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """Spec #43: an unexpected error is logged with the task id, then re-raised (type only, no text)."""
+    task_id = await make_task("queued")
+    secret = "sk-test-" + "secret-0123"
+
+    async def implement(_: StepContext) -> StepResult:
+        raise RuntimeError("step crashed with token " + secret)
+
+    steps = Steps(implement=implement)
+    with capture_logs() as logs, pytest.raises(RuntimeError):
+        await make_engine(engine, RecordingBus(), steps.registry("implement")).run(task_id)
+
+    failed = [e for e in logs if e["event"] == "task_engine_failed"]
+    assert [(e["log_level"], e["task_id"], e["worker_id"], e["step"], e["error_type"]) for e in failed] == [
+        ("error", str(task_id), WORKER, "implement", "RuntimeError")
+    ]
+    assert secret not in repr(logs)
+    assert all("exc_info" not in e for e in logs)
+
+
+async def test_cancelled_run_is_logged_as_cancelled(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("queued")
+    entered = asyncio.Event()
+
+    async def implement(_: StepContext) -> StepResult:
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    steps = Steps(implement=implement)
+    with capture_logs() as logs:
+        run = asyncio.create_task(
+            make_engine(engine, RecordingBus(), steps.registry("implement")).run(task_id)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+    assert [e["event"] for e in logs if e["event"].startswith("task_engine_")] == ["task_engine_cancelled"]
+    cancelled = next(e for e in logs if e["event"] == "task_engine_cancelled")
+    assert (cancelled["log_level"], cancelled["task_id"], cancelled["step"]) == (
+        "warning",
+        str(task_id),
+        "implement",
+    )
+
+
+async def test_release_failure_after_an_error_logs_the_type_only(
+    engine: AsyncEngine,
+    make_task,
+    monkeypatch: pytest.MonkeyPatch,  # type: ignore[no-untyped-def]
+) -> None:
+    task_id = await make_task("queued")
+    secret = "sk-test-" + "release-0123"
+
+    async def broken_release(*_: Any, **__: Any) -> None:
+        raise OSError("cannot release " + secret)
+
+    async def implement(_: StepContext) -> StepResult:
+        monkeypatch.setattr(engine_module, "release_lease", broken_release)
+        raise RuntimeError("step crashed")
+
+    steps = Steps(implement=implement)
+    with capture_logs() as logs, pytest.raises(RuntimeError, match="step crashed"):
+        await make_engine(engine, RecordingBus(), steps.registry("implement")).run(task_id)
+
+    release = [e for e in logs if e["event"] == "lease_release_failed"]
+    assert [(e["task_id"], e["error_type"]) for e in release] == [(str(task_id), "OSError")]
+    assert "exc_info" not in release[0]
+    assert secret not in repr(logs)
+
+
+async def test_heartbeat_give_up_is_logged(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A renewal hung from the first beat gives up at the deadline with no retry line before it: the give-up
+    itself must say why, or a database outage looks like a takeover."""
+    monkeypatch.setattr(lease_module, "_LEASE", timedelta(seconds=1))
+    task_id = await make_task("draft")
+    sessions = BreakableSessions(engine)
+
+    async def long_step(_: StepContext) -> StepResult:
+        sessions.mode = "hangs"
+        await asyncio.sleep(10)
+        return StepResult.done()
+
+    steps = Steps(intake=long_step)
+    # beat 0.5 of a 1 s lease: the first beat is the deadline, so no lease_heartbeat_failed line comes first.
+    task_engine = make_engine(
+        engine, RecordingBus(), steps.registry(*PLANNING), heartbeat_s=0.5, sessions=sessions
+    )
+    with capture_logs() as logs:
+        outcome = await asyncio.wait_for(task_engine.run(task_id), timeout=5)
+
+    assert outcome.stopped == "lease_lost"
+    assert [e for e in logs if e["event"] == "lease_heartbeat_failed"] == []
+    gave_up = [e for e in logs if e["event"] == "lease_heartbeat_gave_up"]
+    assert [(e["log_level"], e["task_id"], e["error_type"]) for e in gave_up] == [
+        ("warning", str(task_id), "TimeoutError")
+    ]
+
+
 async def test_exhausted_pipeline_releases_and_warns(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
     task_id = await make_task("draft", {"completed_steps": ["intake"]})
     steps = Steps()  # every step says done; none moves the task on

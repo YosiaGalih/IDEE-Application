@@ -35,6 +35,8 @@ def test_stable_within_one_process_and_contains_pid() -> None:
     assert 1 <= len(worker_id()) <= MAX_LENGTH
 
 
+# The fork is the point (Celery prefork forks after import); pytest's own threads trigger the 3.12 notice.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
 def test_forked_child_gets_its_own_id_even_with_warm_parent_cache() -> None:
     parent = worker_id()  # warm the cache before the fork
     child_pid, child_id = _run_in("fork")

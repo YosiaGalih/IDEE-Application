@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pickle
 import uuid
 from typing import Any
 
@@ -17,7 +18,7 @@ from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.worker import jobs
-from app.workflow.dispatch import DispatchResult
+from app.workflow.dispatch import DispatchIncomplete, DispatchResult
 from app.workflow.engine import EngineOutcome
 from app.workflow.lease import ClaimResult
 from tests.conftest import make_test_env, reset_data
@@ -103,7 +104,12 @@ async def test_resources_are_closed_when_the_engine_raises(
 
 def test_run_task_runs_the_engine_and_summarises(engine: AsyncEngine, draft_task: uuid.UUID) -> None:
     result = jobs.run_task.apply(args=[str(draft_task)]).get()
-    assert result == {"claim": "acquired", "ran": [], "stopped": "step_unavailable"}
+    assert result == {
+        "task_id": str(draft_task),
+        "claim": "acquired",
+        "ran": [],
+        "stopped": "step_unavailable",
+    }
 
 
 @pytest.mark.parametrize("claim", [ClaimResult.AT_CAPACITY, ClaimResult.BUSY])
@@ -120,7 +126,7 @@ def test_a_deferred_claim_returns_normally_and_is_logged(
     with capture_logs() as logs:
         task = jobs.run_task.apply(args=[str(task_id)])
     assert task.successful()  # no retry, no raise: the dispatch sweep re-sends after the grace period
-    assert task.get() == {"claim": claim.value, "ran": [], "stopped": None}
+    assert task.get() == {"task_id": str(task_id), "claim": claim.value, "ran": [], "stopped": None}
     deferred = [e for e in logs if e["event"] == "task_claim_deferred"]
     assert len(deferred) == 1
     assert deferred[0]["task_id"] == str(task_id) and deferred[0]["reason"] == claim.value
@@ -140,14 +146,57 @@ def test_an_invalid_task_id_is_logged_and_not_raised(monkeypatch: pytest.MonkeyP
     assert len(entry["value"]) <= 80
 
 
-def test_engine_exceptions_propagate_to_celery(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_engine_exceptions_propagate_to_celery_as_run_task_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Celery logs the failure itself; the raw message (it may carry a secret) must not reach that line."""
+    secret = "sk-test-" + "engine-0123"
+
     class Boom:
         async def run(self, task_id: uuid.UUID) -> EngineOutcome:
-            raise RuntimeError("engine blew up")
+            raise RuntimeError("engine blew up with " + secret)
 
     monkeypatch.setattr(jobs, "build_orchestrator", lambda **_: Boom())
-    task = jobs.run_task.apply(args=[str(uuid.uuid4())])
+    with capture_logs() as logs:
+        task = jobs.run_task.apply(args=[str(uuid.uuid4())])
     assert task.failed()
+    assert isinstance(task.result, jobs.RunTaskFailed)
+    assert str(task.result) == "RuntimeError"
+    assert secret not in str(task.result) and secret not in task.traceback
+    assert task.result.__suppress_context__  # `from None`: no chained traceback with the original text
+    assert logs == []  # the engine logged already; run_task does not log a second time
+
+
+def test_run_task_failed_survives_pickling() -> None:
+    again = pickle.loads(pickle.dumps(jobs.RunTaskFailed("OSError")))  # noqa: S301 - our own exception, in-process
+    assert isinstance(again, jobs.RunTaskFailed)
+    assert (str(again), again.error_type) == ("OSError", "OSError")
+
+
+@pytest.mark.parametrize(
+    ("claim", "event", "level"),
+    [
+        (ClaimResult.NOT_FOUND, "task_not_found", "warning"),
+        (ClaimResult.HELD, "task_claim_skipped", "info"),
+        (ClaimResult.NOT_CLAIMABLE, "task_claim_skipped", "info"),
+    ],
+)
+def test_a_skipped_claim_is_logged(
+    claim: ClaimResult, event: str, level: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task_id = uuid.uuid4()
+
+    class Skipped:
+        async def run(self, tid: uuid.UUID) -> EngineOutcome:
+            return EngineOutcome(claim)
+
+    monkeypatch.setattr(jobs, "build_orchestrator", lambda **_: Skipped())
+    with capture_logs() as logs:
+        task = jobs.run_task.apply(args=[str(task_id)])
+    assert task.successful()
+    assert task.get() == {"task_id": str(task_id), "claim": claim.value, "ran": [], "stopped": None}
+    entries = [e for e in logs if e["event"] in ("task_not_found", "task_claim_skipped")]
+    assert [(e["event"], e["log_level"], e["task_id"], e["reason"]) for e in entries] == [
+        (event, level, str(task_id), claim.value)
+    ]
 
 
 class FakeDispatcher:
@@ -179,10 +228,32 @@ async def test_dispatch_sweep_redispatches_through_the_injected_dispatcher(
 
 def test_dispatch_sweep_job_returns_counts(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake(*, dispatcher: Any = None) -> DispatchResult:
+        return DispatchResult(candidates=3, dispatched=3, failed=0, skipped=0)
+
+    monkeypatch.setattr(jobs, "sweep_dispatch", fake)
+    task = jobs.dispatch_sweep.apply()
+    assert task.successful()
+    assert task.get() == {"candidates": 3, "dispatched": 3, "failed": 0, "skipped": 0}
+
+
+def test_dispatch_sweep_job_fails_when_an_enqueue_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R-F3: like recovery_sweep, a sweep that left tasks undispatched must not end as a success."""
+
+    async def fake(*, dispatcher: Any = None) -> DispatchResult:
         return DispatchResult(candidates=3, dispatched=2, failed=1, skipped=0)
 
     monkeypatch.setattr(jobs, "sweep_dispatch", fake)
-    assert jobs.dispatch_sweep.apply().get() == {"candidates": 3, "dispatched": 2, "failed": 1, "skipped": 0}
+    task = jobs.dispatch_sweep.apply()
+    assert task.failed()
+    assert isinstance(task.result, DispatchIncomplete)
+    assert task.result.result == DispatchResult(candidates=3, dispatched=2, failed=1, skipped=0)
+
+
+def test_dispatch_incomplete_survives_pickling() -> None:
+    result = DispatchResult(candidates=3, dispatched=2, failed=1, skipped=4)
+    again = pickle.loads(pickle.dumps(DispatchIncomplete(result)))  # noqa: S301 - our own exception, in-process
+    assert isinstance(again, DispatchIncomplete)
+    assert again.result == result and str(again) == "1 of 3 orphaned dispatches were not sent"
 
 
 async def test_dispatch_sweep_defaults_to_the_celery_job_queue(

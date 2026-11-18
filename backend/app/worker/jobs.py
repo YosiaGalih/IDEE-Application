@@ -19,7 +19,7 @@ from app.services.job_queue import CeleryJobQueue
 from app.services.orchestrator import build_orchestrator
 from app.services.run_recovery import RunRecoveryIncomplete, RunRecoveryResult, recover_runs
 from app.worker.identity import worker_id
-from app.workflow.dispatch import Dispatcher, DispatchResult, redispatch_orphans
+from app.workflow.dispatch import Dispatcher, DispatchIncomplete, DispatchResult, redispatch_orphans
 from app.workflow.engine import EngineOutcome
 from app.workflow.lease import ClaimResult
 from app.workflow.recovery import RecoveryIncomplete, RecoveryResult, recover_expired
@@ -102,6 +102,18 @@ def recovery_counts(tasks: RecoveryResult, runs: RunRecoveryResult) -> dict[str,
     }
 
 
+class RunTaskFailed(Exception):
+    """``run_task`` failed with an unexpected error. Carries the error type only: Celery logs a failed job's
+    exception text and chained traceback, and the engine's own error may hold a secret (it logged already)."""
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(error_type)
+        self.error_type = error_type
+
+    def __reduce__(self) -> tuple[type[RunTaskFailed], tuple[str]]:
+        return (RunTaskFailed, (self.error_type,))  # Celery re-creates task exceptions from their args
+
+
 @shared_task(name="app.worker.jobs.run_task")
 def run_task(task_id: str) -> dict[str, object]:
     """One delivery of the task engine. Engine exceptions propagate to Celery (ruling R-T3c)."""
@@ -111,11 +123,23 @@ def run_task(task_id: str) -> dict[str, object]:
         # Not retried: redelivering an unparseable id would only poison the queue (ruling R-T5a).
         logger.error("run_task_invalid_id", value=repr(task_id)[:_MAX_LOGGED_ID])
         return {"status": "invalid_task_id"}
-    outcome = asyncio.run(execute_task(parsed))
+    try:
+        outcome = asyncio.run(execute_task(parsed))
+    except Exception as exc:  # the engine logged it (task_engine_failed); not again here
+        raise RunTaskFailed(type(exc).__name__) from None
     if outcome.claim in (ClaimResult.AT_CAPACITY, ClaimResult.BUSY):
         # No retry or countdown: the dispatch sweep sends the task again after its grace period.
         logger.info("task_claim_deferred", task_id=str(parsed), reason=outcome.claim.value)
-    return {"claim": outcome.claim.value, "ran": list(outcome.ran), "stopped": outcome.stopped}
+    elif outcome.claim is ClaimResult.NOT_FOUND:
+        logger.warning("task_not_found", task_id=str(parsed), reason=outcome.claim.value)
+    elif outcome.claim in (ClaimResult.HELD, ClaimResult.NOT_CLAIMABLE):
+        logger.info("task_claim_skipped", task_id=str(parsed), reason=outcome.claim.value)
+    return {
+        "task_id": str(parsed),
+        "claim": outcome.claim.value,
+        "ran": list(outcome.ran),
+        "stopped": outcome.stopped,
+    }
 
 
 async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
@@ -138,8 +162,16 @@ async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
 
 @shared_task(name="app.worker.jobs.dispatch_sweep")
 def dispatch_sweep() -> dict[str, int]:
-    """Separate from ``recovery_sweep``: an error in one never blocks the other."""
-    return asdict(asyncio.run(sweep_dispatch()))
+    """Separate from ``recovery_sweep``: an error in one never blocks the other. Fails (DispatchIncomplete)
+    instead of reporting success when an enqueue failed."""
+    return asyncio.run(run_dispatch_sweep())
+
+
+async def run_dispatch_sweep() -> dict[str, int]:
+    result = await sweep_dispatch()
+    if result.failed:
+        raise DispatchIncomplete(result)
+    return asdict(result)
 
 
 async def sweep_dispatch(*, dispatcher: Dispatcher | None = None) -> DispatchResult:

@@ -16,7 +16,7 @@ instead of being retried by every sweep. Re-sending is safe: the claim rejects d
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 
@@ -46,6 +46,17 @@ class DispatchResult:
     dispatched: int
     failed: int
     skipped: int  # locked, or no longer a candidate by the time it was locked; a later sweep sees it again
+
+
+class DispatchIncomplete(Exception):
+    """Some orphaned tasks were not handed over; raised so the job is marked failed, not successful."""
+
+    def __init__(self, result: DispatchResult) -> None:
+        super().__init__(f"{result.failed} of {result.candidates} orphaned dispatches were not sent")
+        self.result = result
+
+    def __reduce__(self) -> tuple[type[DispatchIncomplete], tuple[DispatchResult]]:
+        return (DispatchIncomplete, (self.result,))  # Celery re-creates task exceptions from their args
 
 
 def _dispatched_at() -> ColumnElement[datetime]:
@@ -121,5 +132,5 @@ async def redispatch_orphans(
             logger.error("task_redispatch_failed", task_id=str(task_id), error_type=type(exc).__name__)
     result = DispatchResult(len(candidates), dispatched, failed, skipped)
     if failed:
-        logger.warning("task_redispatch_sweep", **result.__dict__)
+        logger.warning("task_redispatch_sweep", **asdict(result))
     return result

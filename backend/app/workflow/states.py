@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, NoReturn
@@ -74,6 +75,7 @@ class Actor:
 _REASON_COLUMN_LENGTH = 200
 _ACTOR_ID_LENGTH = 80
 _ERROR_CODE_LENGTH = 64  # tasks.error_code
+_ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")  # snake_case, at most _ERROR_CODE_LENGTH
 _ERROR_MESSAGE_LENGTH = 1000
 
 
@@ -199,8 +201,9 @@ async def fail_task(
     # Before any attribute read: an expired object would lazy-load (MissingGreenlet), not fail clearly.
     _check_not_expired(task)
     _check_inputs(db, task, actor)
-    if not 1 <= len(error_code) <= _ERROR_CODE_LENGTH:
-        raise ValueError(f"error_code must be 1-{_ERROR_CODE_LENGTH} characters")
+    if not _ERROR_CODE_PATTERN.fullmatch(error_code):
+        # The value is not echoed: it is stored and exposed, so a secret must not travel in the message too.
+        raise ValueError(f"error_code must be snake_case, 1-{_ERROR_CODE_LENGTH} characters")
     safe_message = audit.redactor.redact(message)[:_ERROR_MESSAGE_LENGTH]
     # Savepoint: if the transition is refused, the error columns are undone with it.
     async with db.begin_nested():

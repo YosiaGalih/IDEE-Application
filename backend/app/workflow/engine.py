@@ -136,7 +136,20 @@ class TaskEngine:
             outcome.stopped = "lease_lost"
         except _StatusChanged:
             outcome.stopped = "status_changed"
-        except (Exception, asyncio.CancelledError):
+        except asyncio.CancelledError:
+            step = outcome.ran[-1] if outcome.ran else None
+            logger.warning("task_engine_cancelled", task_id=str(task_id), step=step)
+            await self._release_after_error(task_id)
+            raise
+        except Exception as exc:
+            # Spec #43: logged with the task id, then raised again. The type only: the text may carry secrets.
+            logger.error(
+                "task_engine_failed",
+                task_id=str(task_id),
+                worker_id=self._ports.worker_id,
+                step=outcome.ran[-1] if outcome.ran else None,
+                error_type=type(exc).__name__,
+            )
             await self._release_after_error(task_id)
             raise
         return outcome
@@ -269,6 +282,9 @@ class TaskEngine:
                 raise
             except Exception as exc:
                 if time.monotonic() >= deadline:
+                    logger.warning(
+                        "lease_heartbeat_gave_up", task_id=str(task_id), error_type=type(exc).__name__
+                    )
                     raise LeaseLost(f"the lease of task {task_id} could not be renewed in time") from exc
                 logger.warning("lease_heartbeat_failed", task_id=str(task_id), error_type=type(exc).__name__)
             else:
@@ -327,5 +343,5 @@ class TaskEngine:
             async with self._ports.sessions() as db:
                 await release_lease(db, task_id, self._ports.worker_id)
                 await commit_and_publish(db, self._ports.bus)
-        except Exception:
-            logger.error("lease_release_failed", task_id=str(task_id), exc_info=True)
+        except Exception as exc:
+            logger.error("lease_release_failed", task_id=str(task_id), error_type=type(exc).__name__)

@@ -363,14 +363,14 @@ async def test_expired_task_object_is_refused_clearly(session: AsyncSession, tas
 
 async def test_fail_task_writes_code_and_status(session: AsyncSession, task_id: uuid.UUID) -> None:
     task = await load(session, task_id)
-    await fail_task(session, task, error_code="STEP_FAILED", message="boom", actor=ACTOR, audit=AUDIT)
+    await fail_task(session, task, error_code="step_failed", message="boom", actor=ACTOR, audit=AUDIT)
     await session.commit()
     fresh = await load(session, task_id)
-    assert (fresh.status, fresh.error_code, fresh.error_message) == ("failed", "STEP_FAILED", "boom")
-    assert fresh.status_reason == "STEP_FAILED"
+    assert (fresh.status, fresh.error_code, fresh.error_message) == ("failed", "step_failed", "boom")
+    assert fresh.status_reason == "step_failed"
     event = await session.scalar(select(TaskEvent).where(TaskEvent.task_id == task_id))
     assert event is not None and event.type == "task.status_changed"
-    assert event.payload == {"from": "draft", "to": "failed", "reason": "STEP_FAILED"}
+    assert event.payload == {"from": "draft", "to": "failed", "reason": "step_failed"}
     audit = await session.scalar(
         select(AuditEvent).where(
             AuditEvent.action == "task.status_changed", AuditEvent.resource_id == str(task_id)
@@ -383,7 +383,7 @@ async def test_fail_task_redacts_and_truncates_message(session: AsyncSession, ta
     audit = AuditWriter(Redactor(["s3cr3t-literal-value"]))
     task = await load(session, task_id)
     message = "token s3cr3t-literal-value " + "x" * 2000
-    await fail_task(session, task, error_code="E", message=message, actor=ACTOR, audit=audit)
+    await fail_task(session, task, error_code="e", message=message, actor=ACTOR, audit=audit)
     await session.commit()
     fresh = await load(session, task_id)
     assert fresh.error_message is not None
@@ -391,10 +391,26 @@ async def test_fail_task_redacts_and_truncates_message(session: AsyncSession, ta
     assert len(fresh.error_message) == 1000
 
 
-async def test_fail_task_rejects_overlong_code(session: AsyncSession, task_id: uuid.UUID) -> None:
+@pytest.mark.parametrize(
+    "code",
+    ["E" * 65, "a" * 65, "STEP_FAILED", "1_step", "has space", "sk-" + "test-secret-0123", "", "_lead"],
+)
+async def test_fail_task_rejects_a_malformed_code(
+    session: AsyncSession, task_id: uuid.UUID, code: str
+) -> None:
     task = await load(session, task_id)
-    with pytest.raises(ValueError, match="error_code"):
-        await fail_task(session, task, error_code="E" * 65, message="m", actor=ACTOR, audit=AUDIT)
+    with pytest.raises(ValueError, match="error_code") as raised:
+        await fail_task(session, task, error_code=code, message="m", actor=ACTOR, audit=AUDIT)
+    assert code not in str(raised.value) or code == ""  # the value is not echoed back
+    assert (await load(session, task_id)).status == "draft"
+
+
+async def test_fail_task_accepts_a_snake_case_code(session: AsyncSession, task_id: uuid.UUID) -> None:
+    task = await load(session, task_id)
+    await fail_task(session, task, error_code="planning_interrupted", message="m", actor=ACTOR, audit=AUDIT)
+    assert task.error_code == "planning_interrupted"
+    task = await load(session, task_id)
+    assert (task.status, task.error_code) == ("failed", "planning_interrupted")
 
 
 async def test_fail_task_rolls_back_together(engine: AsyncEngine, task_id: uuid.UUID) -> None:
@@ -406,7 +422,7 @@ async def test_fail_task_rolls_back_together(engine: AsyncEngine, task_id: uuid.
     async with sessions() as session:
         session.add(stale)
         with pytest.raises(AppError) as caught:
-            await fail_task(session, stale, error_code="E", message="m", actor=ACTOR, audit=AUDIT)
+            await fail_task(session, stale, error_code="e", message="m", actor=ACTOR, audit=AUDIT)
         assert caught.value.code == "VERSION_CONFLICT"
         # Same transaction, no rollback: the savepoint alone must have undone the error columns.
         assert await session.scalar(select(Task.error_code).where(Task.id == task_id)) is None
@@ -421,7 +437,7 @@ async def test_fail_task_refuses_expired_task(session: AsyncSession, task_id: uu
     task = await load(session, task_id)
     session.expire(task)
     with pytest.raises(ValueError, match="reload"):
-        await fail_task(session, task, error_code="E", message="m", actor=ACTOR, audit=AUDIT)
+        await fail_task(session, task, error_code="e", message="m", actor=ACTOR, audit=AUDIT)
     await session.rollback()
     fresh = await load(session, task_id)
     assert (fresh.status, fresh.error_code, fresh.error_message, fresh.version) == ("draft", None, None, 1)
