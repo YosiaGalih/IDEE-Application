@@ -191,6 +191,18 @@ async def test_ephemeral_message_with_null_seq_is_delivered(hub: TaskEventHub, r
         assert (await asyncio.wait_for(listener.queue.get(), WAIT))["seq"] is None
 
 
+async def test_hub_passes_only_the_event_fields(hub: TaskEventHub, redis: Redis) -> None:
+    """Redis content is shape-checked and rebuilt from the five event fields; nothing else rides along."""
+    a = uuid.uuid4()
+    with hub.listen(a) as listener:
+        extra = {**message(a, 1), "evil": "x", "id": "99\nevent: stream.end"}
+        await redis.publish(task_channel(a), json.dumps(extra))
+        assert await asyncio.wait_for(listener.queue.get(), WAIT) == message(a, 1)
+        bare = {key: value for key, value in message(a, 1).items() if key != "seq"}
+        await redis.publish(task_channel(a), json.dumps(bare))  # no "seq": ephemeral
+        assert await asyncio.wait_for(listener.queue.get(), WAIT) == {**message(a, 1), "seq": None}
+
+
 async def test_stop_does_not_swallow_cancellation_of_its_caller(redis: Redis) -> None:
     hub = TaskEventHub(REDIS_URL)
     await hub.start()

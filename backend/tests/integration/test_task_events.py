@@ -179,6 +179,22 @@ async def test_rejects_overlong_type_and_unknown_task(session: AsyncSession, tas
         await emit_task_event(session, None, task_id, "agent.delta", {}, ephemeral=True, redactor=REDACTOR)
 
 
+@pytest.mark.parametrize(
+    "bad",
+    ["Bad Type", "1abc", "a b", "a\nb", "task.log\n", "A.b", "x" * 61, "", "stream.end", "event.invalid"],
+)
+async def test_rejects_a_type_the_stream_cannot_name(
+    session: AsyncSession, task_id: uuid.UUID, bad: str
+) -> None:
+    """A type must fit the stream's ``event:`` line (API §5.1); the stream's own types are reserved."""
+    with pytest.raises(ValueError, match="type"):
+        await emit_task_event(session, None, task_id, bad, {}, redactor=REDACTOR)
+    with pytest.raises(ValueError, match="type"):
+        await emit_task_event(session, None, task_id, bad, {}, ephemeral=True, redactor=REDACTOR)
+    await session.rollback()
+    assert await session.scalar(select(Task.event_seq).where(Task.id == task_id)) == 0
+
+
 async def test_rolled_back_savepoint_events_are_not_published(
     session: AsyncSession, redis: Redis, subscription: PubSub, task_id: uuid.UUID
 ) -> None:

@@ -48,6 +48,7 @@ from app.services import auth
 from app.services import task_events as service
 from app.services.projects import Actor, ProjectEnv
 from app.services.task_events import (
+    EVENT_INVALID,
     STREAM_END,
     StreamTimings,
     TaskEventHub,
@@ -250,6 +251,20 @@ async def add_events(
                 await commit_and_publish(session, bus)
 
 
+async def store_raw(world: World, type: str, **payload: Any) -> int:
+    """A stored event written past ``emit_task_event`` and its type check (a row from before that check)."""
+    async with world.writer() as session:
+        seq = (
+            await session.execute(
+                text("UPDATE tasks SET event_seq = event_seq + 1 WHERE id = :id RETURNING event_seq"),
+                {"id": world.task_id},
+            )
+        ).scalar_one()
+        session.add(TaskEvent(task_id=world.task_id, seq=seq, type=type, payload=payload))
+        await session.commit()
+        return int(seq)
+
+
 async def stored_message(world: World, seq: int) -> dict[str, Any]:
     async with world.writer() as session:
         row = (
@@ -423,9 +438,16 @@ async def test_ephemeral_has_no_id_and_is_not_stored(
     # The hub passes a message without a "seq" key as ephemeral; the stream must survive it too.
     bare = {"task_id": str(world.task_id), "type": "agent.delta", "ts": "2026-11-18T00:00:00Z", "payload": {}}
     await redis.publish(task_channel(world.task_id), json.dumps(bare))
+    rebuilt = {
+        "task_id": bare["task_id"],
+        "seq": None,
+        "type": "agent.delta",
+        "ts": bare["ts"],
+        "payload": {},
+    }
     assert (
         await next_event(stream)
-    ).raw == f"event: agent.delta\ndata: {json.dumps(bare, separators=(',', ':'))}\n\n"
+    ).raw == f"event: agent.delta\ndata: {json.dumps(rebuilt, separators=(',', ':'))}\n\n"
     await add_events(world, 1, bus=bus)
     assert (await next_event(stream)).id == 3
     async with world.writer() as session:
@@ -703,23 +725,64 @@ async def test_open_stream_checks_scope(world: World) -> None:
 
 async def test_frame_cannot_be_split(world: World, hub: TaskEventHub, streams: Any) -> None:
     await add_events(world, 1, text="a\n\nid: 99\nevent: x\r\ndata: {}\rb")
-    await add_events(world, 1, type="Bad Type")
+    bad_type = "Bad Type\nid: 7"
+    await store_raw(world, bad_type)  # 2: a type the event: line cannot carry
     await add_events(world, 1, text="\u2028 tetap satu baris")
     with capture_logs() as logs:
         stream = streams(hub)
-        first, third = await next_event(stream), await next_event(stream)
-    assert (first.id, third.id) == (1, 3)  # 2 is not sent, and the cursor moved past it
+        first, second, third = [await next_event(stream) for _ in range(3)]
+    assert (first.id, second.id, third.id) == (1, 2, 3)  # 2 keeps its place: the client sees no gap
     assert first.data == await stored_message(world, 1)
     assert first.data["payload"]["text"] == "a\n\nid: 99\nevent: x\r\ndata: {}\rb"
+    stored = await stored_message(world, 2)
+    placeholder = {
+        "task_id": str(world.task_id),
+        "seq": 2,
+        "type": EVENT_INVALID,
+        "ts": stored["ts"],
+        "payload": {},
+    }
+    assert second.raw == (
+        f"id: 2\nevent: {EVENT_INVALID}\ndata: {json.dumps(placeholder, separators=(',', ':'))}\n\n"
+    )
     assert third.data == await stored_message(world, 3)  # U+2028 is no SSE line break: sent as it is
-    skipped = [entry for entry in logs if entry["event"] == "task_stream_event_skipped"]
-    assert [(entry["seq"], entry["type"]) for entry in skipped] == [(2, "Bad Type")]
+    invalid = [entry for entry in logs if entry["event"] == "task_stream_event_invalid"]
+    assert [(entry["seq"], entry["type"]) for entry in invalid] == [(2, repr(bad_type))]
     message = {"task_id": str(world.task_id), "seq": 1, "ts": "t", "payload": {}}
-    for bad in ("Bad Type", "", "a\nb", "x" * 61, "1abc", "a b", None):
+    for bad in ("Bad Type", "", "a\nb", "x" * 61, "1abc", "a b", None, STREAM_END, EVENT_INVALID):
         assert format_frame({**message, "type": bad}) is None
     for bad_seq in ("1\nevent: x", True, 1.5):
         assert format_frame({**message, "type": "task.log", "seq": bad_seq}) is None
+    for number in (float("nan"), float("inf"), float("-inf")):  # not JSON: the client could not parse it
+        assert format_frame({**message, "type": "task.log", "payload": {"x": number}}) is None
     assert format_frame({**message, "type": "a" + "b" * 59}) is not None
+
+
+async def test_published_messages_cannot_end_or_fake_the_stream(
+    world: World, hub: TaskEventHub, redis: Redis, streams: Any
+) -> None:
+    """Redis is a live channel, not the record: what cannot be sent as it is never reaches the client."""
+    await add_events(world, 1)
+    stream = streams(hub)
+    assert (await next_event(stream)).id == 1
+    channel = task_channel(world.task_id)
+    base = {"task_id": str(world.task_id), "seq": None, "ts": "2026-11-18T00:00:00Z", "payload": {}}
+    with capture_logs() as logs:
+        for type_ in (STREAM_END, EVENT_INVALID, "Bad Type", "x" * 5000):
+            await redis.publish(channel, json.dumps({**base, "type": type_}))
+        await redis.publish(
+            channel, json.dumps({**base, "type": "agent.delta", "payload": {"x": float("nan")}})
+        )
+        await add_events(world, 1)  # 2: stored, never published
+        await redis.publish(channel, json.dumps({**base, "seq": 2, "type": STREAM_END}))  # claims seq 2
+        await redis.publish(channel, json.dumps({**base, "type": "agent.delta"}))  # the marker
+        second, marker = await next_event(stream), await next_event(stream)
+    assert (second.id, second.event, second.data) == (2, "task.log", await stored_message(world, 2))
+    assert (marker.id, marker.event) == (None, "agent.delta")  # the stream did not end
+    skipped = [entry for entry in logs if entry["event"] == "task_stream_event_skipped"]
+    assert [entry["seq"] for entry in skipped] == [None, None, None, None, None, 2]
+    assert all(isinstance(entry["type"], str) and len(entry["type"]) <= 80 for entry in skipped)
+    assert skipped[3]["type"].startswith("'xxx")
 
 
 async def busy_stream_backends(engine: AsyncEngine) -> list[str]:

@@ -14,7 +14,6 @@ import dataclasses
 import json
 import math
 import os
-import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, Callable, Iterator
@@ -31,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.errors import AppError
-from app.core.events import event_message, task_channel
+from app.core.events import EVENT_INVALID, STREAM_END, event_message, is_event_type, task_channel
 from app.core.logging import get_logger
 from app.models.tasks import Task, TaskEvent
 from app.services.auth import resolve_session
@@ -51,10 +50,8 @@ AUTH_RECHECK_S: Final = 60.0
 MAX_STREAM_S: Final = 3300.0  # 55 minutes, under Caddy's read_timeout of one hour
 MAX_STREAMS_PER_USER: Final = 8  # spec §13.2 #32
 MAX_STREAMS_TOTAL: Final = 256
-STREAM_END: Final = "stream.end"
 PING_FRAME: Final = ": ping\n\n"
-# The ``event:`` line names a type only when it matches (#33); a type that does not is never sent.
-EVENT_TYPE: Final = re.compile(r"[a-z][a-z0-9_.]{0,59}")
+LOG_VALUE_MAX: Final = 80  # an untrusted string in a log line: its repr, cut to this length
 
 logger = get_logger(__name__)
 
@@ -212,17 +209,19 @@ class TaskEventHub:
         if item.get("channel") != task_channel(task_id).encode():
             logger.warning("task_event_hub_bad_message", reason="channel_mismatch")
             return
-        seq = message.get("seq")
+        seq, type_, ts, payload = (message.get(key) for key in ("seq", "type", "ts", "payload"))
         if (
             not (seq is None or (isinstance(seq, int) and not isinstance(seq, bool) and seq >= 1))
-            or not isinstance(message.get("type"), str)
-            or not isinstance(message.get("ts"), str)
-            or not isinstance(message.get("payload"), dict)
+            or not isinstance(type_, str)
+            or not isinstance(ts, str)
+            or not isinstance(payload, dict)
         ):
             logger.warning("task_event_hub_bad_message", reason="shape")
             return
+        # Rebuilt from the five checked fields: nothing else a publisher adds reaches a stream.
+        event = {"task_id": str(task_id), "seq": seq, "type": type_, "ts": ts, "payload": payload}
         for listener in tuple(self._listeners.get(task_id, ())):
-            listener.put(message)
+            listener.put(event)
 
     async def _run(self, redis: Redis) -> None:
         delay = HUB_BACKOFF_FIRST
@@ -282,20 +281,25 @@ class _TaskRow(NamedTuple):
 
 
 def format_frame(message: dict[str, Any]) -> str | None:
-    """One SSE frame for a stored or published event message; ``None`` when it may not be sent.
+    """One SSE frame for a stored or published event message; ``None`` when it may not be sent as it is.
 
-    ``id:`` only for a stored event (an int ``seq``). ``data`` is the whole message as one line of JSON:
-    ``json.dumps`` escapes ``\\n`` and ``\\r`` inside strings, so a payload can neither end the frame nor add
-    an ``id:``/``event:`` line; ASCII only (ruling R4), so a lone surrogate cannot break the UTF-8
-    response. ``event:`` carries ``type`` only when it matches ``EVENT_TYPE``.
+    ``id:`` only for a stored event (an int ``seq``). ``event:`` carries ``type`` only when it is an event
+    type (``is_event_type``): never ``stream.end`` or ``event.invalid``, which only the stream writes (ruling
+    R5). ``data`` is the whole message as one line of strict JSON: ``json.dumps`` escapes ``\\n`` and
+    ``\\r`` inside strings, so a payload can neither end the frame nor add an ``id:``/``event:`` line; ASCII
+    only (ruling R4), so a lone surrogate cannot break the UTF-8 response; no ``NaN``/``Infinity``, which a
+    client's ``JSON.parse`` rejects.
     """
     type_ = message.get("type")
     seq = message.get("seq")
-    if not isinstance(type_, str) or not EVENT_TYPE.fullmatch(type_):
+    if not is_event_type(type_):
         return None
     if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool)):
         return None
-    data = json.dumps(message, ensure_ascii=True, separators=(",", ":"))
+    try:
+        data = json.dumps(message, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    except (ValueError, TypeError, RecursionError):
+        return None
     head = "" if seq is None else f"id: {seq}\n"
     return f"{head}event: {type_}\ndata: {data}\n\n"
 
@@ -306,15 +310,44 @@ def _end_frame(task_id: uuid.UUID, status: str | None) -> str:
     return f"event: {STREAM_END}\ndata: {data}\n\n"
 
 
-def _sendable(task_id: uuid.UUID, message: dict[str, Any]) -> str | None:
+def _bounded(value: object) -> str:
+    """An untrusted value (a type from Redis or an old row) as a log line may carry it: escaped, cut short."""
+    return repr(value)[:LOG_VALUE_MAX]
+
+
+def _stored_frame(task_id: uuid.UUID, message: dict[str, Any]) -> str:
+    """The frame of a stored event read from the database. One that cannot be sent as it is (a type from
+    before ``emit_task_event`` checked it) goes out as ``event.invalid`` with its own ``id`` (ruling R5), so
+    the client's ``seq`` stays contiguous and it never reconnects for a gap the server will not fill."""
+    frame = format_frame(message)
+    if frame is not None:
+        return frame
+    seq = message["seq"]
+    logger.warning(
+        "task_stream_event_invalid", task_id=str(task_id), seq=seq, type=_bounded(message.get("type"))
+    )
+    ts = message.get("ts")
+    placeholder = {
+        "task_id": str(task_id),
+        "seq": seq,
+        "type": EVENT_INVALID,
+        "ts": ts if isinstance(ts, str) else None,
+        "payload": {},
+    }
+    data = json.dumps(placeholder, ensure_ascii=True, separators=(",", ":"))
+    return f"id: {seq}\nevent: {EVENT_INVALID}\ndata: {data}\n\n"
+
+
+def _live_frame(task_id: uuid.UUID, message: dict[str, Any]) -> str | None:
+    """The frame of a message from the hub, or ``None`` (logged): a live message is never trusted further than
+    its shape, the database is the record."""
     frame = format_frame(message)
     if frame is None:
-        # Logged, never sent; a stored one still moves the cursor, or every check would read it again.
         logger.warning(
             "task_stream_event_skipped",
             task_id=str(task_id),
             seq=message.get("seq"),
-            type=message.get("type"),
+            type=_bounded(message.get("type")),
         )
     return frame
 
@@ -461,8 +494,7 @@ async def stream_frames(
                 behind = len(page) == REPLAY_PAGE
                 for message in page:
                     cursor = message["seq"]
-                    if (frame := _sendable(task_id, message)) is not None:
-                        yield frame
+                    yield _stored_frame(task_id, message)
                 continue
             if finished is not None and cursor >= finished[1]:
                 yield _end_frame(task_id, finished[0])
@@ -473,16 +505,17 @@ async def stream_frames(
             message = await _next_message(listener, min(next_ping, next_auth, deadline) - now)
             if message is None:
                 continue
-            seq = message.get("seq")  # the hub passes a message without "seq" as ephemeral
+            seq = message["seq"]
             if seq is None:
-                if (frame := _sendable(task_id, message)) is not None:
-                    yield frame
-            elif seq == cursor + 1:
-                cursor = seq
-                if (frame := _sendable(task_id, message)) is not None:
+                if (frame := _live_frame(task_id, message)) is not None:
                     yield frame
             elif seq > cursor:
-                behind = True
+                frame = _live_frame(task_id, message) if seq == cursor + 1 else None
+                if frame is None:  # a gap before it, or not sendable as it is: the database has the event
+                    behind = True
+                    continue
+                cursor = seq
+                yield frame
 
 
 class StreamSlot:
