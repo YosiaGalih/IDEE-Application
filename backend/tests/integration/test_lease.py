@@ -146,3 +146,31 @@ async def test_claim_gives_up_when_the_claim_lock_is_held(
         result = await asyncio.wait_for(claim(engine, task_ids[1], "w2", max_active=5), timeout=5)
         await first.rollback()
     assert result is ClaimResult.BUSY
+
+
+async def claim_with(
+    engine: AsyncEngine, task_id: uuid.UUID, worker: str, claimable: frozenset[str], max_active: int = 2
+) -> ClaimResult:
+    async with make_sessionmaker(engine)() as session:
+        result = await claim_lease(session, task_id, worker, max_active=max_active, claimable=claimable)
+        await session.commit()
+        return result
+
+
+async def test_claim_draft_when_allowed(engine: AsyncEngine, task_ids: list[uuid.UUID]) -> None:
+    await set_status(engine, task_ids[0], "draft")
+    result = await claim_with(engine, task_ids[0], "w1", frozenset({"draft", "queued"}))
+    assert result is ClaimResult.ACQUIRED
+
+
+async def test_claim_draft_refused_by_default(engine: AsyncEngine, task_ids: list[uuid.UUID]) -> None:
+    await set_status(engine, task_ids[0], "draft")
+    assert await claim(engine, task_ids[0], "w1") is ClaimResult.NOT_CLAIMABLE
+
+
+async def test_capacity_counts_draft_leases(engine: AsyncEngine, task_ids: list[uuid.UUID]) -> None:
+    both = frozenset({"draft", "queued"})
+    await set_status(engine, task_ids[0], "draft")
+    await set_status(engine, task_ids[1], "draft")
+    assert await claim_with(engine, task_ids[0], "w1", both, max_active=1) is ClaimResult.ACQUIRED
+    assert await claim_with(engine, task_ids[1], "w2", both, max_active=1) is ClaimResult.AT_CAPACITY

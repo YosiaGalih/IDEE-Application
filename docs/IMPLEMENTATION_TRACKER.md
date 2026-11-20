@@ -3152,3 +3152,116 @@ AG-13 PoC (scratchpad `ag13poc-3.2b`):
   - tangani `event.invalid` sebagai event yang tidak ditampilkan.
 - **Tier di atas S:** penghitung slot pindah ke Redis.
 - **Syarat 3.2a/3.1f2b dan spec induk §9** tetap berlaku untuk 3.2c–3.2h.
+
+**Sesudah PR #38 (fakta, 18 Nov 2026) [Pasti]:**
+- PR #38 (WP-3.2b) mencapai CI 9/9 di bb3d718. PO me-merge-nya pada 18 Nov 2026 06:13 UTC (157acad).
+
+### WP-3.2c1 (kerangka engine) — job `run_task`, claim `draft|queued`, langkah berurutan dan idempoten lewat checkpoint, heartbeat berbatas, sweep dispatch yatim (sub-WP ketiga WP-3.2; K6/N5, N7, N11, N12; LOW-3 ditinjau ulang)
+
+**Dokumen kerja:**
+- Spec induk §14: rancangan rinci 3.2c1, Keputusan Lead #37–#45, builder check §14.4a, dan ruling eksekusi §14.5 #46.
+- Plan `docs/superpowers/plans/2026-11-18-wp-3.2c1-engine-skeleton.md` (6 task).
+
+**Cara dikerjakan:** subagent-driven-development, dengan implementer dan review per task.
+- Task 1 (`fail_task`), Task 3 (engine), dan Task 6 (dokumen) masing-masing butuh satu putaran perbaikan.
+- Engine (Task 3) juga mendapat satu amandemen sebelum review (R-T3f).
+
+Review akhir datang dari lima kursi:
+- kk-backend-reviewer: BLOCK (log spec #43, konflik antrean N19);
+- kk-silent-failure-hunter: 2 Important, 9 Minor;
+- AG-13: **SIGNED OFF** dengan syarat C1 dan C2;
+- `/code-review` Standards dan Spec.
+
+Sesudahnya ada satu fix wave (FW1–FW9), lalu re-review terlingkup dan delta AG-13 (**SIGNED OFF (delta)**: L2, L7, C1 tertutup). Re-review menemukan satu regresi MEDIUM dari fix wave itu sendiri (galat claim/setup tidak di-log dengan `task_id`, traceback Celery terpotong), ditutup di putaran mikro R-F5. Syarat AG-13 C2 (suite penuh hijau di head final) terpenuhi di 7a7e134.
+
+**Yang dibangun:**
+- **`claim_lease(..., claimable=...)`** (default `{"queued"}`; engine memakai `{"draft","queued"}`). Kapasitas dihitung dari semua lease hidup, apa pun statusnya (N12).
+- **`fail_task`** (`app/workflow/states.py`): `error_code` divalidasi `^[a-z][a-z0-9_]{0,63}$`, pesan diredaksi dan dipotong 1000. Kolom error dan transisi ke `failed` ditulis dalam satu savepoint, jadi transisi yang ditolak ikut membatalkan kolom error.
+- **`TaskEngine`** (`app/workflow/engine.py`):
+  - Claim dan status di satu transaksi: `queued → running`, atau `draft` dengan `dispatch.planning_attempts += 1`. Claim ke-4 menghasilkan `failed planning_interrupted`.
+  - `PIPELINE`: `draft` → `intake`, `context`, `plan`; `running` → `implement`. Langkah di `completed_steps` dilewati.
+  - Setiap tulisan di transaksi pendeknya sendiri plus `commit_and_publish`. Tidak ada sesi DB yang terbuka saat langkah berjalan (dibuktikan dengan `pg_stat_activity`).
+  - Hasil `transition` dicatat sebagai langkah selesai (`step_finished done`); hasil `fail` meng-emit `step_finished failed` tanpa masuk `completed_steps` (R-T3f).
+  - Heartbeat berbatas: perpanjangan yang gagal atau macet diulang hanya sampai `last_ok + lease − heartbeat_s`, dengan timeout per percobaan. Lewat itu dianggap `LeaseLost` dan langkah dibatalkan.
+  - Galat tak terduga: di-log `task_engine_failed` (task_id, step, tipe galat), lease dilepas best-effort, galat dilempar ulang tanpa menulis status (spec #43, R-T3c).
+  - Status berubah dari luar (di dalam atau di antara langkah) → lease dilepas tanpa transisi.
+- **`app/workflow/checkpoint.py`:** helper `jsonb_set` per kunci; checkpoint tidak pernah ditimpa utuh.
+- **Sweep dispatch yatim** (`app/workflow/dispatch.py`, beat `dispatch-sweep` 30 dtk, `expires` 25):
+  - kandidat `draft|queued` dengan `dispatch.at` ada, lease mati, dan `dispatch.at` lebih tua dari 60 dtk; paling tua dulu, paling banyak 100 per sweep;
+  - per kandidat `FOR UPDATE SKIP LOCKED` dan cek ulang, lalu `dispatch.at`/`count` dimajukan, commit, enqueue;
+  - enqueue yang gagal membuat job melempar `DispatchIncomplete` (setara `RecoveryIncomplete`).
+- **Worker:**
+  - `run_task(task_id)`: id tidak sah di-log lalu job kembali tanpa raise; `AT_CAPACITY`/`BUSY` → `task_claim_deferred` tanpa retry Celery; `NOT_FOUND` → `task_not_found`; setiap galat (termasuk saat claim dan setup) di-log `run_task_failed` (task_id, tipe galat) lalu dilempar sebagai `RunTaskFailed(tipe) from None`, sehingga baris kegagalan Celery tidak membawa teks galat.
+  - `worker_id()` per proses dan aman terhadap fork (`host:pid:token`, ≤ 120).
+  - `broker_transport_options` `visibility_timeout` 7200.
+  - `build_orchestrator` (`app/services/orchestrator.py`) dengan registry langkah kosong di produksi. Gerbang 503 `workflow_engine_unavailable` tetap tertutup sampai 3.2d.
+- **Dokumen:**
+  - ARCHITECTURE §5.3 (N12): claim, kapasitas, sweep dispatch, heartbeat, nama log.
+  - AGENT_CATALOG §9 (N11).
+  - API §5: catatan WP-3.2c1, kode error `planning_interrupted`/`step_unavailable`, event `task.step_*`.
+  - DATA_MODEL: kunci `checkpoint`, `error_code`.
+  - SECURITY_MODEL §13: LOW-3 ditinjau ulang.
+  - TEST_STRATEGY, GLOSSARY ("Sweep dispatch").
+  - Spec §14.5 dan konflik N19.
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ p32-pytest.sh -q -rw                  # suite backend penuh @ 7a7e134 (head kode final; commit sesudahnya hanya dokumen)
+5756 passed in 579.00s                  (tanpa warning; test_git_adapter flaky tidak gagal)
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 363 files already formatted · 0 errors, 0 warnings · Contracts: 10 kept, 0 broken
+```
+
+AG-13 PoC (scratchpad `ag13poc-3.2c1`):
+- Loop dispatch ulang berbatas. Langkah yang tidak pernah bertransisi atau selalu melempar galat dijalankan tepat 3 kali, lalu menjadi `failed planning_interrupted`. Task `running` tanpa lease menjadi `interrupted` lewat recovery.
+- Koneksi DB "black hole" di tengah statement: heartbeat membatalkan langkah tepat di tenggat.
+- Pesan broker palsu tidak bisa memilih project, approve, melewati kapasitas, atau menjalankan task yang sudah selesai. Id tidak sah tidak menjadi poison.
+- Tidak ada kebocoran koneksi broker selama 40 sweep.
+
+**Keputusan Lead selama eksekusi (ruling, dari ledger SDD; daftar lengkap di laporan akhir sesi):**
+- **R-P1/R-P2:** `fail_task` meredaksi sendiri; test `enqueue_task` di `tests/unit/test_job_queue.py`.
+- **R-T2a:** `worker_id()` aman terhadap fork.
+- **R-T3a–R-T3q:** tanpa port `clock`; aktor `system:engine`; exception langkah dilempar ulang tanpa status; `pipeline_exhausted`; `planning_attempts` membuat objek `dispatch`; hasil `transition` mencatat langkah; heartbeat berbatas (R-T3h diubah sesudah review); reset putaran checkpoint milik penulis edge masuk ulang (R-T3k); enam Minor dinaikkan ke putaran perbaikan.
+- **R-T4a–R-T4c:** kandidat wajib punya `dispatch.at`; urutan tertua dan batas 100; invarian `dispatch.at` didokumentasikan, tidak dijaga di kode.
+- **R-T5a–R-T5c:** id tidak sah tidak di-raise; belum ada batas durasi job (3.2c2); `visibility_timeout` digabung, bukan diganti.
+- **R-T6a–R-T6c:** Task 6 tanpa suite; dua Minor dokumen dinaikkan.
+- **R-F1:** baris `enforce_budget` di AGENT_CATALOG bukan scope creep (N11).
+- **R-F2:** konflik antrean N19, keputusan sementara antrean sendiri untuk `run_task` (butuh PO).
+- **R-F3:** `DispatchIncomplete`.
+- **R-F4:** fix wave ikut menutup AG-13 L2 dan L7.
+- **R-F5:** putaran mikro untuk regresi diagnosis dari fix wave (`run_task_failed`); duplikat log untuk crash langkah diterima.
+
+**Ditunda (bukan blocker):**
+- savepoint `_finish` berlebih; `StepContext.checkpoint` dict yang bisa diubah; kombinasi `StepResult` hanya dijaga `assert`;
+- tidak ada guard `0 < heartbeat_s < lease` (tidak terjangkau, nilainya konstanta);
+- test hang macet di `__aenter__`, bukan renewal sungguhan (PoC black-hole AG-13 membuktikan jalur nyata);
+- hasil langkah yang sukses dibuang tanpa log bila heartbeat menang (silent M3);
+- `pipeline_exhausted` berujung pesan `planning_interrupted` yang menyesatkan (silent M4);
+- log `task_redispatch_failed` tanpa fase (mark/enqueue) (silent M5);
+- `CeleryJobQueue` per sweep tidak ditutup (AG-13: tidak ada kebocoran dalam 40 sweep);
+- test job deferred memakai engine palsu; merge `visibility_timeout` belum terbukti dengan opsi yang sudah ada; test id tidak sah hanya untuk string panjang;
+- helper lepas-lease + commit yang berulang di engine; status masih string mentah (smell Standards);
+- test fork `worker_id` memakai `filterwarnings`; lebih baik fork di dalam subprocess baru yang single-thread;
+- `DispatchIncomplete` turunan `Exception`, sedangkan `RunRecoveryIncomplete` turunan `RuntimeError`.
+
+**Syarat yang dibawa:**
+- **3.2c2 (syarat masuk dan syarat sign-off AG-13):**
+  - **N19 / AG-13 L4:** pisahkan antrean `run_task` (keputusan sementara R-F2), pasang `TASK_MAX_DURATION_MINUTES` di sekitar `engine.run` (R-T5b), dan batasi batch sweep dengan kapasitas yang tersisa.
+  - **AG-13 L3:** margin heartbeat nol pada kasus terburuk. Batasi tiap percobaan dengan `min(beat, last_ok + lease − SAFETY − now)`, beri lease guard di `StepContext` untuk tulisan langkah, dan jadikan PoC black-hole test regresi.
+  - **AG-13 L6:** lease owner per delivery, atau pool `prefork` dipin dengan test.
+  - **AG-13 I7:** token start `RunStore.start` (SECURITY_MODEL §13), karena delivery ganda kini normal.
+  - Transaksi engine dibatasi `bound_transaction` (lock/statement timeout).
+  - Allowlist target transisi per pipeline (AG-13 I2).
+  - Log di `workflow/recovery.py:113` dan `worker/celery_app.py:112` masih `exc_info=True`; jadikan hanya tipe galat saat disentuh (AG-13 delta INFO-1).
+- **3.2d:**
+  - Pembuat task menulis `checkpoint.dispatch.at` dari `clock_timestamp()` di transaksi pembuatan (R-T4c), lalu enqueue sesudah commit. Draft tanpa `dispatch.at` tidak pernah disapu (silent M9).
+  - Jawaban klarifikasi me-reset `completed_steps`/`planning_attempts` (R-T3k); reset hanya di edge manusia (LOW-3 b).
+  - Opsi marker/reservasi LOW-3 (spec 3.1f2b §6.3 A) diputuskan sebelum langkah LLM pertama terdaftar (AG-13 L1 d).
+  - Claim menolak task milik project yang tidak `active` (AG-13 L5).
+  - Keadilan antrean: task baru langsung di-enqueue, task lama menunggu grace (AG-13 I5).
+  - Validasi `error_code` saat `StepResult.fail` dibuat, supaya kode yang salah tertangkap di test langkah, bukan menjadi `RunTaskFailed` (AG-13 delta INFO-2).
+- **3.2e:** selama pipeline `running` hanya berisi `implement`, task `interrupted` yang di-queue ulang langsung `pipeline_exhausted`. Langkah sesudah `implement` mengakhiri perilaku ini.
+- **3.2f:** resume mempertahankan `completed_steps`; retry `failed → draft` me-reset langkah planning dan `planning_attempts` (R-T3k); putuskan apakah langkah yang selesai saat pause dicatat (R-T3g).
+- **3.2g:** approval `→ draft` menentukan reset-nya sendiri (R-T3k).
+- **Syarat 3.2a/3.2b/3.1f2b dan spec induk §9** tetap berlaku.

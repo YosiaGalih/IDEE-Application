@@ -29,6 +29,10 @@ from app.worker.platform_jobs import (
 from app.worker.pricing import PRICING_PATH_CONF, PricingStep
 
 RECOVERY_SWEEP_SECONDS = 30.0  # ARCHITECTURE §5.3
+DISPATCH_SWEEP_SECONDS = 30.0  # spec WP-3.2 §14 #41
+# An unacked message is redelivered after this; it must exceed the longest task (a lost lease already
+# returns the task to the dispatch sweep), or a running job would be delivered a second time.
+VISIBILITY_TIMEOUT_SECONDS = 7200
 
 
 def create_celery(settings: Settings) -> Celery:
@@ -48,6 +52,10 @@ def create_celery(settings: Settings) -> Celery:
         task_eager_propagates=True,  # eager mode (tests/dev) must not swallow job failures
         worker_hijack_root_logger=False,  # logging goes through core.logging (redaction), see setup_logging
         broker_connection_retry_on_startup=True,
+        broker_transport_options={
+            **app.conf.get("broker_transport_options", {}),
+            "visibility_timeout": VISIBILITY_TIMEOUT_SECONDS,
+        },
         timezone="UTC",
         **{PRICING_PATH_CONF: settings.pricing_path},
         beat_schedule={
@@ -56,6 +64,11 @@ def create_celery(settings: Settings) -> Celery:
                 "schedule": RECOVERY_SWEEP_SECONDS,
                 # A sweep that waited past the next one is dropped, not replayed in a burst.
                 "options": {"expires": RECOVERY_SWEEP_SECONDS - 5},
+            },
+            "dispatch-sweep": {
+                "task": "app.worker.jobs.dispatch_sweep",
+                "schedule": DISPATCH_SWEEP_SECONDS,
+                "options": {"expires": DISPATCH_SWEEP_SECONDS - 5},
             },
             # WP-3.1c: approvals past their time, handler retries (ADR-024), and the 7-day project purge.
             "approvals-sweep": {

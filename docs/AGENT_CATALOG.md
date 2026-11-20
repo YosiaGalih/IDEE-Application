@@ -391,13 +391,13 @@ Orchestrator bertanggung jawab memutuskan workflow, memilih specialist, mengatur
 | Capability PRD | Implementasi MVP |
 |---|---|
 | `orchestrator.route_intent` | S1 intake: hasil A02 (`workflow_type`, `complexity`, `risk`) memilih jalur pipeline (mis. `docs` → G35, `debug` → langsung S5/S6) |
-| `orchestrator.create_workflow` | `workflow/engine.py` menyusun langkah S1–S10 + DAG dari `PlanOutput` ke `tasks.checkpoint.plan` |
-| `orchestrator.schedule_task` | `services/tasks.enqueue` → Celery `jobs.run_task` dengan lease & `MAX_ACTIVE_TASKS` |
+| `orchestrator.create_workflow` | Sekarang (WP-3.2c1): `workflow/engine.py` `PIPELINE` tetap per status (`draft`: `intake`, `context`, `plan`; `running`: `implement`). Penyusunan langkah S1–S10 + DAG dari `PlanOutput` ke `tasks.checkpoint.plan` milik 3.2d |
+| `orchestrator.schedule_task` | `Dispatcher.enqueue_task` (`CeleryJobQueue`) → `jobs.run_task` (WP-3.2c1), dengan lease dan `MAX_ACTIVE_TASKS` dari lease hidup; job yang hilang dikirim ulang sweep dispatch. Pemanggil `enqueue_task` untuk task baru milik 3.2d |
 | `orchestrator.resolve_dependencies` | urutan topologis `PlanStep.depends_on`; `task_dependencies` antar-task |
 | `orchestrator.invoke_agent` | `AgentRuntime.run` untuk llm/profile; pemanggilan tool deterministik atas nama agent tool-mode lewat `ToolGateway.execute` |
-| `orchestrator.enforce_budget` | `workflow/budget.py::BudgetGuard.check_before_call` sebelum setiap request LLM |
+| `orchestrator.enforce_budget` | `workflow/budget.py::BudgetGuard.check_before_attempt` sebelum setiap percobaan request LLM, dan `BudgetGuard.check_before_tool` sebelum setiap tool |
 | `orchestrator.handle_retry` | retry LLM transient (backoff + jitter), debug loop ≤ `TASK_MAX_DEBUG_ATTEMPTS`, auto-remediation ≤ `TASK_AUTO_REMEDIATION_MAX` |
-| `orchestrator.pause_resume` | cancel/interrupt/resume dari checkpoint (`workflow/recovery.py`) |
+| `orchestrator.pause_resume` | Cancel, pause, dan resume milik 3.2f. Sekarang `workflow/recovery.py` hanya menangani task yatim (lease kedaluwarsa → `interrupted`); engine (3.2c1) melanjutkan dari `checkpoint.completed_steps` |
 | `orchestrator.collect_evidence` | mengumpulkan `test_runs`, `artifacts`, `findings`, diff untuk User Proxy (`acceptance.list_evidence`) |
 | `orchestrator.request_approval` | membuat approval `apply_changes` / `budget_increase` (payload-hash); **tidak dapat memutuskan** |
 | `orchestrator.finalize_task` | S9 gate + S10 apply; status hanya lewat `workflow/states.py::transition` |

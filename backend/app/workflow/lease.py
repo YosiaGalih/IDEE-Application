@@ -8,7 +8,8 @@ Contract for the job that runs a task (WP-3.x):
 - ``claim_lease`` returns *why* it did not acquire:
   - ``AT_CAPACITY`` and ``BUSY`` mean "retry later";
   - ``HELD``, ``NOT_CLAIMABLE`` and ``NOT_FOUND`` mean "this delivery has nothing to do".
-- Only ``queued`` tasks are claimable, so a late duplicate delivery never re-runs a finished task.
+- Only ``queued`` tasks are claimable by default (a caller may pass ``claimable``), so a late duplicate
+  delivery never re-runs a finished task.
 - ``renew_lease`` raises ``LeaseLost``. A worker that loses its lease must stop; the recovery sweep owns the
   task from then on.
 """
@@ -37,6 +38,8 @@ _LOCK_NOT_AVAILABLE = "55P03"
 
 logger = get_logger(__name__)
 
+_DEFAULT_CLAIMABLE = frozenset({"queued"})
+
 
 class ClaimResult(StrEnum):
     ACQUIRED = "acquired"
@@ -51,15 +54,28 @@ class LeaseLost(Exception):
     """The worker no longer holds the task's lease and must stop working on it."""
 
 
+def lease_duration() -> timedelta:
+    """The lease length ``claim_lease`` and ``renew_lease`` grant; a holder's own deadlines derive from it."""
+    return _LEASE
+
+
 def _check_worker(worker_id: str) -> None:
     if not 1 <= len(worker_id) <= _WORKER_ID_LENGTH:
         raise ValueError(f"worker id must be 1-{_WORKER_ID_LENGTH} characters")
 
 
 async def claim_lease(
-    db: AsyncSession, task_id: uuid.UUID, worker_id: str, *, max_active: int
+    db: AsyncSession,
+    task_id: uuid.UUID,
+    worker_id: str,
+    *,
+    max_active: int,
+    claimable: frozenset[str] = _DEFAULT_CLAIMABLE,
 ) -> ClaimResult:
-    """Take the lease of a queued task unless it is held or ``max_active`` leases are live elsewhere."""
+    """Take the lease of a task in a ``claimable`` status (default: queued).
+
+    Refused when another worker holds it or ``max_active`` leases are live elsewhere.
+    """
     _check_worker(worker_id)
     try:
         async with db.begin_nested():
@@ -84,7 +100,7 @@ async def claim_lease(
             update(Task)
             .where(
                 Task.id == task_id,
-                Task.status == "queued",
+                Task.status.in_(claimable),
                 or_(Task.lease_expires_at.is_(None), Task.lease_expires_at < now),
                 live_elsewhere < max_active,
             )
@@ -105,7 +121,7 @@ async def claim_lease(
     ).one_or_none()
     if row is None:
         return ClaimResult.NOT_FOUND
-    if row.status != "queued":
+    if row.status not in claimable:
         return ClaimResult.NOT_CLAIMABLE
     if row.live:
         return ClaimResult.HELD

@@ -15,6 +15,7 @@ from celery import Celery
 
 IMPORT_TASK = "app.worker.platform_jobs.import_archive"
 INDEX_TASK = "app.worker.platform_jobs.index_repository"
+RUN_TASK = "app.worker.jobs.run_task"
 PROVIDER_SMOKE_TASK = "app.worker.platform_jobs.provider_smoke"
 QUEUE = "ide"  # platform_jobs run in worker-ide (IMPLEMENTATION_DESIGN_V2 §2)
 SEND_TIMEOUT_S = 10.0
@@ -86,3 +87,7 @@ class CeleryJobQueue:
         kwargs = {"job_id": str(job_id), "provider": provider}
         async with asyncio.timeout(SEND_TIMEOUT_S):
             await asyncio.to_thread(self._celery.send_task, PROVIDER_SMOKE_TASK, kwargs=kwargs, queue=QUEUE)
+
+    async def enqueue_task(self, task_id: uuid.UUID) -> None:
+        async with asyncio.timeout(SEND_TIMEOUT_S):
+            await asyncio.to_thread(self._celery.send_task, RUN_TASK, args=[str(task_id)], queue=QUEUE)
