@@ -166,6 +166,21 @@ Catatan: `Diff` juga memiliki `truncated: bool`; `head` bernilai `null` bila dib
 - **Log.** `task_stream_closed` (`reason` `max_lifetime`, `access`, `client_gone`, `send_timeout`), `task_stream_failed` (galat tak terduga di stream: task, user, tipe galat, tanpa pesan; lalu dilempar), `task_stream_lagged` (antrean listener penuh, sekali per episode, tanpa isi pesan), `task_event_hub_stopped` (pembaca hub berhenti bukan karena `stop()`; `running` menjadi false). Baris log body stream membawa `request_id`.
 - **Klien.** `openEventStream` mengenal `stream.end` (status `ended`, tanpa reconnect; frame sesudahnya di chunk yang sama tidak dikirim). `retry()` dan `reconnect()` melapor `connecting`, bukan `reconnecting`. 429 dicoba ulang dengan backoff. `useTaskEvents` menyimpan paling banyak 500 event persisten terbaru dan menghitung sisanya di `dropped` (muat yang lebih lama lewat riwayat); `ended` bukan galat. `event.invalid` disimpan seperti event lain, sehingga `seq` bersambung. Titik lanjut di-reset di effect yang membuka stream saat task berganti, dan callback stream yang effect-nya sudah dibersihkan diabaikan: stream task baru tidak pernah dibuka dengan `after_seq` task sebelumnya.
 
+**WP-3.2c1** (spec `docs/superpowers/specs/2026-11-17-wp-3.2-workflow-engine-design.md` §14, Keputusan Lead 3.2c1 #37–#45, builder check §14.4a; konflik N11, N12). Implementasi: `app/workflow/{engine,dispatch,checkpoint,lease,states}.py`, `app/services/{job_queue,orchestrator}.py`, `app/worker/{jobs,celery_app,identity}.py`. Tidak ada endpoint baru dan tidak ada perubahan bentuk respons; yang bertambah adalah kode error task dan isi event langkah.
+
+- **Kode error task baru** (`tasks.error_code`, bukan kode respons HTTP; ditulis `fail_task` bersama transisi ke `failed`):
+  - `planning_interrupted`: planning task `draft` terputus tiga kali tanpa selesai (lease mati lalu claim ulang). Claim ke-4 menggagalkan task. Pesan: `Planning was interrupted 3 times without finishing`.
+  - `step_unavailable`: engine tidak punya langkah terdaftar dengan nama langkah di pipeline. Registry produksi masih kosong sampai 3.2c2/3.2d/3.2e, tetapi gerbang pembuatan menjawab 503 `workflow_engine_unavailable`, jadi kode ini hanya muncul di test.
+- **`task.step_started`**: `{step}`, di-emit bersama `tasks.current_step`. `plan_step_id` belum di-emit (DAG plan milik 3.2d).
+- **`task.step_finished`**: `{step, status}` dengan `status` `"done"` atau `"failed"`.
+  - `done`: langkah selesai, atau hasilnya `transition`. Langkah ditambahkan ke `checkpoint.completed_steps` di transaksi yang sama dengan event dan perubahan status.
+  - `failed`: langkah mengembalikan `fail`. Langkah tidak masuk `completed_steps`, jadi dijalankan lagi pada percobaan berikutnya. Event ini ditulis di transaksi yang sama dengan `task.status_changed` ke `failed`.
+  - Langkah yang melempar exception tak terduga, atau lease yang hilang, tidak meng-emit event akhir; recovery menutup task.
+  - `step_unavailable` tidak meng-emit `task.step_started` maupun `task.step_finished`: kegagalan terjadi sebelum langkah dimulai.
+- `tasks.current_step` tidak dikosongkan saat pipeline berakhir atau gagal; nilainya tetap langkah terakhir yang dimulai.
+- `tasks.error_code` divalidasi `fail_task` dengan pola `^[a-z][a-z0-9_]{0,63}$` (snake_case, paling panjang 64); nilai lain ditolak dengan `ValueError` sebelum SQL apa pun.
+- Cancel, pause, resume, dan endpoint kendali lain tetap belum ada (3.2f).
+
 ### 5.1 SSE events (`TaskEvent`)
 ```
 id: <seq>            (tidak ada untuk ephemeral)

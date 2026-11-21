@@ -193,3 +193,19 @@ def test_unverified_prices_are_logged_as_a_warning(
     pricing.hold_pricing(path)
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if "pricing_loaded" in line]
     assert [(event["level"], event["verify_before_production"]) for event in events] == [(level, verify)]
+
+
+def test_visibility_timeout_and_dispatch_sweep_beat() -> None:
+    conf = create_celery(load_settings(make_test_env())).conf
+    assert conf.broker_transport_options == {"visibility_timeout": 7200}  # merged, not replacing
+    schedule = conf.beat_schedule["dispatch-sweep"]
+    assert schedule["task"] == "app.worker.jobs.dispatch_sweep"
+    assert schedule["schedule"] == 30.0
+    assert schedule["options"]["expires"] == 25.0
+    assert "app.worker.jobs.run_task" in _registered()
+
+
+def _registered() -> set[str]:
+    app = create_celery(load_settings(make_test_env()))
+    app.loader.import_default_modules()
+    return set(app.tasks)

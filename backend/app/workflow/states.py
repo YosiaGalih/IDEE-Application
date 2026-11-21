@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, NoReturn
@@ -73,6 +74,9 @@ class Actor:
 
 _REASON_COLUMN_LENGTH = 200
 _ACTOR_ID_LENGTH = 80
+_ERROR_CODE_LENGTH = 64  # tasks.error_code
+_ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")  # snake_case, at most _ERROR_CODE_LENGTH
+_ERROR_MESSAGE_LENGTH = 1000
 
 
 def _check_inputs(db: AsyncSession, task: Task, actor: Actor) -> None:
@@ -84,6 +88,12 @@ def _check_inputs(db: AsyncSession, task: Task, actor: Actor) -> None:
     state = inspect(task)
     if state.attrs.status.history.has_changes() or state.attrs.version.history.has_changes():
         raise ValueError("task.status was modified outside transition")
+
+
+def _check_not_expired(task: Task) -> None:
+    expired = inspect(task).expired_attributes
+    if "status" in expired or "version" in expired:
+        raise ValueError("task object is expired (e.g. after a rollback); reload it before transitioning")
 
 
 async def transition(
@@ -99,9 +109,7 @@ async def transition(
 
     ``audit`` carries the redactor with the configured secret literals; ``reason`` is redacted with it.
     """
-    expired = inspect(task).expired_attributes
-    if "status" in expired or "version" in expired:
-        raise ValueError("task object is expired (e.g. after a rollback); reload it before transitioning")
+    _check_not_expired(task)
     source = TaskStatus(task.status)
     target = TaskStatus(to)
     if target not in ALLOWED[source]:
@@ -175,6 +183,39 @@ async def transition(
     for name, value in row._mapping.items():
         set_committed_value(task, name, value)
     set_committed_value(task, "event_seq", seq)
+
+
+async def fail_task(
+    db: AsyncSession,
+    task: Task,
+    *,
+    error_code: str,
+    message: str,
+    actor: Actor,
+    audit: AuditWriter,
+) -> None:
+    """Record why a task failed and move it to ``failed``, in the caller's transaction (no commit).
+
+    The message is redacted here too (idempotent) so no caller can store a secret by forgetting to.
+    """
+    # Before any attribute read: an expired object would lazy-load (MissingGreenlet), not fail clearly.
+    _check_not_expired(task)
+    _check_inputs(db, task, actor)
+    if not _ERROR_CODE_PATTERN.fullmatch(error_code):
+        # The value is not echoed: it is stored and exposed, so a secret must not travel in the message too.
+        raise ValueError(f"error_code must be snake_case, 1-{_ERROR_CODE_LENGTH} characters")
+    safe_message = audit.redactor.redact(message)[:_ERROR_MESSAGE_LENGTH]
+    # Savepoint: if the transition is refused, the error columns are undone with it.
+    async with db.begin_nested():
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(error_code=error_code, error_message=safe_message)
+            .execution_options(synchronize_session=False)
+        )
+        await transition(db, task, TaskStatus.FAILED, reason=error_code, actor=actor, audit=audit)
+    set_committed_value(task, "error_code", error_code)
+    set_committed_value(task, "error_message", safe_message)
 
 
 async def _raise_conflict(db: AsyncSession, task: Task) -> NoReturn:
