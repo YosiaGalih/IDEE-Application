@@ -1,9 +1,14 @@
-"""Only ``app/services/agent_runtime.py`` and ``app/services/run_recovery.py`` write ``agent_runs`` (plan
-WP-3.1f2a Task 7, Keputusan plan #19; spec WP-3.1f2b Keputusan Lead #3).
+"""Two modules write ``agent_runs``, one statement each (plan WP-3.1f2a Task 7, Keputusan plan #19; spec
+WP-3.2 §16.3 Keputusan Lead #67, §16.3a #6):
 
-The pattern of tests/unit/test_usage_writer_guard.py: a module that reaches ``AgentRun`` must not build one,
-nor ``insert``/``update``/``delete`` it, and no module holds raw SQL that writes ``agent_runs``. Recovery only
-closes runs: it never creates or deletes one.
+- ``app/services/agent_runtime.py`` creates the row: ``AgentRunWriter.start``'s ``pg_insert(AgentRun)``, and
+  no UPDATE;
+- ``app/services/agent_run_rows.py`` closes it: ``close_run_row``'s ``update(AgentRun)``, and nothing else.
+
+``AgentRunWriter.finish``/``fail`` and the run recovery (``app/services/run_recovery.py``, which now has none)
+close a row only through ``close_run_row`` (tests/unit/test_close_run_row_guard.py). The pattern of
+tests/unit/test_usage_writer_guard.py: a module that reaches ``AgentRun`` must not build one, nor
+``insert``/``update``/``delete`` it, and no module holds raw SQL that writes ``agent_runs``.
 """
 
 from __future__ import annotations
@@ -13,9 +18,10 @@ import re
 from pathlib import Path
 
 APP = Path(__file__).resolve().parents[2] / "app"
-RUNTIME_WRITER = APP / "services" / "agent_runtime.py"
-RECOVERY_WRITER = APP / "services" / "run_recovery.py"
-ALLOWED_WRITERS = {RUNTIME_WRITER, RECOVERY_WRITER}
+ROW_CREATOR = APP / "services" / "agent_runtime.py"
+ROW_CLOSER = APP / "services" / "agent_run_rows.py"
+RECOVERY = APP / "services" / "run_recovery.py"
+ALLOWED_WRITERS = {ROW_CREATOR, ROW_CLOSER}
 MODEL = "AgentRun"
 MODULE = "app.models.agents"
 WRITE_FUNCTIONS = {"insert", "update", "delete", "pg_insert"}
@@ -77,7 +83,7 @@ def run_writes(source: str) -> list[str]:
     return found
 
 
-def test_only_the_runtime_store_and_recovery_write_agent_runs() -> None:
+def test_only_the_row_creator_and_the_row_closer_write_agent_runs() -> None:
     violations = {
         str(path.relative_to(APP)): hits
         for path in APP.rglob("*.py")
@@ -86,13 +92,20 @@ def test_only_the_runtime_store_and_recovery_write_agent_runs() -> None:
     assert violations == {}
 
 
-def test_guard_sees_the_allowed_writers() -> None:
-    hits = run_writes(RUNTIME_WRITER.read_text())
-    assert any("pg_insert(AgentRun)" in hit for hit in hits) and any(
-        "update(AgentRun)" in hit for hit in hits
-    )
-    recovery = run_writes(RECOVERY_WRITER.read_text())
-    assert recovery and all("update(AgentRun)" in hit for hit in recovery)  # it closes runs, nothing else
+def _kinds(hits: list[str]) -> list[str]:
+    return [hit.split(": ", 1)[1] for hit in hits]
+
+
+def test_the_runtime_store_only_creates_rows() -> None:
+    assert _kinds(run_writes(ROW_CREATOR.read_text())) == [f"pg_insert({MODEL})"]  # start; no UPDATE
+
+
+def test_the_row_closer_only_updates() -> None:
+    assert _kinds(run_writes(ROW_CLOSER.read_text())) == [f"update({MODEL})"]  # close_run_row, once
+
+
+def test_the_run_recovery_writes_no_row_itself() -> None:
+    assert RECOVERY.exists() and run_writes(RECOVERY.read_text()) == []  # it closes through close_run_row
 
 
 def test_guard_detects_a_second_writer() -> None:
