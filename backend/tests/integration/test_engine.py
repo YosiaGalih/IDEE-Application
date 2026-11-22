@@ -6,11 +6,12 @@ Fake steps, a real database, a small heartbeat.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from sqlalchemy import select, text
@@ -36,6 +37,7 @@ from app.workflow.dispatch import redispatch_orphans
 from app.workflow.engine import (
     MAX_PLANNING_ATTEMPTS,
     EngineOutcome,
+    Pipeline,
     Step,
     StepAbandoned,
     StepContext,
@@ -250,6 +252,34 @@ async def take_over_lease(engine: AsyncEngine, task_id: uuid.UUID) -> None:
 
 def other_tasks() -> list[asyncio.Task[Any]]:
     return [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+
+async def test_every_planning_step_carries_the_draft_pipeline(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("draft", {"user_set": ["title"]})
+    steps = Steps(plan=to_planned)
+
+    await make_engine(engine, RecordingBus(engine), steps.registry(*PLANNING)).run(task_id)
+
+    assert [c.pipeline for c in steps.calls] == ["draft", "draft", "draft"]
+
+
+async def test_the_implement_step_carries_the_running_pipeline(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("queued")
+    steps = Steps()
+
+    await make_engine(engine, RecordingBus(engine), steps.registry("implement")).run(task_id)
+
+    assert [c.pipeline for c in steps.calls] == ["running"]
+    assert get_args(Pipeline) == ("draft", "running")
+
+
+async def test_a_step_context_is_frozen_and_checks_its_pipeline() -> None:
+    guard = LeaseGuard(uuid.uuid4(), WORKER)
+    context = StepContext(uuid.uuid4(), uuid.uuid4(), "implement", {}, guard, "running")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        context.pipeline = "draft"  # type: ignore[misc]
+    with pytest.raises(ValueError, match="pipeline must be draft or running"):
+        StepContext(uuid.uuid4(), uuid.uuid4(), "implement", {}, guard, "planned")  # type: ignore[arg-type]
 
 
 async def test_runs_planning_steps_in_order_and_records_them(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]

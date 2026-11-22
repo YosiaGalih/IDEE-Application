@@ -66,6 +66,18 @@ ALLOWED_STEP_TARGETS: Mapping[str, frozenset[TaskStatus]] = {
     "running": frozenset({TaskStatus.INTERRUPTED}),
 }
 
+Pipeline = Literal["draft", "running"]  # the keys of PIPELINE; an adapter picks fail or interrupt from it
+
+
+def _pipeline_of(status: str) -> Pipeline:
+    """The pipeline a claim's status runs; never guesses (``_claim`` hands over only these two)."""
+    if status == "draft":
+        return "draft"
+    if status == "running":
+        return "running"
+    raise ValueError("pipeline must be draft or running")
+
+
 Stopped = Literal[
     "transitioned",
     "failed",
@@ -90,6 +102,11 @@ class StepContext:
     step: str
     checkpoint: Mapping[str, Any]
     lease: LeaseGuard  # for a write of the step's own (§16.5a #8); read its rules before use
+    pipeline: Pipeline  # which pipeline runs the step: draft (planning) or running (§16.6.2 #83)
+
+    def __post_init__(self) -> None:
+        if self.pipeline not in ("draft", "running"):
+            raise ValueError("pipeline must be draft or running")
 
 
 @dataclass(frozen=True)
@@ -387,7 +404,12 @@ class TaskEngine:
                 db, None, task_id, "task.step_started", {"step": step}, redactor=ports.audit.redactor
             )
             context = StepContext(
-                task_id, task.project_id, step, task.checkpoint, LeaseGuard(task_id, ports.worker_id)
+                task_id=task_id,
+                project_id=task.project_id,
+                step=step,
+                checkpoint=task.checkpoint,
+                lease=LeaseGuard(task_id, ports.worker_id),
+                pipeline=_pipeline_of(status),
             )
             await commit_and_publish(db, ports.bus)
         return context
