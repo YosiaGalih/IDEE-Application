@@ -446,17 +446,17 @@ class TaskEngine:
                     logger.error("step_cleanup_overrun", task_id=str(task_id), step=context.step)
                     beat.cancel()
             beat_won = beat.done()
+        except asyncio.CancelledError:
+            if not work.done():
+                # R-C1: the step may swallow the cancel and is awaited below; its holds and the runtime
+                # heartbeat of this owner must not keep renewing the lease meanwhile.
+                revoke_lease_owner(self._ports.worker_id)
+            raise
         finally:
             if not work_cancelled:
-                work.cancel()
+                work.cancel()  # the engine's only cancel of the step on this exit
             beat.cancel()
-            if not work.done():
-                # The wait for the step stays unbounded by design (it must end before this returns); one that
-                # outlasts CLEANUP_NOTICE_S leaves a line, so a hung cleanup is never silent.
-                await asyncio.wait((work,), timeout=CLEANUP_NOTICE_S)
-                if not work.done():
-                    logger.warning("step_cleanup_waiting", task_id=str(task_id), step=context.step)
-            await asyncio.gather(work, beat, return_exceptions=True)
+            held = await self._settle(task_id, context.step, work, beat)
             if (
                 (beat_won or work_cancelled)
                 and work.done()
@@ -470,6 +470,8 @@ class TaskEngine:
                     step=context.step,
                     error_type=type(error).__name__,
                 )
+        if held:  # an outer cancel was held until the step ended; it wins over every outcome below
+            raise asyncio.CancelledError
         if overrun:  # before beat.result(): the cancelled heartbeat would raise CancelledError there
             raise LeaseLost("the step overran its cleanup grace; the lease was let go")
         if beat_won:
@@ -489,6 +491,40 @@ class TaskEngine:
                 )
             raise _DeliveryLimit
         return work.result()
+
+    async def _settle(
+        self, task_id: uuid.UUID, step: str, work: asyncio.Future[StepResult], beat: asyncio.Task[NoReturn]
+    ) -> int:
+        """Wait until the step and the heartbeat have ended and return how many outer cancels were held.
+
+        The wait for the step is unbounded by design (it must end before ``_run_step`` returns). Each outer
+        ``CancelledError`` is counted and held, never passed on to the step: ``asyncio.wait`` does not cancel
+        what it waits for (``gather`` did, a second cancel of the step: LOW-D2). The first one revokes the
+        owner (R-C1), so no hold of the step renews the lease while it is awaited. A cleanup that outlasts
+        ``CLEANUP_NOTICE_S`` leaves one line, so a hung cleanup is never silent.
+        """
+        loop = asyncio.get_running_loop()
+        notice_at = loop.time() + CLEANUP_NOTICE_S
+        noticed = False
+        held = 0
+        while not (work.done() and beat.done()):
+            try:
+                await asyncio.wait(
+                    (work, beat),
+                    timeout=None if noticed else max(notice_at - loop.time(), 0),
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                held += 1
+                if not work.done():
+                    revoke_lease_owner(self._ports.worker_id)
+            if not noticed and not work.done() and loop.time() >= notice_at:
+                noticed = True
+                logger.warning("step_cleanup_waiting", task_id=str(task_id), step=step)
+        for finished in (work, beat):
+            if not finished.cancelled():
+                finished.exception()  # retrieved here: nobody else reads a dropped error
+        return held
 
     async def _heartbeat(self, task_id: uuid.UUID, last_ok: float) -> NoReturn:
         """Renew the lease every ``heartbeat_s``; give up ``lease_safety_s`` early (R-T3h, §16.5a #5).

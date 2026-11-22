@@ -1883,6 +1883,124 @@ async def test_an_outer_cancel_during_the_limit_cleanup_does_not_cancel_the_step
     assert (await row(engine, task_id)).lease_owner is None  # the cancel path still released the lease
 
 
+@pytest.mark.parametrize("window", ["notice", "gather", "normal"])
+async def test_outer_cancels_are_held_until_the_step_has_ended(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+    window: str,
+) -> None:
+    """#85 / LOW-D2: an outer cancel never reaches the step a second time and never releases the lease while
+    the step lives; the cancel is raised once the step has ended and ``run()`` releases then."""
+    monkeypatch.setattr(engine_module, "CLEANUP_NOTICE_S", 0.3)
+    task_id = await make_task("queued")
+    cancels: list[str] = []
+    entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def absorbs_the_cancel(_: StepContext) -> StepResult:
+        entered.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancels.append("first")
+            cleaning.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancels.append("again")
+            raise
+        return StepResult.done()
+
+    overrun = window != "normal"
+    steps = Steps(implement=absorbs_the_cancel)
+    with capture_logs() as logs:
+        run = asyncio.create_task(
+            make_engine(
+                engine,
+                RecordingBus(),
+                steps.registry("implement"),
+                delivery_limit_s=0.2 if overrun else 3600.0,
+                cleanup_grace_s=0.3 if overrun else None,
+            ).run(task_id)
+        )
+
+        async def wait_for_log(name: str) -> None:
+            for _ in range(100):
+                if any(e["event"] == name for e in logs):
+                    return
+                await asyncio.sleep(0.05)
+            raise AssertionError(name)
+
+        if window == "normal":
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            run.cancel()  # the step is cancelled once, by the finally
+            await asyncio.wait_for(cleaning.wait(), timeout=5)
+            run.cancel()
+            await asyncio.sleep(0.4)
+            run.cancel()
+        else:
+            await wait_for_log("step_cleanup_overrun")
+            if window == "gather":
+                await wait_for_log("step_cleanup_waiting")
+            run.cancel()
+            await asyncio.sleep(0.05)
+            run.cancel()
+            await asyncio.sleep(0.1)
+        try:
+            assert not run.done()
+            assert (await row(engine, task_id)).lease_owner == WORKER  # not released while the step lives
+        finally:
+            release.set()  # also on a failure, so a leaked step never outlives the test
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=5)
+
+    assert cancels == ["first"]
+    assert (await row(engine, task_id)).lease_owner is None
+    assert len([e for e in logs if e["event"] == "task_engine_cancelled"]) == 1
+    assert other_tasks() == []
+
+
+async def test_the_first_outer_cancel_revokes_the_owner_so_a_hold_in_cleanup_is_refused(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """R-C1 (BC-7): the step that swallows the cancel cannot keep the lease alive while it is awaited."""
+    task_id = await make_task("queued")
+    entered, cleaning, probe = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    outcome: list[str] = []
+    sessions = make_sessionmaker(engine)
+
+    async def holds_after_the_outer_cancel(context: StepContext) -> StepResult:
+        entered.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cleaning.set()
+            await probe.wait()
+            try:
+                async with sessions() as db:
+                    await bound_transaction(db)
+                    await context.lease.hold(db)
+                    await db.commit()
+                outcome.append("held")
+            except LeaseLost:
+                outcome.append("lost")
+            raise
+        return StepResult.done()
+
+    steps = Steps(implement=holds_after_the_outer_cancel)
+    run = asyncio.create_task(make_engine(engine, RecordingBus(), steps.registry("implement")).run(task_id))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    run.cancel()
+    await asyncio.wait_for(cleaning.wait(), timeout=5)
+    await asyncio.sleep(0.05)
+    probe.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, timeout=5)
+    assert outcome == ["lost"]
+
+
 async def test_a_step_error_during_the_limit_cleanup_is_logged_by_type(
     engine: AsyncEngine,
     make_task,  # type: ignore[no-untyped-def]
