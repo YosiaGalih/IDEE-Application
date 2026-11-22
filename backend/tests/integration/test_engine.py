@@ -886,10 +886,11 @@ async def test_unexpected_step_error_is_logged_with_its_type_only(engine: AsyncE
         await make_engine(engine, RecordingBus(), steps.registry("implement")).run(task_id)
 
     failed = [e for e in logs if e["event"] == "task_engine_failed"]
-    assert [(e["log_level"], e["task_id"], e["worker_id"], e["step"], e["error_type"]) for e in failed] == [
-        ("error", str(task_id), WORKER, "implement", "RuntimeError")
+    assert [(e["log_level"], e["task_id"], e["step"], e["error_type"]) for e in failed] == [
+        ("error", str(task_id), "implement", "RuntimeError")
     ]
     assert secret not in repr(logs)
+    assert WORKER not in repr(logs)  # AG-13 INFO-3: ids only, never the lease owner
     assert all("exc_info" not in e for e in logs)
 
 
@@ -2250,9 +2251,9 @@ async def test_a_step_cannot_hold_the_lease_after_the_cleanup_overrun(
                     if any(e["event"] == "step_cleanup_overrun" for e in logs):
                         break
                     await asyncio.sleep(0.05)
-                assert any(e["event"] == "step_cleanup_overrun" for e in logs)
-                await asyncio.sleep(0.3)  # an UPDATE already in flight at the cancel has ended
-                after_overrun = len(updates)
+                else:
+                    raise AssertionError("step_cleanup_overrun")
+                after_overrun = len(updates)  # first sight of the overrun: revoked by now
                 for _ in range(100):
                     if await lapsed():
                         break
@@ -2382,3 +2383,237 @@ async def test_a_result_with_an_unknown_kind_fails_the_task_step_result_invalid(
     after = await row(engine, task_id)
     assert (after.status, after.error_code, after.lease_owner) == ("failed", "step_result_invalid", None)
     assert "completed_steps" not in after.checkpoint
+
+
+# --- final review fix wave A: held cancels in _settle, slow heartbeat close, owner-free logs ---------------
+
+
+def slow_heartbeat(
+    monkeypatch: pytest.MonkeyPatch, *, ends_with: BaseException | None, after: float, close_s: float
+) -> asyncio.Event:
+    """Replace the engine's heartbeat: it ends with ``ends_with`` after ``after`` seconds (or runs until
+    cancelled) and takes ``close_s`` to end once cancelled. Returns an event set when the cancel arrives."""
+    cancelled = asyncio.Event()
+
+    async def beat(self: TaskEngine, task_id: uuid.UUID, last_ok: float) -> Any:
+        try:
+            if ends_with is not None:
+                await asyncio.sleep(after)
+                raise ends_with
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            await asyncio.sleep(close_s)
+            raise
+
+    monkeypatch.setattr(TaskEngine, "_heartbeat", beat)
+    return cancelled
+
+
+async def test_a_step_error_is_logged_when_an_outer_cancel_is_held_in_settle(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silent M1: the step raised on its own; the outer cancel lands while the cancelled heartbeat is still
+    closing. The error is dropped for the cancel, so it is logged (type only)."""
+    task_id = await make_task("queued")
+    secret = "sk-test-" + "secret-4567"
+    entered = asyncio.Event()
+    beat_cancelled = slow_heartbeat(monkeypatch, ends_with=None, after=0, close_s=0.4)
+
+    async def raises(_: StepContext) -> StepResult:
+        entered.set()
+        raise RuntimeError("boom " + secret)
+
+    with capture_logs() as logs:
+        run = asyncio.create_task(
+            make_engine(engine, RecordingBus(), Steps(implement=raises).registry("implement")).run(task_id)
+        )
+        await asyncio.wait_for(beat_cancelled.wait(), timeout=5)
+        run.cancel()  # lands in _settle, awaiting the heartbeat's close
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=5)
+
+    dropped = [e for e in logs if e["event"] == "step_error_dropped"]
+    assert [(e["task_id"], e["step"], e["error_type"]) for e in dropped] == [
+        (str(task_id), "implement", "RuntimeError")
+    ]
+    assert secret not in repr(logs)
+    assert other_tasks() == []
+
+
+async def test_a_heartbeat_lease_loss_is_logged_when_an_outer_cancel_is_held(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silent L1: the heartbeat lost the lease, the step is cleaning up and an outer cancel is held: the
+    lease loss is dropped for the cancel, so it is logged."""
+    task_id = await make_task("queued")
+    cleaning, release = asyncio.Event(), asyncio.Event()
+    slow_heartbeat(monkeypatch, ends_with=LeaseLost("gone"), after=0.05, close_s=0)
+
+    async def cleans_up(_: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cleaning.set()
+            await release.wait()
+            raise
+        return StepResult.done()
+
+    with capture_logs() as logs:
+        run = asyncio.create_task(
+            make_engine(engine, RecordingBus(), Steps(implement=cleans_up).registry("implement")).run(task_id)
+        )
+        await asyncio.wait_for(cleaning.wait(), timeout=5)
+        run.cancel()  # the first and only outer cancel lands in _settle
+        await asyncio.sleep(0.05)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=5)
+
+    dropped = [e for e in logs if e["event"] == "lease_lost_dropped"]
+    assert [(e["log_level"], e["task_id"], e["step"]) for e in dropped] == [
+        ("warning", str(task_id), "implement")
+    ]
+    assert WORKER not in repr(logs)
+    assert other_tasks() == []
+
+
+async def test_a_cancel_first_held_in_settle_revokes_the_owner_so_a_hold_is_refused(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first outer cancel lands only in _settle, with the owner not yet revoked (the heartbeat ended by
+    a lease loss the database does not show). The settle revokes it, so the step's hold gets LeaseLost, and
+    one ``step_cleanup_waiting`` is logged although the timed wait was interrupted."""
+    monkeypatch.setattr(engine_module, "CLEANUP_NOTICE_S", 0.3)
+    task_id = await make_task("queued")
+    cleaning, probe = asyncio.Event(), asyncio.Event()
+    outcome: list[str] = []
+    sessions = make_sessionmaker(engine)
+    slow_heartbeat(monkeypatch, ends_with=LeaseLost("gone"), after=0.05, close_s=0)
+
+    async def holds_after_the_cancel(context: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cleaning.set()
+            await probe.wait()
+            try:
+                async with sessions() as db:
+                    await bound_transaction(db)
+                    await context.lease.hold(db)
+                    await db.commit()
+                outcome.append("held")
+            except LeaseLost:
+                outcome.append("lost")
+            raise
+        return StepResult.done()
+
+    with capture_logs() as logs:
+        run = asyncio.create_task(
+            make_engine(
+                engine, RecordingBus(), Steps(implement=holds_after_the_cancel).registry("implement")
+            ).run(task_id)
+        )
+        await asyncio.wait_for(cleaning.wait(), timeout=5)
+        run.cancel()  # inside the timed wait, before the notice
+        await asyncio.sleep(0.6)  # past the notice
+        probe.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=5)
+
+    assert outcome == ["lost"]
+    assert len([e for e in logs if e["event"] == "step_cleanup_waiting"]) == 1
+    assert other_tasks() == []
+
+
+async def test_a_step_result_is_logged_when_an_outer_cancel_is_held(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """Silent L2: the step absorbs the limit cancel and returns a result while an outer cancel is held; the
+    result is dropped for the cancel, so it is logged with its kind."""
+    task_id = await make_task("queued")
+    cleaning, release = asyncio.Event(), asyncio.Event()
+
+    async def absorbs_the_cancel(_: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cleaning.set()
+            await release.wait()
+        return StepResult.done()
+
+    with capture_logs() as logs:
+        run = asyncio.create_task(
+            make_engine(
+                engine,
+                RecordingBus(),
+                Steps(implement=absorbs_the_cancel).registry("implement"),
+                delivery_limit_s=0.2,
+                cleanup_grace_s=0.3,
+            ).run(task_id)
+        )
+        for _ in range(100):
+            if any(e["event"] == "step_cleanup_overrun" for e in logs):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("step_cleanup_overrun")
+        run.cancel()  # lands in _settle
+        await asyncio.sleep(0.05)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=5)
+
+    dropped = [e for e in logs if e["event"] == "step_result_dropped"]
+    assert [(e["log_level"], e["task_id"], e["step"], e["kind"]) for e in dropped] == [
+        ("warning", str(task_id), "implement", "done")
+    ]
+    assert other_tasks() == []
+
+
+async def test_a_heartbeat_that_will_not_end_is_noticed_once(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silent L3: the step is done, the cancelled heartbeat takes longer than the notice to close: one line,
+    then an untimed wait (no spin). The notice is patched down from 1 s to keep the test short."""
+    monkeypatch.setattr(engine_module, "CLEANUP_NOTICE_S", 0.2)
+    task_id = await make_task("queued")
+    slow_heartbeat(monkeypatch, ends_with=None, after=0, close_s=0.7)
+    with capture_logs() as logs:
+        outcome = await make_engine(engine, RecordingBus(), Steps().registry("implement")).run(task_id)
+    assert outcome.stopped == "pipeline_exhausted"
+    waiting = [e for e in logs if e["event"] == "heartbeat_close_waiting"]
+    assert [(e["log_level"], e["task_id"], e["step"]) for e in waiting] == [
+        ("warning", str(task_id), "implement")
+    ]
+    assert [e for e in logs if e["event"] == "step_cleanup_waiting"] == []
+
+
+async def test_a_lost_lease_is_logged_with_the_task_and_never_the_owner(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """AG-13 INFO-3: ``task_lease_lost`` names the task only."""
+    task_id = await make_task("queued")
+
+    async def loses_the_lease(_: StepContext) -> StepResult:
+        await take_over_lease(engine, task_id)
+        return StepResult.done()
+
+    with capture_logs() as logs:
+        outcome = await make_engine(
+            engine, RecordingBus(), Steps(implement=loses_the_lease).registry("implement")
+        ).run(task_id)
+    assert outcome.stopped == "lease_lost"
+    [lost] = [e for e in logs if e["event"] == "task_lease_lost"]
+    assert lost["task_id"] == str(task_id)
+    assert WORKER not in repr(logs)
