@@ -18,8 +18,11 @@ through the ORM). Outside the two writers no module:
 - assigns to an attribute of, or ``setattr`` on, a value bound from an expression that names the model or
   such a value (``get(AgentRun, ...)``, ``select(AgentRun)``, ``scalars``, a loop over them); and, in a module
   that imports the model, assigns an attribute named like one of its columns, whatever the object;
-- holds raw SQL that writes ``agent_runs``, schema-qualified or quoted, built by concatenation, f-string,
-  ``.format`` or ``%``, the model's ``__tablename__`` reading as ``agent_runs``.
+- calls ``delete``/``merge`` (``session.delete(row)``) on a row loaded from the model;
+- holds raw SQL that writes ``agent_runs`` (INSERT INTO, UPDATE [ONLY], DELETE FROM [ONLY], TRUNCATE,
+  MERGE INTO, COPY ... FROM), schema-qualified or quoted, with comments, line breaks or spaces around
+  ``.``, built by concatenation, f-string, ``.format`` or ``%``, the model's ``__tablename__`` reading as
+  ``agent_runs``.
 
 It reads what a module spells, not what runs: a loaded row handed to a helper in a module that never imports
 the model, or a string built at run time, is beyond it.
@@ -48,10 +51,33 @@ COLUMNS = frozenset(column.key for column in sa.inspect(AgentRun).column_attrs)
 WRITE_METHODS = {"insert", "update", "delete"}  # the functions of ``sqlalchemy`` and the Table methods
 WRITE_FUNCTIONS = WRITE_METHODS | {"pg_insert"}
 TABLE_FUNCTIONS = {"table", "Table"}
-# The table bare, schema-qualified (``public.agent_runs``) or quoted (``"public"."agent_runs"``).
-RAW_SQL = re.compile(
-    rf'\b(insert\s+into|update|delete\s+from)\s+(?:(?:"\w+"|\w+)\.)?(?:"{TABLE}"|{TABLE}\b)', re.IGNORECASE
+# Raw SQL is read after ``_normalise_sql``: no comments, one space between words, none around ``.``, no quotes
+# The table is bare or schema-qualified (``public.agent_runs``); ``\b`` keeps ``agent_runs_archive`` out.
+_NAME = rf"(?:\w+\.)?{TABLE}\b"
+RAW_SQL = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        rf"\b(?:insert into|delete from|update|merge into)\s+(?:only\s+)?{_NAME}",
+        rf"\btruncate\s+(?:table\s+)?(?:only\s+)?(?:[\w.]+\s*,\s*(?:only\s+)?)*{_NAME}",
+        rf"\bcopy\s+{_NAME}\s*(?:\([^)]*\)\s*)?from\b",
+    )
 )
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT = re.compile(r"--[^\n]*")
+_AROUND_DOT = re.compile(r"\s*\.\s*")
+_QUOTES = re.compile(r"[\"'`]")
+
+
+def _normalise_sql(text: str) -> str:
+    """The SQL as the matcher reads it: ``/*...*/`` and ``--...`` comments (each a space), whitespace
+    collapsed, no space around ``.``, no quotes (``"``, ``'``, backtick)."""
+    text = _LINE_COMMENT.sub(" ", _BLOCK_COMMENT.sub(" ", text))
+    return _QUOTES.sub("", _AROUND_DOT.sub(".", " ".join(text.split())))
+
+
+def _writes_table(value: str) -> bool:
+    text = _normalise_sql(value)
+    return any(pattern.search(text) for pattern in RAW_SQL)
 
 
 def _model_names(tree: ast.Module) -> set[str]:
@@ -273,6 +299,13 @@ def run_writes(source: str) -> list[str]:
             ):
                 found.append(f"line {line}: {name}({TABLE!r})")
             elif (
+                name in {"delete", "merge"}
+                and isinstance(func, ast.Attribute)
+                and node.args
+                and _mentions(node.args[0], classes, loaded)
+            ):
+                found.append(f"line {line}: .{name}() of a loaded {MODEL}")
+            elif (
                 name is not None
                 and (name == "query" or name.startswith("bulk_"))
                 and any(_mentions(arg, classes, loaded) for arg in args)
@@ -285,7 +318,7 @@ def run_writes(source: str) -> list[str]:
                     found.append(f"line {line}: setattr of a column in a module that imports {MODEL}")
         if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
             value = _string_value(node, classes)
-            if value is not None and RAW_SQL.search(value):
+            if value is not None and _writes_table(value):
                 found.append(f"line {line}: raw SQL writes {TABLE}")
     return found
 
@@ -404,6 +437,52 @@ VARIANTS = {
     "Q = 'UPDATE {t} SET status = :s'.format(t=AgentRun.__tablename__)\n",
     "schema and ident quoted": 'Q = \'delete from "public"."agent_runs" where id = :i\'\n',
 }
+# Raw SQL the matcher reads after normalising it: comments, line breaks, spaces around ``.``, quotes of any
+# kind; and the statements beyond INSERT/UPDATE/DELETE (``ONLY``, TRUNCATE, MERGE, COPY ... FROM).
+SQL_FORMS = {
+    "block comment in the gap": "Q = 'UPDATE /* why */ agent_runs SET status = :s'\n",
+    "block comment as the gap": "Q = 'insert/**/into agent_runs (id) values (:i)'\n",
+    "line comment in the gap": "Q = 'UPDATE -- why\\n agent_runs SET status = :s'\n",
+    "line breaks and indent": "Q = 'DELETE\\n    FROM\\n    agent_runs WHERE id = :i'\n",
+    "spaces around the dot": "Q = 'UPDATE public . agent_runs SET status = :s'\n",
+    "quoted with spaces around the dot": 'Q = \'delete from "public" . "agent_runs" where id = :i\'\n',
+    "backtick quoted": "Q = 'update `agent_runs` set status = :s'\n",
+    "single quoted": "Q = \"update 'agent_runs' set status = :s\"\n",
+    "update only": "Q = 'UPDATE ONLY agent_runs SET status = :s'\n",
+    "delete from only": "Q = 'DELETE FROM ONLY public.agent_runs'\n",
+    "truncate": "Q = 'TRUNCATE agent_runs'\n",
+    "truncate table": "Q = 'truncate table agent_runs restart identity'\n",
+    "truncate table only schema": "Q = 'TRUNCATE TABLE ONLY public.agent_runs CASCADE'\n",
+    "truncate a list, last": "Q = 'TRUNCATE a, agent_runs'\n",
+    "truncate a list, first": "Q = 'truncate agent_runs, b CASCADE'\n",
+    "truncate a list, middle": 'Q = \'TRUNCATE TABLE a , "public"."agent_runs" , b\'\n',
+    "merge into": "Q = 'MERGE INTO agent_runs t USING src s ON t.id = s.id WHEN MATCHED THEN DELETE'\n",
+    "merge into only schema": "Q = 'merge into only public.agent_runs t using src s on t.id = s.id'\n",
+    "merge, comment in the gap": "Q = 'MERGE /* x */ INTO agent_runs t USING src s ON t.id = s.id'\n",
+    "copy from": "Q = 'COPY agent_runs FROM STDIN'\n",
+    "copy with columns from": "Q = \"COPY public.agent_runs (id, status) FROM '/tmp/x.csv'\"\n",
+    "copy quoted, columns glued": "Q = 'copy \"agent_runs\"(id) from stdin'\n",
+    "copy, line breaks": "Q = 'COPY\\n agent_runs\\n (id)\\n FROM STDIN'\n",
+    "normalised after concatenation": "Q = 'UPDATE ' + '/* x */ ' + 'public . ' + 'agent_runs SET a = 1'\n",
+    "normalised after tablename": "from app.models.agents import AgentRun\n"
+    "Q = f'TRUNCATE TABLE ONLY {AgentRun.__tablename__}'\n",
+}
+# ``session.delete(row)`` and ``session.merge(row)`` of a row loaded from the model write it too.
+LOADED_ROW_WRITES = {
+    "delete of a got row": "from app.models.agents import AgentRun\n"
+    "async def f(s, i):\n    run = await s.get(AgentRun, i)\n    await s.delete(run)\n",
+    "merge of a got row": "from app.models.agents import AgentRun\n"
+    "async def f(s, i):\n    run = await s.get(AgentRun, i)\n    run = await s.merge(run)\n",
+    "delete in a loop over a select": "from sqlalchemy import select\n"
+    "from app.models.agents import AgentRun\n"
+    "async def f(s):\n    for run in await s.scalars(select(AgentRun)):\n        await s.delete(run)\n",
+    "delete of the loaded expression": "from app.models.agents import AgentRun\n"
+    "async def f(s, i):\n    await s.delete(await s.get(AgentRun, i))\n",
+    "sync delete": "from app.models.agents import AgentRun\n"
+    "def f(s, i):\n    row = s.get(AgentRun, i)\n    s.delete(row)\n",
+    "merge of a unpacked row": "from sqlalchemy import select\nfrom app.models.agents import AgentRun\n"
+    "async def f(s):\n    rows = (await s.scalars(select(AgentRun))).all()\n    s.merge(rows[0])\n",
+}
 # Reads, and writes of other tables, in a module that names AgentRun: never flagged.
 READS = {
     "select": "from sqlalchemy import select\nfrom app.models.agents import AgentRun\nq = select(AgentRun)\n",
@@ -415,6 +494,21 @@ READS = {
     "another table": "import sqlalchemy as sa\nq = sa.table('agent_profiles').update()\n",
     "raw SQL read": "Q = 'SELECT status FROM agent_runs WHERE id = :i'\n",
     "raw SQL of another table": "Q = 'UPDATE agent_runs_archive SET status = :s'\n",
+    "copy to": "Q = 'COPY agent_runs TO STDOUT'\n",
+    "copy with columns to": "Q = 'COPY public.agent_runs (id, status) TO \\'/tmp/x.csv\\''\n",
+    "truncate of the archive": "Q = 'TRUNCATE agent_runs_archive'\n",
+    "truncate list of other tables": "Q = 'TRUNCATE a, agent_runs2, b'\n",
+    "merge into the archive": "Q = 'MERGE INTO public.agent_runs_archive t USING src s ON t.id = s.id'\n",
+    "copy from into the archive": "Q = 'COPY agent_runs_archive FROM STDIN'\n",
+    "insert into the archive": "Q = 'INSERT INTO agent_runs_archive SELECT * FROM agent_runs'\n",
+    "delete from a longer name": "Q = 'DELETE FROM public.agent_runs2 WHERE id = :i'\n",
+    "write named only in a comment": "Q = 'SELECT 1 /* update agent_runs */ -- truncate agent_runs\\n'\n",
+    "delete of another model's row": "from app.models.agents import AgentProfile, AgentRun\n"
+    "async def f(s, i):\n    profile = await s.get(AgentProfile, i)\n    await s.delete(profile)\n",
+    "merge of another model's row": "from app.models.agents import AgentProfile, AgentRun\n"
+    "async def f(s, i):\n    profile = await s.get(AgentProfile, i)\n    return await s.merge(profile)\n",
+    "delete of an archive row": "from app.models.agents import AgentRun\n"
+    "async def f(s, i):\n    row = await s.get(ArchivedRun, i)\n    await s.delete(row)\n",
     "a column name outside a model module": "def f(job):\n    job.status = 'failed'\n",
 }
 
@@ -435,3 +529,11 @@ def test_guard_sees_the_variants() -> None:
 
 def test_guard_passes_reads_and_other_tables() -> None:
     assert {name: hits for name, source in READS.items() if (hits := run_writes(source))} == {}
+
+
+def test_guard_sees_normalised_sql() -> None:
+    assert [name for name, source in SQL_FORMS.items() if not run_writes(source)] == []
+
+
+def test_guard_sees_delete_and_merge_of_a_loaded_row() -> None:
+    assert [name for name, source in LOADED_ROW_WRITES.items() if not run_writes(source)] == []
