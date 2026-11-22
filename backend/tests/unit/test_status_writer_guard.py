@@ -4,14 +4,22 @@ A static scan of app/: a module that imports the Task model must not assign ``.s
 ``status=`` to ``.values()``, and no module may contain raw SQL that updates tasks.status.
 
 Second guard (#87, N60): outside ``TRANSITION_WRITERS`` no module may name ``transition`` or ``fail_task``
-(import from any module, re-export, alias, ``*`` import of an ``app.*`` module, name or attribute use, or
-``getattr`` with a constant or concatenated name), and outside ``MARKER_HOLDERS`` no module may hold the
-``kk.status_writer`` marker (string, concatenation, f-string, or the ``STATUS_WRITER*`` constants). The plain
-string ``"transition"`` (``kind``) and ``StepResult.transition`` are not flagged.
+(import from any module, re-export, alias, ``*`` import of an ``app.*`` module or a relative ``*``
+import, name or attribute use, a ``match`` class pattern keyword, or a lookup with a constant or
+concatenated name through ``getattr``, ``builtins.getattr``, an alias of it, ``__getattribute__`` or
+``inspect.getattr_static``), and
+outside ``MARKER_HOLDERS`` no module may hold a string constant with the whole word ``status_writer`` (the
+``kk.status_writer`` marker, however it is split: ``+``, f-string, ``%``, ``.format``, ``str.join``, SQL
+``||`` or ``concat_ws``) or the ``STATUS_WRITER*`` constants. ``kk.approval_status_writer`` is another name.
+``StepResult.transition`` is the result type's API and is exempt only when ``StepResult`` is bound once, by a
+plain ``from app.workflow.engine import StepResult``. The plain string ``"transition"`` (``kind``) is not
+flagged. The first guard also flags ``UPDATE [ONLY] [schema.]tasks [[AS] alias] SET ... status`` in any case
+or quoting, and ``table("tasks", ...)``.
 
 Limits that a static scan cannot decide (the import-linter contract N60 in 3.2c2 covers the rest):
-``getattr`` with a computed string, ``importlib``, ``operator.attrgetter``, ``vars()`` / ``__dict__``; and the
-indirect writers, which reach ``transition`` through an allowlisted module:
+``getattr`` with a computed string, ``importlib``, ``operator.attrgetter``, ``vars()`` / ``__dict__`` (and
+``globals()`` / ``sys.modules`` lookups), a string built at run time (``%`` or ``.format`` of SQL, a name read
+from data); and the indirect writers, which reach ``transition`` through an allowlisted module:
 ``project_tasks.cancel_open_tasks``, the ``tool_r3`` functions, ``recovery.recover_expired`` and
 ``TaskEngine._fail``.
 """
@@ -36,8 +44,10 @@ TRANSITION_WRITERS = frozenset(
 MARKER_HOLDERS = frozenset({"workflow/states.py", "models/tasks.py"})
 WRITER_NAMES = frozenset({"transition", "fail_task"})
 MARKER_NAMES = frozenset({"STATUS_WRITER_SETTING", "STATUS_WRITER"})
-MARKER_TEXT = "kk.status_writer"
-RAW_SQL = re.compile(r"update\s+tasks\s+set\b[^;]*\bstatus\b", re.IGNORECASE | re.DOTALL)
+_TASKS_UPDATE = r'update\s+(only\s+)?("?\w+"?\.)?"?tasks"?(\s+(as\s+)?\w+)?\s+set\b'
+RAW_SQL = re.compile(_TASKS_UPDATE + r"[^;]*\bstatus\b", re.IGNORECASE | re.DOTALL)
+DYNAMIC_COLUMN_SQL = re.compile(_TASKS_UPDATE + r"\s+\{\}", re.IGNORECASE)
+MARKER_WORD = re.compile(r"\bstatus_writer\b")
 
 
 def _imports_task(tree: ast.Module) -> bool:
@@ -75,7 +85,17 @@ def _is_raw_status_update(node: ast.expr) -> bool:
     if value is None:
         return False
     # A dynamic column ("{}") after UPDATE tasks SET could be status too.
-    return bool(RAW_SQL.search(value) or re.search(r"update\s+tasks\s+set\s+\{\}", value, re.IGNORECASE))
+    return bool(RAW_SQL.search(value) or DYNAMIC_COLUMN_SQL.search(value))
+
+
+def _is_tasks_table_call(node: ast.Call) -> bool:
+    """``sqlalchemy.table("tasks", ...)``: a table ``update()`` can write without the model."""
+    func = node.func
+    named_table = (isinstance(func, ast.Name) and func.id == "table") or (
+        isinstance(func, ast.Attribute) and func.attr == "table"
+    )
+    first = _string_value(node.args[0]) if node.args else None
+    return named_table and first is not None and first.strip().strip('"').lower() == "tasks"
 
 
 def _is_status_key(key: ast.expr | None) -> bool:
@@ -131,6 +151,8 @@ def status_writes(source: str) -> list[str]:
             and not _inside_string_expression(node, parents)
         ):
             found.append(f"line {node.lineno}: raw SQL updates tasks.status")
+        if isinstance(node, ast.Call) and _is_tasks_table_call(node):
+            found.append(f"line {node.lineno}: table('tasks') can be written without the model")
         if not uses_task:
             continue
         targets: list[ast.expr] = []
@@ -140,7 +162,7 @@ def status_writes(source: str) -> list[str]:
             targets = [node.target]
         for target in targets:
             if isinstance(target, ast.Attribute) and target.attr == "status":
-                found.append(f"line {node.lineno}: assigns .status")
+                found.append(f"line {getattr(node, 'lineno', 0)}: assigns .status")
         if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute) and func.attr == "values":
@@ -266,26 +288,76 @@ def test_only_states_module_names_the_writer_marker() -> None:
     assert offenders == []
 
 
-def _steprecord_bound_plain(tree: ast.Module) -> bool:
-    """``from app.workflow.engine import StepResult`` without alias: ``StepResult.transition`` is its API."""
-    return any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "app.workflow.engine"
-        and any(a.name == "StepResult" and a.asname is None for a in node.names)
+def _bound_names(node: ast.AST) -> list[str]:
+    """Names that ``node`` binds in its scope (imports, assignment targets, parameters, defs, handlers)."""
+    if isinstance(node, ast.Import | ast.ImportFrom):
+        return [(a.asname or a.name).split(".")[0] for a in node.names]
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+        return [node.id]
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        return [node.name]
+    if isinstance(node, ast.ExceptHandler) and node.name:
+        return [node.name]
+    if isinstance(node, ast.MatchAs | ast.MatchStar) and node.name:
+        return [node.name]
+    return []
+
+
+def _step_result_is_plain(tree: ast.Module) -> bool:
+    """``StepResult.transition`` is the result type's own API only when ``StepResult`` is bound exactly
+    once in the module, by ``from app.workflow.engine import StepResult`` with no ``as``: any other binding
+    (a second import, an assignment, a parameter) could make the name the states module."""
+    binds = [n for node in ast.walk(tree) for n in _bound_names(node) if n == "StepResult"]
+    plain = [
+        node
         for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "app.workflow.engine"
+        and node.level == 0
+        and any(a.name == "StepResult" and a.asname is None for a in node.names)
+    ]
+    return len(binds) == 1 and len(plain) == 1
+
+
+def _getattr_aliases(tree: ast.Module) -> set[str]:
+    """Names bound to ``getattr`` or ``builtins.getattr`` (``g = getattr``)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _is_getattr_ref(node.value, set()):
+            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return names
+
+
+def _is_getattr_ref(node: ast.expr, aliases: set[str]) -> bool:
+    return (isinstance(node, ast.Name) and (node.id == "getattr" or node.id in aliases)) or (
+        isinstance(node, ast.Attribute) and node.attr == "getattr"
     )
+
+
+def _is_reflective_writer_lookup(call: ast.Call, aliases: set[str]) -> bool:
+    """getattr, builtins.getattr, an alias, ``__getattribute__`` or ``getattr_static`` with a writer name."""
+    func = call.func
+    reflective = _is_getattr_ref(func, aliases) or (
+        isinstance(func, ast.Attribute) and func.attr in {"__getattribute__", "getattr_static"}
+    )
+    return reflective and any(_string_value(arg) in WRITER_NAMES for arg in call.args[:2])
 
 
 def writer_refs(source: str) -> list[str]:
     """References to transition/fail_task (BC-18), by AST; plain strings such as "transition" are not."""
     tree = ast.parse(source)
-    plain_step_result = _steprecord_bound_plain(tree)
+    plain_step_result = _step_result_is_plain(tree)
+    aliases = _getattr_aliases(tree)
     found: list[str] = []
     for node in ast.walk(tree):
         line = getattr(node, "lineno", 0)
         if isinstance(node, ast.ImportFrom):
-            if any(a.name == "*" for a in node.names) and (node.module or "").startswith("app."):
-                found.append(f"line {line}: star import of {node.module}")
+            if any(a.name == "*" for a in node.names) and (
+                node.level > 0 or (node.module or "").startswith("app.")
+            ):
+                found.append(f"line {line}: star import of {'.' * node.level}{node.module or ''}")
             found += [f"line {line}: imports {a.name}" for a in node.names if a.name in WRITER_NAMES]
         elif isinstance(node, ast.Name) and node.id in WRITER_NAMES:
             found.append(f"line {line}: names {node.id}")
@@ -298,14 +370,10 @@ def writer_refs(source: str) -> list[str]:
             )
             if not is_api:
                 found.append(f"line {line}: attribute {node.attr}")
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "getattr"
-            and len(node.args) >= 2
-            and _string_value(node.args[1]) in WRITER_NAMES
-        ):
-            found.append(f"line {line}: getattr of a writer")
+        elif isinstance(node, ast.Call) and _is_reflective_writer_lookup(node, aliases):
+            found.append(f"line {line}: reflective lookup of a writer")
+        elif isinstance(node, ast.MatchClass) and WRITER_NAMES & set(node.kwd_attrs):
+            found.append(f"line {line}: match class pattern on a writer")
     return found
 
 
@@ -318,7 +386,11 @@ def marker_refs(source: str) -> list[str]:
         line = getattr(node, "lineno", 0)
         if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp):
             value = _string_value(node) if isinstance(node, ast.expr) else None
-            if value is not None and MARKER_TEXT in value and not _inside_string_expression(node, parents):
+            if (
+                value is not None
+                and MARKER_WORD.search(value)
+                and not _inside_string_expression(node, parents)
+            ):
                 found.append(f"line {line}: marker text")
         elif isinstance(node, ast.Name) and node.id in MARKER_NAMES:
             found.append(f"line {line}: names {node.id}")
@@ -374,18 +446,60 @@ WRITER_SAMPLES = [
     "getattr(states, 'transition')\n",
     "getattr(states, 'trans' + 'ition')\n",
     "from app.workflow.engine import StepResult as SR\n\nSR.transition(1, 'r')\n",
+    # AG-13 PoC (3.2c2c1): the exempt name rebound, getattr by other routes, match, relative star import.
+    (
+        "from app.workflow.engine import StepResult\nfrom app.workflow import states as StepResult\n\n"
+        "StepResult.transition(1)\n"
+    ),
+    (
+        "from app.workflow.engine import StepResult\nfrom app.workflow import states\n\n"
+        "def run(StepResult=states):\n    return StepResult.fail_task\n"
+    ),
+    "StepResult = object()\nStepResult.transition(1)\n",
+    "import builtins\nfrom app.workflow import states\nw = builtins.getattr(states, 'transition')\n",
+    "from app.workflow import states\ng = getattr\nw = g(states, 'fail_task')\n",
+    "from app.workflow import states\nw = states.__getattribute__('transition')\n",
+    "from app.workflow import states\nw = object.__getattribute__(states, 'fail_task')\n",
+    "import inspect\nfrom app.workflow import states\nw = inspect.getattr_static(states, 'transition')\n",
+    "from app.workflow import states\nmatch states:\n    case object(transition=w):\n        pass\n",
+    "from .states import *\n",
+    "from ..workflow.states import *\n",
 ]
 MARKER_SAMPLES = [
     "X = 'kk.' + 'status_writer'\n",
     "X = f'kk.status_writer{1}'\n",
     "from app.models.tasks import STATUS_WRITER_SETTING\n",
     "from app.models import tasks\n\ntasks.STATUS_WRITER\n",
+    # AG-13 PoC: the marker built where the AST sees only pieces.
+    "Q = \"SELECT set_config('kk.' || 'status_writer', 'transition', true)\"\n",
+    "M = 'kk.%s' % 'status_writer'\n",
+    "M = 'kk.{}'.format('status_writer')\n",
+    "M = '.'.join(['kk', 'status_writer'])\n",
+    "Q = \"SELECT set_config(concat_ws('.', 'kk', 'status_writer'), 'transition', true)\"\n",
+]
+STATUS_SQL_SAMPLES = [
+    "Q = 'UPDATE public.tasks SET status = :s WHERE id = :id'\n",
+    "Q = 'UPDATE tasks t SET status = :s WHERE t.id = :id'\n",
+    "Q = 'UPDATE tasks AS t SET status = :s WHERE t.id = :id'\n",
+    "Q = 'UPDATE ONLY tasks SET status = :s WHERE id = :id'\n",
+    'Q = \'UPDATE "tasks" SET "status" = :s WHERE id = :id\'\n',
+    "Q = 'update  public.\"tasks\"  as t\\n set status = 1'\n",
+    "from sqlalchemy import table, column, update\nt = table('tasks', column('status'))\n",
+    "import sqlalchemy as sa\nt = sa.table(\"tasks\", sa.column('status'))\n",
 ]
 CLEAN_SAMPLES = [
     "from app.workflow.engine import StepResult\n\nStepResult.transition(TaskStatus.PLANNED, 'r')\n",
     "kind = 'x'\nok = kind == 'transition'\n",
     '"""Docs mention workflow.states.transition and fail_task."""\n',
     "STATUS_WRITER_MODE = 'transition'\n",
+    "from app.workflow.engine import StepResult\n\ndef f():\n    return StepResult.transition(1, 'r')\n",
+    "kind = 'transition'\n",
+    "from .states import thing\n",
+    "SETTING = 'kk.approval_status_writer'\n",
+    "NAME = 'approval_status_writer'\n",
+    "Q = 'SELECT id, status FROM tasks WHERE id = :id'\n",
+    "from sqlalchemy import table\nt = table('projects')\n",
+    "g = getattr\nw = g(obj, 'name')\n",
 ]
 
 
@@ -399,13 +513,33 @@ def test_marker_guard_flags_every_known_idiom() -> None:
         assert marker_refs(source), source
 
 
+def test_status_guard_flags_every_known_idiom() -> None:
+    for source in STATUS_SQL_SAMPLES:
+        assert status_writes(source), source
+
+
 def test_guards_do_not_flag_reads_and_docs() -> None:
     for source in CLEAN_SAMPLES:
         assert writer_refs(source) == [], source
         assert marker_refs(source) == [], source
+        assert status_writes(source) == [], source
 
 
 def test_docstring_names_the_static_limits() -> None:
     doc = __doc__ or ""
-    for limit in ("importlib", "operator.attrgetter", "__dict__", "cancel_open_tasks", "recover_expired"):
-        assert limit in doc
+    limits = (
+        "getattr",
+        "importlib",
+        "operator.attrgetter",
+        "vars()",
+        "__dict__",
+        "globals()",
+        "sys.modules",
+        "a string built at run time",
+        "cancel_open_tasks",
+        "tool_r3",
+        "recover_expired",
+        "TaskEngine._fail",
+    )
+    missing = [limit for limit in limits if limit not in doc]
+    assert missing == []
