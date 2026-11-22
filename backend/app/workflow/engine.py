@@ -47,6 +47,9 @@ MAX_PLANNING_ATTEMPTS = 3
 # Spec §16.4 #76: a wall-clock bound on every engine transaction, over the server-side lock and statement
 # timeouts (a black-holed connection never answers either). Read at call time.
 ENGINE_WRITE_TIMEOUT_S = 15
+# Spec §16.4 #74, §16.5a #3: what a task that ran past the delivery limit says. Fixed; it holds no values.
+DURATION_EXCEEDED = "duration_exceeded"
+DURATION_EXCEEDED_MESSAGE = "The task ran past its delivery time limit"
 CLAIMABLE = frozenset({TaskStatus.DRAFT.value, TaskStatus.QUEUED.value})
 PIPELINE: Mapping[str, tuple[str, ...]] = {"draft": ("intake", "context", "plan"), "running": ("implement",)}
 # Spec §16.4 #75: where a step's result may move a task, per pipeline; narrower than states.ALLOWED. Never to
@@ -68,6 +71,7 @@ Stopped = Literal[
     "interrupted",
     "abandoned",
     "step_result_invalid",
+    "duration_exceeded",
 ]
 
 logger = get_logger(__name__)
@@ -153,6 +157,7 @@ class WorkflowPorts:
     steps: Mapping[str, Step]
     heartbeat_s: float = HEARTBEAT_SECONDS
     lease_safety_s: float = LEASE_SAFETY_SECONDS
+    delivery_limit_s: float = 3600.0  # per delivery, on the loop clock, from the claim (spec §16.4 #74)
 
 
 @dataclass
@@ -168,6 +173,10 @@ class _Claim(NamedTuple):
     todo: tuple[str, ...]
 
 
+class _DeliveryLimit(Exception):
+    """The delivery limit passed while a step ran; the step has been cancelled once and has ended."""
+
+
 class _StatusChanged(Exception):
     """The task left the status its pipeline runs for; the lease has been released."""
 
@@ -181,6 +190,8 @@ class TaskEngine:
             and ports.heartbeat_s + ports.lease_safety_s < lease
         ):
             raise ValueError("heartbeat_s and lease_safety_s must be > 0 and sum to less than the lease")
+        if not ports.delivery_limit_s > 0:
+            raise ValueError("delivery_limit_s must be > 0")
         self._ports = ports
 
     @asynccontextmanager
@@ -204,8 +215,10 @@ class TaskEngine:
         if claim.status is None:
             outcome.stopped = "planning_interrupted"
             return outcome
+        # The delivery limit runs from the committed claim (spec §16.4 #74).
+        deadline = asyncio.get_running_loop().time() + self._ports.delivery_limit_s
         try:
-            outcome.stopped = await self._drive(task_id, claim.status, claim.todo, outcome.ran)
+            outcome.stopped = await self._drive(task_id, claim.status, claim.todo, outcome.ran, deadline)
         except LeaseLost:
             logger.warning("task_lease_lost", task_id=str(task_id), worker_id=self._ports.worker_id)
             outcome.stopped = "lease_lost"
@@ -261,16 +274,31 @@ class TaskEngine:
         todo = tuple(step for step in PIPELINE.get(status or "", ()) if step not in completed)
         return _Claim(result, status, todo)
 
-    async def _drive(self, task_id: uuid.UUID, status: str, todo: tuple[str, ...], ran: list[str]) -> Stopped:
+    async def _drive(
+        self, task_id: uuid.UUID, status: str, todo: tuple[str, ...], ran: list[str], deadline: float
+    ) -> Stopped:
+        loop = asyncio.get_running_loop()
         for step in todo:
+            if loop.time() >= deadline:  # no step starts: an honest status, no step_finished (§16.5a #2)
+                return await self._stop_before_step(task_id, status)
             # Before _start's renewal, so the heartbeat's H errs early.
-            renewed_at = asyncio.get_running_loop().time()
+            renewed_at = loop.time()
             context = await self._start(task_id, status, step)
             if context is None:
                 return "step_unavailable"
             ran.append(step)
-            result = await self._run_step(task_id, self._ports.steps[step], context, renewed_at)
+            over = loop.time() >= deadline  # past the limit after _start: finish the step honestly
+            result = self._limit_result(status)
+            if not over:
+                try:
+                    result = await self._run_step(
+                        task_id, self._ports.steps[step], context, renewed_at, deadline
+                    )
+                except _DeliveryLimit:
+                    over = True
             stopped = await self._finish(task_id, status, step, result)
+            if over:
+                return DURATION_EXCEEDED
             if stopped is not None:
                 return stopped
         async with self._transaction() as db:
@@ -278,6 +306,27 @@ class TaskEngine:
             await commit_and_publish(db, self._ports.bus)
         logger.warning("pipeline_exhausted", task_id=str(task_id), status=status)
         return "pipeline_exhausted"
+
+    @staticmethod
+    def _limit_result(status: str) -> StepResult:
+        if status == TaskStatus.RUNNING.value:
+            return StepResult.interrupt(DURATION_EXCEEDED)
+        return StepResult.fail(DURATION_EXCEEDED, DURATION_EXCEEDED_MESSAGE)
+
+    async def _stop_before_step(self, task_id: uuid.UUID, status: str) -> Stopped:
+        """The limit passed between steps: write the honest status, with no step events (none started)."""
+        ports = self._ports
+        async with self._transaction() as db:
+            task = await self._locked(db, task_id, status)
+            if status == TaskStatus.RUNNING.value:
+                await transition(
+                    db, task, TaskStatus.INTERRUPTED, reason=DURATION_EXCEEDED, actor=ACTOR, audit=ports.audit
+                )
+            else:
+                await self._fail(db, task, DURATION_EXCEEDED, DURATION_EXCEEDED_MESSAGE)
+            await release_lease(db, task_id, ports.worker_id)
+            await commit_and_publish(db, ports.bus)
+        return DURATION_EXCEEDED
 
     async def _locked(self, db: AsyncSession, task_id: uuid.UUID, status: str) -> Task:
         """Renew the lease (raises ``LeaseLost``) and load the task, which must still be in ``status``.
@@ -321,19 +370,36 @@ class TaskEngine:
         return context
 
     async def _run_step(
-        self, task_id: uuid.UUID, step: Step, context: StepContext, renewed_at: float
+        self, task_id: uuid.UUID, step: Step, context: StepContext, renewed_at: float, deadline: float
     ) -> StepResult:
+        """Run the step beside the heartbeat. At the deadline the step is cancelled ONCE (a second cancel
+        would count against a later ``shield``, Python 3.11+) and the heartbeat keeps the lease while it
+        cleans up; ``LeaseLost`` wins over the limit (spec §16.5a #3)."""
+        loop = asyncio.get_running_loop()
         work = asyncio.ensure_future(step(context))
         beat = asyncio.create_task(self._heartbeat(task_id, renewed_at))
         beat_won = True  # also on an outer cancel: the step's own outcome is then dropped too
+        work_cancelled = False
         try:
-            await asyncio.wait((work, beat), return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(
+                (work, beat), timeout=max(deadline - loop.time(), 0), return_when=asyncio.FIRST_COMPLETED
+            )
+            if not work.done() and not beat.done():
+                work_cancelled = True
+                work.cancel()
+                await asyncio.wait((work, beat), return_when=asyncio.FIRST_COMPLETED)
             beat_won = beat.done()
         finally:
-            work.cancel()
+            if not work_cancelled:
+                work.cancel()
             beat.cancel()
             await asyncio.gather(work, beat, return_exceptions=True)
-            if beat_won and work.done() and not work.cancelled() and (error := work.exception()):
+            if (
+                (beat_won or work_cancelled)
+                and work.done()
+                and not work.cancelled()
+                and (error := work.exception())
+            ):
                 # Its type only: the text of a step's error may carry secrets.
                 logger.error(
                     "step_error_dropped",
@@ -343,6 +409,8 @@ class TaskEngine:
                 )
         if beat_won:
             beat.result()  # the heartbeat only ends by raising LeaseLost
+        if work_cancelled:
+            raise _DeliveryLimit
         return work.result()
 
     async def _heartbeat(self, task_id: uuid.UUID, last_ok: float) -> NoReturn:

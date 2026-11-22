@@ -170,6 +170,7 @@ def make_engine(
     heartbeat_s: float = 0.1,
     lease_safety_s: float = LEASE_SAFETY_SECONDS,
     sessions: Any = None,
+    delivery_limit_s: float = 3600.0,
 ) -> TaskEngine:
     return TaskEngine(
         WorkflowPorts(
@@ -181,6 +182,7 @@ def make_engine(
             steps=steps,
             heartbeat_s=heartbeat_s,
             lease_safety_s=lease_safety_s,
+            delivery_limit_s=delivery_limit_s,
         )
     )
 
@@ -1557,3 +1559,279 @@ async def test_a_step_receives_a_lease_guard_it_can_hold_in_its_own_session(
     ((guard, extended),) = seen
     assert extended
     assert (guard.task_id, guard.owner) == (task_id, WORKER)
+
+
+# --- Delivery duration limit (spec §16.4 #74, §16.5a #2-#4) ---
+
+
+async def sleeps_forever(_: StepContext) -> StepResult:
+    await asyncio.sleep(30)
+    return StepResult.done()
+
+
+async def test_a_long_running_step_ends_interrupted_with_duration_exceeded(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    task_id = await make_task("queued")
+    steps = Steps(implement=sleeps_forever)
+    bus = RecordingBus(engine)
+    outcome = await asyncio.wait_for(
+        make_engine(engine, bus, steps.registry("implement"), delivery_limit_s=0.4).run(task_id), timeout=10
+    )
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "duration_exceeded")
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.error_code, after.lease_owner) == (
+        "interrupted",
+        "duration_exceeded",
+        None,
+        None,
+    )
+    assert "completed_steps" not in after.checkpoint  # the step runs again on resume
+    assert await kinds(engine, task_id) == [
+        changed("queued", "running", None),
+        started("implement"),
+        finished("implement", "interrupted"),
+        changed("running", "interrupted", "duration_exceeded"),
+    ]
+    assert bus.unseen == []
+    assert other_tasks() == []  # the step and the heartbeat are both gone
+
+
+async def test_a_long_planning_step_fails_the_task_with_duration_exceeded(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    task_id = await make_task("draft")
+    steps = Steps(intake=sleeps_forever)
+    outcome = await asyncio.wait_for(
+        make_engine(engine, RecordingBus(), steps.registry(*PLANNING), delivery_limit_s=0.4).run(task_id),
+        timeout=10,
+    )
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["intake"], "duration_exceeded")
+    after = await row(engine, task_id)
+    assert (after.status, after.error_code, after.error_message, after.lease_owner) == (
+        "failed",
+        "duration_exceeded",
+        engine_module.DURATION_EXCEEDED_MESSAGE,
+        None,
+    )
+    assert "completed_steps" not in after.checkpoint
+    assert await kinds(engine, task_id) == [
+        started("intake"),
+        finished("intake", "failed"),
+        changed("draft", "failed", "duration_exceeded"),
+    ]
+
+
+async def test_the_limit_passing_between_steps_writes_the_status_without_step_events(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """The step blocks the loop past the limit and returns done: it finishes, and no next step starts."""
+    task_id = await make_task("draft")
+
+    async def uses_the_time(_: StepContext) -> StepResult:
+        time.sleep(0.5)  # noqa: ASYNC251 - blocks the loop on purpose: done and the deadline arrive together
+        return StepResult.done()
+
+    steps = Steps(intake=uses_the_time)
+    bus = RecordingBus(engine)
+    outcome = await make_engine(engine, bus, steps.registry(*PLANNING), delivery_limit_s=0.3).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["intake"], "duration_exceeded")
+    assert steps.names == ["intake"]  # context never started
+    after = await row(engine, task_id)
+    assert (after.status, after.error_code, after.lease_owner) == ("failed", "duration_exceeded", None)
+    assert after.checkpoint["completed_steps"] == ["intake"]
+    assert await kinds(engine, task_id) == [
+        started("intake"),
+        finished("intake"),
+        changed("draft", "failed", "duration_exceeded"),  # no step_started for context
+    ]
+    assert bus.unseen == []
+
+
+async def test_the_limit_already_passed_before_a_running_step_interrupts_without_step_events(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    task_id = await make_task("queued")
+    steps = Steps()
+    outcome = await make_engine(
+        engine, RecordingBus(), steps.registry("implement"), delivery_limit_s=1e-9
+    ).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, [], "duration_exceeded")
+    assert steps.names == []
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.lease_owner) == (
+        "interrupted",
+        "duration_exceeded",
+        None,
+    )
+    assert await kinds(engine, task_id) == [
+        changed("queued", "running", None),
+        changed("running", "interrupted", "duration_exceeded"),
+    ]  # no step_started, no step_finished
+
+
+async def test_the_limit_passing_after_start_finishes_the_step_honestly(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = await make_task("queued")
+    original = TaskEngine._start
+
+    async def slow_start(self: TaskEngine, *args: Any) -> Any:
+        context = await original(self, *args)
+        await asyncio.sleep(0.4)  # past the limit, after step_started is written
+        return context
+
+    monkeypatch.setattr(TaskEngine, "_start", slow_start)
+    steps = Steps()
+    outcome = await make_engine(
+        engine, RecordingBus(), steps.registry("implement"), delivery_limit_s=0.2
+    ).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "duration_exceeded")
+    assert steps.names == []  # the step itself never ran
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.lease_owner) == (
+        "interrupted",
+        "duration_exceeded",
+        None,
+    )
+    assert await kinds(engine, task_id) == [
+        changed("queued", "running", None),
+        started("implement"),
+        finished("implement", "interrupted"),
+        changed("running", "interrupted", "duration_exceeded"),
+    ]
+
+
+async def test_a_step_that_cleans_up_slowly_keeps_its_heartbeat(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = await make_task("queued")
+    seen: dict[str, Any] = {}
+
+    async def slow_cleanup(_: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            seen["at_cancel"] = (await row(engine, task_id)).lease_expires_at
+            await asyncio.sleep(0.6)  # several beats (0.1 s) pass during the cleanup
+            raise
+        return StepResult.done()
+
+    original = TaskEngine._finish
+
+    async def spy_finish(self: TaskEngine, *args: Any) -> Any:
+        after = await row(engine, task_id)
+        seen["at_finish"] = (after.lease_owner, after.lease_expires_at)
+        return await original(self, *args)
+
+    monkeypatch.setattr(TaskEngine, "_finish", spy_finish)
+    steps = Steps(implement=slow_cleanup)
+    outcome = await asyncio.wait_for(
+        make_engine(engine, RecordingBus(), steps.registry("implement"), delivery_limit_s=0.3).run(task_id),
+        timeout=10,
+    )
+
+    assert outcome.stopped == "duration_exceeded"
+    owner, expires = seen["at_finish"]
+    assert owner == WORKER
+    assert expires > seen["at_cancel"] + timedelta(seconds=0.3)  # the heartbeat renewed during the cleanup
+    assert (await row(engine, task_id)).lease_owner is None  # released afterwards
+    assert other_tasks() == []
+
+
+async def test_the_step_is_cancelled_once_at_the_limit(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """A second cancel would count against a later ``shield`` (Python 3.11+): the cleanup sees one."""
+    task_id = await make_task("queued")
+    seen: dict[str, Any] = {"cancels": 0}
+
+    async def swallows(_: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            seen["cancels"] += 1
+            try:
+                await asyncio.sleep(0.5)  # a second cancel would end this sleep
+            except asyncio.CancelledError:
+                seen["cancels"] += 1
+            task = asyncio.current_task()
+            assert task is not None
+            seen["cancelling"] = task.cancelling()
+        return StepResult.done()  # the limit still wins over a result handed back during the cleanup
+
+    steps = Steps(implement=swallows)
+    outcome = await make_engine(
+        engine, RecordingBus(), steps.registry("implement"), delivery_limit_s=0.3
+    ).run(task_id)
+
+    assert outcome.stopped == "duration_exceeded"
+    assert seen == {"cancels": 1, "cancelling": 1}
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason) == ("interrupted", "duration_exceeded")
+    assert "completed_steps" not in after.checkpoint
+
+
+async def test_a_step_error_during_the_limit_cleanup_is_logged_by_type(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    task_id = await make_task("queued")
+
+    async def fails_on_cancel(_: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise RuntimeError("cleanup failed for token sk-test-secret-0123") from None
+        return StepResult.done()
+
+    steps = Steps(implement=fails_on_cancel)
+    with capture_logs() as logs:
+        outcome = await make_engine(
+            engine, RecordingBus(), steps.registry("implement"), delivery_limit_s=0.3
+        ).run(task_id)
+
+    assert outcome.stopped == "duration_exceeded"
+    dropped = [e for e in logs if e["event"] == "step_error_dropped"]
+    assert [(e["task_id"], e["step"], e["error_type"]) for e in dropped] == [
+        (str(task_id), "implement", "RuntimeError")
+    ]
+    assert "sk-test-secret" not in repr(logs)
+
+
+async def test_losing_the_lease_during_the_limit_cleanup_wins(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("queued")
+
+    async def loses_lease_while_cleaning(_: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            await take_over_lease(engine, task_id)
+            await asyncio.sleep(5)  # the heartbeat finds the lease gone and ends the wait
+            raise
+        return StepResult.done()
+
+    steps = Steps(implement=loses_lease_while_cleaning)
+    outcome = await asyncio.wait_for(
+        make_engine(engine, RecordingBus(), steps.registry("implement"), delivery_limit_s=0.3).run(task_id),
+        timeout=10,
+    )
+    assert outcome.stopped == "lease_lost"
+    assert (await row(engine, task_id)).status == "running"  # no honest write: the lease is not ours
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+async def test_engine_rejects_an_unusable_delivery_limit(engine: AsyncEngine, limit: float) -> None:
+    with pytest.raises(ValueError, match="delivery_limit_s"):
+        make_engine(engine, RecordingBus(), {}, delivery_limit_s=limit)

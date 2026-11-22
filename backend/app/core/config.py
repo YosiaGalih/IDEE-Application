@@ -58,6 +58,7 @@ class Settings(BaseModel):
     task_max_debug_attempts: int = Field(default=5, ge=0)
     task_auto_remediation_max: int = Field(default=1, ge=0)
     task_max_duration_minutes: int = Field(default=60, gt=0)
+    task_delivery_max_minutes: int = Field(default=60, gt=0)
     task_max_iterations: int = Field(default=3, gt=0)
     max_active_tasks: int = Field(default=2, gt=0)
     workspace_root: str = "/srv/kodekantor/workspaces"

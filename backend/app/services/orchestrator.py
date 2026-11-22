@@ -30,5 +30,6 @@ def build_orchestrator(
             worker_id=worker_id,
             max_active=settings.max_active_tasks,
             steps=steps if steps is not None else {},
+            delivery_limit_s=settings.task_delivery_max_minutes * 60,
         )
     )

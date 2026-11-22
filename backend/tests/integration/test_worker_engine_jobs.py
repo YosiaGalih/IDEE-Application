@@ -319,8 +319,9 @@ async def test_dispatch_sweep_defaults_to_the_celery_job_queue(
 def test_build_orchestrator_wires_the_ports() -> None:
     from app.core.config import load_settings
     from app.services.orchestrator import build_orchestrator
+    from app.workflow.lease import LEASE_SAFETY_SECONDS
 
-    settings = load_settings(make_test_env(MAX_ACTIVE_TASKS="5"))
+    settings = load_settings(make_test_env(MAX_ACTIVE_TASKS="5", TASK_DELIVERY_MAX_MINUTES="45"))
     engine = build_orchestrator(
         sessions=object(),  # type: ignore[arg-type]
         bus=object(),  # type: ignore[arg-type]
@@ -330,3 +331,4 @@ def test_build_orchestrator_wires_the_ports() -> None:
     )
     ports = engine._ports
     assert (ports.worker_id, ports.max_active, dict(ports.steps)) == ("w1", 5, {})
+    assert (ports.delivery_limit_s, ports.lease_safety_s) == (45 * 60, LEASE_SAFETY_SECONDS)
