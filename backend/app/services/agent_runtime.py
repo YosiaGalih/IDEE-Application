@@ -456,8 +456,9 @@ class AgentRunWriter:
         """Totals from the run's ledger rows (known to be incomplete when ``end`` says so); the row closed by
         ``close_run_row`` with status, code, redacted error (cut) and output, iterations, tokens, cost,
         ``finished_at`` (DB clock) and ``duration_ms``, and ``agent.run_finished``; for ``budget_exceeded``
-        also ``usage.budget_exceeded`` and the audit ``budget.exceeded``. One transaction. Only a row still
-        ``running`` row of this id, task, agent **and start token** is finished (``AgentRunAlreadyFinished``
+        also ``usage.budget_exceeded`` and the audit ``budget.exceeded``. One transaction.
+        Only a row of this id, task, agent **and start token** that is still ``running`` is finished
+        (``AgentRunAlreadyFinished``
         for any other: a duplicate request's row of the same id, another task's or agent's, one with no
         token; spec WP-3.2 §16.6.2 #88). The token is compared, never logged, emitted or put in an
         exception's text."""

@@ -1443,8 +1443,12 @@ async def test_a_retried_finish_that_finds_the_run_finished_is_not_unfinished() 
     fakes.runs = AckLostRuns()
     request = run_request("B14")
     with capture_logs() as logs:
-        with pytest.raises(AgentRunUnfinished):
+        with pytest.raises(AgentRunUnfinished) as raised:
             await make_runtime(fakes).run(request)
+    (run_id,) = fakes.runs.ids
+    # Only what this call knows: it did not close the row. Whose write closed it is not claimed (silent M2).
+    assert str(raised.value) == f"agent run {run_id} was not closed by this call"
+    assert "recorded" not in str(raised.value)
     assert fakes.runs.failed_runs == []
     assert len(fakes.runs.finishes) == 1 and fakes.runs.finishes[0][1].status == "succeeded"
     lines = [log for log in logs if log["event"].startswith("agent_run_")]
@@ -1452,7 +1456,6 @@ async def test_a_retried_finish_that_finds_the_run_finished_is_not_unfinished() 
         ("agent_run_unfinished", 1),
         ("agent_run_already_finished", 2),
     ]
-    (run_id,) = fakes.runs.ids
     assert lines[1]["task_id"] == str(request.task_id)
     assert lines[1]["correlation_id"] == f"agent_run:{run_id}"
 

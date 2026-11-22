@@ -1575,9 +1575,8 @@ class AgentRuntime:
         a minimal ``failed internal_error`` that names the run's task, agent and start token (the store ends
         no other row: ruling R6, spec WP-3.2 §16.3a #1), and ``AgentRunUnfinished``. ``finish`` names the same
         three, so neither end can close a row that is not this run's (spec WP-3.2 §16.6.2 #88). Every failure
-        is logged
-        with the run's ids. ``AgentRunIdConflict`` is the exception: the id is another run's (or another
-        request's), or spent, so it is raised at once, with no retry and no ``fail``."""
+        is logged with the run's ids. ``AgentRunIdConflict`` is the exception: the id is another run's (or
+        another request's), or spent, so it is raised at once, with no retry and no ``fail``."""
         failure: BaseException | None = None
         write = self._write(run, end)
         for attempt in (1, 2):
@@ -1591,10 +1590,11 @@ class AgentRuntime:
             except RunAlreadyFinished as error:
                 # The row is terminal: an earlier write committed and its ack was lost (review N4), or a
                 # retried start found the run ended elsewhere (recovery). Nothing is written over it; the
-                # caller still does not know the end.
+                # caller still does not know the end. The message claims only that this call did not close
+                # the row; the c2 adapter reads ``read_run_outcome`` for attribution (spec #94 item 6).
                 _log.warning("agent_run_already_finished", **_ctx(run), attempt=attempt)
                 raise AgentRunUnfinished(
-                    f"the end of agent run {_id(run.agent_run_id)} was already recorded",
+                    f"agent run {_id(run.agent_run_id)} was not closed by this call",
                     agent_run_id=run.agent_run_id,
                     task_id=run.request.task_id,
                 ) from error
