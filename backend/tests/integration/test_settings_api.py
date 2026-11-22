@@ -17,6 +17,7 @@ from app.core.audit import AuditWriter
 from app.core.config import load_settings
 from app.core.db import make_sessionmaker
 from app.core.redaction import Redactor
+from app.llm.pricing import PricingError, PricingTable, load_pricing
 from app.main import create_app
 from app.models.audit import AuditEvent
 from app.services import provider_settings, smoke_lock
@@ -62,8 +63,13 @@ class InlineSmoke:
         self.calls.append(job_id)
         if self.run:
             deps = self.app.state.dependencies
+            settings = self.app.state.settings
+            try:  # what a worker holds: the table, or why it has none (the check fails with it)
+                pricing: PricingTable | PricingError = load_pricing(Path(settings.pricing_path))
+            except PricingError as exc:
+                pricing = exc
             env = SmokeEnv(
-                settings=self.app.state.settings, sessions=deps.sessions, audit=AuditWriter(Redactor())
+                settings=settings, sessions=deps.sessions, audit=AuditWriter(Redactor()), pricing=pricing
             )
             await run_smoke(env, actor_id="worker", job_id=job_id, provider=provider)
             await smoke_lock.release(deps.redis, provider, job_id)

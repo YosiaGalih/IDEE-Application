@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from redis.asyncio import Redis
@@ -23,7 +22,7 @@ from app.core.audit import AuditWriter
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.llm.factory import ProviderNotConfigured, build_provider
-from app.llm.pricing import PricingError, PricingTable, load_pricing
+from app.llm.pricing import PricingError, PricingTable
 from app.llm.readiness import ReadinessReport, aborted_report, run_readiness
 from app.services import provider_readiness, smoke_lock
 
@@ -41,14 +40,10 @@ class SmokeEnv:
     settings: Settings
     sessions: async_sessionmaker[AsyncSession]
     audit: AuditWriter
+    # The table the caller's process holds (the worker: ``worker_pricing()``), or why it has none: the
+    # ``pricing_verified`` check fails with it and the run goes on. Never re-read per run (3.2 §16.3 #69).
+    pricing: PricingTable | PricingError
     transport: Any = None  # test seam: an httpx2 transport for the Anthropic adapter
-
-
-def _pricing(settings: Settings) -> PricingTable | PricingError:
-    try:
-        return load_pricing(Path(settings.pricing_path))
-    except PricingError as exc:
-        return exc  # a check fails with it; the run goes on
 
 
 async def run_smoke(
@@ -62,7 +57,7 @@ async def run_smoke(
         policy = dict(row.model_policy or {})
         await session.commit()
     models = provider_readiness.effective_models(settings, policy)
-    pricing = _pricing(settings)
+    pricing = env.pricing
     key = settings.anthropic_api_key
 
     def aborted(reason: str) -> ReadinessReport:

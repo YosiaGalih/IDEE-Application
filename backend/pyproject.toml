@@ -123,7 +123,7 @@ name = "The api process never builds a provider or reads its key (spec 3.1e Lead
 type = "forbidden"
 source_modules = ["app.main", "app.api"]
 forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.services.provider_smoke", "app.worker",
-                     "app.services.agent_runtime", "app.agents.runtime"]
+                     "app.services.agent_runtime", "app.agents.runtime", "app.services.agent_run_rows"]
 
 [[tool.importlinter.contracts]]
 name = "Routes reach the workflow only through services (thin routes, ARCHITECTURE §3.2; WP-3.1f1 review)"
@@ -152,9 +152,9 @@ forbidden_modules = ["sqlalchemy", "redis", "app.models", "app.core.db", "app.co
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
-name = "The runtime ends agent runs; it never moves a task (spec 3.1f #15, #30)"
+name = "The runtime ends agent runs; it never moves a task (spec 3.1f #15, #30; WP-3.2 #67)"
 type = "forbidden"
-source_modules = ["app.agents.runtime", "app.services.agent_runtime"]
+source_modules = ["app.agents.runtime", "app.services.agent_runtime", "app.services.agent_run_rows"]
 forbidden_modules = ["app.workflow.states", "app.models.tasks"]
 allow_indirect_imports = true   # emit_task_event and the lease functions touch Task on their own
 

@@ -639,14 +639,16 @@ class AgentRunUnfinished(Exception):
 
 
 class AgentRunIdConflict(ValueError):
-    """``RunStore.start``: the id exists for another task or agent. Never a retry of the same run. ``run()``
+    """``RunStore.start``: the id exists for another task or agent, or, on a retried start, for another
+    request (its start token is not this run's, or it has none). Never a retry of the same run. ``run()``
     also raises it, from the store's ``RunAlreadyFinished``, for an id whose run has ended (ruling R5): the id
     is spent, and nothing runs under it."""
 
 
 class RunAlreadyFinished(LookupError):
     """``RunStore.finish``: the run is not ``running`` any more; a run is finished once, never overwritten.
-    ``RunStore.start``: the id's run, of this task and agent, has ended (a spent id is never reopened)."""
+    ``RunStore.start``: the id's run, of this task, agent and start token, has ended (a spent id is never
+    reopened)."""
 
 
 class _DeadlineReached(Exception):
@@ -777,6 +779,10 @@ class RunStart:
     model_name: str | None
     prompt_version: str
     input: Mapping[str, Any]  # agent_input.model_dump(mode="json"); the store redacts
+    # The request's own token, one per ``run()`` (spec WP-3.2 §16.3 Keputusan Lead #66, §16.3a #4): a retried
+    # start and the minimal end match it, so a duplicate request with the same id is never taken for this
+    # one. Required and last, so a forgotten token is an error, not a false conflict. Never logged or emitted.
+    start_token: uuid.UUID = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -864,16 +870,17 @@ class UsageLedgerPort(Protocol):
 
 class RunStore(Protocol):
     async def start(self, run: RunStart, *, retry: bool) -> None:
-        """A first start (``retry=False``) whose id already has a row raises ``AgentRunIdConflict``, whatever
-        the row's task, agent or status, and writes nothing (ruling R10). A retry after a lost ack
-        (``retry=True``) is idempotent while the run is ``running``: a row that exists for the same task and
-        agent and is still ``running`` is left as it is; for another task or agent, ``AgentRunIdConflict``;
-        for the same task and agent whose run has ended, ``RunAlreadyFinished``. Fail-closed (rulings R5,
-        R10): a first start never takes over a live row and no start reopens an ended one, so resuming under
-        one id (WP-3.2) needs its own explicit, AG-13-reviewed writer path. A retry adopts a ``running`` row
-        of the same task and agent: if the first start died before its INSERT and a duplicate request with
-        the same id wrote its row meanwhile, that row is adopted (SECURITY_MODEL §13; the caller's fresh id
-        per ``run()``, ARCHITECTURE §6.1, is the control)."""
+        """Writes the row with ``run.start_token``. A first start (``retry=False``) whose id already has a row
+        raises ``AgentRunIdConflict``, whatever the row holds, without reading it, and writes nothing (ruling
+        R10). A retry after a lost ack (``retry=True``) that creates the row stores the token too. A retry
+        whose row exists checks identity first, then status (spec WP-3.2 §16.3a #2): unless the row's task,
+        agent and start token are all this run's (a NULL token never is), ``AgentRunIdConflict``, whatever
+        its status; then, a run that has ended is ``RunAlreadyFinished``, and a ``running`` one is left as it
+        is (idempotent, no second event). Fail-closed (rulings R5, R10; Keputusan Lead #66): a first start
+        never takes over a live row, no start reopens an ended one, and a retry never adopts the row of a
+        duplicate request with the same id that was written while this run's first start had died before its
+        INSERT (AG-13 delta-2 LOW-1 of 3.1f2b1). Resuming under one id (WP-3.2) needs its own explicit,
+        AG-13-reviewed writer path. The token is never logged or emitted."""
         ...
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
@@ -886,12 +893,15 @@ class RunStore(Protocol):
         *,
         task_id: uuid.UUID,
         agent_id: str,
+        start_token: uuid.UUID,
         breach: BudgetBreach | None = None,
     ) -> None:
         """The minimal end when ``finish`` could not be written: ``failed internal_error``, only for the row
-        of this id, task and agent that is still ``running`` (a foreign id ends nothing; ruling R6). A known
-        ``breach`` is still audited and published, in the same transaction (D-I5), within a savepoint: their
-        failure never rolls the minimal end back (ruling R7)."""
+        of this id, task, agent and ``start_token`` that is still ``running`` (a foreign id ends nothing,
+        ruling R6; a duplicate request's row of the same id, or a row with no token, neither: spec WP-3.2
+        §16.3a #1). ``start_token`` is required: the runtime passes its run's, the one its ``RunStart``
+        carried. A known ``breach`` is still audited and published, in the same transaction (D-I5), within a
+        savepoint: their failure never rolls the minimal end back (ruling R7)."""
         ...
 
 
@@ -990,6 +1000,8 @@ class _Run:
     report_at: datetime | None = None  # the readiness report the last gate check judged
     started: bool = False  # the store acknowledged ``start``
     start_sent: bool = False  # a ``start`` was sent (its ack may be lost): a later one is a retry
+    # One per run, made here: ``_Run`` is built only by ``_admit`` (spec WP-3.2 §16.3a #4). Never logged.
+    start_token: uuid.UUID = field(default_factory=uuid.uuid4, repr=False)
     iterations: int = 0
     output: BaseModel | None = None
     pending: PendingTool | None = None
@@ -1168,6 +1180,7 @@ class AgentRuntime:
             model_name=model,
             prompt_version=run.prompt.version,
             input=run.request.agent_input.model_dump(mode="json"),
+            start_token=run.start_token,
         )
 
     async def _start(self, run: _Run, start: RunStart) -> None:
@@ -1175,7 +1188,8 @@ class AgentRuntime:
         ``AgentRunIdConflict``, ruling R10), or a retry after a lost ack (``retry=True``). A store's
         ``RunAlreadyFinished`` on the first start still names a used id: it is raised as
         ``AgentRunIdConflict``, so nothing runs and nothing is closed (ruling R5). On a retry it is raised as
-        it is: the row may be this run's, ended elsewhere (recovery), and the row is the truth."""
+        it is: the row matched by token is this run's own, ended elsewhere (recovery), and the row is the
+        truth."""
         retry = run.start_sent
         run.start_sent = True
         try:
@@ -1549,10 +1563,10 @@ class AgentRuntime:
     async def _record_end(self, run: _Run, end: RunEnd) -> RunUsage:
         """The end, written shielded and bounded by ``close_timeout_s``, with one retry (review M5): a write
         still running is waited for once more, a write that failed is tried again. Then, if the row exists,
-        a minimal ``failed internal_error`` that names the run's task and agent (the store ends no other row:
-        ruling R6), and ``AgentRunUnfinished``. Every failure is logged with the run's ids.
-        ``AgentRunIdConflict`` is the exception: the id is another run's, or spent, so it is raised at once,
-        with no retry and no ``fail``."""
+        a minimal ``failed internal_error`` that names the run's task, agent and start token (the store ends
+        no other row: ruling R6, spec WP-3.2 §16.3a #1), and ``AgentRunUnfinished``. Every failure is logged
+        with the run's ids. ``AgentRunIdConflict`` is the exception: the id is another run's (or another
+        request's), or spent, so it is raised at once, with no retry and no ``fail``."""
         failure: BaseException | None = None
         write = self._write(run, end)
         for attempt in (1, 2):
@@ -1582,7 +1596,11 @@ class AgentRuntime:
                     write = self._write(run, end)
         mark = asyncio.ensure_future(
             self._ports.runs.fail(
-                run.agent_run_id, task_id=run.request.task_id, agent_id=run.spec.agent_id, breach=end.budget
+                run.agent_run_id,
+                task_id=run.request.task_id,
+                agent_id=run.spec.agent_id,
+                start_token=run.start_token,
+                breach=end.budget,
             )
         )
         mark.add_done_callback(_retrieve)

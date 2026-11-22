@@ -134,6 +134,9 @@ class AgentRun(UUIDPrimaryKey, Timestamps, Base):
     cost_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)  # redacted text
     error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)  # AGENT_RUN_ERROR_CODES
+    # Migration 0013 (spec WP-3.2 §16.3 Keputusan Lead #66): the token of the request that started the run;
+    # a retried start and the minimal end match it. NULL for a row written before 0013. Never published.
+    start_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

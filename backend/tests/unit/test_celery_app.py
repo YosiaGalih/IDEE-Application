@@ -209,3 +209,108 @@ def _registered() -> set[str]:
     app = create_celery(load_settings(make_test_env()))
     app.loader.import_default_modules()
     return set(app.tasks)
+
+
+# --- the agent registry is loaded when a worker is built (WP-3.2c2a Task 3; spec §16.3 #68) ---
+
+REPO_REGISTRY = Path(__file__).resolve().parents[3] / "agents" / "registry.v2.yaml"
+
+
+def test_registry_step_is_part_of_the_worker() -> None:
+    from app.worker.registry import REGISTRY_PATH_CONF, RegistryStep
+
+    settings = load_settings(make_test_env(AGENT_REGISTRY_PATH="/srv/registry.yaml"))
+    app = create_celery(settings)
+    assert RegistryStep in app.steps["worker"]
+    assert app.conf[REGISTRY_PATH_CONF] == settings.agent_registry_path == "/srv/registry.yaml"
+
+
+def test_registry_is_not_loaded_until_held(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from app.worker import registry
+
+    monkeypatch.setattr(registry, "_held", None)
+    with pytest.raises(registry.RegistryNotLoaded):
+        registry.worker_registry()
+
+
+def test_hold_registry_keeps_and_logs_the_count(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    import json
+
+    from app.worker import registry
+    from app.worker.celery_app import configure_worker_logging
+
+    monkeypatch.setattr(registry, "_held", None)
+    configure_worker_logging(load_settings(make_test_env()))
+    held = registry.hold_registry(REPO_REGISTRY)
+    assert registry.worker_registry() is held
+    events = [
+        json.loads(line) for line in capsys.readouterr().out.splitlines() if "agent_registry_loaded" in line
+    ]
+    assert [event["agents"] for event in events] == [len(held.agents)]
+
+
+def _write_broken(path: Path, case: str) -> None:
+    if case == "bad YAML":
+        path.write_text("agents: [unclosed", encoding="utf-8")
+    elif case == "rule violation":
+        path.write_text("schema_version: 99\nagents: []\n", encoding="utf-8")
+    else:
+        path.write_bytes(b"\xff\xfe\x00 not utf-8 \xc3\x28")
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type", "has_count"),
+    [
+        ("bad YAML", "RegistryError", True),
+        ("rule violation", "RegistryError", True),
+        ("non-UTF-8", "UnicodeDecodeError", False),
+    ],
+)
+def test_a_broken_registry_is_logged_by_type_and_re_raised(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    case: str,
+    error_type: str,
+    has_count: bool,  # type: ignore[no-untyped-def]
+) -> None:
+    import json
+
+    from app.worker import registry
+    from app.worker.celery_app import configure_worker_logging
+
+    monkeypatch.setattr(registry, "_held", None)
+    path = tmp_path / "registry.yaml"
+    _write_broken(path, case)
+    configure_worker_logging(load_settings(make_test_env()))
+    with pytest.raises(Exception) as raised:
+        registry.hold_registry(path)
+    assert type(raised.value).__name__ == error_type
+    assert registry._held is None  # pyright: ignore[reportPrivateUsage]
+    out = capsys.readouterr().out
+    events = [json.loads(line) for line in out.splitlines() if "agent_registry_invalid" in line]
+    assert len(events) == 1
+    event = events[0]
+    assert event["error_type"] == error_type
+    assert ("problems_count" in event) is has_count
+    assert "exc_info" not in event and "exception" not in event
+    assert "unclosed" not in out and "problem(s)" not in out
+
+
+def test_startup_recovery_failure_logs_the_error_type_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from structlog.testing import capture_logs
+
+    from app.worker import jobs
+    from app.worker.celery_app import _recover_on_start
+
+    async def boom() -> dict[str, int]:
+        raise RuntimeError("secret-host")
+
+    monkeypatch.setattr(jobs, "run_recovery_sweep", boom)
+    with capture_logs() as logs:
+        _recover_on_start()
+    entries = [e for e in logs if e["event"] == "startup_recovery_failed"]
+    assert len(entries) == 1
+    assert entries[0]["error_type"] == "RuntimeError"
+    assert "exc_info" not in entries[0]
+    assert "secret-host" not in str(entries[0])

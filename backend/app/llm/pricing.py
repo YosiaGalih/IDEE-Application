@@ -109,7 +109,7 @@ class PricingTable(BaseModel):
 def load_pricing(path: Path) -> PricingTable:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, ValueError, yaml.YAMLError) as exc:  # ValueError: UnicodeDecodeError too (silent L3)
         raise PricingError(f"cannot read pricing file {path}: {type(exc).__name__}") from exc
     try:
         return PricingTable.model_validate(raw)

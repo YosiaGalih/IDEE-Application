@@ -15,14 +15,13 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from sqlalchemy import Integer, cast, func, select, update
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.prompt_book import PromptBook
 from app.agents.registry import AgentRegistry
 from app.agents.runtime import (
-    ERROR_TEXT_MAX,
     AgentRunIdConflict,
     AgentRuntime,
     BudgetBreach,
@@ -48,7 +47,7 @@ from app.core.config import Settings
 from app.core.db import bound_transaction
 from app.core.events import EventBus, emit_task_event, publish_pending, task_project_id
 from app.core.logging import get_logger
-from app.core.money import decimal_str, stored_cost
+from app.core.money import decimal_str
 from app.core.redaction import Redactor
 from app.llm.base import LLMProvider
 from app.llm.factory import ProviderNotConfigured, build_provider
@@ -57,6 +56,7 @@ from app.llm.retry import AttemptHandler
 from app.models.agents import AgentRun
 from app.models.projects import Project
 from app.models.providers import ProviderConfig
+from app.services.agent_run_rows import UNKNOWN_RUN_TOTALS, RowOwner, close_run_row
 from app.services.provider_readiness import (
     PROVIDER,
     WorkerCredentials,
@@ -351,9 +351,10 @@ async def read_run_outcome(
 
 
 class AgentRunWriter:
-    """``RunStore``: one of the two writers of ``agent_runs`` (tests/unit/test_agent_run_writer_guard.py); the
-    other is ``app.services.run_recovery`` (WP-3.1f2b1). Everything stored goes through the audit's redactor,
-    which knows the configured secret literals (3.1b C4)."""
+    """``RunStore``: the only creator of ``agent_runs`` rows (``start``'s INSERT); ``finish`` and ``fail``
+    close a row only through ``app.services.agent_run_rows.close_run_row``, which the run recovery also uses
+    (tests/unit/test_agent_run_writer_guard.py, tests/unit/test_close_run_row_guard.py). Everything stored
+    goes through the audit's redactor, which knows the configured secret literals (3.1b C4)."""
 
     def __init__(
         self, sessions: async_sessionmaker[AsyncSession], bus: EventBus | None, audit: AuditWriter
@@ -364,14 +365,18 @@ class AgentRunWriter:
         self._projects: dict[uuid.UUID, uuid.UUID] = {}  # run -> project, for the audit of its end
 
     async def start(self, run: RunStart, *, retry: bool) -> None:
-        """INSERT ``agent_runs`` (``running``, the input redacted) and ``agent.run_started``, one transaction,
-        committed, then published. A first start (``retry=False``) whose INSERT creates no row is refused
-        with ``AgentRunIdConflict``, whatever that row's task, agent or status: a duplicate request never
-        takes over a live run's row (ruling R10). A retry after a lost ack (``retry=True``) is idempotent
-        while the run is ``running``: a row of the same task and agent that is still ``running`` is left as
-        it is (no second event); for another task or agent, ``AgentRunIdConflict``; for the same task and
-        agent whose run has ended, ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a
-        run; ruling R5)."""
+        """INSERT ``agent_runs`` (``running``, the input redacted, the run's start token) and
+        ``agent.run_started``, one transaction, committed, then published. A first start (``retry=False``)
+        whose INSERT creates no row is refused with ``AgentRunIdConflict``, whatever that row holds, and the
+        row is not read: a duplicate request never takes over a live run's row (ruling R10). A retry after a
+        lost ack (``retry=True``) whose INSERT creates the row stores the token too. One whose row exists
+        checks identity first (spec WP-3.2 §16.3a #2): unless task, agent **and** start token all match
+        (a None token, the row's or the run's, never does), ``AgentRunIdConflict``, whatever the row's
+        status, so a duplicate request that committed the row while this one's first start had failed before
+        its INSERT is never adopted (AG-13 delta-2 LOW-1 of 3.1f2b1; Keputusan Lead #66). Then the status: a
+        run that has ended is ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a run;
+        ruling R5), a ``running`` one is left as it is (no second event). The token is compared, never logged,
+        emitted or put in an exception's text."""
         redactor = self._audit.redactor
         run_id = run.agent_run_id
         async with self._sessions() as session:
@@ -390,6 +395,7 @@ class AgentRunWriter:
                         prompt_version=run.prompt_version,
                         status="running",
                         input=redactor.redact_obj(dict(run.input)),
+                        start_token=run.start_token,
                     )
                     .on_conflict_do_nothing(index_elements=[AgentRun.id])
                     .returning(AgentRun.id)
@@ -400,13 +406,26 @@ class AgentRunWriter:
                     raise AgentRunIdConflict(f"agent run id {run_id} is already used")
                 existing = (
                     await session.execute(
-                        select(AgentRun.task_id, AgentRun.agent_id, AgentRun.status).where(
-                            AgentRun.id == run_id
-                        )
+                        select(
+                            AgentRun.task_id, AgentRun.agent_id, AgentRun.start_token, AgentRun.status
+                        ).where(AgentRun.id == run_id)
                     )
                 ).one()
-                if (existing.task_id, existing.agent_id) != (run.task_id, run.agent_id):
-                    raise AgentRunIdConflict(f"agent run id {run_id} belongs to another task or agent")
+                # Identity before status (spec WP-3.2 §16.3a #2): another request's ended run is never read
+                # back as this one's end. A None token on either side is never an identity, whatever static
+                # typing says (Lead ruling R-F7): checked before the compare, where None would equal None.
+                if existing.start_token is None or run.start_token is None:
+                    raise AgentRunIdConflict(
+                        f"agent run id {run_id} belongs to another task, agent or request"
+                    )
+                if (existing.task_id, existing.agent_id, existing.start_token) != (
+                    run.task_id,
+                    run.agent_id,
+                    run.start_token,
+                ):
+                    raise AgentRunIdConflict(
+                        f"agent run id {run_id} belongs to another task, agent or request"
+                    )
                 if existing.status != "running":
                     raise AgentRunAlreadyFinished(f"agent run {run_id} has ended: its id is spent")
                 self._projects[run_id] = run.project_id  # its end is audited like a first start's
@@ -425,81 +444,52 @@ class AgentRunWriter:
         self._projects[run_id] = run.project_id
 
     async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
-        """Totals from the run's ledger rows; UPDATE status, code, redacted error (cut) and output,
-        iterations, tokens, cost, ``finished_at`` (DB clock) and ``duration_ms``; ``agent.run_finished``;
-        for ``budget_exceeded`` also ``usage.budget_exceeded`` and the audit ``budget.exceeded``. One
-        transaction. Only a row still ``running`` is finished (``AgentRunAlreadyFinished``)."""
+        """Totals from the run's ledger rows (known to be incomplete when ``end`` says so); the row closed by
+        ``close_run_row`` with status, code, redacted error (cut) and output, iterations, tokens, cost,
+        ``finished_at`` (DB clock) and ``duration_ms``, and ``agent.run_finished``; for ``budget_exceeded``
+        also ``usage.budget_exceeded`` and the audit ``budget.exceeded``. One transaction. Only a row still
+        ``running`` is finished (``AgentRunAlreadyFinished``)."""
         redactor = self._audit.redactor
         async with self._sessions() as session:
             await bound_transaction(session)
             run_totals = await run_usage(session, agent_run_id)
             if not end.usage_complete or end.error_code == "usage_unrecorded":
                 run_totals = incomplete_run_totals(run_totals)
-            totals = run_totals.totals
-            cost = stored_cost(totals.estimated_cost) if totals.estimated_cost is not None else None
-            finished = (
-                await session.execute(
-                    update(AgentRun)
-                    .where(AgentRun.id == agent_run_id, AgentRun.status == "running")
-                    .values(
-                        status=end.status,
-                        error_code=end.error_code,
-                        error=redactor.redact(end.error)[:ERROR_TEXT_MAX] if end.error is not None else None,
-                        output=redactor.redact_obj(dict(end.output)) if end.output is not None else None,
-                        iterations=end.iterations,
-                        input_tokens=totals.input_tokens,
-                        output_tokens=totals.output_tokens,
-                        cache_read_tokens=run_totals.cache_read_tokens,
-                        cache_creation_tokens=run_totals.cache_creation_tokens,
-                        estimated_cost=cost,
-                        cost_status=totals.cost_status,
-                        finished_at=func.now(),
-                        duration_ms=cast(
-                            func.extract("epoch", func.now() - AgentRun.started_at) * 1000, Integer
-                        ),
-                    )
-                    .returning(AgentRun.task_id, AgentRun.agent_id)
-                    .execution_options(synchronize_session=False)
-                )
-            ).one_or_none()
-            if finished is None:
-                self._projects.pop(agent_run_id, None)  # finished elsewhere: nothing more to audit
-                raise AgentRunAlreadyFinished(f"agent run {agent_run_id} is not running")
-            task_id, agent_id = finished
-            usage = {
-                "input_tokens": totals.input_tokens,
-                "output_tokens": totals.output_tokens,
-                "estimated_cost": decimal_str(cost) if cost is not None else None,
-                "cost_status": totals.cost_status,
-            }
-            await emit_task_event(
+            closed = await close_run_row(
                 session,
                 self._bus,
-                task_id,
-                "agent.run_finished",
-                {
-                    "agent_run_id": str(agent_run_id),
-                    "agent_id": agent_id,
-                    "status": end.status,
-                    "error_code": end.error_code,
-                    "usage": usage,
-                },
-                redactor=redactor,
+                redactor,
+                agent_run_id,
+                status=end.status,
+                error_code=end.error_code,
+                error=end.error,
+                totals=run_totals,
+                output=end.output,
+                iterations=end.iterations,
             )
+            if closed is None:
+                self._projects.pop(agent_run_id, None)  # finished elsewhere: nothing more to audit
+                raise AgentRunAlreadyFinished(f"agent run {agent_run_id} is not running")
             if end.budget is not None:
                 await self._budget_exceeded(
-                    session, agent_run_id, task_id, agent_id, self._projects.get(agent_run_id), end.budget
+                    session,
+                    agent_run_id,
+                    closed.task_id,
+                    closed.agent_id,
+                    self._projects.get(agent_run_id),
+                    end.budget,
                 )
             await session.commit()
             if self._bus is not None:
                 await publish_pending(session, self._bus)
         self._projects.pop(agent_run_id, None)
+        totals = run_totals.totals
         return RunUsage(
             input_tokens=totals.input_tokens,
             output_tokens=totals.output_tokens,
             cache_read_tokens=run_totals.cache_read_tokens,
             cache_creation_tokens=run_totals.cache_creation_tokens,
-            estimated_cost=cost,
+            estimated_cost=closed.estimated_cost,
             cost_status=totals.cost_status,
         )
 
@@ -509,56 +499,43 @@ class AgentRunWriter:
         *,
         task_id: uuid.UUID,
         agent_id: str,
+        start_token: uuid.UUID,
         breach: BudgetBreach | None = None,
     ) -> None:
         """The minimal end when ``finish`` could not be written (review M5): ``failed internal_error`` with
-        its usage unknown, only for the row of this id, task and agent that is still ``running`` (a foreign
-        id ends nothing; ruling R6); then, in the same transaction,
-        ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d). A known ``breach`` also writes
-        ``usage.budget_exceeded`` and the audit ``budget.exceeded`` (D-I5); the status stays
-        ``failed internal_error``. Those two are written in a savepoint (ruling R7): when they fail, the
-        savepoint alone is rolled back, ``budget_audit_unrecorded`` is logged with the run's ids and the error
-        type, and the minimal end is still committed."""
+        its usage unknown and no ``duration_ms``, only for the row of this id, task, agent and start token
+        that is still ``running`` (a foreign id ends nothing, ruling R6; nor a duplicate request's row of the
+        same id, nor a row with no token, spec WP-3.2 §16.3a #1); then, in the same transaction,
+        ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d): both by ``close_run_row``.
+        When no row matched, nothing is written and ``agent_run_not_marked`` is logged with the ids only. A
+        known ``breach`` also writes ``usage.budget_exceeded`` and the audit ``budget.exceeded`` (D-I5); the
+        status stays ``failed internal_error``. Those two are written in a savepoint (ruling R7): when they
+        fail, the savepoint alone is rolled back, ``budget_audit_unrecorded`` is logged with the run's ids and
+        the error type, and the minimal end is still committed."""
         project_id = self._projects.pop(agent_run_id, None)
         async with self._sessions() as session:
             await bound_transaction(session)
-            ended = (
-                await session.execute(
-                    update(AgentRun)
-                    .where(
-                        AgentRun.id == agent_run_id,
-                        AgentRun.task_id == task_id,
-                        AgentRun.agent_id == agent_id,
-                        AgentRun.status == "running",
-                    )
-                    .values(
-                        status="failed",
-                        error_code="internal_error",
-                        error="the end of the run could not be recorded",
-                        cost_status="unavailable",
-                        finished_at=func.now(),
-                    )
-                    .returning(AgentRun.id)
-                    .execution_options(synchronize_session=False)
-                )
-            ).one_or_none()
-            if ended is None:  # finished elsewhere (its end was already published), or not this run's row
-                return
-            unknown = {"input_tokens": None, "output_tokens": None, "estimated_cost": None}
-            await emit_task_event(
+            closed = await close_run_row(
                 session,
                 self._bus,
-                task_id,
-                "agent.run_finished",
-                {
-                    "agent_run_id": str(agent_run_id),
-                    "agent_id": agent_id,
-                    "status": "failed",
-                    "error_code": "internal_error",
-                    "usage": {**unknown, "cost_status": "unavailable"},
-                },
-                redactor=self._audit.redactor,
+                self._audit.redactor,
+                agent_run_id,
+                status="failed",
+                error_code="internal_error",
+                error="the end of the run could not be recorded",
+                totals=UNKNOWN_RUN_TOTALS,
+                with_duration=False,  # NULL: the agents API's avg_duration_ms counts measured runs only
+                owner=RowOwner(task_id, agent_id, start_token),
             )
+            if closed is None:  # finished elsewhere (its end was already published), or not this run's row
+                _log.warning(  # ids only, never the token (silent L1)
+                    "agent_run_not_marked",
+                    agent_run_id=str(agent_run_id),
+                    task_id=str(task_id),
+                    agent_id=agent_id,
+                    breach_kind=breach.kind if breach else None,
+                )
+                return
             if breach is not None:
                 try:
                     async with session.begin_nested():

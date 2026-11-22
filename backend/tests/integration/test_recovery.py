@@ -35,7 +35,15 @@ from app.services.agents import sync_registry
 from app.services.run_recovery import RunRecoveryIncomplete, RunRecoveryResult, recover_runs
 from app.workflow.recovery import recover_expired
 from tests.conftest import reset_data
-from tests.integration.test_agent_run_writer import ledger_row
+from tests.integration.test_agent_run_writer import (
+    CACHED,
+    CLOSE_CLOCK,
+    MEASURED,
+    closed_row,
+    ledger_row,
+    ledger_sum,
+    task_events,
+)
 from tests.runtime_fakes import REGISTRY, RecordingBus
 
 AUDIT = AuditWriter(Redactor())
@@ -186,6 +194,28 @@ async def test_one_failing_task_does_not_stop_the_sweep(  # type: ignore[no-unty
     assert "task_recovery_failed" in capsys.readouterr().out
     assert (await status_of(engine, good))[0] == "interrupted"
     assert (await status_of(engine, bad))[0] == "running"
+
+
+async def test_failed_task_logs_the_error_type_only(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine,
+    make_task,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The log names the error type, never its text or a traceback (a driver error can carry a value)."""
+    from app.workflow import recovery
+
+    await make_task("running", "-5 seconds")
+
+    async def boom(db, task, to, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(recovery, "transition", boom)
+    await recover_expired(make_sessionmaker(engine), Recorder(), AUDIT)
+    out = capsys.readouterr().out
+    assert "task_recovery_failed" in out and "RuntimeError" in out
+    assert "boom" not in out
+    assert "Traceback" not in out
 
 
 async def seed_orphan(database_url: str) -> uuid.UUID:
@@ -404,6 +434,7 @@ async def start_run(
         model_name="claude-haiku-5-5",
         prompt_version="0123456789ab",
         input={},
+        start_token=uuid.uuid4(),
     )
     await AgentRunWriter(make_sessionmaker(engine), None, AUDIT).start(run, retry=False)
     if age_s is not None:
@@ -519,6 +550,69 @@ async def test_run_of_a_task_without_a_live_lease_is_interrupted(  # type: ignor
             await session.scalars(select(AuditEvent.id).where(AuditEvent.resource_id == str(run_id)))
         ).all()
     assert audited == []  # Keputusan #6: a recovered run is not audited on its own
+
+
+@pytest.mark.parametrize("rows", [2, 0], ids=["with-ledger-rows", "no-ledger-rows"])
+async def test_the_recovery_close_writes_this_row_and_this_event(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles, pricing: PricingTable, rows: int
+) -> None:
+    """Characterisation (WP-3.2c2a Task 1): the recovery's close, the row and ``agent.run_finished`` it
+    writes, before the three closers share ``close_run_row``. Usage is never complete (the known sum,
+    ``partial``; no rows: unknown), ``output`` and ``iterations`` stay as the running row has them (SQL NULL,
+    0), ``duration_ms`` is measured on the DB clock."""
+    task_id = await make_task("running", DEAD)
+    run_id = await start_run(engine, task_id, age_s=7)
+    sessions = make_sessionmaker(engine)
+    project_id = await project_of(engine, task_id)
+    for _ in range(rows):
+        await ledger_row(sessions, pricing, project_id, task_id, run_id, usage=CACHED)
+    bus = RecordingBus(engine)
+
+    assert await recover_runs(sessions, bus, AUDIT) == RunRecoveryResult(
+        tasks=1, runs=1, tool_calls=0, failed=0, skipped=0
+    )
+
+    cost = await ledger_sum(engine, run_id) if rows else None
+    tokens = (100 * rows, 20 * rows, 5 * rows, 3 * rows) if rows else (None,) * 4
+    status = "partial" if rows else "unavailable"
+    assert await closed_row(engine, run_id) == {
+        "task_id": task_id,
+        "agent_id": "B14",
+        "input": {},
+        "status": "failed",
+        "error_code": "interrupted",
+        "error": "the run was interrupted: its worker is gone",
+        "output": None,
+        "output_type": None,
+        "iterations": 0,
+        "input_tokens": tokens[0],
+        "output_tokens": tokens[1],
+        "cache_read_tokens": tokens[2],
+        "cache_creation_tokens": tokens[3],
+        "estimated_cost": cost,
+        "cost_status": status,
+        "finished_at": CLOSE_CLOCK,
+        "duration_ms": MEASURED,
+    }
+    finished = {
+        "agent_run_id": str(run_id),
+        "agent_id": "B14",
+        "status": "failed",
+        "error_code": "interrupted",
+        "usage": {
+            "input_tokens": tokens[0],
+            "output_tokens": tokens[1],
+            "estimated_cost": decimal_str(cost) if cost is not None else None,
+            "cost_status": status,
+        },
+    }
+    started = {"agent_run_id": str(run_id), "agent_id": "B14", "status": "running"}
+    assert await task_events(engine, task_id) == [
+        ("agent.run_started", started),
+        ("agent.run_finished", finished),
+    ]
+    assert [(m["type"], m["payload"]) for m in bus.messages] == [("agent.run_finished", finished)]
+    assert bus.messages[0]["seq"] is not None and bus.unseen == []  # committed, then published
 
 
 async def test_recovered_run_without_ledger_rows_reports_unavailable_usage(  # type: ignore[no-untyped-def]

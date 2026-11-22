@@ -147,6 +147,16 @@ def test_load_rejects(tmp_path: Path, content: str | None, reason: str) -> None:
         load_pricing(path)
 
 
+def test_load_rejects_a_file_that_is_not_utf8_by_the_error_type_only(tmp_path: Path) -> None:
+    """Final review 3.2c2a (backend Minor 3, silent L3): a decode error is a ``PricingError`` too, never an
+    error of another type that a caller would not catch; the message names the type, not the bytes."""
+    path = tmp_path / "pricing.yaml"
+    path.write_bytes(TABLE.replace('version: "2026-11-05"', 'version: "caf\xe9"').encode("latin-1"))
+    with pytest.raises(PricingError) as raised:
+        load_pricing(path)
+    assert str(raised.value) == f"cannot read pricing file {path}: UnicodeDecodeError"
+
+
 def test_repo_pricing_file_loads() -> None:
     table = load_pricing(BACKEND / "config" / "pricing.yaml")
     assert table.verify_before_production is True

@@ -28,6 +28,7 @@ from app.core.config import ConfigError, load_settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.db_roles import InvalidRoleName, grant_runtime_role
 from app.core.redaction import Redactor
+from app.llm.pricing import PricingError, PricingTable, load_pricing
 from app.services.agents import sync_registry
 from app.services.users import EmailTakenError, OwnerExistsError, create_owner
 
@@ -100,6 +101,10 @@ async def _claude_smoke(as_json: bool) -> int:
     redis = Redis.from_url(settings.redis_url, socket_timeout=5.0, socket_connect_timeout=5.0)
     job_id = uuid.uuid4()
     try:
+        try:  # this process is not a worker: it loads the table once, and a broken file fails the check
+            pricing: PricingTable | PricingError = load_pricing(Path(settings.pricing_path))
+        except PricingError as exc:
+            pricing = exc
         try:
             if not await smoke_lock.acquire(redis, PROVIDER, job_id):
                 print("a smoke test is already running for this provider; try again later", file=sys.stderr)
@@ -111,6 +116,7 @@ async def _claude_smoke(as_json: bool) -> int:
             settings=settings,
             sessions=make_sessionmaker(engine),
             audit=AuditWriter(Redactor(settings.secret_values())),
+            pricing=pricing,
         )
         try:
             report = await provider_smoke.run_smoke(env, actor_id="cli", job_id=job_id)

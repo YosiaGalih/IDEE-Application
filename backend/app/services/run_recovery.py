@@ -1,9 +1,10 @@
 """Recovery of agent runs and tool calls left ``running`` by a worker that is gone (WP-3.1f2b1;
 spec 3.1f2b Keputusan Lead #3-#8, ARCHITECTURE §5.3).
 
-The ``recovery_sweep`` job runs this after task recovery (``app.workflow.recovery.recover_expired``). It is
-the second writer of ``agent_runs`` (tests/unit/test_agent_run_writer_guard.py) and closes ``tool_calls`` only
-through ``app.tools.gateway.close_abandoned_calls``.
+The ``recovery_sweep`` job runs this after task recovery (``app.workflow.recovery.recover_expired``). It
+closes ``agent_runs`` rows only through ``app.services.agent_run_rows.close_run_row`` and writes none itself
+(tests/unit/test_agent_run_writer_guard.py, tests/unit/test_close_run_row_guard.py), and closes
+``tool_calls`` only through ``app.tools.gateway.close_abandoned_calls``.
 
 **Predicates**, on the DB clock (``clock_timestamp()``), never the worker's:
 - lease_dead: ``tasks.lease_expires_at IS NULL OR tasks.lease_expires_at < clock_timestamp()``
@@ -24,8 +25,8 @@ busy task row, or a candidate run or tool call the lock passed over. A skip is n
 transaction may hold the task row for a moment). When recovery closes a run first, the runtime's ``finish``
 raises ``AgentRunAlreadyFinished``. The transaction commits, then its events are published.
 
-This module writes ``agent_runs.status`` and so never holds the Task model (tests/unit/
-test_status_writer_guard.py); the task side comes from ``app.workflow.recovery``.
+This module ends runs (``agent_runs.status``, through ``close_run_row``) and so never holds the Task model
+(tests/unit/test_status_writer_guard.py); the task side comes from ``app.workflow.recovery``.
 """
 
 from __future__ import annotations
@@ -47,19 +48,18 @@ from sqlalchemy import (
     or_,
     select,
     union,
-    update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.runtime import ERROR_TEXTS
 from app.core.audit import AuditWriter
 from app.core.db import bound_transaction
-from app.core.events import EventBus, emit_task_event, publish_pending
+from app.core.events import EventBus, publish_pending
 from app.core.logging import get_logger
-from app.core.money import decimal_str, stored_cost
 from app.core.redaction import Redactor
 from app.models.agents import AgentProfile, AgentRun
 from app.models.tools import ToolCall
+from app.services.agent_run_rows import close_run_row
 from app.services.usage import incomplete_run_totals, run_usage
 from app.tools.gateway import close_abandoned_calls
 from app.workflow.recovery import lease_dead, lock_task_row
@@ -67,7 +67,6 @@ from app.workflow.recovery import lease_dead, lock_task_row
 RUN_CLOSE_BOUND_S: Final = 60  # above a run's own close-out (ARCHITECTURE §5.3, ±25 s), plus clock margin
 MAX_TIMEOUT_S: Final = 3600  # the registry's ceiling (AgentLimits.timeout_seconds, le=3600)
 _CODE: Final = "interrupted"
-_INT4_MAX: Final = 2_147_483_647  # duration_ms is int4: an orphan older than ±24.8 days keeps this ceiling
 
 logger = get_logger(__name__)
 
@@ -185,7 +184,7 @@ async def _recover_task(
         held_runs, held_calls = await _held(db, task_id, run_ids, [call.id for call in calls])
         closed: list[str] = []
         for run in runs:
-            if await _close_run(db, bus, audit.redactor, task_id, run.id, run.agent_id):
+            if await _close_run(db, bus, audit.redactor, run.id):
                 closed.append(str(run.id))
         closed_calls = await close_abandoned_calls(db, audit, calls, project_id=project_id)
         await db.commit()
@@ -221,61 +220,13 @@ async def _held(
     return runs or 0, calls or 0
 
 
-async def _close_run(
-    db: AsyncSession,
-    bus: EventBus,
-    redactor: Redactor,
-    task_id: uuid.UUID,
-    run_id: uuid.UUID,
-    agent_id: str,
-) -> bool:
-    """The UPDATE of ``AgentRunWriter.finish`` for ``failed``/``interrupted``: usage never complete
-    (``incomplete_run_totals``), ``finished_at`` and ``duration_ms`` from the DB clock, ``output`` NULL; then
-    ``agent.run_finished`` in finish's envelope. False when the row is no longer ``running``."""
-    run_totals = incomplete_run_totals(await run_usage(db, run_id))
-    totals = run_totals.totals
-    cost = stored_cost(totals.estimated_cost) if totals.estimated_cost is not None else None
-    closed = await db.scalar(
-        update(AgentRun)
-        .where(AgentRun.id == run_id, AgentRun.status == "running")
-        .values(
-            status="failed",
-            error_code=_CODE,
-            error=ERROR_TEXTS[_CODE],
-            input_tokens=totals.input_tokens,
-            output_tokens=totals.output_tokens,
-            cache_read_tokens=run_totals.cache_read_tokens,
-            cache_creation_tokens=run_totals.cache_creation_tokens,
-            estimated_cost=cost,
-            cost_status=totals.cost_status,
-            finished_at=func.now(),
-            duration_ms=cast(
-                func.least(func.extract("epoch", func.now() - AgentRun.started_at) * 1000, _INT4_MAX), Integer
-            ),
-        )
-        .returning(AgentRun.id)
-        .execution_options(synchronize_session=False)
+async def _close_run(db: AsyncSession, bus: EventBus, redactor: Redactor, run_id: uuid.UUID) -> bool:
+    """``close_run_row`` for ``failed``/``interrupted``: usage never complete (``incomplete_run_totals``),
+    ``finished_at`` and ``duration_ms`` from the DB clock (clamped to int4: an orphan older than ±24.8 days
+    still closes), ``output`` and ``iterations`` left as the running row has them; then ``agent.run_finished``
+    in finish's envelope. False when the row is no longer ``running``."""
+    totals = incomplete_run_totals(await run_usage(db, run_id))
+    closed = await close_run_row(
+        db, bus, redactor, run_id, status="failed", error_code=_CODE, error=ERROR_TEXTS[_CODE], totals=totals
     )
-    if closed is None:
-        return False
-    usage = {
-        "input_tokens": totals.input_tokens,
-        "output_tokens": totals.output_tokens,
-        "estimated_cost": decimal_str(cost) if cost is not None else None,
-        "cost_status": totals.cost_status,
-    }
-    await emit_task_event(
-        db,
-        bus,
-        task_id,
-        "agent.run_finished",
-        {
-            "agent_run_id": str(run_id),
-            "agent_id": agent_id,
-            "status": "failed",
-            "error_code": _CODE,
-            "usage": usage,
-        },
-        redactor=redactor,
-    )
-    return True
+    return closed is not None

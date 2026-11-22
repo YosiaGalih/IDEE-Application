@@ -165,6 +165,7 @@ class FakeRuns:
         self.ids: list[uuid.UUID] = []  # the id of each start, as the caller sent it
         self.failed_runs: list[tuple[uuid.UUID, BudgetBreach | None]] = []
         self.fail_owners: list[tuple[uuid.UUID, str]] = []  # the (task_id, agent_id) each fail names
+        self.fail_tokens: list[uuid.UUID] = []  # the start token each fail carries
         self.retries: list[bool] = []  # the ``retry`` flag of each start
 
     async def start(self, run: RunStart, *, retry: bool) -> None:
@@ -182,10 +183,12 @@ class FakeRuns:
         *,
         task_id: uuid.UUID,
         agent_id: str,
+        start_token: uuid.UUID,
         breach: BudgetBreach | None = None,
     ) -> None:
         self.failed_runs.append((agent_run_id, breach))
         self.fail_owners.append((task_id, agent_id))
+        self.fail_tokens.append(start_token)
 
 
 class FakeEvents:

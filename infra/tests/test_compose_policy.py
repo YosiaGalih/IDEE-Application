@@ -288,6 +288,39 @@ class ComposePolicy(unittest.TestCase):
             if name != "api":
                 self.assertNotIn("FORWARDED_ALLOW_IPS", svc.get("environment", {}), name)
 
+    def test_one_backend_image_with_no_pricing_or_registry_override(self) -> None:
+        """Spec 3.2 §16.3a #8: every process runs one image, so one pricing table and one agent registry."""
+        built = {
+            name
+            for name, svc in self.services.items()
+            if str(svc.get("build", {}).get("dockerfile", "")).replace("\\", "/").endswith("backend/Dockerfile")
+        }
+        self.assertEqual(built, BACKEND)
+        self.assertEqual(len({self.services[name]["image"] for name in built}), 1, "one backend image string")
+        for name in built:
+            env = self.services[name].get("environment", {})
+            for var in ("PRICING_PATH", "AGENT_REGISTRY_PATH"):
+                self.assertNotIn(var, env, f"{name}: {var} would let this process read another table")
+            for volume in self.services[name].get("volumes", []):
+                target = volume["target"]
+                for baked in ("/app/config", "/app/agents"):
+                    self.assertFalse(
+                        target == baked or target.startswith(baked + "/"), f"{name}: {target} shadows the image"
+                    )
+
+    def test_backend_services_keep_the_image_working_dir_and_its_app_tree(self) -> None:
+        """Lead ruling R-F9 of 3.2c2a (AG-13 INFO-3): the default PRICING_PATH, ``config/pricing.yaml``, is relative
+        to the image's working directory, /app. So no backend service sets ``working_dir`` (another table would be
+        read), and no tmpfs is mounted at or under /app (it would hide the table or the registry baked there)."""
+        for name in BACKEND:
+            svc = self.services[name]
+            with self.subTest(service=name):
+                self.assertIsNone(svc.get("working_dir"), f"{name}: working_dir moves the relative pricing path")
+                targets = [str(entry).split(":", 1)[0] for entry in svc.get("tmpfs", [])]
+                targets += [v["target"] for v in svc.get("volumes", []) if v.get("type") == "tmpfs"]
+                for target in targets:
+                    self.assertFalse(target == "/app" or target.startswith("/app/"), f"{name}: tmpfs at {target}")
+
     def test_backend_image_trusts_no_proxy(self) -> None:
         """uvicorn trusts only FORWARDED_ALLOW_IPS (default 127.0.0.1); the image must not override it."""
         dockerfile = (ROOT / "backend" / "Dockerfile").read_text()
