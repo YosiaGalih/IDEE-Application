@@ -3265,3 +3265,103 @@ AG-13 PoC (scratchpad `ag13poc-3.2c1`):
 - **3.2f:** resume mempertahankan `completed_steps`; retry `failed → draft` me-reset langkah planning dan `planning_attempts` (R-T3k); putuskan apakah langkah yang selesai saat pause dicatat (R-T3g).
 - **3.2g:** approval `→ draft` menentukan reset-nya sendiri (R-T3k).
 - **Syarat 3.2a/3.2b/3.1f2b dan spec induk §9** tetap berlaku.
+
+**Sesudah PR #39 (fakta, 21 Nov 2026) [Pasti]:**
+- PR #39 (WP-3.2c1) mencapai 8/9 job CI di 02b7e80. security-scan merah karena CVE upstream di image caddy (Go stdlib 1.26.10 → 1.26.11) dan web (nginx 1.30.6 → 1.30.7). Kedua image itu tidak disentuh PR ini.
+- PO menandai PR #39 ready, lalu me-merge-nya pada 21 Nov 2026 23:03 UTC (a82006c).
+- **Utang terbuka:** security-scan `main` merah sampai base image caddy dan web dinaikkan. `nginxinc/nginx-unprivileged` belum menerbitkan 1.30.7 per 21 Nov, padahal image resmi `nginx:1.30.7-alpine` sudah ada. Keputusan base image web menunggu PO.
+
+### WP-3.2c2a (🔒 integritas RunStore) — token start per run, satu penutup baris `agent_runs`, registry di worker, tarif seragam (sub-WP keempat WP-3.2; §9 baris 3/12/16; AG-13 3.2c1 I7; AG-13 3.1f2b1 delta-2 LOW-1)
+
+**Dokumen kerja:**
+- Spec induk §16: pemecahan 3.2c2 menjadi a/b/c, konflik N20–N37, Keputusan Lead #47–#72, rancangan rinci §16.3, dan builder check §16.3a.
+- Plan `docs/superpowers/plans/2026-11-21-wp-3.2c2a-runstore-integrity.md` (5 task).
+
+**Cara dikerjakan:** subagent-driven-development, dengan implementer dan review per task. Kelima task lolos tanpa putaran perbaikan. Review akhir datang dari lima kursi:
+- kk-backend-reviewer: APPROVE;
+- kk-silent-failure-hunter: approve with conditions (1 Medium);
+- AG-13: **SIGNED OFF 🔒** dengan syarat;
+- `/code-review` Standards dan Spec.
+
+Sesudahnya ada satu fix wave (FW1–FW8), re-review terlingkup (semua ADDRESSED, tanpa kerusakan baru), dan delta AG-13 (**SIGNED OFF (delta)**).
+
+Delta AG-13 dijalankan di DB terpisah `kodekantor_test_32b`, karena review akhir sebelumnya memakai satu DB bersama dan menghasilkan galat palsu. Hasilnya:
+- MEDIUM-1 (14 idiom guard) CLOSED: PoC `test_poc_guard_bypass.py` kini 14 failed, artinya semua idiom tertangkap.
+- LOW-1 (token None) CLOSED: PoC pengambilalihan dibalik.
+- FW1, FW2, dan FW7 CLOSED.
+- Test: 154 passed (guard, token, writer, smoke, tarif) dan 46 passed (recovery).
+- gitleaks/semgrep tidak terpasang di container ini, jadi tidak dijalankan. Scanner dijalankan CI sebelum merge.
+
+**Yang dibangun:**
+- **Token start** (`agent_runs.start_token`, migrasi 0013):
+  - `_Run.start_token` dibuat sekali per run, dan `RunStart.start_token` wajib.
+  - `AgentRunWriter.start(retry=True)` memeriksa identitas lebih dulu (task, agent, token; token None di sisi mana pun ditolak), baru status.
+  - `RunStore.fail(..., start_token)` hanya mengakhiri baris dengan tokennya sendiri, dengan `start_token IS NOT NULL` di WHERE.
+  - Token tidak pernah keluar dari DB.
+  - Hasilnya, jendela retry `start` dan pintu `fail` tertutup.
+- **Satu penutup baris** `app/services/agent_run_rows.py::close_run_row`:
+  - dipakai `finish`, `fail`, dan recovery;
+  - ditulis sesudah test karakterisasi kolom per kolom, tanpa perubahan perilaku kecuali clamp `INT4_MAX` yang kini seragam.
+  - Guard AST penulis `agent_runs` dikeraskan: kini menangkap 14 idiom jalan pintas (alias, `__table__`, query/bulk, tulisan atribut ORM, SQL mentah dengan schema atau kutip, string rakitan). Guard pemanggil `close_run_row` juga ada.
+  - `fail` yang tidak menutup baris apa pun mencatat log `agent_run_not_marked`, berisi id saja.
+- **Registry di worker** (`app/worker/registry.py`): `RegistryStep` memuatnya sekali saat start. Registry rusak membuat worker tidak start, dan log hanya mencatat tipe galat dan jumlah masalah.
+- **Tarif seragam:**
+  - `SmokeEnv.pricing` diinjeksi; job memakai `worker_pricing()`, sedangkan CLI memuat tabel sekali.
+  - Tabel yang belum dimuat, atau file non-UTF-8, menjadi check `pricing_verified` gagal dengan laporan tercatat, dan lock dilepas.
+  - Test kebijakan compose: satu image backend; tanpa `PRICING_PATH`/`AGENT_REGISTRY_PATH`; tanpa volume, tmpfs, atau `working_dir` yang menimpa `/app`.
+- **Log hanya tipe galat** di `task_recovery_failed` dan `startup_recovery_failed`.
+- **Isolasi test:** fixture conftest memulihkan app Celery aktif. Sebelumnya enam test gagal bila urutan file dibalik.
+- **Dokumen:**
+  - SECURITY_MODEL §13 (jendela retry ditutup);
+  - DATA_MODEL (`start_token` adalah nonce korelasi, bukan kredensial; penulis `agent_runs`);
+  - ARCHITECTURE §5.3/§6.1, CONFIGURATION, DEPLOYMENT, TEST_STRATEGY.
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ p32-pytest.sh -q -rw            # suite backend penuh @ 8b4a1c7 (head kode final)
+5810 passed in 580.33s            (tanpa warning)
+$ p32-pytest.sh -q tests/unit/test_celery_app.py tests/integration/test_worker_engine_jobs.py tests/integration/test_recovery.py
+86 passed                         (sebelum fixture: 6 failed)
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 0 errors · Contracts: 10 kept, 0 broken
+$ python3 -m unittest discover -s infra/tests
+Ran 114 tests … OK (skipped=1)
+```
+
+AG-13 PoC (scratchpad `ag13poc-3.2c2a`):
+- Probe jendela retry lama direproduksi di dfed5cb (baris B diakhiri A), lalu tertutup.
+- 20 ronde balapan retry dan start pertama: selalu tepat satu pemenang, dan yang kalah mendapat `AgentRunIdConflict`.
+- Mutan "`fail` tanpa token" tertangkap 3/3.
+- Token tidak muncul di stdout/stderr, `task_events`, `audit_events`, atau traceback.
+- Empat file registry jahat membuat worker keluar dengan rc=1 tanpa canary di output, dan tag YAML tidak dieksekusi.
+
+**Keputusan Lead selama eksekusi (ruling, dari ledger SDD):**
+- **R-A1:** sentinel `UNWRITTEN` mempertahankan JSON null milik `finish` vs SQL NULL milik `fail`/recovery.
+- **R-A2:** sebagian digantikan R-F7.
+- **R-A3:** docstring pra-token diperbaiki di Task 5.
+- **R-F6:** guard dikeraskan sekarang, tanpa backstop mapper event (fixture ORM menyisipkan baris).
+- **R-F7:** `RowOwner.start_token` wajib; `start` menolak token None.
+- **R-F8:** nama `start_token` dipertahankan, dengan penjelasan di DATA_MODEL.
+- **R-F9:** aturan compose diperluas; path tarif bawaan tetap relatif.
+
+**Ditunda (bukan blocker):**
+- guard belum melihat `session.delete(loaded_row)` (LOW), baris yang dioper ke helper di modul yang tidak mengimpor `AgentRun`, dan string yang dirakit saat runtime. Semuanya terdokumentasi di docstring guard;
+- guard pemanggil mengimpor helper privat dari modul test guard penulis;
+- `_closable_runs` masih memilih `agent_id` yang tidak terpakai;
+- smell Standards: `close_run_row` punya 12 parameter dengan flag `with_duration`; identitas run dikodekan dua kali (tuple `start` dan `RowOwner`); `registry.py` dan `pricing.py` berbentuk serupa (disengaja);
+- diagnosabilitas log yang hanya tipe galat (silent L4) dan `IndexError` pada `PricingError` kosong (L5, tidak terjangkau);
+- `pricing_version` masih string yang dideklarasikan, bukan hash isi (sudah ada sebelumnya).
+
+**Syarat yang dibawa:**
+- **3.2c2c (syarat sign-off AG-13):**
+  - INFO-2: `read_run_outcome` membaca id, task, dan agent tanpa token, jadi perlu diverifikasi bahwa `agent_run_id` baru per `run()`, atau token ditambahkan ke pembacaan;
+  - INFO-1: `finish` sebaiknya juga lewat `RowOwner` dengan token (pertahanan berlapis);
+  - test end-to-end positif retry ack hilang dengan token sama, sebagai bagian test `ScriptedProvider`;
+  - guard ditambah `session.delete`/`merge` atas baris yang dimuat, bila guard disentuh lagi.
+- **3.2c2c (invarian #11):** registry worker diinjeksi dari `app.worker`; agent baru gagal FK bila worker start sebelum api menyinkronkan `agent_profiles`.
+- **PR ini:** situs `exc_info` di luar cakupan disebut di PR: gateway, approval handlers, project delete/imports, `projects.py:432`, `core/errors.py:153`, workspace API, dan repo index.
+- **Sebelum 3.2c2c merge (syarat delta AG-13):** guard menangkap `session.delete`/`merge` atas baris yang dimuat, dan SQL mentah dengan spasi atau komentar di sekitar titik (`public . agent_runs`, `/* c */`). Bila murah, tambah `TRUNCATE`/`MERGE INTO`/`COPY`. Celah yang tidak dapat diputuskan secara statis (alias `__table__` lewat variabel, `__dict__`, helper di modul yang tidak mengimpor `AgentRun`, SQL rakitan runtime) dicatat sebagai batas; penjaganya review kode ditambah pemeriksaan owner dan token di SQL.
+- **Compose (delta AG-13, LOW):** aturan volume diperluas ke target `/app` dan `/app/app`, karena volume di sana menutupi tarif dan registry bawaan image.
+- **INFO (delta AG-13):** INSERT pertama dengan token None tidak ditolak; baris seperti itu hanya dapat ditutup recovery. Pertimbangkan migrasi NOT NULL sesudah baris lama habis.
+- **Syarat 3.2c1 untuk 3.2c2b** tetap: N19/N25 antrean (butuh PO), durasi job, L3, L6, `bound_transaction`, dan allowlist I2.
