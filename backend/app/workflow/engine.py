@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, NoReturn
 
@@ -24,6 +25,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
+from app.core.db import bound_transaction
 from app.core.events import EventBus, commit_and_publish, emit_task_event
 from app.core.logging import get_logger
 from app.models.tasks import Task
@@ -41,6 +43,9 @@ from app.workflow.states import Actor, TaskStatus, check_error_code, fail_task, 
 
 ACTOR = Actor("system", "engine")
 MAX_PLANNING_ATTEMPTS = 3
+# Spec §16.4 #76: a wall-clock bound on every engine transaction, over the server-side lock and statement
+# timeouts (a black-holed connection never answers either). Read at call time.
+ENGINE_WRITE_TIMEOUT_S = 15
 CLAIMABLE = frozenset({TaskStatus.DRAFT.value, TaskStatus.QUEUED.value})
 PIPELINE: Mapping[str, tuple[str, ...]] = {"draft": ("intake", "context", "plan"), "running": ("implement",)}
 # Spec §16.4 #75: where a step's result may move a task, per pipeline; narrower than states.ALLOWED. Never to
@@ -168,6 +173,17 @@ class TaskEngine:
     def __init__(self, ports: WorkflowPorts) -> None:
         self._ports = ports
 
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[AsyncSession]:
+        """A session whose first statement bounds lock and statement time, all within ENGINE_WRITE_TIMEOUT_S.
+
+        On expiry the body is cancelled and ``asyncio.timeout`` raises ``TimeoutError`` (an ``Exception``).
+        """
+        async with asyncio.timeout(ENGINE_WRITE_TIMEOUT_S):
+            async with self._ports.sessions() as db:
+                await bound_transaction(db)
+                yield db
+
     async def run(self, task_id: uuid.UUID) -> EngineOutcome:
         claim = await self._claim(task_id)
         outcome = EngineOutcome(claim.result)
@@ -209,7 +225,7 @@ class TaskEngine:
 
     async def _claim(self, task_id: uuid.UUID) -> _Claim:
         ports = self._ports
-        async with ports.sessions() as db:
+        async with self._transaction() as db:
             result = await claim_lease(
                 db, task_id, ports.worker_id, max_active=ports.max_active, claimable=CLAIMABLE
             )
@@ -244,7 +260,7 @@ class TaskEngine:
             stopped = await self._finish(task_id, status, step, result)
             if stopped is not None:
                 return stopped
-        async with self._ports.sessions() as db:
+        async with self._transaction() as db:
             await release_lease(db, task_id, self._ports.worker_id)
             await commit_and_publish(db, self._ports.bus)
         logger.warning("pipeline_exhausted", task_id=str(task_id), status=status)
@@ -269,7 +285,7 @@ class TaskEngine:
 
     async def _start(self, task_id: uuid.UUID, status: str, step: str) -> StepContext | None:
         ports = self._ports
-        async with ports.sessions() as db:
+        async with self._transaction() as db:
             task = await self._locked(db, task_id, status)
             if step not in ports.steps:
                 await self._fail(db, task, "step_unavailable", f"No step is registered as {step}")
@@ -328,7 +344,7 @@ class TaskEngine:
             attempt = time.monotonic()
             try:
                 async with asyncio.timeout(beat):
-                    async with self._ports.sessions() as db:
+                    async with self._transaction() as db:
                         await renew_lease(db, task_id, self._ports.worker_id)
                         await commit_and_publish(db, self._ports.bus)
             except LeaseLost:
@@ -345,7 +361,7 @@ class TaskEngine:
 
     async def _finish(self, task_id: uuid.UUID, status: str, step: str, result: StepResult) -> Stopped | None:
         ports = self._ports
-        async with ports.sessions() as db:
+        async with self._transaction() as db:
             task = await self._locked(db, task_id, status)
             stopped: Stopped | None = None
             target = TaskStatus.INTERRUPTED if result.kind == "interrupt" else result.to
@@ -426,7 +442,7 @@ class TaskEngine:
     async def _release_after_error(self, task_id: uuid.UUID) -> None:
         """Best effort: a failed release is logged and the original error goes on."""
         try:
-            async with self._ports.sessions() as db:
+            async with self._transaction() as db:
                 await release_lease(db, task_id, self._ports.worker_id)
                 await commit_and_publish(db, self._ports.bus)
         except Exception as exc:

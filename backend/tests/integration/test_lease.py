@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from app.core.db import make_sessionmaker
+from app.core.db import bound_transaction, make_sessionmaker
 from app.core.security import hash_password
 from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task
-from app.workflow.lease import ClaimResult, LeaseLost, claim_lease, release_lease, renew_lease
+from app.workflow.lease import (
+    ClaimResult,
+    LeaseLost,
+    _is_lock_timeout,
+    claim_lease,
+    release_lease,
+    renew_lease,
+)
 from tests.conftest import reset_data
 
 
@@ -174,3 +183,32 @@ async def test_capacity_counts_draft_leases(engine: AsyncEngine, task_ids: list[
     await set_status(engine, task_ids[1], "draft")
     assert await claim_with(engine, task_ids[0], "w1", both, max_active=1) is ClaimResult.ACQUIRED
     assert await claim_with(engine, task_ids[1], "w2", both, max_active=1) is ClaimResult.AT_CAPACITY
+
+
+async def test_lock_timeout_on_the_claim_update_is_busy(
+    engine: AsyncEngine, task_ids: list[uuid.UUID]
+) -> None:
+    async with engine.connect() as holder:
+        await holder.execute(text("SELECT id FROM tasks WHERE id = :id FOR UPDATE"), {"id": task_ids[0]})
+        async with make_sessionmaker(engine)() as session:
+            await bound_transaction(session)  # as the engine does; the claim UPDATE inherits LOCK_TIMEOUT
+            await session.execute(select(func.set_config("lock_timeout", "200ms", True)))
+            started_at = time.monotonic()
+            result = await claim_lease(session, task_ids[0], "w1", max_active=2)
+            # The savepoint kept the caller's transaction usable.
+            assert await session.scalar(select(func.count()).select_from(Task)) == 3
+            await session.rollback()
+        await holder.rollback()
+    assert result is ClaimResult.BUSY
+    assert time.monotonic() - started_at < 3
+
+
+def test_is_lock_timeout_tells_55p03_from_a_statement_timeout() -> None:
+    def error(sqlstate: str, text_: str) -> DBAPIError:
+        orig = Exception(text_)
+        orig.sqlstate = sqlstate  # type: ignore[attr-defined]
+        return DBAPIError("SELECT 1", None, orig)
+
+    assert _is_lock_timeout(error("55P03", "x"))
+    assert not _is_lock_timeout(error("57014", "canceling statement due to statement timeout"))
+    assert not _is_lock_timeout(error("23505", "duplicate"))

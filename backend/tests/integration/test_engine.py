@@ -6,6 +6,7 @@ Fake steps, a real database, a small heartbeat.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -1246,3 +1247,156 @@ async def test_abandoned_running_task_is_left_to_recovery(engine: AsyncEngine, m
     assert swept.recovered == 1
     after = await row(engine, task_id)
     assert (after.status, after.status_reason, after.lease_owner) == ("interrupted", "lease_expired", None)
+
+
+# --- Task 3 (spec §16.4 #76): every engine transaction is bounded ---
+
+
+class SpySessions:
+    """The real sessionmaker; records the first statement each session executes."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._real = make_sessionmaker(engine)
+        self.first: list[str] = []
+
+    def __call__(self) -> Any:
+        session = self._real()
+        recorded = False
+
+        def wrap(name: str) -> None:
+            original = getattr(session, name)
+
+            async def spy(statement: Any, *args: Any, **kwargs: Any) -> Any:
+                nonlocal recorded
+                if not recorded:
+                    recorded = True
+                    compiled = statement.compile()
+                    self.first.append(f"{compiled} {sorted(map(str, compiled.params.values()))}")
+                return await original(statement, *args, **kwargs)
+
+            setattr(session, name, spy)
+
+        for name in ("execute", "scalar", "scalars"):
+            wrap(name)
+        return session
+
+
+@pytest.mark.parametrize("scenario", ["planned", "pipeline_end", "step_error"])
+async def test_every_engine_session_starts_with_bound_transaction(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    scenario: str,
+) -> None:
+    task_id = await make_task(
+        "draft", {"completed_steps": ["intake"]} if scenario == "pipeline_end" else None
+    )
+
+    async def slow(_: StepContext) -> StepResult:
+        await asyncio.sleep(0.35)  # several heartbeats of 0.1 s
+        if scenario == "step_error":
+            raise RuntimeError("step crashed")
+        return StepResult.done()
+
+    steps = Steps(intake=slow, plan=to_planned) if scenario == "planned" else Steps(context=slow)
+    spy = SpySessions(engine)
+    task_engine = make_engine(engine, RecordingBus(), steps.registry(*PLANNING), sessions=spy)
+    if scenario == "step_error":
+        with pytest.raises(RuntimeError, match="step crashed"):
+            await task_engine.run(task_id)
+    else:
+        await task_engine.run(task_id)
+
+    # claim, start/finish pairs, heartbeats and the release: at least 1 + 2 * steps sessions each way.
+    assert len(spy.first) >= 5
+    for first in spy.first:
+        assert first.startswith("SELECT set_config(") and first.count("set_config(") == 2, first
+        assert "'lock_timeout'" in first and "'statement_timeout'" in first, first
+    if scenario == "planned":
+        assert (await row(engine, task_id)).status == "planned"
+
+
+async def test_lock_timeout_on_the_claim_is_busy(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.core.db as db_module
+
+    monkeypatch.setattr(db_module, "LOCK_TIMEOUT", "200ms")
+    task_id = await make_task("queued", lease_owner="dead", lease_seconds=-5)
+    before = await row(engine, task_id)
+    steps = Steps()
+    async with engine.connect() as holder:
+        await holder.execute(text("SELECT id FROM tasks WHERE id = :id FOR UPDATE"), {"id": task_id})
+        started_at = time.monotonic()
+        outcome = await asyncio.wait_for(
+            make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id), timeout=10
+        )
+        elapsed = time.monotonic() - started_at
+        await holder.rollback()
+
+    assert outcome == EngineOutcome(ClaimResult.BUSY, [], None)
+    assert elapsed < 3
+    assert steps.names == []
+    assert await row(engine, task_id) == before
+
+
+class StalledSession:
+    """A session on a black-holed connection: every statement waits on something that never happens."""
+
+    async def __aenter__(self) -> StalledSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def execute(self, *_: Any, **__: Any) -> Any:
+        await asyncio.Event().wait()
+
+    scalar = scalars = rollback = commit = execute
+
+
+class StallingSessions:
+    """The real sessionmaker until armed; then every new session stalls."""
+
+    def __init__(self, engine: AsyncEngine, *, armed: bool) -> None:
+        self._real = make_sessionmaker(engine)
+        self.armed = armed
+
+    def __call__(self) -> Any:
+        return StalledSession() if self.armed else self._real()
+
+
+@pytest.mark.parametrize("stall_at", ["claim", "mid_run"])
+async def test_a_black_holed_database_ends_the_run_within_the_bound(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+    stall_at: str,
+) -> None:
+    monkeypatch.setattr(engine_module, "ENGINE_WRITE_TIMEOUT_S", 1)
+    task_id = await make_task("draft")
+    sessions = StallingSessions(engine, armed=stall_at == "claim")
+
+    async def intake(_: StepContext) -> StepResult:
+        sessions.armed = True  # the connection goes dark while the step runs
+        await asyncio.sleep(0.2)
+        return StepResult.done()
+
+    steps = Steps(intake=intake)
+    task_engine = make_engine(engine, RecordingBus(), steps.registry(*PLANNING), sessions=sessions)
+    started_at = time.monotonic()
+    with capture_logs() as logs, pytest.raises(TimeoutError):
+        await asyncio.wait_for(task_engine.run(task_id), timeout=10)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed <= 2 * (1 + 2.5)
+    failed = [e for e in logs if e["event"] == "task_engine_failed"]
+    if stall_at == "mid_run":
+        assert [(e["task_id"], e["error_type"]) for e in failed] == [(str(task_id), "TimeoutError")]
+        assert [e["error_type"] for e in logs if e["event"] == "lease_release_failed"] == ["TimeoutError"]
+    else:
+        assert failed == []  # _claim sits outside run()'s try: the timeout simply propagates

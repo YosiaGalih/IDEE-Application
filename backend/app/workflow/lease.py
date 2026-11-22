@@ -38,6 +38,12 @@ _LOCK_NOT_AVAILABLE = "55P03"
 
 logger = get_logger(__name__)
 
+
+def _is_lock_timeout(exc: DBAPIError) -> bool:
+    """55P03 (lock_not_available). A statement timeout (57014) and every other error are not."""
+    return getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE or "lock timeout" in str(exc.orig)
+
+
 _DEFAULT_CLAIMABLE = frozenset({"queued"})
 
 
@@ -84,7 +90,7 @@ async def claim_lease(
             await db.execute(select(func.pg_advisory_xact_lock(func.hashtext(_CLAIM_LOCK))))
             await db.execute(select(func.set_config("lock_timeout", previous, True)))
     except DBAPIError as exc:
-        if getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE or "lock timeout" in str(exc.orig):
+        if _is_lock_timeout(exc):
             return ClaimResult.BUSY
         raise
 
@@ -95,20 +101,27 @@ async def claim_lease(
         .where(Task.lease_expires_at > now, Task.id != task_id)
         .scalar_subquery()
     )
-    claimed = (
-        await db.execute(
-            update(Task)
-            .where(
-                Task.id == task_id,
-                Task.status.in_(claimable),
-                or_(Task.lease_expires_at.is_(None), Task.lease_expires_at < now),
-                live_elsewhere < max_active,
-            )
-            .values(lease_owner=worker_id, lease_expires_at=now + _LEASE)
-            .returning(Task.id)
-            .execution_options(synchronize_session=False)
-        )
-    ).scalar_one_or_none()
+    try:
+        # A savepoint: a lock timeout on a row held elsewhere must not abort the caller's transaction.
+        async with db.begin_nested():
+            claimed = (
+                await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.status.in_(claimable),
+                        or_(Task.lease_expires_at.is_(None), Task.lease_expires_at < now),
+                        live_elsewhere < max_active,
+                    )
+                    .values(lease_owner=worker_id, lease_expires_at=now + _LEASE)
+                    .returning(Task.id)
+                    .execution_options(synchronize_session=False)
+                )
+            ).scalar_one_or_none()
+    except DBAPIError as exc:
+        if _is_lock_timeout(exc):
+            return ClaimResult.BUSY
+        raise
     if claimed is not None:
         return ClaimResult.ACQUIRED
 
