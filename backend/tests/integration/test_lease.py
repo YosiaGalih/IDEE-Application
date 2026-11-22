@@ -212,3 +212,5 @@ def test_is_lock_timeout_tells_55p03_from_a_statement_timeout() -> None:
     assert _is_lock_timeout(error("55P03", "x"))
     assert not _is_lock_timeout(error("57014", "canceling statement due to statement timeout"))
     assert not _is_lock_timeout(error("23505", "duplicate"))
+    # The message alone never makes a BUSY: only the sqlstate does (review L1).
+    assert not _is_lock_timeout(error("40001", "canceling statement due to lock timeout"))

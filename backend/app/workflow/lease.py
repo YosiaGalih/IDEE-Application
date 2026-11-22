@@ -45,7 +45,7 @@ logger = get_logger(__name__)
 
 def _is_lock_timeout(exc: DBAPIError) -> bool:
     """55P03 (lock_not_available). A statement timeout (57014) and every other error are not."""
-    return getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE or "lock timeout" in str(exc.orig)
+    return getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE
 
 
 _DEFAULT_CLAIMABLE = frozenset({"queued"})
@@ -55,7 +55,9 @@ class ClaimResult(StrEnum):
     ACQUIRED = "acquired"
     HELD = "held"  # another worker holds a live lease
     AT_CAPACITY = "at_capacity"  # MAX_ACTIVE_TASKS live leases elsewhere: retry later
-    BUSY = "busy"  # the claim lock was not available in time: retry later
+    # The claim lock was not available in time: retry later. The advisory lock (``pg_advisory_xact_lock``) may
+    # still be held after BUSY, so the caller must end its transaction (commit or rollback) promptly.
+    BUSY = "busy"
     NOT_CLAIMABLE = "not_claimable"  # not queued (finished, running, ...): nothing to do
     NOT_FOUND = "not_found"
 
