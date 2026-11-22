@@ -1,27 +1,34 @@
 """Only workflow/states.py may write tasks.status (CLAUDE.md #4, ARCHITECTURE §5.1).
 
-A static scan of app/: a module that imports the Task model must not assign ``.status`` or pass
-``status=`` to ``.values()``, and no module may contain raw SQL that updates tasks.status.
+A static scan of app/: a module that imports the Task model must not assign ``.status`` or pass ``status=`` to
+``.values()``, and no module may contain raw SQL that updates tasks.status.
 
 Second guard (#87, N60): outside ``TRANSITION_WRITERS`` no module may name ``transition`` or ``fail_task``
-(import from any module, re-export, alias, ``*`` import of an ``app.*`` module or a relative ``*``
-import, name or attribute use, a ``match`` class pattern keyword, or a lookup with a constant or
-concatenated name through ``getattr``, ``builtins.getattr``, an alias of it, ``__getattribute__`` or
-``inspect.getattr_static``), and
-outside ``MARKER_HOLDERS`` no module may hold a string constant with the whole word ``status_writer`` (the
-``kk.status_writer`` marker, however it is split: ``+``, f-string, ``%``, ``.format``, ``str.join``, SQL
-``||`` or ``concat_ws``) or the ``STATUS_WRITER*`` constants. ``kk.approval_status_writer`` is another name.
-``StepResult.transition`` is the result type's API and is exempt only when ``StepResult`` is bound once, by a
-plain ``from app.workflow.engine import StepResult``. The plain string ``"transition"`` (``kind``) is not
-flagged. The first guard also flags ``UPDATE [ONLY] [schema.]tasks [[AS] alias] SET ... status`` in any case
-or quoting, and ``table("tasks", ...)``.
+(import from any module, re-export, alias, ``*`` import of an ``app.*`` module or a relative ``*`` import,
+name or attribute use, a ``match`` class pattern keyword, or a lookup with a constant or concatenated name
+through ``getattr``, ``builtins.getattr``, an alias of it, ``__getattribute__`` or
+``inspect.getattr_static``), and outside ``MARKER_HOLDERS`` no module may hold a string constant with the
+whole word ``status_writer`` (the ``kk.status_writer`` marker, also when the whole word stays in one piece
+across ``+``, f-string, ``%``, ``.format``, ``str.join``, SQL ``||`` or ``concat_ws``) or the
+``STATUS_WRITER*`` constants. ``kk.approval_status_writer`` is another name. ``StepResult.transition`` is the
+result type's API and is exempt only when ``StepResult`` is bound once, by a plain ``from app.workflow.engine
+import StepResult``. The plain string ``"transition"`` (``kind``) is not flagged. The first guard also flags
+``UPDATE [ONLY] [schema.]tasks [[AS] alias] SET ... status`` (case-insensitive, plain or quoted names) and
+``table("tasks", ...)``.
 
-Limits that a static scan cannot decide (the import-linter contract N60 in 3.2c2 covers the rest):
-``getattr`` with a computed string, ``importlib``, ``operator.attrgetter``, ``vars()`` / ``__dict__`` (and
-``globals()`` / ``sys.modules`` lookups), a string built at run time (``%`` or ``.format`` of SQL, a name read
-from data); and the indirect writers, which reach ``transition`` through an allowlisted module:
-``project_tasks.cancel_open_tasks``, the ``tool_r3`` functions, ``recovery.recover_expired`` and
-``TaskEngine._fail``.
+Known gaps, open until the hardening owed before 3.2d (AG-13 3.2c2c1 delta LOW; spec §16.6): the marker in
+another letter case (PostgreSQL reads GUC names case-insensitively: ``'kk.Status_Writer'``) or split inside
+the word (``'kk.status' || '_writer'``, ``concat``, a ``%``/``.format``/``join`` of pieces); SQL with comments
+or spacing inside ``UPDATE``/``tasks``/``.``, a quoted alias, ``tasks *``, ``MERGE ... UPDATE SET`` and ``ON
+CONFLICT DO UPDATE SET``; a ``getattr`` alias bound by ``from builtins import getattr as g``, an annotated or
+walrus assignment, a tuple target or ``functools.partial``; ``operator.methodcaller`` and
+``inspect.getmembers``. The import-linter contract N60 sees imports only, never strings or SQL.
+
+Limits that a static scan cannot decide: ``getattr`` with a computed string, ``importlib``,
+``operator.attrgetter``, ``vars()`` / ``__dict__`` (and ``globals()`` / ``sys.modules`` lookups),
+a string built at run time (``%`` or ``.format`` of SQL, a name read from data); and the indirect writers,
+which reach ``transition`` through an allowlisted module: ``project_tasks.cancel_open_tasks``, the
+``tool_r3`` functions, ``recovery.recover_expired`` and ``TaskEngine._fail``.
 """
 
 from __future__ import annotations
