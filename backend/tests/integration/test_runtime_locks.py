@@ -211,6 +211,7 @@ async def test_ports_bound_their_statements(
     async def spy(db: AsyncSession, task: uuid.UUID, worker_id: str) -> None:
         seen["lock"] = await db.scalar(text("SELECT current_setting('lock_timeout')"))
         seen["statement"] = await db.scalar(text("SELECT current_setting('statement_timeout')"))
+        seen["idle"] = await db.scalar(text("SELECT current_setting('idle_in_transaction_session_timeout')"))
         await original(db, task, worker_id)
 
     module.renew_lease = spy  # type: ignore[assignment]
@@ -218,7 +219,7 @@ async def test_ports_bound_their_statements(
         await LeaseHeartbeat(sessions, WORKER_ID).beat(task_id)
     finally:
         module.renew_lease = original  # type: ignore[assignment]
-    assert seen == {"lock": "5s", "statement": "10s"}
+    assert seen == {"lock": "5s", "statement": "10s", "idle": "30s"}
 
 
 def _paid_attempt(scope: RunScope) -> tuple[UsageCallContext, AttemptRecord]:
@@ -278,6 +279,7 @@ async def test_the_ledger_bounds_its_statements(
     async def spy(db: AsyncSession, call: UsageCallContext) -> None:
         seen["lock"] = await db.scalar(text("SELECT current_setting('lock_timeout')"))
         seen["statement"] = await db.scalar(text("SELECT current_setting('statement_timeout')"))
+        seen["idle"] = await db.scalar(text("SELECT current_setting('idle_in_transaction_session_timeout')"))
         await original(db, call)
 
     usage_module._check_context = spy  # type: ignore[assignment]
@@ -285,7 +287,7 @@ async def test_the_ledger_bounds_its_statements(
         await UsageLedger(sessions, pricing).record(ctx, attempt)
     finally:
         usage_module._check_context = original  # type: ignore[assignment]
-    assert seen == {"lock": "5s", "statement": "10s"}
+    assert seen == {"lock": "5s", "statement": "10s", "idle": "30s"}
 
 
 async def test_the_runtime_heartbeat_renews_through_renew_lease_so_a_revoked_owner_is_refused(

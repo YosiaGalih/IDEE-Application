@@ -200,7 +200,9 @@ class LeaseGuard:
 
     1. Call ``hold`` first in the transaction: the renewal locks the task row until commit, which is what
        makes the writes after it safe against a takeover.
-    2. Only for short transactions: the row stays locked, and the heartbeat's renewal waits behind it.
+    2. Only for short transactions: the row stays locked, and the heartbeat's renewal waits behind it. The
+       server ends the session of a transaction that idles longer than ``IDLE_IN_TRANSACTION_TIMEOUT`` (30 s,
+       set by ``bound_transaction``), so a step that holds and then waits on non-database IO is cut off.
     3. The caller opens the transaction with ``bound_transaction`` (and its own wall-clock timeout); ``hold``
        sets no bound.
     4. ``hold`` does not advance the heartbeat's ``last_ok``: the heartbeat still renews on its own schedule.

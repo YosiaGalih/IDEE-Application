@@ -552,6 +552,33 @@ async def test_run_of_a_task_without_a_live_lease_is_interrupted(  # type: ignor
     assert audited == []  # Keputusan #6: a recovered run is not audited on its own
 
 
+async def test_run_recovery_locks_the_task_row_in_a_fully_bound_transaction(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task, profiles, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unit's first statement bounds lock, statement and idle-in-transaction time (spec §16.6.2 #86)."""
+    task_id = await make_task("running", DEAD)
+    await start_run(engine, task_id)
+    seen: list[dict[str, Any]] = []
+    original = run_recovery.lock_task_row
+
+    async def spy(db: Any, locked: uuid.UUID) -> Any:
+        settings = {}
+        for key, name in (
+            ("lock", "lock_timeout"),
+            ("statement", "statement_timeout"),
+            ("idle", "idle_in_transaction_session_timeout"),
+        ):
+            settings[key] = await db.scalar(text(f"SELECT current_setting('{name}')"))
+        seen.append(settings)
+        return await original(db, locked)
+
+    monkeypatch.setattr(run_recovery, "lock_task_row", spy)
+
+    await recover_runs(make_sessionmaker(engine), RecordingBus(engine), AUDIT)
+
+    assert seen == [{"lock": "5s", "statement": "10s", "idle": "30s"}]
+
+
 @pytest.mark.parametrize("rows", [2, 0], ids=["with-ledger-rows", "no-ledger-rows"])
 async def test_the_recovery_close_writes_this_row_and_this_event(  # type: ignore[no-untyped-def]
     engine: AsyncEngine, make_task, profiles, pricing: PricingTable, rows: int

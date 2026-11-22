@@ -1383,8 +1383,9 @@ async def test_every_engine_session_starts_with_bound_transaction(
     # claim, start/finish pairs, heartbeats and the release: at least 1 + 2 * steps sessions each way.
     assert len(spy.first) >= 5
     for first in spy.first:
-        assert first.startswith("SELECT set_config(") and first.count("set_config(") == 2, first
+        assert first.startswith("SELECT set_config(") and first.count("set_config(") == 3, first
         assert "'lock_timeout'" in first and "'statement_timeout'" in first, first
+        assert "'idle_in_transaction_session_timeout'" in first, first
     if scenario == "planned":
         assert (await row(engine, task_id)).status == "planned"
 
