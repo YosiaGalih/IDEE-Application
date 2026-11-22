@@ -93,6 +93,8 @@ async def _list_candidates(
                         and_(_waiting_dispatched(), _dispatched_at() >= now - timedelta(seconds=grace_s))
                     ),
                 )
+                # Only rows either count can see: finished task history is not scanned every sweep.
+                .where(or_(Task.lease_expires_at > now, Task.status.in_(_WAITING)))
             )
         ).one()
         capacity = max_active - live - in_flight

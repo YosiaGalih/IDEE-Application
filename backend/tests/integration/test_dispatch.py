@@ -285,6 +285,22 @@ async def test_in_flight_tasks_reduce_the_batch(engine: AsyncEngine, make_task) 
     assert result == DispatchResult(candidates=1, dispatched=1, failed=0, skipped=0)
 
 
+async def test_what_is_neither_live_nor_in_flight_takes_no_capacity(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """Review T6: a dead lease without dispatch.at, a recent dispatch already past the waiting statuses, and
+    finished history count for nothing; only the 3 orphans are left, so all 3 go out."""
+    recent = {"dispatch": {"at": at(timedelta(seconds=1))}}
+    await make_task("draft", lease_seconds=-5)  # never dispatched
+    await make_task("running", recent, lease_seconds=-5)  # dispatched recently, but no longer waiting
+    await make_task("completed", recent)
+    for age in (OLD * 3, OLD * 2, OLD):
+        await make_task("draft", {"dispatch": {"at": at(age)}})
+    dispatcher = RecordingDispatcher()
+
+    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=3)
+
+    assert result == DispatchResult(candidates=3, dispatched=3, failed=0, skipped=0)
+
+
 async def test_no_capacity_runs_no_candidate_query_and_sends_nothing(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
     await make_task("running", lease_seconds=60)
     await make_task("draft", {"dispatch": {"at": at(OLD)}})
