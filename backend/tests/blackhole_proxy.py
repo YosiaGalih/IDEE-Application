@@ -39,6 +39,8 @@ class BlackHole:
         self._armed = True
 
     def release(self) -> None:
+        """Let traffic flow again for good: disarmed too, or the next client chunk would refreeze it."""
+        self._armed = False
         self._flowing.set()
 
     async def close(self) -> None:

@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.engine import Row
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
@@ -692,6 +693,9 @@ async def test_heartbeat_gives_up_before_the_lease_runs_out(
     assert cancelled == [True]
     failed = [e for e in logs if e["event"] == "lease_heartbeat_failed"]
     assert failed and {e["error_type"] for e in failed} == {"OSError" if how == "fails" else "TimeoutError"}
+    # The give-up names the failure that spent the margin, also when it fires at the top of the loop.
+    gave_up = [e for e in logs if e["event"] == "lease_heartbeat_gave_up"]
+    assert [e["error_type"] for e in gave_up] == ["OSError" if how == "fails" else "TimeoutError"]
     after = await row(engine, task_id)
     assert (after.status, after.current_step, after.lease_owner) == ("draft", "intake", WORKER)
     assert "completed_steps" not in after.checkpoint  # nothing more written
@@ -1489,6 +1493,40 @@ async def test_lease_guard_hold_raises_lease_lost(
     async with make_sessionmaker(engine)() as db:
         with pytest.raises(LeaseLost):
             await guard.hold(db)
+
+
+async def test_lease_guard_hold_locks_the_row_until_the_caller_commits(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """Rule 1 of LeaseGuard: the writes after ``hold`` are safe because the row stays locked until commit."""
+    task_id = await claimed(engine, make_task)
+    lock = text("SELECT id FROM tasks WHERE id = :id FOR UPDATE NOWAIT")
+    async with make_sessionmaker(engine)() as db:
+        await LeaseGuard(task_id, WORKER).hold(db)
+        async with engine.connect() as other:
+            with pytest.raises(DBAPIError) as caught:
+                await other.execute(lock, {"id": task_id})
+            assert getattr(caught.value.orig, "sqlstate", None) == "55P03"
+        await db.commit()
+    async with engine.begin() as other:
+        assert (await other.execute(lock, {"id": task_id})).scalar_one() == task_id
+
+
+async def test_heartbeat_past_its_margin_gives_up_with_a_reason(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """No renewal failed, yet H already passed (the step began past its margin): the log says so plainly."""
+    task_id = await claimed(engine, make_task)
+    task_engine = make_engine(engine, RecordingBus(), {})
+    long_ago = asyncio.get_running_loop().time() - 3600
+    with capture_logs() as logs, pytest.raises(LeaseLost):
+        await task_engine._heartbeat(task_id, long_ago)  # pyright: ignore[reportPrivateUsage]
+    gave_up = [e for e in logs if e["event"] == "lease_heartbeat_gave_up"]
+    assert [(e["task_id"], e.get("reason"), "error_type" in e) for e in gave_up] == [
+        (str(task_id), "lease_margin_spent", False)
+    ]
 
 
 async def test_lease_guard_hides_the_owner_and_is_frozen() -> None:

@@ -263,9 +263,8 @@ class TaskEngine:
 
     async def _drive(self, task_id: uuid.UUID, status: str, todo: tuple[str, ...], ran: list[str]) -> Stopped:
         for step in todo:
-            renewed_at = (
-                asyncio.get_running_loop().time()
-            )  # before _start's renewal: the heartbeat's H errs early
+            # Before _start's renewal, so the heartbeat's H errs early.
+            renewed_at = asyncio.get_running_loop().time()
             context = await self._start(task_id, status, step)
             if context is None:
                 return "step_unavailable"
@@ -358,10 +357,11 @@ class TaskEngine:
         """
         loop = asyncio.get_running_loop()
         beat = self._ports.heartbeat_s
+        last_error: Exception | None = None  # the give-up names the failure that spent the margin
         while True:
             give_up_at = last_ok + lease_duration().total_seconds() - self._ports.lease_safety_s
             if give_up_at - loop.time() <= 0:
-                self._give_up(task_id, None)
+                self._give_up(task_id, last_error)
             await asyncio.sleep(min(beat, give_up_at - loop.time()))
             attempt = loop.time()
             bound = min(attempt + beat, give_up_at, attempt + ENGINE_WRITE_TIMEOUT_S)
@@ -377,15 +377,15 @@ class TaskEngine:
                 if loop.time() >= give_up_at or (bounded.expired() and bound >= give_up_at):
                     self._give_up(task_id, exc)
                 logger.warning("lease_heartbeat_failed", task_id=str(task_id), error_type=type(exc).__name__)
+                last_error = exc
             else:
                 last_ok = attempt
+                last_error = None
 
     def _give_up(self, task_id: uuid.UUID, cause: Exception | None) -> NoReturn:
-        logger.warning(
-            "lease_heartbeat_gave_up",
-            task_id=str(task_id),
-            error_type=type(cause).__name__ if cause else "LeaseMarginSpent",
-        )
+        """``cause`` is None only when no renewal failed before H passed (the step began past its margin)."""
+        why = {"error_type": type(cause).__name__} if cause else {"reason": "lease_margin_spent"}
+        logger.warning("lease_heartbeat_gave_up", task_id=str(task_id), **why)
         raise LeaseLost(f"the lease of task {task_id} could not be renewed in time") from cause
 
     async def _finish(self, task_id: uuid.UUID, status: str, step: str, result: StepResult) -> Stopped | None:
