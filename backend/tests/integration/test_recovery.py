@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from app.agents.runtime import ERROR_TEXTS, RunEnd, RunStart
 from app.core.audit import AuditWriter
@@ -120,6 +121,20 @@ async def test_expired_lease_marks_interrupted(engine: AsyncEngine, make_task) -
             )
         ).all()
     assert actors == ["recovery"]
+
+
+async def test_task_recovered_is_logged_with_the_expiry_and_never_the_lease_owner(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine, make_task
+) -> None:
+    """AG-13 INFO-3: the trail names the task and when its lease ran out, not the owner (``w-old``)."""
+    task_id = await make_task("running", "-5 seconds")
+    with capture_logs() as logs:
+        await recover_expired(make_sessionmaker(engine), Recorder(), AUDIT)
+    [recovered] = [e for e in logs if e["event"] == "task_recovered"]
+    assert (recovered["task_id"], recovered["to"]) == (str(task_id), "interrupted")
+    assert recovered["lease_expired_at"] is not None
+    assert "w-old" not in repr(logs)
+    assert "lease_owner" not in recovered
 
 
 async def test_cancel_requested_becomes_cancelled(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
@@ -998,8 +1013,6 @@ async def test_a_busy_task_is_skipped_reported_and_recovered_later(  # type: ign
 ) -> None:
     """Silent M1: a task row another transaction holds is skipped, counted and logged, never hidden behind a
     healthy-looking idle sweep. A skip does not fail the sweep; the next one closes the run."""
-    from structlog.testing import capture_logs
-
     task_id = await make_task("running", DEAD)
     run_id = await start_run(engine, task_id)
     sessions = make_sessionmaker(engine)
@@ -1026,8 +1039,6 @@ async def test_held_run_and_tool_call_rows_are_skipped_and_reported(  # type: ig
 ) -> None:
     """Silent M1: inside a task, a candidate run or tool call row that ``SKIP LOCKED`` passed over is counted
     as skipped (and logged with the task); the rows it could lock are still closed."""
-    from structlog.testing import capture_logs
-
     task_id = await make_task("running", DEAD)
     held_run, free_run = await start_run(engine, task_id), await start_run(engine, task_id)
     held_call = await running_call(engine, task_id, None)

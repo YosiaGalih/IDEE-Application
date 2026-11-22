@@ -129,7 +129,7 @@ async def _recover_one(
         if task is None:  # another sweep has it, or the worker renewed in time
             return False
         cancel = task.cancel_requested
-        lease_owner, lease_expired_at = task.lease_owner, task.lease_expires_at
+        lease_expired_at = task.lease_expires_at
         target = TaskStatus.CANCELLED if cancel else TaskStatus.INTERRUPTED
         await transition(
             db,
@@ -146,12 +146,11 @@ async def _recover_one(
             .execution_options(synchronize_session=False)
         )
         await commit_and_publish(db, bus)
-        # Which worker vanished, and when: the trail an operator needs after a crash.
+        # When the lease ran out: the trail an operator needs after a crash (ids only, never the owner).
         logger.info(
             "task_recovered",
             task_id=str(task_id),
             to=target.value,
-            lease_owner=lease_owner,
             lease_expired_at=lease_expired_at.isoformat() if lease_expired_at else None,
         )
         return True

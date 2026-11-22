@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from structlog.testing import capture_logs
 
 from app.core.db import bound_transaction, make_sessionmaker
 from app.core.security import hash_password
@@ -255,3 +256,23 @@ async def test_a_revoked_owner_cannot_renew_and_its_lease_is_left_to_lapse(
         event.remove(engine.sync_engine, "before_cursor_execute", count)
     assert await expiry(task_ids[0]) == before
     assert len(updates) == 1
+
+
+async def test_the_lease_messages_and_logs_carry_the_task_id_and_never_the_owner(
+    engine: AsyncEngine, task_ids: list[uuid.UUID]
+) -> None:
+    """AG-13 INFO-3: the owner is not logged and not copied into an exception text (the runtime copies
+    ``str(LeaseLost)`` into its own error)."""
+    owner, intruder = "w-owner-secret", "w-intruder-secret"
+    await claim(engine, task_ids[0], owner)
+    with capture_logs() as logs:
+        async with make_sessionmaker(engine)() as session:
+            with pytest.raises(LeaseLost) as caught:
+                await renew_lease(session, task_ids[0], intruder)
+            assert await release_lease(session, task_ids[0], intruder) is False
+            await session.rollback()
+    assert str(task_ids[0]) in str(caught.value)
+    assert intruder not in str(caught.value)
+    released = [e for e in logs if e["event"] == "lease_release_not_owner"]
+    assert [e["task_id"] for e in released] == [str(task_ids[0])]
+    assert intruder not in repr(logs) and owner not in repr(logs)

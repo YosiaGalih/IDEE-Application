@@ -14,8 +14,12 @@ Contract for the job that runs a task (WP-3.x):
   task from then on.
 - ``revoke_lease_owner`` makes every later ``renew_lease`` of that owner, in this process, raise
   ``LeaseLost`` without SQL (spec §16.6.2 #84). The engine revokes its delivery's owner when a step hangs in
-  its cleanup past the grace, or when its heartbeat gives up; ``claim_lease`` and ``release_lease`` are not
-  gated.
+  its cleanup past the grace, or when its heartbeat gives up. A renewal already past the gate can still land
+  up to the lock/statement timeout later (on the engine path at most ``ENGINE_WRITE_TIMEOUT_S``, 15 s), so a
+  lease ends at most revocation + 15 s + ``LEASE_SECONDS``.
+- ``claim_lease`` returns ``HELD`` for a revoked owner, without SQL: an owner is unique per delivery and the
+  engine claims before it ever revokes, so a legitimate claim never meets a revoked owner. ``release_lease``
+  is not gated (it frees only a lease the owner still holds).
 """
 
 from __future__ import annotations
@@ -91,8 +95,9 @@ def revoke_lease_owner(owner: str) -> None:
       delivery), and its owner is unique to the delivery (#80), so a revoked owner never serves a later one;
     - it grows by one entry per revocation, which is accepted (an overrun or a give-up is rare, and a child
       is recycled);
-    - a renewal already sent to the database before the revocation can still land; the lease then ends at
-      most one lease period (``LEASE_SECONDS``) after the revocation.
+    - a renewal already past this gate can still land, up to the lock/statement timeout later (on the engine
+      path at most ``ENGINE_WRITE_TIMEOUT_S``, 15 s); the lease then ends at most 15 s + one lease period
+      (``LEASE_SECONDS``) after the revocation.
 
     Tests clear the set with a fixture (``tests/conftest.py``).
     """
@@ -110,9 +115,12 @@ async def claim_lease(
 ) -> ClaimResult:
     """Take the lease of a task in a ``claimable`` status (default: queued).
 
-    Refused when another worker holds it or ``max_active`` leases are live elsewhere.
+    Refused when another worker holds it or ``max_active`` leases are live elsewhere, and for a revoked owner
+    (``HELD``, no SQL).
     """
     _check_worker(worker_id)
+    if worker_id in _REVOKED_OWNERS:
+        return ClaimResult.HELD
     try:
         async with db.begin_nested():
             previous = await db.scalar(select(func.current_setting("lock_timeout")))
@@ -187,7 +195,7 @@ async def renew_lease(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> N
         )
     ).scalar_one_or_none()
     if renewed is None:
-        raise LeaseLost(f"worker {worker_id} lost the lease of task {task_id}")
+        raise LeaseLost(f"the lease of task {task_id} was lost")
 
 
 @dataclass(frozen=True)
@@ -229,5 +237,5 @@ async def release_lease(db: AsyncSession, task_id: uuid.UUID, worker_id: str) ->
         )
     ).scalar_one_or_none()
     if released is None:
-        logger.warning("lease_release_not_owner", task_id=str(task_id), worker_id=worker_id)
+        logger.warning("lease_release_not_owner", task_id=str(task_id))
     return released is not None

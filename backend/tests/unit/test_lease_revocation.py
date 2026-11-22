@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from app.workflow.lease import LeaseLost, renew_lease, revoke_lease_owner
+from app.workflow.lease import ClaimResult, LeaseLost, claim_lease, renew_lease, revoke_lease_owner
 
 
 class NoSqlDb:
@@ -22,6 +22,27 @@ async def test_a_revoked_owner_is_refused_with_no_sql_and_no_owner_in_the_messag
     with pytest.raises(LeaseLost) as caught:
         await renew_lease(NoSqlDb(), uuid.uuid4(), "w-x")  # type: ignore[arg-type]
     assert "w-x" not in str(caught.value)
+
+
+class SpyDb:
+    """A session that records every attribute the code under test touches; a revoked owner touches none."""
+
+    def __init__(self) -> None:
+        self.touched: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.touched.append(name)
+        raise AssertionError(f"no database access for a revoked owner: {name}")
+
+
+async def test_a_revoked_owner_cannot_claim_and_no_statement_runs() -> None:
+    """AG-13 INFO-1b: a claim with a revoked owner is HELD before any SQL (an owner is unique per delivery,
+    and the engine claims before it revokes, so a legitimate claim never meets this)."""
+    revoke_lease_owner("w-claim")
+    db = SpyDb()
+    result = await claim_lease(db, uuid.uuid4(), "w-claim", max_active=5)  # type: ignore[arg-type]
+    assert result is ClaimResult.HELD
+    assert db.touched == []
 
 
 async def test_another_owner_still_reaches_the_database() -> None:
