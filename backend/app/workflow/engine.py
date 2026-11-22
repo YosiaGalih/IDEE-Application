@@ -107,6 +107,10 @@ class StepResult:
     reason: str | None = None
 
     def __post_init__(self) -> None:
+        if self.kind not in ("done", "fail", "transition", "interrupt"):
+            raise ValueError("kind must be done, fail, transition or interrupt")
+        if self.kind == "transition" and self.to is None:
+            raise ValueError("a transition needs a target status (to)")
         if self.kind == "fail":
             check_error_code(self.error_code, "error_code")
         elif self.kind == "interrupt":

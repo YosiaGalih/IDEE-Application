@@ -29,6 +29,14 @@ def test_a_direct_construction_is_checked_too() -> None:
         StepResult("interrupt")
 
 
+def test_an_unknown_kind_or_a_transition_without_a_target_is_refused() -> None:
+    """Task 1 review: an unknown kind passed through as no stop at all, so the pipeline went on silently."""
+    with pytest.raises(ValueError, match="kind"):
+        StepResult("skip")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="to"):
+        StepResult("transition")
+
+
 def test_good_codes_are_kept() -> None:
     assert StepResult.fail("intake_rejected", "m") == StepResult(
         "fail", error_code="intake_rejected", message="m"
