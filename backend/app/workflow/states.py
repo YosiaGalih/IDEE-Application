@@ -79,6 +79,18 @@ _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")  # snake_case, at most
 _ERROR_MESSAGE_LENGTH = 1000
 
 
+def check_error_code(value: str, what: str) -> None:
+    """Raise ``ValueError`` unless ``value`` fits ``tasks.error_code``: snake_case, 1-64 characters.
+
+    Every code that is stored or logged passes here (spec WP-3.2 §16.5a #6): a ``fail_task`` code, a step's
+    ``StepResult.fail``/``interrupt`` code and a ``StepAbandoned`` reason. ``what`` names the checked field in
+    the message; the value is never echoed, because it is stored and exposed or logged, so a secret must not
+    travel in the message too.
+    """
+    if not isinstance(value, str) or not _ERROR_CODE_PATTERN.fullmatch(value):
+        raise ValueError(f"{what} must be snake_case, 1-{_ERROR_CODE_LENGTH} characters")
+
+
 def _check_inputs(db: AsyncSession, task: Task, actor: Actor) -> None:
     """Refuse calls that could leave a status change without its audit row, or a lying local object."""
     if actor.type not in ACTOR_TYPES or not 1 <= len(actor.id) <= _ACTOR_ID_LENGTH:
@@ -201,9 +213,7 @@ async def fail_task(
     # Before any attribute read: an expired object would lazy-load (MissingGreenlet), not fail clearly.
     _check_not_expired(task)
     _check_inputs(db, task, actor)
-    if not _ERROR_CODE_PATTERN.fullmatch(error_code):
-        # The value is not echoed: it is stored and exposed, so a secret must not travel in the message too.
-        raise ValueError(f"error_code must be snake_case, 1-{_ERROR_CODE_LENGTH} characters")
+    check_error_code(error_code, "error_code")
     safe_message = audit.redactor.redact(message)[:_ERROR_MESSAGE_LENGTH]
     # Savepoint: if the transition is refused, the error columns are undone with it.
     async with db.begin_nested():

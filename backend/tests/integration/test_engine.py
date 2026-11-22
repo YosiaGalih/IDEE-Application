@@ -28,16 +28,19 @@ from app.models.projects import Project
 from app.models.tasks import Task
 from app.workflow import engine as engine_module
 from app.workflow import lease as lease_module
+from app.workflow.dispatch import redispatch_orphans
 from app.workflow.engine import (
     MAX_PLANNING_ATTEMPTS,
     EngineOutcome,
     Step,
+    StepAbandoned,
     StepContext,
     StepResult,
     TaskEngine,
     WorkflowPorts,
 )
-from app.workflow.lease import ClaimResult, LeaseLost
+from app.workflow.lease import LEASE_SECONDS, ClaimResult, LeaseLost
+from app.workflow.recovery import recover_expired
 from app.workflow.states import Actor, TaskStatus, transition
 from tests.conftest import reset_data
 from tests.runtime_fakes import RecordingBus
@@ -907,24 +910,200 @@ async def test_completed_steps_never_duplicates(engine: AsyncEngine, make_task) 
     assert (await row(engine, task_id)).checkpoint["completed_steps"] == ["intake", "context", "plan"]
 
 
-@pytest.mark.parametrize("how", ["transition", "fail"])
+def pipeline_of(status: str) -> tuple[str, tuple[str, ...]]:
+    """The status a task is created in, and the steps to register, for a delivery of ``status``'s pipeline."""
+    return ("draft", PLANNING) if status == "draft" else ("queued", ("implement",))
+
+
+async def requeue_directly(engine: AsyncEngine, task_id: uuid.UUID) -> None:
+    """Test setup: interrupted -> queued is 3.2f's edge, so the task is placed back as make_task places it."""
+    async with engine.begin() as conn:
+        await conn.execute(text("SELECT set_config('kk.status_writer', 'transition', true)"))
+        await conn.execute(text("UPDATE tasks SET status = 'queued' WHERE id = :id"), {"id": task_id})
+
+
+async def abandons(_: StepContext) -> StepResult:
+    raise StepAbandoned("provider_not_ready")
+
+
+class SentTasks:
+    """A dispatcher that records what the sweep hands over."""
+
+    def __init__(self) -> None:
+        self.sent: list[uuid.UUID] = []
+
+    async def enqueue_task(self, task_id: uuid.UUID) -> None:
+        self.sent.append(task_id)
+
+
+async def test_interrupt_leaves_the_step_undone_and_a_resume_runs_it_again(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """Spec §16.5: interrupt moves running -> interrupted without recording the step, so a resume runs it."""
+    task_id = await make_task("queued", {"user_set": ["title"]})
+
+    async def interrupts(_: StepContext) -> StepResult:
+        return StepResult.interrupt("validation_unavailable")
+
+    steps = Steps(implement=interrupts)
+    bus = RecordingBus(engine)
+    outcome = await make_engine(engine, bus, steps.registry("implement")).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "interrupted")
+    after = await row(engine, task_id)
+    assert (
+        after.status,
+        after.status_reason,
+        after.error_code,
+        after.lease_owner,
+        after.lease_expires_at,
+    ) == (
+        "interrupted",
+        "validation_unavailable",
+        None,
+        None,
+        None,
+    )
+    assert after.checkpoint == {"user_set": ["title"]}  # no completed_steps: the step's work is not done
+    assert await kinds(engine, task_id) == [
+        changed("queued", "running", None),
+        started("implement"),
+        finished("implement", "interrupted"),  # same savepoint as the status change, just before it
+        changed("running", "interrupted", "validation_unavailable"),
+    ]
+    assert bus.unseen == []
+
+    await requeue_directly(engine, task_id)
+    outcome = await make_engine(engine, RecordingBus(), steps.registry("implement")).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "interrupted")
+    assert steps.names == ["implement", "implement"]  # the resumed delivery ran the step again
+
+
+@pytest.mark.parametrize(
+    ("status", "kind", "target"),
+    [
+        ("draft", "interrupt", "interrupted"),  # interrupt is only for running
+        ("draft", "transition", "completed"),  # refused by the state machine too: never raised (#75)
+        ("draft", "transition", "failed"),  # the state machine allows it; failed only through fail()
+        ("running", "transition", "cancelled"),  # the state machine allows it; never a step's choice
+    ],
+)
+async def test_target_outside_the_pipeline_allowlist_fails_the_task(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    status: str,
+    kind: str,
+    target: str,
+) -> None:
+    """Spec §16.4 #75: a refused target is written honestly and terminally, with no raise that would spend a
+    planning attempt, and the step joins no completed_steps."""
+    created, registered = pipeline_of(status)
+    task_id = await make_task(created)
+    step = registered[0]
+
+    async def returns(_: StepContext) -> StepResult:
+        if kind == "interrupt":
+            return StepResult.interrupt("validation_unavailable")
+        return StepResult.transition(TaskStatus(target), "skip")
+
+    steps = Steps(**{step: returns})
+    bus = RecordingBus(engine)
+    with capture_logs() as logs:
+        outcome = await make_engine(engine, bus, steps.registry(*registered)).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, [step], "step_result_invalid")
+    assert steps.names == [step]  # the engine stops at the refused result
+    after = await row(engine, task_id)
+    assert (
+        after.status,
+        after.status_reason,
+        after.error_code,
+        after.lease_owner,
+        after.lease_expires_at,
+    ) == (
+        "failed",
+        "step_result_invalid",
+        "step_result_invalid",
+        None,
+        None,
+    )
+    assert step in after.error_message and target in after.error_message
+    assert "completed_steps" not in after.checkpoint
+    assert (await kinds(engine, task_id))[-3:] == [
+        started(step),
+        finished(step, "failed"),
+        changed(status, "failed", "step_result_invalid"),
+    ]
+    assert bus.unseen == []
+    invalid = [e for e in logs if e["event"] == "step_result_invalid"]
+    assert [(e["log_level"], e["task_id"], e["step"], e["kind"], e["target"]) for e in invalid] == [
+        ("error", str(task_id), step, kind, target)
+    ]
+    assert [e for e in logs if e["event"] == "task_engine_failed"] == []
+
+
+@pytest.mark.parametrize("how", ["transition", "fail", "step_result_invalid"])
+async def test_refused_status_write_undoes_the_step_finish(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+    how: str,
+) -> None:
+    """Ruling R-T3f: the step's finish and its status write share one savepoint, so a refused write also
+    undoes the step_finished event and the completed_steps entry."""
+    task_id = await make_task("draft")
+
+    async def refused(*_: Any, **__: Any) -> None:
+        raise AppError("VERSION_CONFLICT", "The task changed meanwhile", http_status=409)
+
+    # A draft claim calls neither: it moves no status and only counts its attempt.
+    monkeypatch.setattr(engine_module, "transition" if how == "transition" else "fail_task", refused)
+
+    async def result(_: StepContext) -> StepResult:
+        if how == "transition":
+            return StepResult.transition(TaskStatus.PLANNED, "plan ready")  # allowed: done, then refused
+        if how == "fail":
+            return StepResult.fail("intake_rejected", "The request names no repository")
+        return StepResult.transition(TaskStatus.COMPLETED, "skip")
+
+    steps = Steps(intake=result)
+    bus = RecordingBus(engine)
+    with pytest.raises(AppError) as caught:
+        await make_engine(engine, bus, steps.registry(*PLANNING)).run(task_id)
+
+    assert caught.value.code == "VERSION_CONFLICT"
+    assert steps.names == ["intake"]
+    after = await row(engine, task_id)
+    # R-T3c: the error goes up, the lease is released, no status or error code is written.
+    assert (after.status, after.error_code, after.current_step, after.lease_owner) == (
+        "draft",
+        None,
+        "intake",
+        None,
+    )
+    assert "completed_steps" not in after.checkpoint
+    assert await kinds(engine, task_id) == [started("intake")]
+    assert [m["type"] for m in bus.messages] == ["task.step_started"]  # no step_finished was published
+
+
+@pytest.mark.parametrize("how", ["fail", "interrupt"])
 async def test_refused_result_leaves_no_step_finish(engine: AsyncEngine, make_task, how: str) -> None:  # type: ignore[no-untyped-def]
+    """Spec §16.5a #6: a code off the tasks.error_code pattern is refused when the step makes its result: a
+    bug of the step (R-T3c), so no status, event or checkpoint is written for it."""
     task_id = await make_task("draft")
 
     async def refused(_: StepContext) -> StepResult:
-        if how == "transition":
-            return StepResult.transition(TaskStatus.COMPLETED, "skip")  # draft -> completed is not allowed
-        return StepResult.fail("", "an empty error code is refused")
+        if how == "fail":
+            return StepResult.fail("", "an empty error code is refused")
+        return StepResult.interrupt("Validation unavailable")
 
     steps = Steps(intake=refused)
     bus = RecordingBus(engine)
-    with pytest.raises((AppError, ValueError)) as caught:
+    with pytest.raises(ValueError, match="error_code" if how == "fail" else "reason"):
         await make_engine(engine, bus, steps.registry(*PLANNING)).run(task_id)
 
-    if how == "transition":
-        assert isinstance(caught.value, AppError) and caught.value.code == "INVALID_TRANSITION"
-    else:
-        assert isinstance(caught.value, ValueError) and "error_code" in str(caught.value)
     assert steps.names == ["intake"]  # the engine stops: nothing after the refused step runs
     after = await row(engine, task_id)
     # R-T3c: the error goes up, the lease is released, no status or error code is written.
@@ -937,3 +1116,88 @@ async def test_refused_result_leaves_no_step_finish(engine: AsyncEngine, make_ta
     assert "completed_steps" not in after.checkpoint
     assert await kinds(engine, task_id) == [started("intake")]
     assert [m["type"] for m in bus.messages] == ["task.step_started"]  # no step_finished was published
+
+
+@pytest.mark.parametrize("status", ["draft", "running"])
+async def test_step_abandoned_writes_nothing_and_releases_the_lease(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    status: str,
+) -> None:
+    """Spec §16.5: a step that gives up raises StepAbandoned; the delivery returns (no raise to Celery), the
+    lease is released, and no status, event or checkpoint is written for the step."""
+    created, registered = pipeline_of(status)
+    task_id = await make_task(created)
+    step = registered[0]
+    steps = Steps(**{step: abandons})
+    bus = RecordingBus(engine)
+
+    with capture_logs() as logs:
+        outcome = await make_engine(engine, bus, steps.registry(*registered)).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, [step], "abandoned")
+    after = await row(engine, task_id)
+    assert (
+        after.status,
+        after.error_code,
+        after.current_step,
+        after.lease_owner,
+        after.lease_expires_at,
+    ) == (
+        status,
+        None,
+        step,
+        None,
+        None,
+    )
+    # Only the claim's own writes stay: a draft's planning attempt, a queued task's move to running.
+    assert after.checkpoint == ({"dispatch": {"planning_attempts": 1}} if status == "draft" else {})
+    claimed = [] if status == "draft" else [changed("queued", "running", None)]
+    assert await kinds(engine, task_id) == [*claimed, started(step)]
+    assert bus.unseen == []
+    abandoned = [e for e in logs if e["event"] == "step_abandoned"]
+    assert [(e["log_level"], e["task_id"], e["step"], e["reason"]) for e in abandoned] == [
+        ("warning", str(task_id), step, "provider_not_ready")
+    ]
+    assert [e for e in logs if e["event"] in ("task_engine_failed", "step_error_dropped")] == []
+    assert all("exc_info" not in e for e in logs)
+    assert other_tasks() == []  # the heartbeat stopped
+
+
+async def test_abandoned_draft_is_sent_again_and_counts_an_attempt(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """Spec §16.5: with its lease released, the dispatch sweep sends the draft again, and that delivery's
+    claim counts another planning attempt (a step that keeps giving up ends at planning_interrupted)."""
+    task_id = await make_task("draft", {"dispatch": DISPATCHED})
+    first = await make_engine(engine, RecordingBus(), Steps(intake=abandons).registry(*PLANNING)).run(task_id)
+    assert first.stopped == "abandoned"
+
+    dispatcher = SentTasks()
+    swept = await redispatch_orphans(make_sessionmaker(engine), dispatcher)
+
+    assert (swept.dispatched, dispatcher.sent) == (1, [task_id])
+    steps = Steps(plan=to_planned)
+    second = await make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id)
+    assert second == EngineOutcome(ClaimResult.ACQUIRED, list(PLANNING), "transitioned")  # intake runs again
+    dispatch = (await row(engine, task_id)).checkpoint["dispatch"]
+    assert (dispatch["count"], dispatch["planning_attempts"]) == (DISPATCHED["count"] + 1, 2)
+
+
+async def test_abandoned_running_task_is_left_to_recovery(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """N49 (spec §16.4 #79): a running task whose step gave up holds no lease; once the no-lease grace has
+    passed the recovery sweep moves it to interrupted lease_expired."""
+    task_id = await make_task("queued")
+    outcome = await make_engine(engine, RecordingBus(), Steps(implement=abandons).registry("implement")).run(
+        task_id
+    )
+    assert outcome.stopped == "abandoned"
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE tasks SET updated_at = now() - make_interval(secs => :s) WHERE id = :id"),
+            {"s": LEASE_SECONDS * 2, "id": task_id},
+        )
+
+    swept = await recover_expired(make_sessionmaker(engine), RecordingBus(), AUDIT)
+
+    assert swept.recovered == 1
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.lease_owner) == ("interrupted", "lease_expired", None)
