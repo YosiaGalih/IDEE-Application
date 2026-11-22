@@ -2,6 +2,18 @@
 
 A static scan of app/: a module that imports the Task model must not assign ``.status`` or pass
 ``status=`` to ``.values()``, and no module may contain raw SQL that updates tasks.status.
+
+Second guard (#87, N60): outside ``TRANSITION_WRITERS`` no module may name ``transition`` or ``fail_task``
+(import from any module, re-export, alias, ``*`` import of an ``app.*`` module, name or attribute use, or
+``getattr`` with a constant or concatenated name), and outside ``MARKER_HOLDERS`` no module may hold the
+``kk.status_writer`` marker (string, concatenation, f-string, or the ``STATUS_WRITER*`` constants). The plain
+string ``"transition"`` (``kind``) and ``StepResult.transition`` are not flagged.
+
+Limits that a static scan cannot decide (the import-linter contract N60 in 3.2c2 covers the rest):
+``getattr`` with a computed string, ``importlib``, ``operator.attrgetter``, ``vars()`` / ``__dict__``; and the
+indirect writers, which reach ``transition`` through an allowlisted module:
+``project_tasks.cancel_open_tasks``, the ``tool_r3`` functions, ``recovery.recover_expired`` and
+``TaskEngine._fail``.
 """
 
 from __future__ import annotations
@@ -12,6 +24,19 @@ from pathlib import Path
 
 APP = Path(__file__).resolve().parents[2] / "app"
 ALLOWED_WRITER = APP / "workflow" / "states.py"
+TRANSITION_WRITERS = frozenset(
+    {
+        "workflow/states.py",
+        "workflow/engine.py",
+        "workflow/recovery.py",
+        "services/project_tasks.py",
+        "services/tool_r3.py",
+    }
+)
+MARKER_HOLDERS = frozenset({"workflow/states.py", "models/tasks.py"})
+WRITER_NAMES = frozenset({"transition", "fail_task"})
+MARKER_NAMES = frozenset({"STATUS_WRITER_SETTING", "STATUS_WRITER"})
+MARKER_TEXT = "kk.status_writer"
 RAW_SQL = re.compile(r"update\s+tasks\s+set\b[^;]*\bstatus\b", re.IGNORECASE | re.DOTALL)
 
 
@@ -239,3 +264,148 @@ def test_only_states_module_names_the_writer_marker() -> None:
         and ("kk.status_writer" in path.read_text() or "STATUS_WRITER" in path.read_text())
     ]
     assert offenders == []
+
+
+def _steprecord_bound_plain(tree: ast.Module) -> bool:
+    """``from app.workflow.engine import StepResult`` without alias: ``StepResult.transition`` is its API."""
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "app.workflow.engine"
+        and any(a.name == "StepResult" and a.asname is None for a in node.names)
+        for node in ast.walk(tree)
+    )
+
+
+def writer_refs(source: str) -> list[str]:
+    """References to transition/fail_task (BC-18), by AST; plain strings such as "transition" are not."""
+    tree = ast.parse(source)
+    plain_step_result = _steprecord_bound_plain(tree)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.ImportFrom):
+            if any(a.name == "*" for a in node.names) and (node.module or "").startswith("app."):
+                found.append(f"line {line}: star import of {node.module}")
+            found += [f"line {line}: imports {a.name}" for a in node.names if a.name in WRITER_NAMES]
+        elif isinstance(node, ast.Name) and node.id in WRITER_NAMES:
+            found.append(f"line {line}: names {node.id}")
+        elif isinstance(node, ast.Attribute) and node.attr in WRITER_NAMES:
+            is_api = (
+                plain_step_result
+                and node.attr == "transition"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "StepResult"
+            )
+            if not is_api:
+                found.append(f"line {line}: attribute {node.attr}")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and _string_value(node.args[1]) in WRITER_NAMES
+        ):
+            found.append(f"line {line}: getattr of a writer")
+    return found
+
+
+def marker_refs(source: str) -> list[str]:
+    """The kk.status_writer marker, in any string form, or its constants (BC-18 #6)."""
+    tree = ast.parse(source)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    found: list[str] = []
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp):
+            value = _string_value(node) if isinstance(node, ast.expr) else None
+            if value is not None and MARKER_TEXT in value and not _inside_string_expression(node, parents):
+                found.append(f"line {line}: marker text")
+        elif isinstance(node, ast.Name) and node.id in MARKER_NAMES:
+            found.append(f"line {line}: names {node.id}")
+        elif isinstance(node, ast.Attribute) and node.attr in MARKER_NAMES:
+            found.append(f"line {line}: attribute {node.attr}")
+        elif isinstance(node, ast.ImportFrom):
+            found += [f"line {line}: imports {a.name}" for a in node.names if a.name in MARKER_NAMES]
+    return found
+
+
+def _rel(path: Path) -> str:
+    return path.relative_to(APP).as_posix()
+
+
+def test_only_listed_modules_name_transition_or_fail_task() -> None:
+    violations = {
+        _rel(path): hits
+        for path in APP.rglob("*.py")
+        if _rel(path) not in TRANSITION_WRITERS and (hits := writer_refs(path.read_text()))
+    }
+    assert violations == {}
+
+
+def test_transition_allowlist_is_exactly_the_modules_that_reference_it() -> None:
+    """Anti-bitrot: scanning without the allowlist finds exactly TRANSITION_WRITERS."""
+    hit = {_rel(path) for path in APP.rglob("*.py") if writer_refs(path.read_text())}
+    assert hit == TRANSITION_WRITERS
+
+
+def test_marker_is_held_only_by_its_holders() -> None:
+    violations = {
+        _rel(path): hits
+        for path in APP.rglob("*.py")
+        if _rel(path) not in MARKER_HOLDERS and (hits := marker_refs(path.read_text()))
+    }
+    assert violations == {}
+
+
+def test_marker_allowlist_is_exactly_the_modules_that_reference_it() -> None:
+    hit = {_rel(path) for path in APP.rglob("*.py") if marker_refs(path.read_text())}
+    assert hit == MARKER_HOLDERS
+
+
+WRITER_SAMPLES = [
+    "from app.workflow.states import transition\n",
+    "from app.workflow.states import transition as t\n",
+    "from app.workflow.engine import fail_task\n",
+    "from app.services.project_tasks import transition\n",
+    "from app.workflow.states import *\n",
+    "import app.workflow.states as s\n\ns.transition(1)\n",
+    "from app.workflow import states\n\nstates.fail_task(1)\n",
+    "import app.workflow.states\n\napp.workflow.states.transition(1)\n",
+    "getattr(states, 'transition')\n",
+    "getattr(states, 'trans' + 'ition')\n",
+    "from app.workflow.engine import StepResult as SR\n\nSR.transition(1, 'r')\n",
+]
+MARKER_SAMPLES = [
+    "X = 'kk.' + 'status_writer'\n",
+    "X = f'kk.status_writer{1}'\n",
+    "from app.models.tasks import STATUS_WRITER_SETTING\n",
+    "from app.models import tasks\n\ntasks.STATUS_WRITER\n",
+]
+CLEAN_SAMPLES = [
+    "from app.workflow.engine import StepResult\n\nStepResult.transition(TaskStatus.PLANNED, 'r')\n",
+    "kind = 'x'\nok = kind == 'transition'\n",
+    '"""Docs mention workflow.states.transition and fail_task."""\n',
+    "STATUS_WRITER_MODE = 'transition'\n",
+]
+
+
+def test_writer_guard_flags_every_known_idiom() -> None:
+    for source in WRITER_SAMPLES:
+        assert writer_refs(source), source
+
+
+def test_marker_guard_flags_every_known_idiom() -> None:
+    for source in MARKER_SAMPLES:
+        assert marker_refs(source), source
+
+
+def test_guards_do_not_flag_reads_and_docs() -> None:
+    for source in CLEAN_SAMPLES:
+        assert writer_refs(source) == [], source
+        assert marker_refs(source) == [], source
+
+
+def test_docstring_names_the_static_limits() -> None:
+    doc = __doc__ or ""
+    for limit in ("importlib", "operator.attrgetter", "__dict__", "cancel_open_tasks", "recover_expired"):
+        assert limit in doc
