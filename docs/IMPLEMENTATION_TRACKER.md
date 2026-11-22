@@ -3365,3 +3365,147 @@ AG-13 PoC (scratchpad `ag13poc-3.2c2a`):
 - **Compose (delta AG-13, LOW):** aturan volume diperluas ke target `/app` dan `/app/app`, karena volume di sana menutupi tarif dan registry bawaan image.
 - **INFO (delta AG-13):** INSERT pertama dengan token None tidak ditolak; baris seperti itu hanya dapat ditutup recovery. Pertimbangkan migrasi NOT NULL sesudah baris lama habis.
 - **Syarat 3.2c1 untuk 3.2c2b** tetap: N19/N25 antrean (butuh PO), durasi job, L3, L6, `bound_transaction`, dan allowlist I2.
+
+**Sesudah PR #40 (fakta, 22 Nov 2026) [Pasti]:**
+- PR #40 (WP-3.2c2a) mencapai 8/9 job CI. security-scan merah karena CVE di image upstream (web nginx/libxml2, postgres libxml2), yang tidak disentuh PR ini.
+- PO me-merge PR #40 pada 22 Nov 2026 06:31 UTC (ca80a39).
+- **Utang terbuka:** security-scan `main` masih merah, dan keputusan base image web masih menunggu PO.
+
+### WP-3.2c2b1 (🔒 pengerasan engine) — kontrak hasil langkah, owner lease per delivery, transaksi berbatas, margin heartbeat dan lease guard, batas durasi per delivery dengan batas pembersihan, dispatch sesuai kapasitas, celah guard `agent_runs` (sub-WP kelima WP-3.2; AG-13 3.2c1 L3/L4-batch/L6/I2, delta INFO-2)
+
+**Dokumen kerja:**
+- Spec induk:
+  - §16.4: pemecahan 3.2c2b, konflik N38–N49, Keputusan Lead #73–#81;
+  - §16.5: rancangan rinci;
+  - §16.5a: builder check, jawaban 1–12;
+  - §16.5b: ruling eksekusi R-B1–R-B6 dan tiga konflik internal spec.
+- Plan `docs/superpowers/plans/2026-11-22-wp-3.2c2b1-engine-hardening.md` (8 task).
+
+**Cara dikerjakan:** subagent-driven-development, dengan implementer dan review per task.
+- **Review per task:** kedelapan task di-Approve, dan temuan minor ditutup controller dengan commit lanjutan.
+- **Kerja paralel:**
+  - Task 7, yang hanya menyentuh test, dikerjakan di worktree terpisah lalu di-cherry-pick.
+  - Task 6 berjalan bersamaan dengan review Task 5. Akibatnya c7565b4 ter-commit saat `test_engine` masih punya 1 kegagalan dan 1 galat pyright: kwarg `max_active` yang baru diwajibkan belum dipakai di satu pemanggil. Diperbaiki di 25f1381; pelajarannya ada di ledger.
+- **Review akhir lima kursi:**
+  - kk-backend-reviewer: **APPROVE**, 5 Minor.
+  - kk-silent-failure-hunter: pass with follow-ups, 3 Medium dan 8 Low.
+  - AG-13: **SIGNED OFF WITH CONDITIONS 🔒**. Syarat C1 adalah batas waktu pembersihan sesudah cancel karena batas durasi; C2 diverifikasi di 3.2c2c.
+  - `/code-review` Standards: 1 pelanggaran keras, yaitu literal mirip secret di test.
+  - `/code-review` Spec: tidak ada requirement yang hilang atau salah; ada 3 konflik internal spec.
+- **Perbaikan dan putaran berikutnya:**
+  - Satu fix wave dikerjakan dua fixer paralel di file yang terpisah: E1–E7 (engine) dan L1–L4 (lease, dispatch, guard).
+  - Re-review terlingkup: **APPROVE**, semua temuan ADDRESSED.
+  - Delta AG-13: **SIGNED OFF WITH CONDITIONS (delta)**, C1 TERPENUHI.
+  - Gelombang kecil terakhir menutup INFO-D4/D5/D6.
+
+**Yang dibangun:**
+- **Kontrak hasil langkah** (`workflow/engine.py`):
+  - `StepResult.interrupt(reason)` dan exception publik `StepAbandoned(reason)`.
+  - `ALLOWED_STEP_TARGETS`: `draft` → `planned`/`needs_clarification`; `running` → `interrupted`. Pelanggaran membuat task `failed` `step_result_invalid` di savepoint `_finish`, tanpa raise.
+  - `check_error_code` (`states.py`) dijalankan saat hasil dibuat.
+  - `StepResult` menolak `kind` yang tidak dikenal, menolak `transition` tanpa `to`, dan mengubah `to` menjadi `TaskStatus`.
+  - Nilai yang bukan `StepResult` dibaca sebagai `foreign:<tipe>`, lalu menjadi `step_result_invalid`.
+- **Owner per delivery:** `delivery_owner()` = `worker_id():token_hex(4)`. Panjangnya ≤ `LEASE_OWNER_LENGTH` (120) berapa pun panjang hostname. Nilainya dibuat sekali per `execute_task`. Test L6 di tingkat engine: delivery kedua dalam satu proses memagari delivery pertama.
+- **Transaksi berbatas:**
+  - Ketujuh jenis transaksi engine lewat `_transaction()`, yaitu `asyncio.timeout(ENGINE_WRITE_TIMEOUT_S=15)` ditambah `bound_transaction` sebagai statement pertama.
+  - `UPDATE` claim di savepoint. Lock timeout (sqlstate `55P03` saja) → `BUSY`.
+  - PoC black hole asyncpg asli sebelum `_finish` menjadi test regresi.
+- **Heartbeat:**
+  - H = last_ok + lease − `lease_safety_s` (`LEASE_SAFETY_SECONDS=10`), di jam loop.
+  - Tiap percobaan dibatasi `timeout_at(min(attempt+beat, H, attempt+15))`, dan engine menyerah secara deterministik.
+  - Log menyerah memuat penyebab terakhir, atau `reason=lease_margin_spent`.
+  - Invarian diperiksa saat engine dibuat.
+  - `LeaseGuard(task_id, owner)` dengan `hold(db)` adalah field kelima `StepContext`, dengan empat aturan.
+- **Batas delivery:**
+  - `TASK_DELIVERY_MAX_MINUTES`: bawaan 60, maksimum 110. `create_celery` menolak nilai di atasnya dengan `ConfigError` tanpa menyebut nilainya.
+  - Status jujur: `running` → `interrupted duration_exceeded`, `draft` → `failed duration_exceeded`. Tenggat dicek sebelum dan sesudah `_start`.
+  - Cancel hanya sekali, dan heartbeat tetap hidup selama langkah membersihkan diri.
+  - **Batas pembersihan (C1):** `STEP_CLEANUP_GRACE_S` = 300. Sesudahnya hanya heartbeat yang dibatalkan, lease kedaluwarsa, recovery mengambil task, dan engine tidak menulis apa pun.
+  - Log: `task_delivery_limit`, `step_cleanup_overrun`, `step_cleanup_waiting` (sesudah 1 dtk), dan `step_result_dropped`.
+- **Dispatch sesuai kapasitas:** kapasitas = `max_active` − lease hidup − in flight, dihitung dalam satu statement yang hanya membaca baris hidup atau menunggu.
+  - Kapasitas 0: tanpa query kandidat. Bila ada task yatim, dicatat `task_dispatch_no_capacity` (warning). Bila kapasitas terpotong, `task_dispatch_capped`.
+  - `max_active` adalah kwarg wajib. `DispatchResult` tidak berubah.
+- **Guard penulis `agent_runs`** (test):
+  - SQL dinormalkan dengan lexer yang sadar literal: standar, E-string, dollar-quote, `U&`.
+  - Menangkap TRUNCATE/MERGE/COPY FROM, `delete`/`merge` atas baris yang dimuat, alias model, kelas DML, `local_table`/`persist_selectable`/`metadata.tables`, `' '.join`, dan `set_attribute`.
+- **Dokumen:**
+  - API §5: kode `step_result_invalid`, `duration_exceeded`, `step_unavailable`; `step_finished interrupted`; `StepAbandoned`; kelas N34.
+  - DATA_MODEL `error_code`.
+  - ARCHITECTURE §5.3, termasuk perbaikan teks `visibility_timeout` dan owner lease.
+  - SECURITY_MODEL §13, CONFIGURATION, `.env.example`, compose (satu baris env), TEST_STRATEGY §2.5, GLOSSARY, spec induk #8.
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ p32-pytest.sh -q -rw            # suite backend penuh @ bc7aab2 (sesudah fix wave)
+5908 passed in 611.53s            (tanpa warning)
+$ p32-pytest.sh -q -rw            # suite backend penuh @ fea61ce (head kode final)
+5910 passed in 583.42s            (tanpa warning)
+$ p32-pytest.sh -q tests/integration/test_engine.py   # 4× sesudah fea61ce
+86 passed (×4)
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 370 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
+$ python3 -m unittest discover -s infra/tests
+Ran 114 tests … OK
+```
+
+**Hasil PoC AG-13** (scratchpad `ag13poc-3.2c2b1`, `ag13poc-3.2c2b1-delta`):
+- **Black hole sebelum `_finish`** (`ENGINE_WRITE_TIMEOUT_S=2`): `run()` berakhir dengan `TimeoutError` 6,01 dtk sesudah freeze, dengan maupun tanpa pre-ping.
+- **Heartbeat black hole** (lease 6, beat 1, safety 3,5): sisa lease saat langkah dibatalkan +1,99 dtk, syaratnya ≥ 1,0.
+- **Langkah macet di pembersihan:**
+  - Sebelum C1: slot terpakai dan recovery tidak bisa masuk.
+  - Sesudah C1: lease kedaluwarsa ±2,3 dtk sesudah grace, recovery mengambil task, A tidak menulis apa pun, dan langkah dibatalkan sekali.
+- **Renewal yang sedang berjalan saat overrun** memperpanjang lease paling lama sampai overrun + lease. Ini masih di dalam margin.
+- **Guard:** 10 idiom PoC kini tertangkap. 6 idiom yang tercatat "belum" memang masih lolos, ditambah 4 idiom alias tabel (INFO-D5) yang kini tercatat.
+- **Scanner:**
+  - pip-audit (dependensi tidak berubah): No known vulnerabilities.
+  - `npm audit --omit=dev`: 0 vulnerabilities.
+  - semgrep offline (595 rules): tidak ada temuan keamanan baru.
+  - gitleaks dan trivy tidak terpasang di container. Gantinya grep pola secret atas baris tambahan, hasilnya 0. CI menjalankan kedua scanner itu.
+
+**Keputusan Lead selama eksekusi:** R-B1–R-B6 di spec induk §16.5b.
+- **R-B2:** C1 dikerjakan di WP ini, tidak dibawa.
+- **R-B3:** parameter black hole mengikuti §16.5a #1.
+- **R-B4:** `DispatchResult` tetap. Bukti kapasitas ditulis di log.
+- **R-B5:** `token_hex(4)`.
+- **R-B6:** lock timeout dikenali dari sqlstate saja.
+
+**Konflik internal spec** (kode mengikuti §16.5a; dilaporkan di #72):
+- #74 "tidak lebih kecil" vs maksimum 110 menit.
+- #77 vs §16.5a #5.
+- "keenam" transaksi vs tujuh.
+
+**Ditunda (bukan blocker):**
+- **Smell Standards:**
+  - `worker_id` vs owner: satu konsep dengan dua nama (Ports, `claim_lease`).
+  - `_stop_before_step` mirip bentuk `_finish`.
+  - Daftar `kind` ditulis berulang.
+  - Data clump timing (`heartbeat_s`/`lease_safety_s`/`delivery_limit_s`/`cleanup_grace_s`).
+  - `engine.py` berubah karena empat alasan.
+  - `type: ignore` berulang untuk fixture `make_task`.
+- **Dari silent-failure:**
+  - L4: nama langkah di log bila `_start` gagal.
+  - L5: heartbeat menganggap semua galat sementara.
+  - L6: `StepAbandoned` meninggalkan `step_started` tanpa `step_finished` (terdokumentasi).
+  - L8: timeout `_claim` dicatat oleh `run_task_failed`.
+- **Backend M3:** claim tanpa log `task_engine_failed`.
+- **Test bergantung waktu:** black hole dengan margin ±1 dtk; overrun dengan ±0,7 dtk.
+- **Re-review LOW:** `kind` StepResult yang rusak masih di-echo di log (hanya nilai).
+
+**Syarat yang dibawa:**
+- **3.2c2c (syarat AG-13 C2, diperluas delta):**
+  - `build_agent_runtime` memakai owner delivery yang sama.
+  - Adapter `AgentStep` meneruskan `CancelledError`.
+  - `LeaseGuard` langkah dicabut saat overrun, dibuktikan dengan test (delta LOW-D1).
+- **Sebelum 3.2c2c/3.2d mendaftarkan langkah:**
+  - INFO-1: guard statis untuk impor `transition`/`fail_task`.
+  - LOW-D2: cancel dari luar sesudah overrun ditahan sampai langkah selesai.
+  - LOW-D3: `idle_in_transaction_session_timeout` di `bound_transaction`, dengan test black hole.
+- **WP cancel:** INFO-2, engine membaca `cancel_requested`.
+- **Syarat 3.2c2a untuk 3.2c2c tetap berlaku:**
+  - INFO-2 `read_run_outcome`;
+  - INFO-1 `finish` lewat `RowOwner`;
+  - test e2e ack hilang;
+  - invarian #11;
+  - planning `provider_not_ready` → `fail`.
+- **3.2c2b2:** N25/N19 topologi antrean, yaitu sisi antrean L4 (butuh PO). Juga aturan volume `/app` dan N38/N44/N45/N46/N48.
