@@ -14,7 +14,6 @@ recovery sweep owns the task), and a status changed from outside only releases t
 from __future__ import annotations
 
 import asyncio
-import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -32,7 +31,9 @@ from app.models.tasks import Task
 from app.workflow.checkpoint import add_completed_step, count_planning_attempt
 from app.workflow.lease import (
     HEARTBEAT_SECONDS,
+    LEASE_SAFETY_SECONDS,
     ClaimResult,
+    LeaseGuard,
     LeaseLost,
     claim_lease,
     lease_duration,
@@ -78,6 +79,7 @@ class StepContext:
     project_id: uuid.UUID
     step: str
     checkpoint: Mapping[str, Any]
+    lease: LeaseGuard  # for a write of the step's own (§16.5a #8); read its rules before use
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ class WorkflowPorts:
     max_active: int
     steps: Mapping[str, Step]
     heartbeat_s: float = HEARTBEAT_SECONDS
+    lease_safety_s: float = LEASE_SAFETY_SECONDS
 
 
 @dataclass
@@ -171,6 +174,13 @@ class _StatusChanged(Exception):
 
 class TaskEngine:
     def __init__(self, ports: WorkflowPorts) -> None:
+        lease = lease_duration().total_seconds()
+        if not (
+            ports.heartbeat_s > 0
+            and ports.lease_safety_s > 0
+            and ports.heartbeat_s + ports.lease_safety_s < lease
+        ):
+            raise ValueError("heartbeat_s and lease_safety_s must be > 0 and sum to less than the lease")
         self._ports = ports
 
     @asynccontextmanager
@@ -253,7 +263,9 @@ class TaskEngine:
 
     async def _drive(self, task_id: uuid.UUID, status: str, todo: tuple[str, ...], ran: list[str]) -> Stopped:
         for step in todo:
-            renewed_at = time.monotonic()  # before _start's renewal, so the heartbeat deadline errs early
+            renewed_at = (
+                asyncio.get_running_loop().time()
+            )  # before _start's renewal: the heartbeat's H errs early
             context = await self._start(task_id, status, step)
             if context is None:
                 return "step_unavailable"
@@ -303,7 +315,9 @@ class TaskEngine:
             await emit_task_event(
                 db, None, task_id, "task.step_started", {"step": step}, redactor=ports.audit.redactor
             )
-            context = StepContext(task_id, task.project_id, step, task.checkpoint)
+            context = StepContext(
+                task_id, task.project_id, step, task.checkpoint, LeaseGuard(task_id, ports.worker_id)
+            )
             await commit_and_publish(db, ports.bus)
         return context
 
@@ -333,33 +347,46 @@ class TaskEngine:
         return work.result()
 
     async def _heartbeat(self, task_id: uuid.UUID, last_ok: float) -> NoReturn:
-        """Renew the lease every ``heartbeat_s`` (ruling R-T3h).
+        """Renew the lease every ``heartbeat_s``; give up ``lease_safety_s`` early (R-T3h, §16.5a #5).
 
-        A failed or hung renewal is retried until ``last_ok + lease - heartbeat_s``; past it, ``LeaseLost``.
-        No wait runs past that deadline, so the last try ends (``asyncio.timeout``) by ``last_ok + lease``.
-        ``last_ok`` is taken before its renewal, so the database lease cannot have run out before then.
+        ``H = last_ok + lease - lease_safety_s``, on the loop clock (``timeout_at`` reads it). Each try is
+        bound by ``min(attempt + beat, H, attempt + ENGINE_WRITE_TIMEOUT_S)``, so no wait runs past H. The
+        engine gives up (``LeaseLost``) when H has passed or when the timeout that fired was H itself, which
+        does not depend on a clock reading. ``last_ok`` is taken before its renewal, so the database lease
+        cannot have run out before ``last_ok + lease``; the safety also covers the close of a cancelled
+        connection (about 2 s).
         """
+        loop = asyncio.get_running_loop()
         beat = self._ports.heartbeat_s
         while True:
-            deadline = last_ok + lease_duration().total_seconds() - beat
-            await asyncio.sleep(min(beat, max(0.0, deadline - time.monotonic())))
-            attempt = time.monotonic()
+            give_up_at = last_ok + lease_duration().total_seconds() - self._ports.lease_safety_s
+            if give_up_at - loop.time() <= 0:
+                self._give_up(task_id, None)
+            await asyncio.sleep(min(beat, give_up_at - loop.time()))
+            attempt = loop.time()
+            bound = min(attempt + beat, give_up_at, attempt + ENGINE_WRITE_TIMEOUT_S)
+            bounded = asyncio.timeout_at(bound)
             try:
-                async with asyncio.timeout(beat):
+                async with bounded:
                     async with self._transaction() as db:
                         await renew_lease(db, task_id, self._ports.worker_id)
                         await commit_and_publish(db, self._ports.bus)
             except LeaseLost:
                 raise
             except Exception as exc:
-                if time.monotonic() >= deadline:
-                    logger.warning(
-                        "lease_heartbeat_gave_up", task_id=str(task_id), error_type=type(exc).__name__
-                    )
-                    raise LeaseLost(f"the lease of task {task_id} could not be renewed in time") from exc
+                if loop.time() >= give_up_at or (bounded.expired() and bound >= give_up_at):
+                    self._give_up(task_id, exc)
                 logger.warning("lease_heartbeat_failed", task_id=str(task_id), error_type=type(exc).__name__)
             else:
                 last_ok = attempt
+
+    def _give_up(self, task_id: uuid.UUID, cause: Exception | None) -> NoReturn:
+        logger.warning(
+            "lease_heartbeat_gave_up",
+            task_id=str(task_id),
+            error_type=type(cause).__name__ if cause else "LeaseMarginSpent",
+        )
+        raise LeaseLost(f"the lease of task {task_id} could not be renewed in time") from cause
 
     async def _finish(self, task_id: uuid.UUID, status: str, step: str, result: StepResult) -> Stopped | None:
         ports = self._ports

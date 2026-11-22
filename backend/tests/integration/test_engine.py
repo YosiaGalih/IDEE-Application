@@ -41,7 +41,14 @@ from app.workflow.engine import (
     TaskEngine,
     WorkflowPorts,
 )
-from app.workflow.lease import LEASE_SECONDS, ClaimResult, LeaseLost, claim_lease
+from app.workflow.lease import (
+    LEASE_SAFETY_SECONDS,
+    LEASE_SECONDS,
+    ClaimResult,
+    LeaseGuard,
+    LeaseLost,
+    claim_lease,
+)
 from app.workflow.recovery import recover_expired
 from app.workflow.states import Actor, TaskStatus, transition
 from tests.conftest import reset_data
@@ -160,6 +167,7 @@ def make_engine(
     worker: str = WORKER,
     max_active: int = 5,
     heartbeat_s: float = 0.1,
+    lease_safety_s: float = LEASE_SAFETY_SECONDS,
     sessions: Any = None,
 ) -> TaskEngine:
     return TaskEngine(
@@ -171,6 +179,7 @@ def make_engine(
             max_active=max_active,
             steps=steps,
             heartbeat_s=heartbeat_s,
+            lease_safety_s=lease_safety_s,
         )
     )
 
@@ -562,9 +571,9 @@ async def test_heartbeat_extends_lease_during_long_step(
         return StepResult.transition(TaskStatus.INTERRUPTED, "validation_unavailable")
 
     steps = Steps(implement=long_step)
-    outcome = await make_engine(engine, RecordingBus(), steps.registry("implement"), heartbeat_s=0.2).run(
-        task_id
-    )
+    outcome = await make_engine(
+        engine, RecordingBus(), steps.registry("implement"), heartbeat_s=0.2, lease_safety_s=0.5
+    ).run(task_id)
 
     assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "transitioned")
     (first, first_live, _), (last, last_live, owner) = samples
@@ -673,7 +682,9 @@ async def test_heartbeat_gives_up_before_the_lease_runs_out(
         return StepResult.done()
 
     steps = Steps(intake=long_step)
-    task_engine = make_engine(engine, RecordingBus(), steps.registry(*PLANNING), sessions=sessions)
+    task_engine = make_engine(
+        engine, RecordingBus(), steps.registry(*PLANNING), lease_safety_s=0.3, sessions=sessions
+    )
     with capture_logs() as logs:
         outcome = await asyncio.wait_for(task_engine.run(task_id), timeout=5)
 
@@ -909,9 +920,15 @@ async def test_heartbeat_give_up_is_logged(
         return StepResult.done()
 
     steps = Steps(intake=long_step)
-    # beat 0.5 of a 1 s lease: the first beat is the deadline, so no lease_heartbeat_failed line comes first.
+    # H = last_ok + 0.8: the first attempt starts at ~0.5 and is bound by H itself, so it gives up at once and
+    # no lease_heartbeat_failed line comes first.
     task_engine = make_engine(
-        engine, RecordingBus(), steps.registry(*PLANNING), heartbeat_s=0.5, sessions=sessions
+        engine,
+        RecordingBus(),
+        steps.registry(*PLANNING),
+        heartbeat_s=0.5,
+        lease_safety_s=0.2,
+        sessions=sessions,
     )
     with capture_logs() as logs:
         outcome = await asyncio.wait_for(task_engine.run(task_id), timeout=5)
@@ -1405,3 +1422,100 @@ async def test_a_black_holed_database_ends_the_run_within_the_bound(
         assert [e["error_type"] for e in logs if e["event"] == "lease_release_failed"] == ["TimeoutError"]
     else:
         assert failed == []  # _claim sits outside run()'s try: the timeout simply propagates
+
+
+@pytest.mark.parametrize(
+    ("beat", "safety"),
+    [(0, 10), (-1, 10), (20, 0), (20, -1), (50, 10), (60, 1), (40, 30)],
+    ids=[
+        "beat_zero",
+        "beat_negative",
+        "safety_zero",
+        "safety_negative",
+        "sum_equals_lease",
+        "beat_over_lease",
+        "sum_over_lease",
+    ],
+)
+async def test_engine_rejects_unusable_heartbeat_settings(
+    engine: AsyncEngine, beat: float, safety: float
+) -> None:
+    """Spec §16.5a #5: heartbeat_s > 0, lease_safety_s > 0 and heartbeat_s + lease_safety_s < lease."""
+    with pytest.raises(ValueError, match="heartbeat_s") as raised:
+        make_engine(engine, RecordingBus(), {}, heartbeat_s=beat, lease_safety_s=safety)
+    assert str(raised.value) == "heartbeat_s and lease_safety_s must be > 0 and sum to less than the lease"
+
+
+async def test_engine_accepts_the_production_heartbeat_settings(engine: AsyncEngine) -> None:
+    make_engine(engine, RecordingBus(), {}, heartbeat_s=20, lease_safety_s=10)
+    assert LEASE_SAFETY_SECONDS == 10
+
+
+async def claimed(engine: AsyncEngine, make_task) -> uuid.UUID:  # type: ignore[no-untyped-def]
+    task_id = await make_task("queued")
+    async with make_sessionmaker(engine)() as db:
+        assert await claim_lease(db, task_id, WORKER, max_active=5) is ClaimResult.ACQUIRED
+        await db.commit()
+    return task_id
+
+
+async def test_lease_guard_hold_extends_the_lease_in_the_callers_transaction(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    task_id = await claimed(engine, make_task)
+    before = (await row(engine, task_id)).lease_expires_at
+    async with make_sessionmaker(engine)() as db:
+        await LeaseGuard(task_id, WORKER).hold(db)
+        assert (await row(engine, task_id)).lease_expires_at == before  # not committed yet
+        await db.commit()
+    assert (await row(engine, task_id)).lease_expires_at > before
+
+
+@pytest.mark.parametrize("how", ["wrong_owner", "expired"])
+async def test_lease_guard_hold_raises_lease_lost(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    how: str,
+) -> None:
+    task_id = await claimed(engine, make_task)
+    if how == "expired":
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = :id"),
+                {"id": task_id},
+            )
+    guard = LeaseGuard(task_id, "w-other" if how == "wrong_owner" else WORKER)
+    async with make_sessionmaker(engine)() as db:
+        with pytest.raises(LeaseLost):
+            await guard.hold(db)
+
+
+async def test_lease_guard_hides_the_owner_and_is_frozen() -> None:
+    guard = LeaseGuard(uuid.uuid4(), "w-secret-owner")
+    assert "w-secret-owner" not in repr(guard)
+    with pytest.raises(AttributeError):
+        guard.task_id = uuid.uuid4()  # type: ignore[misc]
+
+
+async def test_a_step_receives_a_lease_guard_it_can_hold_in_its_own_session(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    task_id = await make_task("draft")
+    seen: list[Any] = []
+
+    async def holds(context: StepContext) -> StepResult:
+        before = (await row(engine, task_id)).lease_expires_at
+        async with make_sessionmaker(engine)() as db:
+            await context.lease.hold(db)
+            await db.commit()
+        seen.append((context.lease, (await row(engine, task_id)).lease_expires_at > before))
+        return StepResult.done()
+
+    steps = Steps(intake=holds)
+    await make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id)
+
+    ((guard, extended),) = seen
+    assert extended
+    assert (guard.task_id, guard.owner) == (task_id, WORKER)
