@@ -1304,7 +1304,12 @@ async def test_every_engine_session_starts_with_bound_transaction(
         with pytest.raises(RuntimeError, match="step crashed"):
             await task_engine.run(task_id)
     else:
-        await task_engine.run(task_id)
+        outcome = await task_engine.run(task_id)
+        if scenario == "pipeline_end":
+            assert outcome.stopped == "pipeline_exhausted"  # the end-of-_drive release session ran
+    if scenario != "planned":
+        # pipeline_end: the end-of-_drive release; step_error: _release_after_error. Both sessions ran.
+        assert ((await row(engine, task_id)).lease_owner) is None
 
     # claim, start/finish pairs, heartbeats and the release: at least 1 + 2 * steps sessions each way.
     assert len(spy.first) >= 5

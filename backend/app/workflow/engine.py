@@ -178,6 +178,8 @@ class TaskEngine:
         """A session whose first statement bounds lock and statement time, all within ENGINE_WRITE_TIMEOUT_S.
 
         On expiry the body is cancelled and ``asyncio.timeout`` raises ``TimeoutError`` (an ``Exception``).
+        A ``commit_and_publish`` in the body publishes inside the same bound (spec §16.5a #7, F28): a hung
+        publish ends the transaction like a hung statement.
         """
         async with asyncio.timeout(ENGINE_WRITE_TIMEOUT_S):
             async with self._ports.sessions() as db:
