@@ -183,6 +183,8 @@ async def sweep_dispatch(*, dispatcher: Dispatcher | None = None) -> DispatchRes
         if dispatcher is None:
             dispatcher = CeleryJobQueue(settings.redis_url)
         async with asyncio.timeout(DISPATCH_SWEEP_TIMEOUT_SECONDS):
-            return await redispatch_orphans(make_sessionmaker(engine), dispatcher)
+            return await redispatch_orphans(
+                make_sessionmaker(engine), dispatcher, max_active=settings.max_active_tasks
+            )
     finally:
         await engine.dispose()

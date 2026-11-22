@@ -332,3 +332,18 @@ def test_build_orchestrator_wires_the_ports() -> None:
     ports = engine._ports
     assert (ports.worker_id, ports.max_active, dict(ports.steps)) == ("w1", 5, {})
     assert (ports.delivery_limit_s, ports.lease_safety_s) == (45 * 60, LEASE_SAFETY_SECONDS)
+
+
+async def test_dispatch_sweep_forwards_max_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake(sessions: Any, dispatcher: Any, **kwargs: Any) -> DispatchResult:
+        seen.update(kwargs)
+        return DispatchResult(0, 0, 0, 0)
+
+    monkeypatch.setattr(jobs, "redispatch_orphans", fake)
+    Spy(monkeypatch)
+    await jobs.sweep_dispatch(dispatcher=FakeDispatcher())
+    from app.core.config import load_settings
+
+    assert seen == {"max_active": load_settings().max_active_tasks}
