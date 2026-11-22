@@ -19,13 +19,20 @@ through the ORM). Outside the two writers no module:
   such a value (``get(AgentRun, ...)``, ``select(AgentRun)``, ``scalars``, a loop over them); and, in a module
   that imports the model, assigns an attribute named like one of its columns, whatever the object;
 - calls ``delete``/``merge`` (``session.delete(row)``) on a row loaded from the model;
+- also: ``Insert``/``Update``/``Delete`` classes, ``__mapper__.local_table``/``persist_selectable`` and
+  ``metadata.tables['agent_runs']`` as the table, ``set_attribute``, a model bound to a local name
+  (``R = AgentRun; update(R)``);
 - holds raw SQL that writes ``agent_runs`` (INSERT INTO, UPDATE [ONLY], DELETE FROM [ONLY], TRUNCATE,
   MERGE INTO, COPY ... FROM), schema-qualified or quoted, with comments, line breaks or spaces around
-  ``.``, built by concatenation, f-string, ``.format`` or ``%``, the model's ``__tablename__`` reading as
+  ``.``, ``U&"..."`` escapes, built by concatenation, f-string, ``.format``, ``%`` or
+  ``" ".join([...])``, the model's ``__tablename__`` reading as
   ``agent_runs``.
 
-It reads what a module spells, not what runs: a loaded row handed to a helper in a module that never imports
-the model, or a string built at run time, is beyond it.
+The SQL scan is literal-aware for standard, E- and dollar-quoted literals (a comment marker inside one is not
+a comment). It reads what a module spells, not what runs. Out of scope: a loaded row handed to a helper in a
+module that never imports the model, a string built at run time (``join`` of a variable list, ``str.replace``,
+``bytes``), ``flag_modified`` and other ORM state APIs, a ``U&`` identifier with ``UESCAPE``, and a table
+reached through ``reflect``/``automap`` under a name the AST cannot spell.
 """
 
 from __future__ import annotations
@@ -49,7 +56,9 @@ MODULE = "app.models.agents"
 TABLE = AgentRun.__tablename__
 COLUMNS = frozenset(column.key for column in sa.inspect(AgentRun).column_attrs)
 WRITE_METHODS = {"insert", "update", "delete"}  # the functions of ``sqlalchemy`` and the Table methods
-WRITE_FUNCTIONS = WRITE_METHODS | {"pg_insert"}
+DML_CLASSES = {"Insert", "Update", "Delete"}  # ``sa.Update(AgentRun)`` builds the same statement
+WRITE_FUNCTIONS = WRITE_METHODS | DML_CLASSES | {"pg_insert"}
+TABLE_ATTRIBUTES = {"local_table", "persist_selectable"}  # ``Model.__mapper__.<attr>`` is the model's table
 TABLE_FUNCTIONS = {"table", "Table"}
 # Raw SQL is read after ``_normalise_sql``: no comments, one space between words, none around ``.``, no quotes
 # The table is bare or schema-qualified (``public.agent_runs``); ``\b`` keeps ``agent_runs_archive`` out.
@@ -62,16 +71,28 @@ RAW_SQL = tuple(
         rf"\bcopy\s+{_NAME}\s*(?:\([^)]*\)\s*)?from\b",
     )
 )
-# A literal or quoted name comes first, so ``--`` or ``/*`` inside one is not taken for a comment (review T7).
-_LEXEME = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|--[^\n]*|/\*.*?\*/", re.DOTALL)
+# A literal or quoted name comes first, so ``--`` or ``/*`` inside one is not taken for a comment (review T7):
+# E-strings (backslash escapes) and dollar-quoted strings before the plain ones (AG-13 LOW-2).
+_LEXEME = re.compile(
+    r"\b[eE]'(?:[^'\\]|\\.|'')*'|\$(\w*)\$.*?\$\1\$|'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|--[^\n]*|/\*.*?\*/",
+    re.DOTALL,
+)
+_UNICODE_IDENT = re.compile(r'\bU&"((?:[^"]|"")*)"', re.IGNORECASE)
+_UNICODE_ESCAPE = re.compile(r"\\(?:\+([0-9a-fA-F]{6})|([0-9a-fA-F]{4}))")
 _AROUND_DOT = re.compile(r"\s*\.\s*")
 _QUOTES = re.compile(r"[\"'`]")
+
+
+def _unescape_unicode(name: str) -> str:
+    """``U&"\\0061b"`` (the default escape character) reads as ``"ab"``."""
+    return _UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), name)
 
 
 def _normalise_sql(text: str) -> str:
     """The SQL as the matcher reads it: ``/*...*/`` and ``--...`` comments (each a space), whitespace
     collapsed, no space around ``.``, no quotes (``"``, ``'``, backtick)."""
     text = _LEXEME.sub(lambda m: " " if m.group().startswith(("--", "/*")) else m.group(), text)
+    text = _UNICODE_IDENT.sub(lambda m: f'"{_unescape_unicode(m.group(1))}"', text)
     return _QUOTES.sub("", _AROUND_DOT.sub(".", " ".join(text.split())))
 
 
@@ -107,17 +128,33 @@ def _write_functions(tree: ast.Module) -> set[str]:
     names = set(WRITE_FUNCTIONS)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "sqlalchemy":
-            names |= {a.asname or a.name for a in node.names if a.name in WRITE_METHODS}
+            names |= {a.asname or a.name for a in node.names if a.name in WRITE_METHODS | DML_CLASSES}
     return names
 
 
 def _is_model(node: ast.expr, classes: Set[str]) -> bool:
-    """The model or its ``__table__``: by a name it is imported as, a module attribute, or ``getattr`` with a
+    """The model or its table (``__table__``, ``__mapper__.local_table``/``persist_selectable``,
+    ``metadata.tables['agent_runs']``): by a name it is imported as, a module attribute, or ``getattr`` with a
     name the AST can spell (``getattr(m, "Agent" + "Run")``)."""
     if isinstance(node, ast.Name):
         return node.id in classes
     if isinstance(node, ast.Attribute):
-        return node.attr == MODEL or (node.attr == "__table__" and _is_model(node.value, classes))
+        return (
+            node.attr == MODEL
+            or (node.attr == "__table__" and _is_model(node.value, classes))
+            or (
+                node.attr in TABLE_ATTRIBUTES
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "__mapper__"
+                and _is_model(node.value.value, classes)
+            )
+        )
+    if isinstance(node, ast.Subscript):  # ``Model.metadata.tables['agent_runs']``
+        return (
+            isinstance(node.value, ast.Attribute)
+            and node.value.attr == "tables"
+            and _table_name(_string_value(node.slice, classes)) == TABLE
+        )
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -156,6 +193,17 @@ def _string_value(node: ast.expr, classes: Set[str] = frozenset({MODEL})) -> str
         template = _string_value(node.left, classes)
         if template is not None:
             return _percent(template, node.right, classes)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.List | ast.Tuple)
+    ):  # ``" ".join([...])``
+        sep = _string_value(node.func.value, classes)
+        parts = [_string_value(e, classes) for e in node.args[0].elts]
+        if sep is not None and None not in parts:
+            return sep.join(_hole(p) for p in parts)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
         template = _string_value(node.func.value, classes)
         if template is not None:
@@ -288,7 +336,7 @@ def run_writes(source: str) -> list[str]:
             args = [*node.args, *(k.value for k in node.keywords)]
             if _is_model(func, classes):
                 found.append(f"line {line}: builds {MODEL}(...)")
-            elif name in writers and node.args and _is_model(node.args[0], classes):
+            elif name in writers and node.args and _mentions(node.args[0], classes, loaded):
                 found.append(f"line {line}: {name}({MODEL})")
             elif isinstance(func, ast.Attribute) and name in WRITE_METHODS and _is_model(func.value, classes):
                 found.append(f"line {line}: .{name}() of {MODEL} or its table")
@@ -311,7 +359,7 @@ def run_writes(source: str) -> list[str]:
                 and any(_mentions(arg, classes, loaded) for arg in args)
             ):
                 found.append(f"line {line}: {name}(...) names {MODEL}")
-            elif name == "setattr" and len(node.args) >= 2:
+            elif name in {"setattr", "set_attribute"} and len(node.args) >= 2:
                 if _mentions(node.args[0], classes, loaded):
                     found.append(f"line {line}: setattr on a loaded {MODEL}")
                 elif imports_model and _string_value(node.args[1], classes) in COLUMNS:
@@ -485,6 +533,29 @@ LOADED_ROW_WRITES = {
     "merge of a unpacked row": "from sqlalchemy import select\nfrom app.models.agents import AgentRun\n"
     "async def f(s):\n    rows = (await s.scalars(select(AgentRun))).all()\n    s.merge(rows[0])\n",
 }
+# AG-13 PoC 3.2c2b1 (LOW-2): idioms the guard of 3.2c2a missed; each must be flagged.
+POC_GAPS = {
+    "E-string with an escaped quote": "Q = \"SELECT E'\\\\'--'; UPDATE agent_runs SET status = 'x'\"\n",
+    "dollar-quoted dashes": "Q = \"SELECT $$--$$; UPDATE agent_runs SET status = 'x'\"\n",
+    "dollar-quoted block opener": 'Q = "SELECT $t$/*$t$; DELETE FROM agent_runs; SELECT $t$*/$t$"\n',
+    "unicode-escaped identifier": "Q = 'UPDATE U&\"\\\\0061gent_runs\" SET status = 1'\n",
+    "model alias by assignment": "from sqlalchemy import update\nfrom app.models.agents import AgentRun\n"
+    "R = AgentRun\nq = update(R)\n",
+    "DML class constructor": "import sqlalchemy as sa\nfrom app.models.agents import AgentRun\n"
+    "q = sa.Update(AgentRun)\n",
+    "DML class imported": "from sqlalchemy import Delete\nfrom app.models.agents import AgentRun\n"
+    "q = Delete(AgentRun)\n",
+    "mapper local_table": "from app.models.agents import AgentRun\n"
+    "q = AgentRun.__mapper__.local_table.update()\n",
+    "mapper persist_selectable": "from app.models.agents import AgentRun\n"
+    "q = AgentRun.__mapper__.persist_selectable.delete()\n",
+    "metadata.tables[...]": "from app.models.agents import AgentRun\n"
+    "q = AgentRun.metadata.tables['agent_runs'].delete()\n",
+    "str.join of SQL": "Q = ' '.join(['UPDATE', 'agent_runs', 'SET status = 1'])\n",
+    "ORM set_attribute": "from sqlalchemy.orm.attributes import set_attribute\n"
+    "from app.models.agents import AgentRun\n"
+    "async def f(s, i):\n    r = await s.get(AgentRun, i)\n    set_attribute(r, 'status', 'x')\n",
+}
 # Reads, and writes of other tables, in a module that names AgentRun: never flagged.
 READS = {
     "select": "from sqlalchemy import select\nfrom app.models.agents import AgentRun\nq = select(AgentRun)\n",
@@ -512,6 +583,14 @@ READS = {
     "delete of an archive row": "from app.models.agents import AgentRun\n"
     "async def f(s, i):\n    row = await s.get(ArchivedRun, i)\n    await s.delete(row)\n",
     "a column name outside a model module": "def f(job):\n    job.status = 'failed'\n",
+    "dollar-quoted dashes in a read": "Q = 'SELECT $$--$$ FROM agent_runs'\n",
+    "E-string dashes in a read": "Q = \"SELECT E'\\\\'--' FROM agent_runs\"\n",
+    "alias of another model": "from sqlalchemy import update\n"
+    "from app.models.agents import AgentProfile, AgentRun\n"
+    "R = AgentProfile\nq = update(R)\n",
+    "another table by metadata": "from app.models.agents import AgentRun\n"
+    "q = AgentRun.metadata.tables['agent_profiles'].update()\n",
+    "join of a read": "Q = ' '.join(['SELECT', 'status', 'FROM', 'agent_runs'])\n",
 }
 
 
@@ -527,6 +606,10 @@ def test_guard_still_sees_what_it_saw() -> None:
 
 def test_guard_sees_the_variants() -> None:
     assert [name for name, source in VARIANTS.items() if not run_writes(source)] == []
+
+
+def test_guard_sees_the_gaps_of_ag13_low_2() -> None:
+    assert [name for name, source in POC_GAPS.items() if not run_writes(source)] == []
 
 
 def test_guard_passes_reads_and_other_tables() -> None:
