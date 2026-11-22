@@ -10,7 +10,8 @@ import sys
 import pytest
 
 from app.worker import identity
-from app.worker.identity import worker_id
+from app.worker.identity import delivery_owner, worker_id
+from app.workflow.lease import LEASE_OWNER_LENGTH
 
 MAX_LENGTH = 120
 
@@ -68,3 +69,22 @@ def test_long_hostname_is_truncated_but_pid_and_token_survive(monkeypatch: pytes
     assert pid == str(os.getpid())
     assert len(token) == 8
     assert set(host) == {"h"}
+
+
+@pytest.mark.parametrize("hostname_length", [120, 500])
+def test_delivery_owner_fits_the_column_and_extends_the_worker_id(
+    monkeypatch: pytest.MonkeyPatch, hostname_length: int
+) -> None:
+    monkeypatch.setattr(identity.socket, "gethostname", lambda: "h" * hostname_length)
+    monkeypatch.setattr(identity, "_cached", None)
+    owner = delivery_owner()
+    assert LEASE_OWNER_LENGTH == MAX_LENGTH
+    assert len(owner) <= LEASE_OWNER_LENGTH
+    if hostname_length == 500:
+        assert len(owner) == LEASE_OWNER_LENGTH  # the reserve matches the suffix exactly
+    assert owner.startswith(f"{worker_id()}:")
+    assert len(owner.rsplit(":", 1)[1]) == 8
+
+
+def test_each_delivery_owner_is_new() -> None:
+    assert delivery_owner() != delivery_owner()

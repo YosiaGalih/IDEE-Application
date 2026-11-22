@@ -18,6 +18,7 @@ from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.worker import jobs
+from app.worker.identity import worker_id
 from app.workflow.dispatch import DispatchIncomplete, DispatchResult
 from app.workflow.engine import EngineOutcome
 from app.workflow.lease import ClaimResult
@@ -85,6 +86,26 @@ async def test_execute_task_fails_a_draft_with_no_registered_steps(
     row = await row_of(engine, draft_task)
     assert (row.status, row.error_code) == ("failed", "step_unavailable")
     assert (spy.disposed, spy.closed) == (1, 1)
+
+
+async def test_each_delivery_gets_its_own_lease_owner(
+    draft_task: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owners: list[str] = []
+
+    class Noop:
+        async def run(self, task_id: uuid.UUID) -> EngineOutcome:
+            return EngineOutcome(ClaimResult.ACQUIRED, [], "done")
+
+    def fake_build(**kwargs: Any) -> Noop:
+        owners.append(kwargs["worker_id"])
+        return Noop()
+
+    monkeypatch.setattr(jobs, "build_orchestrator", fake_build)
+    await jobs.execute_task(draft_task)
+    await jobs.execute_task(draft_task)
+    assert len(owners) == 2 and owners[0] != owners[1]
+    assert all(o.startswith(f"{worker_id()}:") for o in owners)
 
 
 async def test_resources_are_closed_when_the_engine_raises(
@@ -298,8 +319,9 @@ async def test_dispatch_sweep_defaults_to_the_celery_job_queue(
 def test_build_orchestrator_wires_the_ports() -> None:
     from app.core.config import load_settings
     from app.services.orchestrator import build_orchestrator
+    from app.workflow.lease import LEASE_SAFETY_SECONDS
 
-    settings = load_settings(make_test_env(MAX_ACTIVE_TASKS="5"))
+    settings = load_settings(make_test_env(MAX_ACTIVE_TASKS="5", TASK_DELIVERY_MAX_MINUTES="45"))
     engine = build_orchestrator(
         sessions=object(),  # type: ignore[arg-type]
         bus=object(),  # type: ignore[arg-type]
@@ -309,3 +331,19 @@ def test_build_orchestrator_wires_the_ports() -> None:
     )
     ports = engine._ports
     assert (ports.worker_id, ports.max_active, dict(ports.steps)) == ("w1", 5, {})
+    assert (ports.delivery_limit_s, ports.lease_safety_s) == (45 * 60, LEASE_SAFETY_SECONDS)
+
+
+async def test_dispatch_sweep_forwards_max_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake(sessions: Any, dispatcher: Any, **kwargs: Any) -> DispatchResult:
+        seen.update(kwargs)
+        return DispatchResult(0, 0, 0, 0)
+
+    monkeypatch.setattr(jobs, "redispatch_orphans", fake)
+    Spy(monkeypatch)
+    await jobs.sweep_dispatch(dispatcher=FakeDispatcher())
+    from app.core.config import load_settings
+
+    assert seen == {"max_active": load_settings().max_active_tasks}

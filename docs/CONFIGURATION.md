@@ -31,6 +31,7 @@ Satu daftar kanonik. `backend/app/core/config.py`, `sandbox_manager/…/config.p
 | `TASK_MAX_DEBUG_ATTEMPTS` | `5` | worker | PRD §5.6 |
 | `TASK_AUTO_REMEDIATION_MAX` | `1` | worker | siklus perbaikan otomatis setelah User Proxy gagal |
 | `TASK_MAX_DURATION_MINUTES` | `60` | worker, api | batas waktu total per task (FR-132, ADR-031); diukur dari `tasks.started_at` (Keputusan Lead 3.1f #11) |
+| `TASK_DELIVERY_MAX_MINUTES` | `60` | worker | batas waktu satu delivery engine, diukur dari claim lease (WP-3.2c2b1, spec §16.4 #74). Terpisah dari `TASK_MAX_DURATION_MINUTES`. Lewat batas: `running` menjadi `interrupted` (`status_reason` `duration_exceeded`), `draft` menjadi `failed` (`error_code` `duration_exceeded`). Maksimum 110: di atasnya `create_celery` menolak start, karena delivery harus selesai sebelum `visibility_timeout` (7200 dtk) dikurangi margin 600 dtk |
 | `TASK_MAX_ITERATIONS` | `3` | worker, api | batas keras total iterasi per task (PRD §6.2 `max_iterations: 3`) |
 | `MAX_ACTIVE_TASKS` | `2` | worker | ADR-010 |
 | `WORKSPACE_ROOT` ★ | `/srv/kodekantor/workspaces` | api, worker, sandbox-manager | path identik host↔container |

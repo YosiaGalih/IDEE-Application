@@ -81,6 +81,15 @@ Isi `tasks.checkpoint` (JSONB) yang menyimpan posisi engine dan isian awal user 
 **Lease**:
 Hak sementara satu worker atas satu task (`lease_owner`, `lease_expires_at`), diperpanjang selama bekerja; lease yang kedaluwarsa membuat sweep recovery mengambil alih task itu, dan jumlah lease hidup membatasi `MAX_ACTIVE_TASKS`.
 
+**Owner delivery**:
+Pengenal pemegang lease yang baru untuk setiap delivery job `run_task` (`delivery_owner()` = `worker_id()` + `:` + 8 heksadesimal, paling panjang 120 karakter), bukan pengenal proses. Dua delivery dalam satu proses tidak berbagi owner, sehingga yang lama ditolak `LeaseLost` begitu yang baru meng-claim task.
+
+**Lease safety**:
+Selisih waktu (`lease_safety_s`, 10 dtk di produksi) antara saat heartbeat menyerah dan saat lease berakhir: heartbeat menyerah pada `last_ok + lease - lease_safety_s`, supaya langkah dibatalkan selagi lease masih milik kita. Karena koneksi yang dibatalkan dapat melampaui batasnya ±2 dtk, margin efektifnya 8 dtk.
+
+**StepAbandoned**:
+Exception yang dilempar langkah yang menyerah tanpa hasil. Engine tidak menulis status, event, maupun checkpoint, melepas lease, dan `run_task` kembali normal; task `draft` dikirim ulang sweep dispatch (dihitung satu percobaan planning), task `running` diambil recovery.
+
 **Sweep dispatch**:
 Job beat (`dispatch_sweep`, tiap 30 dtk) yang mengirim ulang task `draft|queued` yang pernah di-dispatch (`checkpoint.dispatch.at`) tetapi lease-nya mati dan sudah lewat masa tunggu 60 dtk, karena job `run_task`-nya hilang; berbeda dari sweep recovery, yang memulihkan task `running|validating` yang lease-nya kedaluwarsa.
 

@@ -17,6 +17,7 @@ Contract for the job that runs a task (WP-3.x):
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
 
@@ -29,14 +30,23 @@ from app.models.tasks import Task
 
 LEASE_SECONDS = 60
 HEARTBEAT_SECONDS = 20
+# The heartbeat gives up this long before the lease ends: a hung renewal is cut off and the step cancelled
+# while the lease is still ours. A cancelled asyncpg connection can overrun its bound by 2 s (§16.5a #1).
+LEASE_SAFETY_SECONDS = 10
 CLAIM_LOCK_TIMEOUT = "5s"
 _LEASE = timedelta(seconds=LEASE_SECONDS)
-_WORKER_ID_LENGTH = 120  # tasks.lease_owner
+LEASE_OWNER_LENGTH = 120  # tasks.lease_owner
 # Serialises claims so the MAX_ACTIVE_TASKS count and the claim cannot interleave.
 _CLAIM_LOCK = "kodekantor.claim_lease"
 _LOCK_NOT_AVAILABLE = "55P03"
 
 logger = get_logger(__name__)
+
+
+def _is_lock_timeout(exc: DBAPIError) -> bool:
+    """55P03 (lock_not_available). A statement timeout (57014) and every other error are not."""
+    return getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE
+
 
 _DEFAULT_CLAIMABLE = frozenset({"queued"})
 
@@ -45,7 +55,9 @@ class ClaimResult(StrEnum):
     ACQUIRED = "acquired"
     HELD = "held"  # another worker holds a live lease
     AT_CAPACITY = "at_capacity"  # MAX_ACTIVE_TASKS live leases elsewhere: retry later
-    BUSY = "busy"  # the claim lock was not available in time: retry later
+    # The claim lock was not available in time: retry later. The advisory lock (``pg_advisory_xact_lock``) may
+    # still be held after BUSY, so the caller must end its transaction (commit or rollback) promptly.
+    BUSY = "busy"
     NOT_CLAIMABLE = "not_claimable"  # not queued (finished, running, ...): nothing to do
     NOT_FOUND = "not_found"
 
@@ -60,8 +72,8 @@ def lease_duration() -> timedelta:
 
 
 def _check_worker(worker_id: str) -> None:
-    if not 1 <= len(worker_id) <= _WORKER_ID_LENGTH:
-        raise ValueError(f"worker id must be 1-{_WORKER_ID_LENGTH} characters")
+    if not 1 <= len(worker_id) <= LEASE_OWNER_LENGTH:
+        raise ValueError(f"worker id must be 1-{LEASE_OWNER_LENGTH} characters")
 
 
 async def claim_lease(
@@ -84,7 +96,7 @@ async def claim_lease(
             await db.execute(select(func.pg_advisory_xact_lock(func.hashtext(_CLAIM_LOCK))))
             await db.execute(select(func.set_config("lock_timeout", previous, True)))
     except DBAPIError as exc:
-        if getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE or "lock timeout" in str(exc.orig):
+        if _is_lock_timeout(exc):
             return ClaimResult.BUSY
         raise
 
@@ -95,20 +107,27 @@ async def claim_lease(
         .where(Task.lease_expires_at > now, Task.id != task_id)
         .scalar_subquery()
     )
-    claimed = (
-        await db.execute(
-            update(Task)
-            .where(
-                Task.id == task_id,
-                Task.status.in_(claimable),
-                or_(Task.lease_expires_at.is_(None), Task.lease_expires_at < now),
-                live_elsewhere < max_active,
-            )
-            .values(lease_owner=worker_id, lease_expires_at=now + _LEASE)
-            .returning(Task.id)
-            .execution_options(synchronize_session=False)
-        )
-    ).scalar_one_or_none()
+    try:
+        # A savepoint: a lock timeout on a row held elsewhere must not abort the caller's transaction.
+        async with db.begin_nested():
+            claimed = (
+                await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.status.in_(claimable),
+                        or_(Task.lease_expires_at.is_(None), Task.lease_expires_at < now),
+                        live_elsewhere < max_active,
+                    )
+                    .values(lease_owner=worker_id, lease_expires_at=now + _LEASE)
+                    .returning(Task.id)
+                    .execution_options(synchronize_session=False)
+                )
+            ).scalar_one_or_none()
+    except DBAPIError as exc:
+        if _is_lock_timeout(exc):
+            return ClaimResult.BUSY
+        raise
     if claimed is not None:
         return ClaimResult.ACQUIRED
 
@@ -143,6 +162,29 @@ async def renew_lease(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> N
     ).scalar_one_or_none()
     if renewed is None:
         raise LeaseLost(f"worker {worker_id} lost the lease of task {task_id}")
+
+
+@dataclass(frozen=True)
+class LeaseGuard:
+    """A step's way to keep its lease inside the transaction of a write of its own (spec §16.5a #8).
+
+    ``hold(db)`` renews the lease in the caller's transaction and raises ``LeaseLost`` when this worker no
+    longer holds a live one, so a write that follows cannot land after a takeover. It does not check the
+    task's status. Four rules:
+
+    1. Call ``hold`` first in the transaction: the renewal locks the task row until commit, which is what
+       makes the writes after it safe against a takeover.
+    2. Only for short transactions: the row stays locked, and the heartbeat's renewal waits behind it.
+    3. The caller opens the transaction with ``bound_transaction`` (and its own wall-clock timeout); ``hold``
+       sets no bound.
+    4. ``hold`` does not advance the heartbeat's ``last_ok``: the heartbeat still renews on its own schedule.
+    """
+
+    task_id: uuid.UUID
+    owner: str = field(repr=False)
+
+    async def hold(self, db: AsyncSession) -> None:
+        await renew_lease(db, self.task_id, self.owner)
 
 
 async def release_lease(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> bool:

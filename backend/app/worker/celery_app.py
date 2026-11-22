@@ -17,7 +17,7 @@ from typing import Any
 from celery import Celery
 from celery.signals import setup_logging, worker_ready
 
-from app.core.config import Settings, load_settings
+from app.core.config import ConfigError, Settings, load_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.redaction import Redactor
 from app.worker.platform_jobs import (
@@ -34,9 +34,15 @@ DISPATCH_SWEEP_SECONDS = 30.0  # spec WP-3.2 §14 #41
 # An unacked message is redelivered after this; it must exceed the longest task (a lost lease already
 # returns the task to the dispatch sweep), or a running job would be delivered a second time.
 VISIBILITY_TIMEOUT_SECONDS = 7200
+# A delivery must end this long before the broker redelivers it (spec §16.5a #4): the delivery limit may
+# not exceed VISIBILITY_TIMEOUT_SECONDS - DELIVERY_MARGIN_SECONDS (110 minutes).
+DELIVERY_MARGIN_SECONDS = 600  # must cover STEP_CLEANUP_GRACE_S + lease + recovery sweep + one engine write
 
 
 def create_celery(settings: Settings) -> Celery:
+    if settings.task_delivery_max_minutes * 60 > VISIBILITY_TIMEOUT_SECONDS - DELIVERY_MARGIN_SECONDS:
+        # No value in the message (it is config, but the rule is what the operator needs).
+        raise ConfigError(["TASK_DELIVERY_MAX_MINUTES: must end before the broker visibility timeout"])
     app = Celery(
         "kodekantor", broker=settings.redis_url, include=["app.worker.jobs", "app.worker.platform_jobs"]
     )

@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
@@ -22,6 +22,7 @@ from app.workflow.dispatch import DISPATCH_GRACE_S, DispatchResult, redispatch_o
 from tests.conftest import reset_data
 
 OLD = timedelta(seconds=DISPATCH_GRACE_S * 5)
+MAX_ACTIVE = 100  # generous: capacity is not what these tests look at
 
 
 def at(age: timedelta) -> str:
@@ -99,13 +100,15 @@ async def test_orphans_are_dispatched_once_per_grace(engine: AsyncEngine, make_t
     dispatcher = RecordingDispatcher()
     sessions = make_sessionmaker(engine)
 
-    first = await redispatch_orphans(sessions, dispatcher)
+    first = await redispatch_orphans(sessions, dispatcher, max_active=MAX_ACTIVE)
     assert first == DispatchResult(candidates=2, dispatched=2, failed=0, skipped=0)
     assert set(dispatcher.sent) == {draft, queued}
     assert (await checkpoint_of(engine, draft))["dispatch"]["count"] == 2
     assert (await checkpoint_of(engine, queued))["dispatch"]["count"] == 1  # coalesce(missing, 0) + 1
 
-    second = await redispatch_orphans(sessions, dispatcher)  # dispatch.at just advanced: inside the grace
+    second = await redispatch_orphans(
+        sessions, dispatcher, max_active=MAX_ACTIVE
+    )  # dispatch.at just advanced: inside the grace
     assert second == DispatchResult(0, 0, 0, 0)
     assert len(dispatcher.sent) == 2
 
@@ -114,7 +117,7 @@ async def test_live_lease_or_inside_grace_is_left_alone(engine: AsyncEngine, mak
     await make_task("queued", {"dispatch": {"at": at(OLD)}}, lease_seconds=60)
     await make_task("draft", {"dispatch": {"at": at(timedelta(seconds=1))}})
     dispatcher = RecordingDispatcher()
-    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher)
+    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=MAX_ACTIVE)
     assert result == DispatchResult(0, 0, 0, 0)
     assert dispatcher.sent == []
 
@@ -125,7 +128,7 @@ async def test_never_dispatched_tasks_are_ignored(engine: AsyncEngine, make_task
     # R-T4a: the engine's draft claim can leave a dispatch object that holds only planning_attempts.
     await make_task("queued", {"dispatch": {"planning_attempts": 1}})
     dispatcher = RecordingDispatcher()
-    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher)
+    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=MAX_ACTIVE)
     assert result == DispatchResult(0, 0, 0, 0)
     assert dispatcher.sent == []
 
@@ -136,7 +139,7 @@ async def test_never_dispatched_tasks_are_ignored(engine: AsyncEngine, make_task
 async def test_other_statuses_are_ignored(engine: AsyncEngine, make_task, status: str) -> None:  # type: ignore[no-untyped-def]
     await make_task(status, {"dispatch": {"at": at(OLD)}})
     dispatcher = RecordingDispatcher()
-    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher)
+    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=MAX_ACTIVE)
     assert result == DispatchResult(0, 0, 0, 0)
     assert dispatcher.sent == []
 
@@ -146,7 +149,7 @@ async def test_enqueue_error_does_not_stop_the_others(engine: AsyncEngine, make_
     good = await make_task("draft", {"dispatch": {"at": at(OLD), "count": 0}})
     dispatcher = RecordingDispatcher(fail={bad})
     with capture_logs() as logs:
-        result = await redispatch_orphans(make_sessionmaker(engine), dispatcher)
+        result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=MAX_ACTIVE)
     assert result == DispatchResult(candidates=2, dispatched=1, failed=1, skipped=0)
     assert dispatcher.sent == [good]
     failed_logs = [e for e in logs if e["event"] == "task_redispatch_failed"]
@@ -162,14 +165,18 @@ async def test_enqueue_error_does_not_stop_the_others(engine: AsyncEngine, make_
     ] == [("warning", 2, 1, 1, 0)]
     # The write committed before the enqueue: the task waits one more grace, not a busy loop.
     assert (await checkpoint_of(engine, bad))["dispatch"]["count"] == 1
-    assert (await redispatch_orphans(make_sessionmaker(engine), dispatcher)).candidates == 0
+    assert (
+        await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=MAX_ACTIVE)
+    ).candidates == 0
 
 
 async def test_cancellation_is_not_swallowed(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
     await make_task("draft", {"dispatch": {"at": at(OLD)}})
     with pytest.raises(asyncio.CancelledError):
         await redispatch_orphans(
-            make_sessionmaker(engine), RecordingDispatcher(raises=asyncio.CancelledError())
+            make_sessionmaker(engine),
+            RecordingDispatcher(raises=asyncio.CancelledError()),
+            max_active=MAX_ACTIVE,
         )
 
 
@@ -179,11 +186,11 @@ async def test_skip_locked_candidate_returns_later(engine: AsyncEngine, make_tas
     sessions = make_sessionmaker(engine)
     async with sessions() as holder:
         await holder.execute(text("SELECT id FROM tasks WHERE id = :i FOR UPDATE"), {"i": task_id})
-        locked = await redispatch_orphans(sessions, dispatcher)
+        locked = await redispatch_orphans(sessions, dispatcher, max_active=MAX_ACTIVE)
         assert locked == DispatchResult(candidates=1, dispatched=0, failed=0, skipped=1)
         assert dispatcher.sent == []
         await holder.rollback()
-    later = await redispatch_orphans(sessions, dispatcher)
+    later = await redispatch_orphans(sessions, dispatcher, max_active=MAX_ACTIVE)
     assert later == DispatchResult(candidates=1, dispatched=1, failed=0, skipped=0)
     assert dispatcher.sent == [task_id]
 
@@ -211,7 +218,7 @@ async def test_lease_claimed_between_listing_and_locking_is_skipped(
 
     monkeypatch.setattr(dispatch_module, "_list_candidates", list_then_claim)
     dispatcher = RecordingDispatcher()
-    result = await redispatch_orphans(sessions, dispatcher)
+    result = await redispatch_orphans(sessions, dispatcher, max_active=MAX_ACTIVE)
     assert result == DispatchResult(candidates=1, dispatched=0, failed=0, skipped=1)
     assert dispatcher.sent == []
 
@@ -223,11 +230,13 @@ async def test_oldest_first_and_capped_per_sweep(engine: AsyncEngine, make_task)
     dispatcher = RecordingDispatcher()
     sessions = make_sessionmaker(engine)
 
-    first = await redispatch_orphans(sessions, dispatcher, batch=2)
+    first = await redispatch_orphans(sessions, dispatcher, max_active=MAX_ACTIVE, batch=2)
     assert first.candidates == 2
     assert dispatcher.sent == [oldest, middle]
 
-    second = await redispatch_orphans(sessions, dispatcher, batch=2)  # the first two are inside the grace now
+    second = await redispatch_orphans(
+        sessions, dispatcher, max_active=MAX_ACTIVE, batch=2
+    )  # the first two are inside the grace now
     assert second.candidates == 1
     assert dispatcher.sent == [oldest, middle, newest]
 
@@ -241,10 +250,122 @@ async def test_dispatch_write_keeps_the_rest_of_the_checkpoint(engine: AsyncEngi
             "completed_steps": ["intake"],
         },
     )
-    await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher())
+    await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=MAX_ACTIVE)
     checkpoint = await checkpoint_of(engine, task_id)
     assert checkpoint["user_set"] == {"k": "v"}
     assert checkpoint["completed_steps"] == ["intake"]
     assert checkpoint["dispatch"]["planning_attempts"] == 2
     assert checkpoint["dispatch"]["count"] == 5
     assert datetime.fromisoformat(checkpoint["dispatch"]["at"]) > datetime.now(UTC) - timedelta(seconds=30)
+
+
+async def test_live_leases_reduce_the_batch(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("running", lease_seconds=60)  # any status counts, as claim_lease does
+    await make_task("queued", {"dispatch": {"at": at(OLD)}}, lease_seconds=60)
+    for age in (OLD * 3, OLD * 2, OLD):
+        await make_task("draft", {"dispatch": {"at": at(age)}})
+    dispatcher = RecordingDispatcher()
+
+    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=3)
+
+    assert result == DispatchResult(candidates=1, dispatched=1, failed=0, skipped=0)
+    assert len(dispatcher.sent) == 1
+
+
+async def test_in_flight_tasks_reduce_the_batch(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    recent = {"dispatch": {"at": at(timedelta(seconds=1))}}
+    await make_task("queued", recent)  # sent inside the grace, not claimed yet
+    await make_task("draft", recent, lease_seconds=-5)
+    for age in (OLD * 3, OLD * 2, OLD):
+        await make_task("draft", {"dispatch": {"at": at(age)}})
+    dispatcher = RecordingDispatcher()
+
+    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=3)
+
+    assert result == DispatchResult(candidates=1, dispatched=1, failed=0, skipped=0)
+
+
+async def test_what_is_neither_live_nor_in_flight_takes_no_capacity(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """Review T6: a dead lease without dispatch.at, a recent dispatch already past the waiting statuses, and
+    finished history count for nothing; only the 3 orphans are left, so all 3 go out."""
+    recent = {"dispatch": {"at": at(timedelta(seconds=1))}}
+    await make_task("draft", lease_seconds=-5)  # never dispatched
+    await make_task("running", recent, lease_seconds=-5)  # dispatched recently, but no longer waiting
+    await make_task("completed", recent)
+    for age in (OLD * 3, OLD * 2, OLD):
+        await make_task("draft", {"dispatch": {"at": at(age)}})
+    dispatcher = RecordingDispatcher()
+
+    result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=3)
+
+    assert result == DispatchResult(candidates=3, dispatched=3, failed=0, skipped=0)
+
+
+async def test_no_capacity_runs_no_candidate_query_and_sends_nothing(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("running", lease_seconds=60)
+    await make_task("draft", {"dispatch": {"at": at(OLD)}})
+    dispatcher = RecordingDispatcher()
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *rest: Any) -> None:
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        result = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=1)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+
+    assert result == DispatchResult(0, 0, 0, 0)
+    assert dispatcher.sent == []
+    assert len(statements) == 1  # the capacity count only
+    assert "LIMIT" not in statements[0].upper()
+
+
+async def test_starved_orphans_are_a_warning_with_counts(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("running", lease_seconds=60)
+    await make_task("draft", {"dispatch": {"at": at(OLD)}})
+    await make_task("draft", {"dispatch": {"at": at(OLD * 2)}})
+
+    with capture_logs() as logs:
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=1)
+
+    [event_] = [e for e in logs if e["event"] == "task_dispatch_no_capacity"]
+    assert event_["log_level"] == "warning"
+    assert (event_["live"], event_["in_flight"], event_["max_active"], event_["orphans"]) == (1, 0, 1, 2)
+
+
+async def test_no_capacity_without_orphans_is_not_a_warning(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("running", lease_seconds=60)
+
+    with capture_logs() as logs:
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=1)
+
+    assert [e for e in logs if e["log_level"] in ("warning", "error")] == []
+
+
+async def test_capped_sweep_logs_capacity_and_orphans(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("running", lease_seconds=60)
+    for age in (OLD * 3, OLD * 2, OLD):
+        await make_task("draft", {"dispatch": {"at": at(age)}})
+
+    with capture_logs() as logs:
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=3)
+
+    [event_] = [e for e in logs if e["event"] == "task_dispatch_capped"]
+    assert event_["log_level"] == "info"
+    assert (event_["capacity"], event_["orphans"]) == (2, 3)
+
+
+async def test_uncapped_sweep_logs_no_capacity_event(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("draft", {"dispatch": {"at": at(OLD)}})
+
+    with capture_logs() as logs:
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=MAX_ACTIVE)
+
+    assert [e for e in logs if e["event"] in ("task_dispatch_capped", "task_dispatch_no_capacity")] == []
+
+
+async def test_max_active_is_required(engine: AsyncEngine) -> None:
+    with pytest.raises(TypeError):
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher())  # type: ignore[call-arg]

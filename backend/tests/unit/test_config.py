@@ -55,6 +55,7 @@ def test_defaults_follow_the_documentation() -> None:
     assert settings.llm_provider == "anthropic"
     assert settings.max_active_tasks == 2
     assert settings.task_max_cost_usd == 2.0
+    assert settings.task_delivery_max_minutes == 60
     assert settings.sandbox_driver == "docker"
     assert settings.sandbox_egress == "off"
     assert settings.cookie_secure is True
@@ -92,6 +93,7 @@ def test_missing_required_variable_fails_start(missing: str) -> None:
         ({"LLM_PROVIDER": "openai"}, "LLM_PROVIDER"),
         ({"SANDBOX_DRIVER": "local"}, "SANDBOX_DRIVER"),
         ({"MAX_ACTIVE_TASKS": "two"}, "MAX_ACTIVE_TASKS"),
+        ({"TASK_DELIVERY_MAX_MINUTES": "0"}, "TASK_DELIVERY_MAX_MINUTES"),
     ],
 )
 def test_invalid_values_fail_start(overrides: dict[str, str], variable: str) -> None:

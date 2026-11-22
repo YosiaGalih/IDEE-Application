@@ -7,6 +7,12 @@ the sweep that hands a task over again when its queued job was lost.
 - its lease is dead (NULL or expired, on the DB clock, as ``recovery.lease_dead``);
 - ``dispatch.at`` is older than the grace period.
 
+**Capacity.** A sweep sends at most ``max_active`` minus the tasks that already hold a live lease (any status,
+as ``claim_lease`` counts) minus those in flight: waiting, lease dead, ``dispatch.at`` inside the grace. They
+were sent recently and no worker has claimed them yet. With no capacity the candidate query does not run;
+orphans left waiting for capacity are logged (``task_dispatch_no_capacity`` warning,
+``task_dispatch_capped`` info), counts only.
+
 **Sweep.** Oldest ``dispatch.at`` first, at most ``DISPATCH_BATCH`` per sweep. Each candidate is re-checked
 under ``FOR UPDATE SKIP LOCKED`` in its own short transaction, which advances ``dispatch.at`` and
 ``dispatch.count`` and commits before the enqueue. A failed enqueue therefore waits one more grace period
@@ -63,22 +69,52 @@ def _dispatched_at() -> ColumnElement[datetime]:
     return func.jsonb_extract_path_text(Task.checkpoint, "dispatch", "at").cast(TIMESTAMP(timezone=True))
 
 
+def _lease_dead() -> ColumnElement[bool]:
+    return or_(Task.lease_expires_at.is_(None), Task.lease_expires_at < func.clock_timestamp())
+
+
+def _waiting_dispatched() -> ColumnElement[bool]:
+    return and_(Task.status.in_(_WAITING), Task.checkpoint["dispatch"].has_key("at"), _lease_dead())
+
+
 def _orphaned(grace_s: float) -> ColumnElement[bool]:
-    now = func.clock_timestamp()
-    return and_(
-        Task.status.in_(_WAITING),
-        Task.checkpoint["dispatch"].has_key("at"),
-        or_(Task.lease_expires_at.is_(None), Task.lease_expires_at < now),
-        _dispatched_at() < now - timedelta(seconds=grace_s),
-    )
+    return and_(_waiting_dispatched(), _dispatched_at() < func.clock_timestamp() - timedelta(seconds=grace_s))
 
 
 async def _list_candidates(
-    sessions: async_sessionmaker[AsyncSession], grace_s: float, batch: int
+    sessions: async_sessionmaker[AsyncSession], grace_s: float, batch: int, max_active: int
 ) -> list[uuid.UUID]:
+    """Oldest orphans first, at most the free capacity and ``batch``; ``[]`` at capacity 0, with no query."""
+    now = func.clock_timestamp()
     async with sessions() as db:
+        live, in_flight, orphans = (
+            await db.execute(
+                select(
+                    func.count().filter(Task.lease_expires_at > now),
+                    func.count().filter(
+                        and_(_waiting_dispatched(), _dispatched_at() >= now - timedelta(seconds=grace_s))
+                    ),
+                    func.count().filter(_orphaned(grace_s)),
+                )
+                # Only rows either count can see: finished task history is not scanned every sweep.
+                .where(or_(Task.lease_expires_at > now, Task.status.in_(_WAITING)))
+            )
+        ).one()
+        capacity = max_active - live - in_flight
+        if capacity <= 0:
+            if orphans:  # starved orphans must not look like "nothing to do"
+                logger.warning(
+                    "task_dispatch_no_capacity",
+                    live=live,
+                    in_flight=in_flight,
+                    max_active=max_active,
+                    orphans=orphans,
+                )
+            return []
+        if capacity < orphans:
+            logger.info("task_dispatch_capped", capacity=capacity, orphans=orphans)
         rows = await db.scalars(
-            select(Task.id).where(_orphaned(grace_s)).order_by(_dispatched_at()).limit(batch)
+            select(Task.id).where(_orphaned(grace_s)).order_by(_dispatched_at()).limit(min(batch, capacity))
         )
         return list(rows.all())
 
@@ -112,10 +148,11 @@ async def redispatch_orphans(
     sessions: async_sessionmaker[AsyncSession],
     dispatcher: Dispatcher,
     *,
+    max_active: int,
     grace_s: float = DISPATCH_GRACE_S,
     batch: int = DISPATCH_BATCH,
 ) -> DispatchResult:
-    candidates = await _list_candidates(sessions, grace_s, batch)
+    candidates = await _list_candidates(sessions, grace_s, batch, max_active)
     dispatched = failed = skipped = 0
     for task_id in candidates:
         try:
