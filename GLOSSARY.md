@@ -87,6 +87,12 @@ Pengenal pemegang lease yang baru untuk setiap delivery job `run_task` (`deliver
 **Lease safety**:
 Selisih waktu (`lease_safety_s`, 10 dtk di produksi) antara saat heartbeat menyerah dan saat lease berakhir: heartbeat menyerah pada `last_ok + lease - lease_safety_s`, supaya langkah dibatalkan selagi lease masih milik kita. Karena koneksi yang dibatalkan dapat melampaui batasnya ±2 dtk, margin efektifnya 8 dtk.
 
+**Pencabutan owner (lease owner revocation)**:
+Tindakan engine (`revoke_lease_owner`, `workflow/lease.py`) yang membuat setiap `renew_lease` atas owner delivery itu di proses yang sama melempar `LeaseLost` tanpa SQL, sehingga `LeaseGuard.hold` dan heartbeat runtime yang memakai owner yang sama berhenti memperpanjang lease. Terjadi saat pembersihan langkah melewati grace, saat heartbeat menyerah, dan saat cancel luar pertama datang selama langkah masih hidup. Perpanjangan yang sudah terkirim masih dapat mendarat, jadi lease berakhir paling lama pencabutan + 60 dtk; lease tidak dilepas, hanya perpanjangannya yang dihentikan.
+
+**`StepContext.pipeline`**:
+Field `StepContext` (`draft` atau `running`) yang diisi engine dari status claim: pipeline mana yang menjalankan langkah itu, planning atau implementasi. Adapter langkah memakainya untuk memilih jalur henti yang sah (`fail` di `draft`, `interrupt` di `running`).
+
 **StepAbandoned**:
 Exception yang dilempar langkah yang menyerah tanpa hasil. Engine tidak menulis status, event, maupun checkpoint, melepas lease, dan `run_task` kembali normal; task `draft` dikirim ulang sweep dispatch (dihitung satu percobaan planning), task `running` diambil recovery.
 
