@@ -100,11 +100,11 @@ async def _claude_smoke(as_json: bool) -> int:
     engine = make_engine(settings.database_url)
     redis = Redis.from_url(settings.redis_url, socket_timeout=5.0, socket_connect_timeout=5.0)
     job_id = uuid.uuid4()
-    try:  # this process is not a worker: it loads the table once, and a broken file fails the check
-        pricing: PricingTable | PricingError = load_pricing(Path(settings.pricing_path))
-    except PricingError as exc:
-        pricing = exc
     try:
+        try:  # this process is not a worker: it loads the table once, and a broken file fails the check
+            pricing: PricingTable | PricingError = load_pricing(Path(settings.pricing_path))
+        except PricingError as exc:
+            pricing = exc
         try:
             if not await smoke_lock.acquire(redis, PROVIDER, job_id):
                 print("a smoke test is already running for this provider; try again later", file=sys.stderr)

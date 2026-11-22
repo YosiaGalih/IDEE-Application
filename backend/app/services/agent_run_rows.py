@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Final
@@ -47,14 +47,14 @@ UNWRITTEN: Final = Unwritten.UNWRITTEN
 
 @dataclass(frozen=True, slots=True)
 class RowOwner:
-    """The run a closer may end besides its id: the row must also be of this task and agent and, when
-    ``start_token`` is given, hold that token (migration 0013; spec WP-3.2 §16.3a #1). ``AgentRunWriter.fail``
-    always gives it, so its minimal end never ends a duplicate request's row of the same id (nor a row
-    written before 0013, whose token is NULL)."""
+    """The run a closer may end besides its id: the row must also be of this task and agent and hold this
+    start token (migration 0013; spec WP-3.2 §16.3a #1). The token is required (Lead ruling R-F7), so
+    ``AgentRunWriter.fail``'s minimal end never ends a duplicate request's row of the same id, nor a row
+    written before 0013, whose token is NULL. It is compared only, and kept out of ``repr``."""
 
     task_id: uuid.UUID
     agent_id: str
-    start_token: uuid.UUID | None = None
+    start_token: uuid.UUID = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,8 +81,8 @@ async def close_run_row(
     with_duration: bool = True,
     owner: RowOwner | None = None,
 ) -> ClosedRun | None:
-    """UPDATE the row of ``agent_run_id`` while it is still ``running`` (and, with ``owner``, of that task and
-    agent, and of its start token when it has one), then ``agent.run_finished`` in ``finish``'s envelope;
+    """UPDATE the row of ``agent_run_id`` while it is still ``running`` (and, with ``owner``, of that task,
+    agent and start token: a NULL token matches none), then ``agent.run_finished`` in ``finish``'s envelope;
     None when no row matched (nothing is written or emitted). The token is only compared: it is never
     written, returned or emitted.
 
@@ -115,9 +115,14 @@ async def close_run_row(
         values["duration_ms"] = cast(func.least(elapsed_ms, INT4_MAX), Integer)
     where = [AgentRun.id == agent_run_id, AgentRun.status == "running"]
     if owner is not None:
-        where += [AgentRun.task_id == owner.task_id, AgentRun.agent_id == owner.agent_id]
-        if owner.start_token is not None:  # NULL (a row written before 0013) never equals a token
-            where.append(AgentRun.start_token == owner.start_token)
+        # A NULL token (a row written before 0013) equals none; IS NOT NULL also keeps an untyped None from
+        # becoming ``start_token IS NULL`` (Lead ruling R-F7): a None token matches no row.
+        where += [
+            AgentRun.task_id == owner.task_id,
+            AgentRun.agent_id == owner.agent_id,
+            AgentRun.start_token.is_not(None),
+            AgentRun.start_token == owner.start_token,
+        ]
     closed = (
         await session.execute(
             update(AgentRun)

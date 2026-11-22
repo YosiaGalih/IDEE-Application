@@ -371,12 +371,12 @@ class AgentRunWriter:
         row is not read: a duplicate request never takes over a live run's row (ruling R10). A retry after a
         lost ack (``retry=True``) whose INSERT creates the row stores the token too. One whose row exists
         checks identity first (spec WP-3.2 §16.3a #2): unless task, agent **and** start token all match
-        (a NULL token never does), ``AgentRunIdConflict``, whatever the row's status, so a duplicate request
-        that committed the row while this one's first start had failed before its INSERT is never adopted
-        (AG-13 delta-2 LOW-1 of 3.1f2b1; Keputusan Lead #66). Then the status: a run that has ended is
-        ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a run; ruling R5), a ``running``
-        one is left as it is (no second event). The token is compared, never logged, emitted or put in an
-        exception's text."""
+        (a None token, the row's or the run's, never does), ``AgentRunIdConflict``, whatever the row's
+        status, so a duplicate request that committed the row while this one's first start had failed before
+        its INSERT is never adopted (AG-13 delta-2 LOW-1 of 3.1f2b1; Keputusan Lead #66). Then the status: a
+        run that has ended is ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a run;
+        ruling R5), a ``running`` one is left as it is (no second event). The token is compared, never logged,
+        emitted or put in an exception's text."""
         redactor = self._audit.redactor
         run_id = run.agent_run_id
         async with self._sessions() as session:
@@ -412,7 +412,12 @@ class AgentRunWriter:
                     )
                 ).one()
                 # Identity before status (spec WP-3.2 §16.3a #2): another request's ended run is never read
-                # back as this one's end.
+                # back as this one's end. A None token on either side is never an identity, whatever static
+                # typing says (Lead ruling R-F7): checked before the compare, where None would equal None.
+                if existing.start_token is None or run.start_token is None:
+                    raise AgentRunIdConflict(
+                        f"agent run id {run_id} belongs to another task, agent or request"
+                    )
                 if (existing.task_id, existing.agent_id, existing.start_token) != (
                     run.task_id,
                     run.agent_id,
@@ -501,7 +506,8 @@ class AgentRunWriter:
         its usage unknown and no ``duration_ms``, only for the row of this id, task, agent and start token
         that is still ``running`` (a foreign id ends nothing, ruling R6; nor a duplicate request's row of the
         same id, nor a row with no token, spec WP-3.2 §16.3a #1); then, in the same transaction,
-        ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d): both by ``close_run_row``. A
+        ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d): both by ``close_run_row``.
+        When no row matched, nothing is written and ``agent_run_not_marked`` is logged with the ids only. A
         known ``breach`` also writes ``usage.budget_exceeded`` and the audit ``budget.exceeded`` (D-I5); the
         status stays ``failed internal_error``. Those two are written in a savepoint (ruling R7): when they
         fail, the savepoint alone is rolled back, ``budget_audit_unrecorded`` is logged with the run's ids and
@@ -522,6 +528,13 @@ class AgentRunWriter:
                 owner=RowOwner(task_id, agent_id, start_token),
             )
             if closed is None:  # finished elsewhere (its end was already published), or not this run's row
+                _log.warning(  # ids only, never the token (silent L1)
+                    "agent_run_not_marked",
+                    agent_run_id=str(agent_run_id),
+                    task_id=str(task_id),
+                    agent_id=agent_id,
+                    breach_kind=breach.kind if breach else None,
+                )
                 return
             if breach is not None:
                 try:

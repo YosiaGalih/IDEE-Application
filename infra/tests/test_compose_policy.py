@@ -308,6 +308,19 @@ class ComposePolicy(unittest.TestCase):
                         target == baked or target.startswith(baked + "/"), f"{name}: {target} shadows the image"
                     )
 
+    def test_backend_services_keep_the_image_working_dir_and_its_app_tree(self) -> None:
+        """Lead ruling R-F9 of 3.2c2a (AG-13 INFO-3): the default PRICING_PATH, ``config/pricing.yaml``, is relative
+        to the image's working directory, /app. So no backend service sets ``working_dir`` (another table would be
+        read), and no tmpfs is mounted at or under /app (it would hide the table or the registry baked there)."""
+        for name in BACKEND:
+            svc = self.services[name]
+            with self.subTest(service=name):
+                self.assertIsNone(svc.get("working_dir"), f"{name}: working_dir moves the relative pricing path")
+                targets = [str(entry).split(":", 1)[0] for entry in svc.get("tmpfs", [])]
+                targets += [v["target"] for v in svc.get("volumes", []) if v.get("type") == "tmpfs"]
+                for target in targets:
+                    self.assertFalse(target == "/app" or target.startswith("/app/"), f"{name}: tmpfs at {target}")
+
     def test_backend_image_trusts_no_proxy(self) -> None:
         """uvicorn trusts only FORWARDED_ALLOW_IPS (default 127.0.0.1); the image must not override it."""
         dockerfile = (ROOT / "backend" / "Dockerfile").read_text()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
@@ -50,6 +50,17 @@ def make_test_env(**overrides: str) -> dict[str, str]:
 @pytest.fixture
 def settings() -> Settings:
     return load_settings(make_test_env())
+
+
+@pytest.fixture(autouse=True)
+def _keep_the_current_celery_app() -> Iterator[None]:
+    """create_celery makes its app current (task_eager_propagates=True); each test gets back the app it
+    found."""
+    import celery
+
+    previous = celery.current_app._get_current_object()
+    yield
+    previous.set_current()
 
 
 def alembic_config(database_url: str) -> Config:

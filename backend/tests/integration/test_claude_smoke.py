@@ -315,6 +315,32 @@ async def test_the_job_records_the_table_the_process_holds_and_never_reloads(
     assert row.pricing_version == "2026-11-08-test"
 
 
+async def test_a_job_in_a_process_with_no_table_records_a_failed_report_and_frees_the_lock(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final review 3.2c2a (silent M1): ``PricingNotLoaded`` after the claim is a failed ``pricing_verified``
+    on a recorded report, and the lock is released at once (never held to its TTL with nothing said)."""
+    from redis.asyncio import Redis
+
+    use_env(monkeypatch)
+    monkeypatch.setattr(worker_pricing_module, "_held", None)  # this process loaded no table
+    redis = Redis.from_url(make_test_env()["REDIS_URL"])
+    job_id = uuid.uuid4()
+    try:
+        await redis.set(LOCK, str(job_id), ex=60)
+        assert await run_provider_smoke_job(job_id=job_id, provider="anthropic") == "not_ready"
+        assert await redis.get(LOCK) is None  # released by the job, not by the TTL
+    finally:
+        await redis.delete(LOCK)
+        await redis.aclose()
+    async with async_sessionmaker(engine)() as session:
+        row = (await session.scalars(select(ProviderConfig))).one()
+    assert row.readiness_status == "failed" and row.pricing_version is None
+    assert row.readiness_report["job_id"] == str(job_id)
+    check = next(c for c in row.readiness_report["checks"] if c["key"] == "pricing_verified")
+    assert (check["status"], check["detail"]) == ("failed", "no pricing table in this process")
+
+
 def test_the_cli_with_a_broken_pricing_file_fails_the_check_and_still_records(
     monkeypatch: pytest.MonkeyPatch, redis: SyncRedis, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
@@ -327,4 +353,23 @@ def test_the_cli_with_a_broken_pricing_file_fails_the_check_and_still_records(
     row, _ = stored()
     assert row is not None and row.readiness_status == "failed" and row.pricing_version is None
     check = next(c for c in row.readiness_report["checks"] if c["key"] == "pricing_verified")
-    assert check["status"] != "passed"
+    assert check["status"] == "failed"
+
+
+def test_the_cli_with_a_pricing_file_that_is_not_utf8_fails_the_check_and_still_records(
+    monkeypatch: pytest.MonkeyPatch, redis: SyncRedis, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Final review 3.2c2a (backend Minor 3, silent L3): a decode error is a ``PricingError`` like any broken
+    file, so the run is recorded as not ready (exit 1), never "could not run" (exit 2)."""
+    broken = tmp_path / "latin1.yaml"
+    broken.write_bytes(PRICING.replace("2026-11-08-test", "2026-11-08-caf\xe9").encode("latin-1"))
+    use_env(monkeypatch)
+    monkeypatch.setenv("PRICING_PATH", str(broken))
+    assert cli_main(["claude-smoke"]) == 1
+    captured = capsys.readouterr()
+    assert "pricing_verified" in captured.out and "could not run" not in captured.err
+    row, _ = stored()
+    assert row is not None and row.readiness_status == "failed" and row.pricing_version is None
+    check = next(c for c in row.readiness_report["checks"] if c["key"] == "pricing_verified")
+    assert check["status"] == "failed" and "UnicodeDecodeError" in check["detail"]
+    assert redis.get(LOCK) is None

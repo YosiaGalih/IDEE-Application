@@ -523,3 +523,72 @@ async def test_fail_ends_only_the_row_of_its_start_token(
     session.expire_all()
     row = await session.get(AgentRun, live.agent_run_id)
     assert row is not None and (row.status, row.error_code) == ("failed", "internal_error")
+
+
+def test_a_row_owner_holds_a_token_it_never_shows() -> None:
+    """Final review 3.2c2a (AG-13 LOW-1, Lead ruling R-F7): ``RowOwner.start_token`` is required, so no closer
+    builds an owner that matches a row of any token, and it is out of the owner's ``repr``."""
+    from app.services.agent_run_rows import RowOwner
+
+    task_id, token = uuid.uuid4(), uuid.uuid4()
+    with pytest.raises(TypeError):
+        RowOwner(task_id, "B14")  # type: ignore[call-arg]
+    owner = RowOwner(task_id, "B14", token)
+    assert owner.start_token == token
+    assert str(token) not in repr(owner) and token.hex not in repr(owner)
+    assert str(task_id) in repr(owner)
+
+
+@pytest.mark.parametrize("side", ["row", "claim", "both"])
+async def test_a_retried_start_refuses_a_none_token_on_either_side(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], side: str
+) -> None:
+    """Final review 3.2c2a (AG-13 LOW-1, Lead ruling R-F7; PoC ``test_none_token_is_only_stopped_by_static_
+    typing`` flipped): a None token is never an identity, whatever static typing says. A retried start whose
+    row holds no token (written before 0013), or whose own token is None, or both, is ``AgentRunIdConflict``
+    (never adoption), with nothing written, emitted or cached."""
+    project_id, task_id = await a_task_of(session)
+    bus = RecordingBus()
+    run = run_start_of(run_request("B14", task_id=task_id, project_id=project_id))
+    await AgentRunWriter(sessions, bus, AUDIT).start(run, retry=False)
+    if side in ("row", "both"):
+        await session.execute(
+            text("UPDATE agent_runs SET start_token = NULL WHERE id = :id"), {"id": run.agent_run_id}
+        )
+        await session.commit()
+    claim = replace(run, start_token=None) if side in ("claim", "both") else run  # type: ignore[arg-type]
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    with pytest.raises(AgentRunIdConflict):
+        await writer.start(claim, retry=True)
+    assert writer._projects == {}
+    assert await task_event_types(session, task_id) == ["agent.run_started"]
+    assert [m["type"] for m in bus.messages] == ["agent.run_started"]
+    session.expire_all()
+    row = await session.get(AgentRun, run.agent_run_id)
+    assert row is not None and row.status == "running"
+
+
+async def test_the_minimal_end_with_a_none_token_ends_no_row(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Final review 3.2c2a (AG-13 LOW-1; PoC flipped): ``fail(start_token=None)`` ends neither a live row of
+    another request's token nor a row written before 0013 (NULL token): no status, no event. The token is
+    compared in SQL, and a None never matches."""
+    project_id, task_id = await a_task_of(session)
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    request = run_request("B14", task_id=task_id, project_id=project_id)
+    live, legacy = run_start_of(request), replace(run_start_of(request), agent_run_id=uuid.uuid4())
+    await writer.start(live, retry=False)
+    await writer.start(legacy, retry=False)
+    await session.execute(
+        text("UPDATE agent_runs SET start_token = NULL WHERE id = :id"), {"id": legacy.agent_run_id}
+    )
+    await session.commit()
+    for run_id in (live.agent_run_id, legacy.agent_run_id):
+        await writer.fail(run_id, task_id=task_id, agent_id="B14", start_token=None)  # type: ignore[arg-type]
+    session.expire_all()
+    for run_id in (live.agent_run_id, legacy.agent_run_id):
+        row = await session.get(AgentRun, run_id)
+        assert row is not None and (row.status, row.error_code, row.finished_at) == ("running", None, None)
+    assert bus.of_type("agent.run_finished") == []

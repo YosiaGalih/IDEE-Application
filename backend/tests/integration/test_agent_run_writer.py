@@ -616,6 +616,51 @@ async def test_fail_ends_only_the_row_of_its_task_and_agent(
     assert (await stored(session, foreign)).error_code == "internal_error"
 
 
+async def test_a_minimal_end_that_marks_no_row_says_so_once_without_the_token(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Final review 3.2c2a (silent L1): ``fail`` that matched no row (a duplicate request's row of another
+    token, or a row that has ended) logs ``agent_run_not_marked`` once per call, with ids and the breach kind
+    only: never the token. The row is left as it was."""
+    from structlog.testing import capture_logs
+
+    project_id, task_id = await a_task(session)
+    writer = AgentRunWriter(sessions, None, AUDIT)
+    live = await begin(writer, start(task_id, project_id))
+    ended = await begin(writer, start(task_id, project_id))
+    await writer.fail(ended, task_id=task_id, agent_id="B14", start_token=TOKEN)
+    other_token = uuid.uuid4()
+    breach = BudgetBreach("tokens", 1, 1, 0)
+    with capture_logs() as logs:
+        await writer.fail(live, task_id=task_id, agent_id="B14", start_token=other_token, breach=breach)
+        await writer.fail(ended, task_id=task_id, agent_id="B14", start_token=TOKEN)
+    assert [log for log in logs if log["event"] == "agent_run_not_marked"] == [
+        {
+            "event": "agent_run_not_marked",
+            "log_level": "warning",
+            "agent_run_id": str(live),
+            "task_id": str(task_id),
+            "agent_id": "B14",
+            "breach_kind": "tokens",
+        },
+        {
+            "event": "agent_run_not_marked",
+            "log_level": "warning",
+            "agent_run_id": str(ended),
+            "task_id": str(task_id),
+            "agent_id": "B14",
+            "breach_kind": None,
+        },
+    ]
+    assert str(TOKEN) not in repr(logs) and str(other_token) not in repr(logs)
+    assert TOKEN.hex not in repr(logs) and other_token.hex not in repr(logs)
+    assert (await stored(session, live)).status == "running"
+    with capture_logs() as logs:
+        await writer.fail(live, task_id=task_id, agent_id="B14", start_token=TOKEN)  # its own: marked, silent
+    assert [log for log in logs if log["event"] == "agent_run_not_marked"] == []
+    assert (await stored(session, live)).error_code == "internal_error"
+
+
 async def test_read_run_outcome_of_another_task_is_missing(
     session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
 ) -> None:

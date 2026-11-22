@@ -3,16 +3,19 @@ WP-3.2 §16.3 Keputusan Lead #67, §16.3a #6).
 
 ``close_run_row`` ends an ``agent_runs`` row that is still ``running`` for whoever calls it. What makes that
 safe is each caller's own context: the runtime ends the run it started (``AgentRunWriter.finish``, and
-``fail`` for that id, task and agent only); the run recovery ends a run whose lease is dead or that is stale,
-under its task's row lock. The pattern of tests/unit/test_close_abandoned_calls_guard.py: a module other than
-the two callers may not name the function at all (call, import, attribute, string), and the module that
-defines it never calls it.
+``fail`` for that id, task, agent and start token only); the run recovery ends a run whose lease is dead or
+that is stale, under its task's row lock. The pattern of tests/unit/test_close_abandoned_calls_guard.py: a
+module other than the two callers may not name the function at all (call, import, attribute, string, also
+one built by concatenation, f-string, ``%`` or ``.format``: ``_string_value`` of the writer guard), and the
+module that defines it never calls it.
 """
 
 from __future__ import annotations
 
 import ast
 from pathlib import Path
+
+from tests.unit.test_agent_run_writer_guard import _string_value
 
 APP = Path(__file__).resolve().parents[2] / "app"
 DEFINER = APP / "services" / "agent_run_rows.py"
@@ -49,10 +52,9 @@ def references(source: str) -> list[str]:
         elif isinstance(node, ast.ImportFrom) and any(alias.name == NAME for alias in node.names):
             found.append(f"line {node.lineno}: import")
         elif (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and NAME in node.value
+            isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call)
             and id(node) not in prose
+            and NAME in (_string_value(node) or "")
         ):
             found.append(f"line {node.lineno}: string")
     return found
@@ -92,6 +94,9 @@ def test_guard_detects_another_caller() -> None:
         "import app.services.agent_run_rows as rows\nf = rows.close_run_row\n",
         "f = getattr(agent_run_rows, 'close_run_row')\n",
         "close = close_run_row\n",
+        # Final review 3.2c2a (AG-13 MEDIUM-1): a name built from pieces is still the name.
+        "f = getattr(agent_run_rows, 'close_' + 'run_row')\n",
+        "f = getattr(agent_run_rows, 'close_{}'.format('run_row'))\n",
     ):
         assert references(source), source
     assert references('async def close_run_row():\n    """close_run_row closes."""\n') == []
