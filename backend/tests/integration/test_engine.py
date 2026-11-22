@@ -586,12 +586,13 @@ async def test_a_second_delivery_in_the_same_process_fences_the_first(
     b_expiry: list[Any] = []
 
     async def expires_then_b_claims(_: StepContext) -> StepResult:
-        async with engine.begin() as conn:
-            await conn.execute(
+        # Expiry and B's claim commit together: a heartbeat of A in between would see a dead lease, stop the
+        # step before B claims, and fail the test for the wrong reason (review T2).
+        async with make_sessionmaker(engine)() as session:
+            await session.execute(
                 text("UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = :id"),
                 {"id": task_id},
             )
-        async with make_sessionmaker(engine)() as session:
             claimed = await claim_lease(
                 session, task_id, owner_b, max_active=5, claimable=frozenset({"draft"})
             )

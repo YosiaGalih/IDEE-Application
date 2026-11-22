@@ -80,6 +80,8 @@ def test_delivery_owner_fits_the_column_and_extends_the_worker_id(
     owner = delivery_owner()
     assert LEASE_OWNER_LENGTH == MAX_LENGTH
     assert len(owner) <= LEASE_OWNER_LENGTH
+    if hostname_length == 500:
+        assert len(owner) == LEASE_OWNER_LENGTH  # the reserve matches the suffix exactly
     assert owner.startswith(f"{worker_id()}:")
     assert len(owner.rsplit(":", 1)[1]) == 8
 
