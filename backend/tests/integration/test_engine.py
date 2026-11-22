@@ -1241,7 +1241,7 @@ async def test_abandoned_draft_is_sent_again_and_counts_an_attempt(engine: Async
     assert first.stopped == "abandoned"
 
     dispatcher = SentTasks()
-    swept = await redispatch_orphans(make_sessionmaker(engine), dispatcher)
+    swept = await redispatch_orphans(make_sessionmaker(engine), dispatcher, max_active=5)
 
     assert (swept.dispatched, dispatcher.sent) == (1, [task_id])
     steps = Steps(plan=to_planned)
