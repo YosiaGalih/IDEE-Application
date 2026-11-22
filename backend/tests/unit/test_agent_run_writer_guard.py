@@ -62,8 +62,8 @@ RAW_SQL = tuple(
         rf"\bcopy\s+{_NAME}\s*(?:\([^)]*\)\s*)?from\b",
     )
 )
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
-_LINE_COMMENT = re.compile(r"--[^\n]*")
+# A literal or quoted name comes first, so ``--`` or ``/*`` inside one is not taken for a comment (review T7).
+_LEXEME = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|--[^\n]*|/\*.*?\*/", re.DOTALL)
 _AROUND_DOT = re.compile(r"\s*\.\s*")
 _QUOTES = re.compile(r"[\"'`]")
 
@@ -71,7 +71,7 @@ _QUOTES = re.compile(r"[\"'`]")
 def _normalise_sql(text: str) -> str:
     """The SQL as the matcher reads it: ``/*...*/`` and ``--...`` comments (each a space), whitespace
     collapsed, no space around ``.``, no quotes (``"``, ``'``, backtick)."""
-    text = _LINE_COMMENT.sub(" ", _BLOCK_COMMENT.sub(" ", text))
+    text = _LEXEME.sub(lambda m: " " if m.group().startswith(("--", "/*")) else m.group(), text)
     return _QUOTES.sub("", _AROUND_DOT.sub(".", " ".join(text.split())))
 
 
@@ -443,6 +443,8 @@ SQL_FORMS = {
     "block comment in the gap": "Q = 'UPDATE /* why */ agent_runs SET status = :s'\n",
     "block comment as the gap": "Q = 'insert/**/into agent_runs (id) values (:i)'\n",
     "line comment in the gap": "Q = 'UPDATE -- why\\n agent_runs SET status = :s'\n",
+    "dashes inside an earlier literal": "Q = \"SELECT 'a--b'; UPDATE agent_runs SET status = :s\"\n",
+    "block opener inside an earlier literal": "Q = \"SELECT '/*'; DELETE FROM agent_runs; SELECT '*/'\"\n",
     "line breaks and indent": "Q = 'DELETE\\n    FROM\\n    agent_runs WHERE id = :i'\n",
     "spaces around the dot": "Q = 'UPDATE public . agent_runs SET status = :s'\n",
     "quoted with spaces around the dot": 'Q = \'delete from "public" . "agent_runs" where id = :i\'\n',
