@@ -26,6 +26,7 @@ from app.models.audit import AuditEvent
 from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task
+from app.worker.identity import delivery_owner
 from app.workflow import engine as engine_module
 from app.workflow import lease as lease_module
 from app.workflow.dispatch import redispatch_orphans
@@ -39,7 +40,7 @@ from app.workflow.engine import (
     TaskEngine,
     WorkflowPorts,
 )
-from app.workflow.lease import LEASE_SECONDS, ClaimResult, LeaseLost
+from app.workflow.lease import LEASE_SECONDS, ClaimResult, LeaseLost, claim_lease
 from app.workflow.recovery import recover_expired
 from app.workflow.states import Actor, TaskStatus, transition
 from tests.conftest import reset_data
@@ -569,6 +570,49 @@ async def test_heartbeat_extends_lease_during_long_step(
     assert first_live and last_live and owner == WORKER
     assert last > first + timedelta(seconds=1)
     assert (await row(engine, task_id)).status == "interrupted"
+
+
+@pytest.mark.parametrize("how", ["heartbeat", "after_step"])
+async def test_a_second_delivery_in_the_same_process_fences_the_first(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    how: str,
+) -> None:
+    """L6: two deliveries of one worker process hold different owners, so once B claims after A's lease
+    expired, A's heartbeat or finish raises LeaseLost and never extends B's lease."""
+    owner_a, owner_b = delivery_owner(), delivery_owner()
+    assert owner_a != owner_b
+    task_id = await make_task("draft")
+    b_expiry: list[Any] = []
+
+    async def expires_then_b_claims(_: StepContext) -> StepResult:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = :id"),
+                {"id": task_id},
+            )
+        async with make_sessionmaker(engine)() as session:
+            claimed = await claim_lease(
+                session, task_id, owner_b, max_active=5, claimable=frozenset({"draft"})
+            )
+            await session.commit()
+        assert claimed is ClaimResult.ACQUIRED
+        b_expiry.append((await row(engine, task_id)).lease_expires_at)
+        if how == "heartbeat":
+            await asyncio.sleep(10)
+        return StepResult.done()
+
+    steps = Steps(intake=expires_then_b_claims)
+    beat = 30 if how == "after_step" else 0.1
+    engine_a = make_engine(
+        engine, RecordingBus(), steps.registry(*PLANNING), worker=owner_a, heartbeat_s=beat
+    )
+    outcome = await asyncio.wait_for(engine_a.run(task_id), timeout=5)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["intake"], "lease_lost")
+    after = await row(engine, task_id)
+    assert after.lease_owner == owner_b
+    assert after.lease_expires_at == b_expiry[0]
 
 
 @pytest.mark.parametrize("how", ["heartbeat", "after_step", "step_raises"])

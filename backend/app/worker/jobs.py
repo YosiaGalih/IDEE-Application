@@ -18,7 +18,7 @@ from app.core.redaction import Redactor
 from app.services.job_queue import CeleryJobQueue
 from app.services.orchestrator import build_orchestrator
 from app.services.run_recovery import RunRecoveryIncomplete, RunRecoveryResult, recover_runs
-from app.worker.identity import worker_id
+from app.worker.identity import delivery_owner
 from app.workflow.dispatch import Dispatcher, DispatchIncomplete, DispatchResult, redispatch_orphans
 from app.workflow.engine import EngineOutcome
 from app.workflow.lease import ClaimResult
@@ -154,7 +154,7 @@ async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
             bus=RedisEventBus(redis),
             audit=AuditWriter(Redactor(settings.secret_values())),
             settings=settings,
-            worker_id=worker_id(),
+            worker_id=delivery_owner(),
         )
         return await orchestrator.run(task_id)
     finally:

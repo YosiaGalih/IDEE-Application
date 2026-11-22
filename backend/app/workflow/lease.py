@@ -31,7 +31,7 @@ LEASE_SECONDS = 60
 HEARTBEAT_SECONDS = 20
 CLAIM_LOCK_TIMEOUT = "5s"
 _LEASE = timedelta(seconds=LEASE_SECONDS)
-_WORKER_ID_LENGTH = 120  # tasks.lease_owner
+LEASE_OWNER_LENGTH = 120  # tasks.lease_owner
 # Serialises claims so the MAX_ACTIVE_TASKS count and the claim cannot interleave.
 _CLAIM_LOCK = "kodekantor.claim_lease"
 _LOCK_NOT_AVAILABLE = "55P03"
@@ -60,8 +60,8 @@ def lease_duration() -> timedelta:
 
 
 def _check_worker(worker_id: str) -> None:
-    if not 1 <= len(worker_id) <= _WORKER_ID_LENGTH:
-        raise ValueError(f"worker id must be 1-{_WORKER_ID_LENGTH} characters")
+    if not 1 <= len(worker_id) <= LEASE_OWNER_LENGTH:
+        raise ValueError(f"worker id must be 1-{LEASE_OWNER_LENGTH} characters")
 
 
 async def claim_lease(

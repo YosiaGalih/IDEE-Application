@@ -18,6 +18,7 @@ from app.models.identity import User
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.worker import jobs
+from app.worker.identity import worker_id
 from app.workflow.dispatch import DispatchIncomplete, DispatchResult
 from app.workflow.engine import EngineOutcome
 from app.workflow.lease import ClaimResult
@@ -85,6 +86,26 @@ async def test_execute_task_fails_a_draft_with_no_registered_steps(
     row = await row_of(engine, draft_task)
     assert (row.status, row.error_code) == ("failed", "step_unavailable")
     assert (spy.disposed, spy.closed) == (1, 1)
+
+
+async def test_each_delivery_gets_its_own_lease_owner(
+    draft_task: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owners: list[str] = []
+
+    class Noop:
+        async def run(self, task_id: uuid.UUID) -> EngineOutcome:
+            return EngineOutcome(ClaimResult.ACQUIRED, [], "done")
+
+    def fake_build(**kwargs: Any) -> Noop:
+        owners.append(kwargs["worker_id"])
+        return Noop()
+
+    monkeypatch.setattr(jobs, "build_orchestrator", fake_build)
+    await jobs.execute_task(draft_task)
+    await jobs.execute_task(draft_task)
+    assert len(owners) == 2 and owners[0] != owners[1]
+    assert all(o.startswith(f"{worker_id()}:") for o in owners)
 
 
 async def test_resources_are_closed_when_the_engine_raises(
