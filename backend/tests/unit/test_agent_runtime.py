@@ -1045,6 +1045,7 @@ class FlakyRuns(FakeRuns):
         *,
         task_id: uuid.UUID,
         agent_id: str,
+        start_token: uuid.UUID,
         breach: BudgetBreach | None = None,
     ) -> None:
         self.failed.append(agent_run_id)
@@ -1791,8 +1792,38 @@ async def test_a_lost_start_ack_retries_start_with_the_same_id_and_writes_one_en
     with pytest.raises(ConnectionError):  # the unexpected error is raised again after the row is closed
         await make_runtime(fakes).run(run_request("B14", agent_run_id=rid))
     assert [s.agent_run_id for s in fakes.runs.starts] == [rid, rid]
+    # One request, one start token (spec WP-3.2 §16.3 #66): the retry is recognised as this request's start.
+    first, retried = (s.start_token for s in fakes.runs.starts)
+    assert isinstance(first, uuid.UUID) and retried == first
     assert [run_id for run_id, _ in fakes.runs.finishes] == [rid]
     assert fakes.runs.failed_runs == []
+
+
+async def test_each_run_has_a_start_token_of_its_own() -> None:
+    """Spec WP-3.2 §16.3 #66, §16.3a #4: the token is made once per ``run()``, so two runs of one request (a
+    duplicate with the same id) carry different tokens, and neither can pass as the other's start."""
+    rid = uuid.uuid4()
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT), submit_turn(VALID_IMPLEMENT)))
+    runtime = make_runtime(fakes)
+    request = run_request("B14", agent_run_id=rid)
+    await runtime.run(request)
+    await runtime.run(request)
+    first, second = (s.start_token for s in fakes.runs.starts)
+    assert [s.agent_run_id for s in fakes.runs.starts] == [rid, rid] and first != second
+
+
+async def test_the_minimal_end_carries_the_runs_start_token() -> None:
+    """Spec WP-3.2 §16.3a #1: ``fail`` is bound to the run's start token as well as its task and agent, so
+    the minimal end of a run can never end a duplicate request's row of the same id."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    runs = DownRuns()
+    fakes.runs = runs
+    request = run_request("B14")
+    with pytest.raises(AgentRunUnfinished):
+        await make_runtime(fakes, runtime_config=config(close_timeout_s=0.2)).run(request)
+    (start,) = runs.starts
+    assert runs.fail_tokens == [start.start_token]
+    assert runs.fail_owners == [(request.task_id, "B14")]
 
 
 class ConflictRuns(FakeRuns):

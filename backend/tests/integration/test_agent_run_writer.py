@@ -47,6 +47,9 @@ from tests.runtime_fakes import REGISTRY, RecordingBus, begin
 
 SECRET = "kk-writer-secret-" + "s" * 24  # built, not written: a test value
 AUDIT = AuditWriter(Redactor([SECRET]))
+TOKEN = (
+    uuid.uuid4()
+)  # the start token of the runs ``start`` builds; ``fail`` names it (spec WP-3.2 §16.3a #1)
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +77,7 @@ def start(task_id: uuid.UUID, project_id: uuid.UUID, **overrides: Any) -> RunSta
         "model_name": "claude-haiku-5-5",
         "prompt_version": "0123456789ab",
         "input": {"task_id": str(task_id), "gap_feedback": "none"},
+        "start_token": TOKEN,
     }
     values.update(overrides)
     return RunStart(**values)
@@ -130,6 +134,7 @@ async def test_start_writes_a_running_row_with_its_identity(
         "claude-haiku-5-5",
         "0123456789ab",
     )
+    assert row.start_token == TOKEN  # spec WP-3.2 §16.3 #66: the run's start token, never published
     (started,) = bus.of_type("agent.run_started")
     assert started["payload"] == {"agent_run_id": str(run_id), "agent_id": "B14", "status": "running"}
     types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
@@ -386,12 +391,14 @@ async def test_fail_is_the_minimal_end_of_a_running_run(
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
-    await writer.fail(run_id, task_id=task_id, agent_id="B14")
+    await writer.fail(run_id, task_id=task_id, agent_id="B14", start_token=TOKEN)
     row = await stored(session, run_id)
     assert (row.status, row.error_code, row.finished_at is not None) == ("failed", "internal_error", True)
     with pytest.raises(AgentRunAlreadyFinished):
         await writer.finish(run_id, RunEnd("succeeded", 1, output={}))
-    await writer.fail(run_id, task_id=task_id, agent_id="B14")  # a second time changes nothing
+    await writer.fail(
+        run_id, task_id=task_id, agent_id="B14", start_token=TOKEN
+    )  # a second time changes nothing
     assert (await stored(session, run_id)).error_code == "internal_error"
 
 
@@ -405,7 +412,7 @@ async def test_the_minimal_end_publishes_run_finished_once(
     bus = RecordingBus(engine)
     writer = AgentRunWriter(sessions, bus, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
-    await writer.fail(run_id, task_id=task_id, agent_id="B14")
+    await writer.fail(run_id, task_id=task_id, agent_id="B14", start_token=TOKEN)
     (finished,) = bus.of_type("agent.run_finished")
     assert finished["payload"] == {
         "agent_run_id": str(run_id),
@@ -422,7 +429,9 @@ async def test_the_minimal_end_publishes_run_finished_once(
     assert finished["seq"] is not None and bus.unseen == []  # stored, committed, then published
     row = await stored(session, run_id)
     assert (row.input_tokens, row.estimated_cost, row.cost_status) == (None, None, "unavailable")
-    await writer.fail(run_id, task_id=task_id, agent_id="B14")  # nothing matched: no second event
+    await writer.fail(
+        run_id, task_id=task_id, agent_id="B14", start_token=TOKEN
+    )  # nothing matched: no second event
     assert len(bus.of_type("agent.run_finished")) == 1
 
 
@@ -433,7 +442,7 @@ async def test_the_run_store_keeps_no_project_of_an_ended_run(
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
     first = await begin(writer, start(task_id, project_id))
-    await writer.fail(first, task_id=task_id, agent_id="B14")
+    await writer.fail(first, task_id=task_id, agent_id="B14", start_token=TOKEN)
     assert first not in writer._projects
     second = await begin(writer, start(task_id, project_id))
     await writer.finish(second, RunEnd("cancelled", 0))
@@ -519,7 +528,7 @@ async def test_fail_with_a_breach_audits_budget_exceeded_in_its_transaction(
     run_id = await begin(writer, start(task_id, project_id))
     writer._projects.clear()  # a start that found its row leaves no cache entry
     breach = BudgetBreach("cost", Decimal("2"), Decimal("1.95"), Decimal("0.1"))
-    await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=breach)
+    await writer.fail(run_id, task_id=task_id, agent_id="B14", start_token=TOKEN, breach=breach)
     row = await stored(session, run_id)
     assert (row.status, row.error_code) == ("failed", "internal_error")
     audit = await session.scalar(
@@ -546,7 +555,7 @@ async def test_fail_on_a_finished_row_writes_no_audit(
     run_id = await begin(writer, start(task_id, project_id))
     await writer.finish(run_id, RunEnd("cancelled", 0))
     breach = BudgetBreach("tokens", 1, 1, 0)
-    await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=breach)
+    await writer.fail(run_id, task_id=task_id, agent_id="B14", start_token=TOKEN, breach=breach)
     audits = list(
         await session.scalars(
             select(AuditEvent).where(
@@ -598,12 +607,12 @@ async def test_fail_ends_only_the_row_of_its_task_and_agent(
     writer = AgentRunWriter(sessions, bus, AUDIT)
     foreign = await begin(writer, start(other_id, project_id))
     breach = BudgetBreach("tokens", 1, 1, 0)
-    await writer.fail(foreign, task_id=task_id, agent_id="B14", breach=breach)
-    await writer.fail(foreign, task_id=other_id, agent_id="B15")
+    await writer.fail(foreign, task_id=task_id, agent_id="B14", start_token=TOKEN, breach=breach)
+    await writer.fail(foreign, task_id=other_id, agent_id="B15", start_token=TOKEN)
     row = await stored(session, foreign)
     assert (row.status, row.error_code, row.finished_at) == ("running", None, None)
     assert bus.of_type("agent.run_finished") == [] and bus.of_type("usage.budget_exceeded") == []
-    await writer.fail(foreign, task_id=other_id, agent_id="B14")  # its own identity: ended
+    await writer.fail(foreign, task_id=other_id, agent_id="B14", start_token=TOKEN)  # its own identity: ended
     assert (await stored(session, foreign)).error_code == "internal_error"
 
 
@@ -712,7 +721,9 @@ async def test_a_failing_breach_audit_never_rolls_back_the_minimal_end(
     run_id = await begin(writer, start(task_id, project_id))
     audit.write = broken_write  # type: ignore[method-assign]
     with capture_logs() as logs:
-        await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=BudgetBreach("cost", 2, 3, 1))
+        await writer.fail(
+            run_id, task_id=task_id, agent_id="B14", start_token=TOKEN, breach=BudgetBreach("cost", 2, 3, 1)
+        )
     row = await stored(session, run_id)
     assert (row.status, row.error_code) == ("failed", "internal_error")
     types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
@@ -803,7 +814,9 @@ async def test_a_breach_audit_failing_at_flush_still_publishes_the_minimal_end(
     run_id = await begin(writer, start(task_id, project_id))
     audit.write = broken_write  # type: ignore[method-assign]
     with capture_logs() as logs:
-        await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=BudgetBreach("cost", 2, 3, 1))
+        await writer.fail(
+            run_id, task_id=task_id, agent_id="B14", start_token=TOKEN, breach=BudgetBreach("cost", 2, 3, 1)
+        )
     row = await stored(session, run_id)
     assert (row.status, row.error_code) == ("failed", "internal_error")
     types = list(await session.scalars(select(TaskEvent.type).where(TaskEvent.task_id == task_id)))
@@ -1013,7 +1026,9 @@ async def test_fail_writes_this_row_and_this_event(
         await ledger_row(sessions, pricing, project_id, task_id, run_id, usage=CACHED)
     await age(engine, run_id, "7.2345675")
 
-    assert await writer.fail(run_id, task_id=task_id, agent_id="B14", breach=breach) is None
+    assert (
+        await writer.fail(run_id, task_id=task_id, agent_id="B14", start_token=TOKEN, breach=breach) is None
+    )
 
     assert await closed_row(engine, run_id) == {
         "task_id": task_id,

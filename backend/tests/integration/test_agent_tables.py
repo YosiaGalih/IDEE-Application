@@ -1,5 +1,6 @@
-"""``agent_profiles`` and ``agent_runs`` (DATA_MODEL M07, migration 0006; spec WP-3.1b goal 5), and
-``agent_runs.error_code`` (migration 0011; spec WP-3.1f Keputusan Lead #15, #35)."""
+"""``agent_profiles`` and ``agent_runs`` (DATA_MODEL M07, migration 0006; spec WP-3.1b goal 5),
+``agent_runs.error_code`` (migration 0011; spec WP-3.1f Keputusan Lead #15, #35) and
+``agent_runs.start_token`` (migration 0013; spec WP-3.2 §16.3 Keputusan Lead #66)."""
 
 from __future__ import annotations
 
@@ -287,3 +288,47 @@ def test_error_code_migration_round_trip(migrated_database: str) -> None:
     assert asyncio.run(_has_error_code(migrated_database))
     code = asyncio.run(_sql(migrated_database, "SELECT error_code FROM agent_runs WHERE id = :id", id=run_id))
     assert code == "interrupted"
+
+
+async def _start_token_column(database_url: str) -> tuple[str, str] | None:
+    """``(data_type, is_nullable)`` of ``agent_runs.start_token``, or None when the column does not exist."""
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            found = (
+                await connection.execute(
+                    text(
+                        "SELECT data_type, is_nullable FROM information_schema.columns "
+                        "WHERE table_name = 'agent_runs' AND column_name = 'start_token'"
+                    )
+                )
+            ).one_or_none()
+    finally:
+        await engine.dispose()
+    return None if found is None else (found.data_type, found.is_nullable)
+
+
+def test_start_token_migration_round_trip(migrated_database: str) -> None:
+    """Migration 0013: ``agent_runs.start_token uuid NULL``; a row written before it keeps a NULL token."""
+    config = alembic_config(migrated_database)
+    assert asyncio.run(_start_token_column(migrated_database)) == ("uuid", "YES")
+    task_id = asyncio.run(_a_task_and_a_profile(migrated_database))
+    # Pinned to the revision under 0013: "-1" stops meaning 0013 once a later migration is head.
+    command.downgrade(config, "0012_messages_task_context_refs")
+    try:
+        assert asyncio.run(_start_token_column(migrated_database)) is None
+        run_id = uuid.uuid4()
+        asyncio.run(
+            _sql(
+                migrated_database,
+                "INSERT INTO agent_runs (id, task_id, agent_id, agent_version, step) "
+                "VALUES (:id, :task_id, 'A02', 1, 'intake')",
+                id=run_id,
+                task_id=task_id,
+            )
+        )
+    finally:
+        command.upgrade(config, "head")
+    assert asyncio.run(_start_token_column(migrated_database)) == ("uuid", "YES")
+    query = "SELECT start_token IS NULL FROM agent_runs WHERE id = :id"
+    assert asyncio.run(_sql(migrated_database, query, id=run_id)) is True

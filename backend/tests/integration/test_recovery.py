@@ -412,6 +412,7 @@ async def start_run(
         model_name="claude-haiku-5-5",
         prompt_version="0123456789ab",
         input={},
+        start_token=uuid.uuid4(),
     )
     await AgentRunWriter(make_sessionmaker(engine), None, AUDIT).start(run, retry=False)
     if age_s is not None:

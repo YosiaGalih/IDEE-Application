@@ -47,8 +47,10 @@ UNWRITTEN: Final = Unwritten.UNWRITTEN
 
 @dataclass(frozen=True, slots=True)
 class RowOwner:
-    """The run a closer may end besides its id: the row must also be of this task and agent. ``start_token``
-    is not bound yet (WP-3.2c2a Task 2, migration 0013, binds it into ``fail``)."""
+    """The run a closer may end besides its id: the row must also be of this task and agent and, when
+    ``start_token`` is given, hold that token (migration 0013; spec WP-3.2 §16.3a #1). ``AgentRunWriter.fail``
+    always gives it, so its minimal end never ends a duplicate request's row of the same id (nor a row
+    written before 0013, whose token is NULL)."""
 
     task_id: uuid.UUID
     agent_id: str
@@ -80,8 +82,9 @@ async def close_run_row(
     owner: RowOwner | None = None,
 ) -> ClosedRun | None:
     """UPDATE the row of ``agent_run_id`` while it is still ``running`` (and, with ``owner``, of that task and
-    agent), then ``agent.run_finished`` in ``finish``'s envelope; None when no row matched (nothing is
-    written or emitted).
+    agent, and of its start token when it has one), then ``agent.run_finished`` in ``finish``'s envelope;
+    None when no row matched (nothing is written or emitted). The token is only compared: it is never
+    written, returned or emitted.
 
     Written: ``status``, ``error_code``, ``error`` (redacted, cut to ``ERROR_TEXT_MAX``), the four token
     counts, the cost (``stored_cost``) and ``cost_status`` from ``totals``, ``finished_at`` from the DB clock
@@ -113,6 +116,8 @@ async def close_run_row(
     where = [AgentRun.id == agent_run_id, AgentRun.status == "running"]
     if owner is not None:
         where += [AgentRun.task_id == owner.task_id, AgentRun.agent_id == owner.agent_id]
+        if owner.start_token is not None:  # NULL (a row written before 0013) never equals a token
+            where.append(AgentRun.start_token == owner.start_token)
     closed = (
         await session.execute(
             update(AgentRun)

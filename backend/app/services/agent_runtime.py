@@ -365,14 +365,18 @@ class AgentRunWriter:
         self._projects: dict[uuid.UUID, uuid.UUID] = {}  # run -> project, for the audit of its end
 
     async def start(self, run: RunStart, *, retry: bool) -> None:
-        """INSERT ``agent_runs`` (``running``, the input redacted) and ``agent.run_started``, one transaction,
-        committed, then published. A first start (``retry=False``) whose INSERT creates no row is refused
-        with ``AgentRunIdConflict``, whatever that row's task, agent or status: a duplicate request never
-        takes over a live run's row (ruling R10). A retry after a lost ack (``retry=True``) is idempotent
-        while the run is ``running``: a row of the same task and agent that is still ``running`` is left as
-        it is (no second event); for another task or agent, ``AgentRunIdConflict``; for the same task and
-        agent whose run has ended, ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a
-        run; ruling R5)."""
+        """INSERT ``agent_runs`` (``running``, the input redacted, the run's start token) and
+        ``agent.run_started``, one transaction, committed, then published. A first start (``retry=False``)
+        whose INSERT creates no row is refused with ``AgentRunIdConflict``, whatever that row holds, and the
+        row is not read: a duplicate request never takes over a live run's row (ruling R10). A retry after a
+        lost ack (``retry=True``) whose INSERT creates the row stores the token too. One whose row exists
+        checks identity first (spec WP-3.2 §16.3a #2): unless task, agent **and** start token all match
+        (a NULL token never does), ``AgentRunIdConflict``, whatever the row's status, so a duplicate request
+        that committed the row while this one's first start had failed before its INSERT is never adopted
+        (AG-13 delta-2 LOW-1 of 3.1f2b1; Keputusan Lead #66). Then the status: a run that has ended is
+        ``AgentRunAlreadyFinished`` (the id is spent: ``start`` never reopens a run; ruling R5), a ``running``
+        one is left as it is (no second event). The token is compared, never logged, emitted or put in an
+        exception's text."""
         redactor = self._audit.redactor
         run_id = run.agent_run_id
         async with self._sessions() as session:
@@ -391,6 +395,7 @@ class AgentRunWriter:
                         prompt_version=run.prompt_version,
                         status="running",
                         input=redactor.redact_obj(dict(run.input)),
+                        start_token=run.start_token,
                     )
                     .on_conflict_do_nothing(index_elements=[AgentRun.id])
                     .returning(AgentRun.id)
@@ -401,13 +406,21 @@ class AgentRunWriter:
                     raise AgentRunIdConflict(f"agent run id {run_id} is already used")
                 existing = (
                     await session.execute(
-                        select(AgentRun.task_id, AgentRun.agent_id, AgentRun.status).where(
-                            AgentRun.id == run_id
-                        )
+                        select(
+                            AgentRun.task_id, AgentRun.agent_id, AgentRun.start_token, AgentRun.status
+                        ).where(AgentRun.id == run_id)
                     )
                 ).one()
-                if (existing.task_id, existing.agent_id) != (run.task_id, run.agent_id):
-                    raise AgentRunIdConflict(f"agent run id {run_id} belongs to another task or agent")
+                # Identity before status (spec WP-3.2 §16.3a #2): another request's ended run is never read
+                # back as this one's end.
+                if (existing.task_id, existing.agent_id, existing.start_token) != (
+                    run.task_id,
+                    run.agent_id,
+                    run.start_token,
+                ):
+                    raise AgentRunIdConflict(
+                        f"agent run id {run_id} belongs to another task, agent or request"
+                    )
                 if existing.status != "running":
                     raise AgentRunAlreadyFinished(f"agent run {run_id} has ended: its id is spent")
                 self._projects[run_id] = run.project_id  # its end is audited like a first start's
@@ -481,11 +494,13 @@ class AgentRunWriter:
         *,
         task_id: uuid.UUID,
         agent_id: str,
+        start_token: uuid.UUID,
         breach: BudgetBreach | None = None,
     ) -> None:
         """The minimal end when ``finish`` could not be written (review M5): ``failed internal_error`` with
-        its usage unknown and no ``duration_ms``, only for the row of this id, task and agent that is still
-        ``running`` (a foreign id ends nothing; ruling R6); then, in the same transaction,
+        its usage unknown and no ``duration_ms``, only for the row of this id, task, agent and start token
+        that is still ``running`` (a foreign id ends nothing, ruling R6; nor a duplicate request's row of the
+        same id, nor a row with no token, spec WP-3.2 §16.3a #1); then, in the same transaction,
         ``agent.run_finished`` in ``finish``'s envelope (review N6 of 073e68d): both by ``close_run_row``. A
         known ``breach`` also writes ``usage.budget_exceeded`` and the audit ``budget.exceeded`` (D-I5); the
         status stays ``failed internal_error``. Those two are written in a savepoint (ruling R7): when they
@@ -504,7 +519,7 @@ class AgentRunWriter:
                 error="the end of the run could not be recorded",
                 totals=UNKNOWN_RUN_TOTALS,
                 with_duration=False,  # NULL: the agents API's avg_duration_ms counts measured runs only
-                owner=RowOwner(task_id, agent_id),
+                owner=RowOwner(task_id, agent_id, start_token),
             )
             if closed is None:  # finished elsewhere (its end was already published), or not this run's row
                 return

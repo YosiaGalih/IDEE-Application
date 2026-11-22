@@ -140,7 +140,9 @@ async def test_a_lock_released_after_the_deadline_ends_the_run_timeout(
 
 
 def _start(task_id: uuid.UUID, project_id: uuid.UUID) -> RunStart:
-    return RunStart(uuid.uuid4(), task_id, project_id, "B14", 1, "implement", "scripted", "m", "0" * 12, {})
+    return RunStart(
+        uuid.uuid4(), task_id, project_id, "B14", 1, "implement", "scripted", "m", "0" * 12, {}, uuid.uuid4()
+    )
 
 
 async def _beat(sessions: async_sessionmaker[AsyncSession], scope: RunScope) -> None:
