@@ -15,7 +15,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.agents.runtime import (
@@ -50,6 +50,11 @@ AUDIT = AuditWriter(Redactor([SECRET]))
 TOKEN = (
     uuid.uuid4()
 )  # the start token of the runs ``start`` builds; ``fail`` names it (spec WP-3.2 §16.3a #1)
+
+
+def owned(task_id: uuid.UUID, **overrides: Any) -> dict[str, Any]:
+    """What ``finish`` names of a run ``start`` built: its task, agent and start token (spec §16.6.2 #88)."""
+    return {"task_id": task_id, "agent_id": "B14", "start_token": TOKEN, **overrides}
 
 
 @pytest.fixture(autouse=True)
@@ -163,12 +168,16 @@ async def test_input_output_and_error_are_redacted(
     run_id = await begin(writer, start(task_id, project_id, input=run_input))
     if column == "output":
         await writer.finish(
-            run_id, RunEnd("succeeded", 1, output={"summary": SECRET, "api_key": "plain-value-1"})
+            run_id,
+            RunEnd("succeeded", 1, output={"summary": SECRET, "api_key": "plain-value-1"}),
+            **owned(task_id),
         )
     elif column == "error":
-        await writer.finish(run_id, RunEnd("failed", 1, "internal_error", f"boom {SECRET} " + "x" * 3000))
+        await writer.finish(
+            run_id, RunEnd("failed", 1, "internal_error", f"boom {SECRET} " + "x" * 3000), **owned(task_id)
+        )
     else:
-        await writer.finish(run_id, RunEnd("cancelled", 1))
+        await writer.finish(run_id, RunEnd("cancelled", 1), **owned(task_id))
     row = await stored(session, run_id)
     rendered = json.dumps([row.input, row.output, row.error])
     assert SECRET not in rendered and "plain-value-1" not in rendered
@@ -187,7 +196,7 @@ async def test_finish_totals_come_from_the_run_ledger_rows(
     await ledger_row(sessions, pricing, project_id, task_id, run_id)
     await ledger_row(sessions, pricing, project_id, task_id, run_id, status="cancelled", usage=None)
     await ledger_row(sessions, pricing, project_id, task_id, None)  # the task's, not the run's
-    usage = await writer.finish(run_id, RunEnd("succeeded", 3, output={}))
+    usage = await writer.finish(run_id, RunEnd("succeeded", 3, output={}), **owned(task_id))
     row = await stored(session, run_id)
     assert (row.input_tokens, row.output_tokens, row.cache_read_tokens) == (200, 40, 10)
     assert row.cost_status == "partial"  # a row without usage (Keputusan Lead #5)
@@ -207,7 +216,9 @@ async def test_a_run_without_ledger_rows_is_estimated_zero(
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
     usage = await writer.finish(
-        run_id, RunEnd("failed", 0, "PROVIDER_DISABLED", "PROVIDER_DISABLED (kill_switch)")
+        run_id,
+        RunEnd("failed", 0, "PROVIDER_DISABLED", "PROVIDER_DISABLED (kill_switch)"),
+        **owned(task_id),
     )
     row = await stored(session, run_id)
     assert (row.input_tokens, row.output_tokens, row.estimated_cost, row.cost_status) == (
@@ -228,7 +239,7 @@ async def test_tiny_run_cost_keeps_ten_places(
     await ledger_row(
         sessions, pricing, project_id, task_id, run_id, usage=Usage(input_tokens=1, output_tokens=0)
     )
-    await writer.finish(run_id, RunEnd("succeeded", 1, output={}))
+    await writer.finish(run_id, RunEnd("succeeded", 1, output={}), **owned(task_id))
     row = await stored(session, run_id)
     assert row.estimated_cost is not None and Decimal(0) < row.estimated_cost < Decimal("0.00001")
     assert row.estimated_cost.as_tuple().exponent == -10
@@ -241,7 +252,7 @@ async def test_finish_writes_the_failed_code(
     project_id, task_id = await a_task(session)
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
-    await writer.finish(run_id, RunEnd("failed", 2, code, "text"))  # type: ignore[arg-type]
+    await writer.finish(run_id, RunEnd("failed", 2, code, "text"), **owned(task_id))  # type: ignore[arg-type]
     row = await stored(session, run_id)
     assert (row.status, row.error_code, row.iterations) == ("failed", code, 2)
 
@@ -261,7 +272,7 @@ async def test_budget_exceeded_emits_the_event_and_the_audit_once(
     writer = AgentRunWriter(sessions, bus, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
     breach = BudgetBreach("cost", Decimal("2"), Decimal("1.9500000001"), Decimal("0.1"))
-    await writer.finish(run_id, RunEnd("budget_exceeded", 3, budget=breach))
+    await writer.finish(run_id, RunEnd("budget_exceeded", 3, budget=breach), **owned(task_id))
     (event,) = bus.of_type("usage.budget_exceeded")
     assert event["payload"] == {"kind": "cost", "limit": "2", "used": "1.9500000001"}
     audits = list(
@@ -299,7 +310,9 @@ async def test_an_unbounded_cost_is_used_null(
     writer = AgentRunWriter(sessions, bus, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
     await writer.finish(
-        run_id, RunEnd("budget_exceeded", 1, budget=BudgetBreach("cost", Decimal("2"), None, None))
+        run_id,
+        RunEnd("budget_exceeded", 1, budget=BudgetBreach("cost", Decimal("2"), None, None)),
+        **owned(task_id),
     )
     (event,) = bus.of_type("usage.budget_exceeded")
     assert event["payload"] == {"kind": "cost", "limit": "2", "used": None}
@@ -312,9 +325,9 @@ async def test_a_finished_run_is_not_finished_twice(
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
-    await writer.finish(run_id, RunEnd("succeeded", 1, output={"summary": "first"}))
+    await writer.finish(run_id, RunEnd("succeeded", 1, output={"summary": "first"}), **owned(task_id))
     with pytest.raises(AgentRunAlreadyFinished):
-        await writer.finish(run_id, RunEnd("failed", 2, "model_error", "second"))
+        await writer.finish(run_id, RunEnd("failed", 2, "model_error", "second"), **owned(task_id))
     row = await stored(session, run_id)
     assert (row.status, row.output, row.error_code) == ("succeeded", {"summary": "first"}, None)
     assert len(bus.of_type("agent.run_finished")) == 1
@@ -328,7 +341,7 @@ async def test_run_finished_carries_status_code_and_usage(
     writer = AgentRunWriter(sessions, bus, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
     await ledger_row(sessions, pricing, project_id, task_id, run_id)
-    await writer.finish(run_id, RunEnd("failed", 1, "model_error", "LLMError: refusal"))
+    await writer.finish(run_id, RunEnd("failed", 1, "model_error", "LLMError: refusal"), **owned(task_id))
     (finished,) = bus.of_type("agent.run_finished")
     payload = finished["payload"]
     assert (payload["agent_run_id"], payload["agent_id"], payload["status"], payload["error_code"]) == (
@@ -342,6 +355,105 @@ async def test_run_finished_carries_status_code_and_usage(
     assert finished["seq"] is not None  # stored, then published
 
 
+@pytest.mark.parametrize("ended", ["succeeded", "budget_exceeded"])
+async def test_finish_closes_the_row_and_emits_the_unchanged_event(
+    session: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    pricing: PricingTable,
+    ended: str,
+) -> None:
+    """Characterization (spec WP-3.2 §16.6.2 #88): binding ``finish`` to the start token changes who may close
+    a row, not what a close writes: the same columns and the same ``agent.run_finished`` payload, and for
+    ``budget_exceeded`` the same ``usage.budget_exceeded`` and audit."""
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    run_id = await begin(writer, start(task_id, project_id))
+    await ledger_row(sessions, pricing, project_id, task_id, run_id)
+    if ended == "succeeded":
+        end = RunEnd("succeeded", 2, output={"summary": f"done {SECRET}"})
+    else:
+        end = RunEnd("budget_exceeded", 2, budget=BudgetBreach("cost", Decimal("2"), Decimal("1.5"), None))
+    usage = await writer.finish(run_id, end, **owned(task_id))
+    row = await stored(session, run_id)
+    assert (row.status, row.error_code, row.iterations, row.start_token) == (ended, None, 2, TOKEN)
+    assert (row.input_tokens, row.output_tokens, row.cache_read_tokens) == (100, 20, 5)
+    assert row.estimated_cost == usage.estimated_cost and row.cost_status == "estimated"
+    assert row.finished_at is not None and row.duration_ms is not None
+    if ended == "succeeded":
+        assert row.output == {"summary": "done [REDACTED]"}
+    (finished,) = bus.of_type("agent.run_finished")
+    assert finished["payload"] == {
+        "agent_run_id": str(run_id),
+        "agent_id": "B14",
+        "status": ended,
+        "error_code": None,
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "estimated_cost": decimal_str(usage.estimated_cost) if usage.estimated_cost is not None else None,
+            "cost_status": "estimated",
+        },
+    }
+    assert len(bus.of_type("usage.budget_exceeded")) == (ended == "budget_exceeded")
+    audits = await session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(AuditEvent.action == "budget.exceeded", AuditEvent.resource_id == str(run_id))
+    )
+    assert audits == (ended == "budget_exceeded")
+
+
+@pytest.mark.parametrize("budget", [False, True], ids=["plain", "budget"])
+@pytest.mark.parametrize("other", ["token", "task", "agent", "no_token"])
+async def test_finish_of_another_token_task_or_agent_closes_nothing(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], other: str, budget: bool
+) -> None:
+    """Spec WP-3.2 §16.6.2 #88: ``finish`` closes the row of its run's task, agent **and** start token only.
+    Any other (a None token matches no row) is ``AgentRunAlreadyFinished``: the row stays ``running``, no
+    ``agent.run_finished`` is stored or published, nothing is audited, and the token is not in the error."""
+    project_id, task_id = await a_task(session)
+    bus = RecordingBus()
+    writer = AgentRunWriter(sessions, bus, AUDIT)
+    run_id = await begin(writer, start(task_id, project_id))
+    foreign_token = uuid.uuid4()
+    overrides: dict[str, Any] = {
+        "token": {"start_token": foreign_token},
+        "task": {"task_id": uuid.uuid4()},
+        "agent": {"agent_id": "B15"},
+        "no_token": {"start_token": None},
+    }[other]
+    end = (
+        RunEnd("budget_exceeded", 1, budget=BudgetBreach("cost", Decimal("2"), Decimal("3"), None))
+        if budget
+        else RunEnd("succeeded", 1, output={"summary": "foreign"})
+    )
+    with pytest.raises(AgentRunAlreadyFinished) as raised:
+        await writer.finish(run_id, end, **{**owned(task_id), **overrides})
+    assert str(foreign_token) not in str(raised.value) and str(TOKEN) not in str(raised.value)
+    row = await stored(session, run_id)
+    assert (row.status, row.output, row.finished_at) == ("running", None, None)
+    assert await task_event_types(session, task_id) == ["agent.run_started"]
+    assert [m["type"] for m in bus.messages] == ["agent.run_started"]
+    audits = await session.scalar(
+        select(func.count())
+        .select_from(AuditEvent)
+        .where(AuditEvent.action == "budget.exceeded", AuditEvent.resource_id == str(run_id))
+    )
+    assert audits == 0
+    await writer.finish(run_id, RunEnd("cancelled", 0), **owned(task_id))  # its own run still closes it
+    assert (await stored(session, run_id)).status == "cancelled"
+
+
+async def task_event_types(session: AsyncSession, task_id: uuid.UUID) -> list[str]:
+    session.expire_all()
+    return list(
+        await session.scalars(
+            select(TaskEvent.type).where(TaskEvent.task_id == task_id).order_by(TaskEvent.seq)
+        )
+    )
+
+
 # --- usage truth (review H1 of 42bcb2e) ---------------------------------------------------------------------
 
 
@@ -352,7 +464,9 @@ async def test_an_incomplete_run_without_rows_is_unavailable_never_zero(
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
-    usage = await writer.finish(run_id, RunEnd("failed", 1, "usage_unrecorded", "not recorded"))
+    usage = await writer.finish(
+        run_id, RunEnd("failed", 1, "usage_unrecorded", "not recorded"), **owned(task_id)
+    )
     row = await stored(session, run_id)
     assert (row.input_tokens, row.output_tokens, row.estimated_cost, row.cost_status) == (
         None,
@@ -377,7 +491,7 @@ async def test_an_incomplete_run_with_rows_is_the_known_sum_partial(
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
     await ledger_row(sessions, pricing, project_id, task_id, run_id)
-    usage = await writer.finish(run_id, RunEnd("cancelled", 1, usage_complete=False))
+    usage = await writer.finish(run_id, RunEnd("cancelled", 1, usage_complete=False), **owned(task_id))
     row = await stored(session, run_id)
     assert (row.input_tokens, row.cost_status) == (100, "partial")
     assert row.estimated_cost is not None and row.estimated_cost > 0
@@ -395,7 +509,7 @@ async def test_fail_is_the_minimal_end_of_a_running_run(
     row = await stored(session, run_id)
     assert (row.status, row.error_code, row.finished_at is not None) == ("failed", "internal_error", True)
     with pytest.raises(AgentRunAlreadyFinished):
-        await writer.finish(run_id, RunEnd("succeeded", 1, output={}))
+        await writer.finish(run_id, RunEnd("succeeded", 1, output={}), **owned(task_id))
     await writer.fail(
         run_id, task_id=task_id, agent_id="B14", start_token=TOKEN
     )  # a second time changes nothing
@@ -445,13 +559,13 @@ async def test_the_run_store_keeps_no_project_of_an_ended_run(
     await writer.fail(first, task_id=task_id, agent_id="B14", start_token=TOKEN)
     assert first not in writer._projects
     second = await begin(writer, start(task_id, project_id))
-    await writer.finish(second, RunEnd("cancelled", 0))
+    await writer.finish(second, RunEnd("cancelled", 0), **owned(task_id))
     assert second not in writer._projects
     with pytest.raises(AgentRunAlreadyFinished):
-        await writer.finish(second, RunEnd("cancelled", 0))
+        await writer.finish(second, RunEnd("cancelled", 0), **owned(task_id))
     third = await begin(writer, start(task_id, project_id))
     with pytest.raises(AgentRunAlreadyFinished):
-        await writer.finish(first, RunEnd("cancelled", 0))
+        await writer.finish(first, RunEnd("cancelled", 0), **owned(task_id))
     assert set(writer._projects) == {third}
 
 
@@ -500,9 +614,9 @@ async def test_read_run_outcome_reports_missing_running_and_finished(
     writer = AgentRunWriter(sessions, None, AUDIT)
     running_id = await begin(writer, start(task_id, project_id))
     failed_id = await begin(writer, start(task_id, project_id))
-    await writer.finish(failed_id, RunEnd("failed", 1, "interrupted", "text"))
+    await writer.finish(failed_id, RunEnd("failed", 1, "interrupted", "text"), **owned(task_id))
     done_id = await begin(writer, start(task_id, project_id))
-    await writer.finish(done_id, RunEnd("succeeded", 1, output={}))
+    await writer.finish(done_id, RunEnd("succeeded", 1, output={}), **owned(task_id))
     assert await read_run_outcome(session, uuid.uuid4(), task_id=task_id, agent_id="B14") == RunOutcome(
         "missing", None, None
     )
@@ -553,7 +667,7 @@ async def test_fail_on_a_finished_row_writes_no_audit(
     bus = RecordingBus()
     writer = AgentRunWriter(sessions, bus, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
-    await writer.finish(run_id, RunEnd("cancelled", 0))
+    await writer.finish(run_id, RunEnd("cancelled", 0), **owned(task_id))
     breach = BudgetBreach("tokens", 1, 1, 0)
     await writer.fail(run_id, task_id=task_id, agent_id="B14", start_token=TOKEN, breach=breach)
     audits = list(
@@ -577,7 +691,9 @@ async def test_start_of_an_ended_run_is_refused_and_changes_nothing(
     writer = AgentRunWriter(sessions, bus, AUDIT)
     first = start(task_id, project_id)
     await writer.start(first, retry=False)
-    await writer.finish(first.agent_run_id, RunEnd("succeeded", 1, output={"summary": "first"}))
+    await writer.finish(
+        first.agent_run_id, RunEnd("succeeded", 1, output={"summary": "first"}), **owned(task_id)
+    )
     with pytest.raises(RunAlreadyFinished) as raised:
         await writer.start(first, retry=True)
     assert isinstance(raised.value, AgentRunAlreadyFinished)
@@ -711,7 +827,7 @@ async def test_finish_with_an_empty_project_cache_audits_the_tasks_project(
     run_id = await begin(writer, start(task_id, project_id))
     writer._projects.clear()
     breach = BudgetBreach("tokens", 10, 12, 4)
-    await writer.finish(run_id, RunEnd("budget_exceeded", 2, budget=breach))
+    await writer.finish(run_id, RunEnd("budget_exceeded", 2, budget=breach), **owned(task_id))
     [audit] = await audits_of(session, run_id)
     assert audit.project_id == project_id
 
@@ -732,7 +848,9 @@ async def test_a_budget_audit_whose_project_is_unknown_is_logged(
     run_id = await begin(writer, start(task_id, project_id))
     writer._projects.clear()
     with capture_logs() as logs:
-        await writer.finish(run_id, RunEnd("budget_exceeded", 1, budget=BudgetBreach("tokens", 1, 1, 0)))
+        await writer.finish(
+            run_id, RunEnd("budget_exceeded", 1, budget=BudgetBreach("tokens", 1, 1, 0)), **owned(task_id)
+        )
     [missing] = [log for log in logs if log["event"] == "budget_audit_project_missing"]
     assert (missing["log_level"], missing["agent_run_id"], missing["task_id"]) == (
         "error",
@@ -790,7 +908,7 @@ async def test_read_run_outcome_reports_a_paused_run(
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
     pending = {"pending_tool": {"tool_use_id": "toolu_1", "tool_name": "git.push"}}
-    await writer.finish(run_id, RunEnd("approval_required", 2, output=pending))
+    await writer.finish(run_id, RunEnd("approval_required", 2, output=pending), **owned(task_id))
     outcome = await read_run_outcome(session, run_id, task_id=task_id, agent_id="B14")
     assert outcome == RunOutcome("paused", "approval_required", None)
 
@@ -987,7 +1105,7 @@ async def test_finish_writes_this_row_and_this_event(
         await ledger_row(sessions, pricing, project_id, task_id, run_id, usage=CACHED)
     await age(engine, run_id, "7.2345675")
 
-    usage = await writer.finish(run_id, end)
+    usage = await writer.finish(run_id, end, **owned(task_id))
 
     unknown = end.error_code == "usage_unrecorded"
     cost = None if unknown else (await ledger_sum(engine, run_id) if rows else Decimal(0))
@@ -1126,6 +1244,6 @@ async def test_finish_of_a_run_older_than_the_int4_milliseconds_keeps_the_ceilin
     writer = AgentRunWriter(sessions, None, AUDIT)
     run_id = await begin(writer, start(task_id, project_id))
     await age(engine, run_id, str(25 * 24 * 3600))
-    await writer.finish(run_id, RunEnd("cancelled", 1))
+    await writer.finish(run_id, RunEnd("cancelled", 1), **owned(task_id))
     row = await stored(session, run_id)
     assert (row.status, row.duration_ms) == ("cancelled", 2_147_483_647)

@@ -492,6 +492,14 @@ async def running_call(
         return call.id
 
 
+async def finish_owner(engine: AsyncEngine, run_id: uuid.UUID) -> dict[str, Any]:
+    """What ``finish`` names of a row ``start_run`` wrote (spec WP-3.2 §16.6.2 #88): task, agent, token."""
+    async with engine.connect() as conn:
+        query = text("SELECT task_id, agent_id, start_token FROM agent_runs WHERE id = :id")
+        task_id, agent_id, start_token = (await conn.execute(query, {"id": run_id})).one()
+    return {"task_id": task_id, "agent_id": agent_id, "start_token": start_token}
+
+
 async def run_row(engine: AsyncEngine, run_id: uuid.UUID) -> Row[Any]:
     async with engine.connect() as conn:
         query = text(
@@ -770,7 +778,7 @@ async def test_running_tool_call_of_a_finished_run_closes_under_a_live_lease(  #
     run_id = await start_run(engine, task_id)
     call_id = await running_call(engine, task_id, run_id)
     await AgentRunWriter(make_sessionmaker(engine), None, AUDIT).finish(
-        run_id, RunEnd("succeeded", 1, output={})
+        run_id, RunEnd("succeeded", 1, output={}), **await finish_owner(engine, run_id)
     )
     result = await recover_runs(make_sessionmaker(engine), RecordingBus(), AUDIT)
     assert result == RunRecoveryResult(tasks=1, runs=0, tool_calls=1, failed=0, skipped=0)
@@ -849,7 +857,7 @@ async def test_runtime_finish_after_recovery_is_already_finished(  # type: ignor
     await recover_runs(sessions, RecordingBus(), AUDIT)
     end = RunEnd("succeeded", 1, output={"summary": "late"})
     with pytest.raises(AgentRunAlreadyFinished):
-        await writer.finish(run_id, end)
+        await writer.finish(run_id, end, **await finish_owner(engine, run_id))
     row = await run_row(engine, run_id)
     assert row.error_code == "interrupted"
     assert (row.status, row.output) == ("failed", None)
@@ -870,7 +878,9 @@ async def test_runtime_finish_racing_a_recovery_ends_the_run_once(  # type: igno
     task_id = await make_task("running", DEAD)  # the lease lapsed while the worker was still finishing
     run_id = await start_run(engine, task_id)
     sessions = make_sessionmaker(engine)
-    finishing = AgentRunWriter(sessions, None, AUDIT).finish(run_id, RunEnd("succeeded", 1, output={}))
+    finishing = AgentRunWriter(sessions, None, AUDIT).finish(
+        run_id, RunEnd("succeeded", 1, output={}), **await finish_owner(engine, run_id)
+    )
     recovering = recover_runs(sessions, RecordingBus(), AUDIT)
     if recovery_first:
         recovery, finish = await asyncio.gather(recovering, finishing, return_exceptions=True)

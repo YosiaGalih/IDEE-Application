@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -159,7 +159,16 @@ async def _usage_event(sessions: async_sessionmaker[AsyncSession], scope: RunSco
 
 
 async def _finish_run(sessions: async_sessionmaker[AsyncSession], scope: RunScope) -> None:
-    await AgentRunWriter(sessions, None, AUDIT).finish(scope.agent_run_id, RunEnd("cancelled", 0))
+    async with sessions() as session:  # the token of the row ``start`` wrote (spec WP-3.2 §16.6.2 #88)
+        token = await session.scalar(select(AgentRun.start_token).where(AgentRun.id == scope.agent_run_id))
+    assert token is not None
+    await AgentRunWriter(sessions, None, AUDIT).finish(
+        scope.agent_run_id,
+        RunEnd("cancelled", 0),
+        task_id=scope.task_id,
+        agent_id=scope.agent_id,
+        start_token=token,
+    )
 
 
 PORTS: dict[str, Callable[[async_sessionmaker[AsyncSession], RunScope], Awaitable[None]]] = {
