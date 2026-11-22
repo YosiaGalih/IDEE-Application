@@ -647,7 +647,8 @@ class AgentRunIdConflict(ValueError):
 
 class RunAlreadyFinished(LookupError):
     """``RunStore.finish``: the run is not ``running`` any more; a run is finished once, never overwritten.
-    ``RunStore.start``: the id's run, of this task and agent, has ended (a spent id is never reopened)."""
+    ``RunStore.start``: the id's run, of this task, agent and start token, has ended (a spent id is never
+    reopened)."""
 
 
 class _DeadlineReached(Exception):
@@ -1187,7 +1188,8 @@ class AgentRuntime:
         ``AgentRunIdConflict``, ruling R10), or a retry after a lost ack (``retry=True``). A store's
         ``RunAlreadyFinished`` on the first start still names a used id: it is raised as
         ``AgentRunIdConflict``, so nothing runs and nothing is closed (ruling R5). On a retry it is raised as
-        it is: the row may be this run's, ended elsewhere (recovery), and the row is the truth."""
+        it is: the row matched by token is this run's own, ended elsewhere (recovery), and the row is the
+        truth."""
         retry = run.start_sent
         run.start_sent = True
         try:

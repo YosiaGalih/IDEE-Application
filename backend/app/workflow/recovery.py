@@ -110,7 +110,6 @@ async def recover_expired(
                 task_id=str(task_id),
                 error_type=type(exc).__name__,
                 error_code=getattr(exc, "code", None),
-                exc_info=True,
             )
     result = RecoveryResult(len(candidates), recovered, failed, skipped)
     if failed:

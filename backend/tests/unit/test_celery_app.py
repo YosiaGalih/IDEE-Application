@@ -295,3 +295,22 @@ def test_a_broken_registry_is_logged_by_type_and_re_raised(
     assert ("problems_count" in event) is has_count
     assert "exc_info" not in event and "exception" not in event
     assert "unclosed" not in out and "problem(s)" not in out
+
+
+def test_startup_recovery_failure_logs_the_error_type_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from structlog.testing import capture_logs
+
+    from app.worker import jobs
+    from app.worker.celery_app import _recover_on_start
+
+    async def boom() -> dict[str, int]:
+        raise RuntimeError("secret-host")
+
+    monkeypatch.setattr(jobs, "run_recovery_sweep", boom)
+    with capture_logs() as logs:
+        _recover_on_start()
+    entries = [e for e in logs if e["event"] == "startup_recovery_failed"]
+    assert len(entries) == 1
+    assert entries[0]["error_type"] == "RuntimeError"
+    assert "exc_info" not in entries[0]
+    assert "secret-host" not in str(entries[0])

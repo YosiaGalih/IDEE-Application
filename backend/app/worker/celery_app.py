@@ -111,7 +111,7 @@ def _recover_on_start(**_: Any) -> None:
     try:
         counts = asyncio.run(run_recovery_sweep())
     except Exception as exc:
-        get_logger(__name__).error("startup_recovery_failed", error_type=type(exc).__name__, exc_info=True)
+        get_logger(__name__).error("startup_recovery_failed", error_type=type(exc).__name__)
         return
     get_logger(__name__).info("startup_recovery", **counts)
 

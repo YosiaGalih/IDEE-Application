@@ -196,6 +196,28 @@ async def test_one_failing_task_does_not_stop_the_sweep(  # type: ignore[no-unty
     assert (await status_of(engine, bad))[0] == "running"
 
 
+async def test_failed_task_logs_the_error_type_only(  # type: ignore[no-untyped-def]
+    engine: AsyncEngine,
+    make_task,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The log names the error type, never its text or a traceback (a driver error can carry a value)."""
+    from app.workflow import recovery
+
+    await make_task("running", "-5 seconds")
+
+    async def boom(db, task, to, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(recovery, "transition", boom)
+    await recover_expired(make_sessionmaker(engine), Recorder(), AUDIT)
+    out = capsys.readouterr().out
+    assert "task_recovery_failed" in out and "RuntimeError" in out
+    assert "boom" not in out
+    assert "Traceback" not in out
+
+
 async def seed_orphan(database_url: str) -> uuid.UUID:
     """Own engine: callers are synchronous tests that drive asyncio.run themselves."""
     from sqlalchemy.ext.asyncio import create_async_engine

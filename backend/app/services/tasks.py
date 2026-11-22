@@ -1,7 +1,8 @@
 """Tasks: create (API_CONTRACTS §5; spec WP-3.2 §8, §12) and the ``Task`` view. Framework-free.
 
-**Gate.** Until the workflow engine exists (WP-3.2b flips ``RUNTIMES_AVAILABLE["workflow_engine"]``) a task
-cannot be created: nothing could ever run it. The gate is read through the module attribute, so a test can
+**Gate.** Until WP-3.2d registers the first production steps and flips
+``RUNTIMES_AVAILABLE["workflow_engine"]``, a task cannot be created: nothing could ever run it. The flag means
+"the code exists", not a health check. The gate is read through the module attribute, so a test can
 open it. A task is created ``draft``; no job is enqueued here.
 
 **Two short transactions** (Ruling R11). Creating a task:
