@@ -20,9 +20,11 @@ from app.cli import main as cli_main
 from app.core.audit import AuditWriter
 from app.core.config import load_settings
 from app.core.redaction import Redactor
+from app.llm.pricing import load_pricing
 from app.models.audit import AuditEvent
 from app.models.providers import ProviderConfig
 from app.services import provider_smoke, smoke_lock
+from app.worker import pricing as worker_pricing_module
 from app.worker.platform_jobs import run_provider_smoke_job
 from tests.conftest import make_test_env, reset_data
 from tests.unit.test_llm_readiness import fake_api
@@ -45,6 +47,8 @@ def pricing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "pricing.yaml"
     path.write_text(PRICING, encoding="utf-8")
     monkeypatch.setenv("KK_TEST_PRICING_PATH", str(path))
+    # This process "is" a worker that loaded the table at start (the job reads the held one).
+    monkeypatch.setattr(worker_pricing_module, "_held", load_pricing(path))
     return path
 
 
@@ -66,6 +70,10 @@ def smoke_env(**overrides: str) -> dict[str, str]:
     import os
 
     return make_test_env(PRICING_PATH=os.environ["KK_TEST_PRICING_PATH"], **overrides)
+
+
+def _table(settings: Any) -> Any:
+    return load_pricing(Path(settings.pricing_path))
 
 
 def use_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
@@ -142,7 +150,7 @@ async def test_the_anthropic_adapter_with_a_refused_key_leaks_it_nowhere(
     settings = load_settings(smoke_env(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=KEY))
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     env = provider_smoke.SmokeEnv(
-        settings=settings, sessions=sessions, audit=AuditWriter(Redactor()),
+        settings=settings, sessions=sessions, audit=AuditWriter(Redactor()), pricing=_table(settings),
         transport=fake_api(refuse=True).transport(),
     )  # fmt: skip
     report = await provider_smoke.run_smoke(env, actor_id="cli", job_id=uuid.uuid4())
@@ -230,7 +238,9 @@ async def test_the_job_extends_the_lock_it_was_given(monkeypatch: Any) -> None:
 async def _smoke(engine: AsyncEngine) -> tuple[Any, ProviderConfig]:
     settings = load_settings(smoke_env())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
-    env = provider_smoke.SmokeEnv(settings=settings, sessions=sessions, audit=AuditWriter(Redactor()))
+    env = provider_smoke.SmokeEnv(
+        settings=settings, sessions=sessions, audit=AuditWriter(Redactor()), pricing=_table(settings)
+    )
     report = await provider_smoke.run_smoke(env, actor_id="worker", job_id=uuid.uuid4())
     async with sessions() as session:
         return report, (await session.scalars(select(ProviderConfig))).one()
@@ -274,3 +284,47 @@ def test_the_cli_says_when_it_could_not_run(
     monkeypatch.setattr(provider_smoke, "run_smoke", down)
     assert cli_main(["claude-smoke"]) == 2
     assert "could not run" in capsys.readouterr().err and redis.get(LOCK) is None
+
+
+async def test_the_job_records_the_table_the_process_holds_and_never_reloads(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """3.2 §16.3 #69: held version X, PRICING_PATH points at version Y: the report carries X, no file read."""
+    from redis.asyncio import Redis
+
+    other = tmp_path / "other.yaml"
+    other.write_text(PRICING.replace("2026-11-08-test", "2026-11-09-file-y"), encoding="utf-8")
+    use_env(monkeypatch)
+    monkeypatch.setenv("PRICING_PATH", str(other))
+
+    def no_load(*_: Any, **__: Any) -> Any:
+        raise AssertionError("the smoke must not load the pricing file")
+
+    monkeypatch.setattr(provider_smoke, "load_pricing", no_load, raising=False)
+    monkeypatch.setattr("app.llm.pricing.load_pricing", no_load)
+    redis = Redis.from_url(make_test_env()["REDIS_URL"])
+    job_id = uuid.uuid4()
+    try:
+        await redis.set(LOCK, str(job_id), ex=60)
+        assert await run_provider_smoke_job(job_id=job_id, provider="anthropic") == "ready"
+    finally:
+        await redis.delete(LOCK)
+        await redis.aclose()
+    async with async_sessionmaker(engine)() as session:
+        row = (await session.scalars(select(ProviderConfig))).one()
+    assert row.pricing_version == "2026-11-08-test"
+
+
+def test_the_cli_with_a_broken_pricing_file_fails_the_check_and_still_records(
+    monkeypatch: pytest.MonkeyPatch, redis: SyncRedis, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("version: [unterminated", encoding="utf-8")
+    use_env(monkeypatch)
+    monkeypatch.setenv("PRICING_PATH", str(broken))
+    assert cli_main(["claude-smoke"]) == 1  # not ready, not "could not run" (2)
+    assert "pricing_verified" in capsys.readouterr().out
+    row, _ = stored()
+    assert row is not None and row.readiness_status == "failed" and row.pricing_version is None
+    check = next(c for c in row.readiness_report["checks"] if c["key"] == "pricing_verified")
+    assert check["status"] != "passed"

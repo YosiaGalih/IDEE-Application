@@ -27,6 +27,7 @@ from app.services.job_queue import IMPORT_TASK, INDEX_TASK, PROVIDER_SMOKE_TASK,
 from app.services.project_imports import ImportEnv, ImportRetry, run_import
 from app.services.projects import ProjectEnv
 from app.services.repo_index import IndexEnv, Trigger, index_soon, run_index
+from app.worker.pricing import worker_pricing
 
 logger = get_logger(__name__)
 
@@ -202,7 +203,9 @@ async def run_provider_smoke_job(*, job_id: uuid.UUID, provider: str) -> str:
                 metadata={"provider": provider, "job_id": str(job_id), "reason": "lock_not_held"},
             )  # fmt: skip
             return "skipped"
-        env = provider_smoke.SmokeEnv(settings=settings, sessions=sessions, audit=audit)
+        env = provider_smoke.SmokeEnv(
+            settings=settings, sessions=sessions, audit=audit, pricing=worker_pricing()
+        )
         try:
             report = await provider_smoke.run_smoke(env, actor_id="worker", job_id=job_id, provider=provider)
         finally:
