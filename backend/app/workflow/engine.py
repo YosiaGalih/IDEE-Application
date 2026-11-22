@@ -511,7 +511,8 @@ class TaskEngine:
             try:
                 await asyncio.wait(
                     (work, beat),
-                    timeout=None if noticed else max(notice_at - loop.time(), 0),
+                    # Once the step is done (or noticed), only the heartbeat's cancel is left: no timed spin.
+                    timeout=None if (noticed or work.done()) else max(notice_at - loop.time(), 0),
                     return_when=asyncio.ALL_COMPLETED,
                 )
             except asyncio.CancelledError:
