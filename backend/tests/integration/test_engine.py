@@ -14,14 +14,14 @@ from datetime import timedelta
 from typing import Any, get_args
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
 from app.core.audit import AuditWriter
-from app.core.db import make_sessionmaker
+from app.core.db import bound_transaction, make_sessionmaker
 from app.core.errors import AppError
 from app.core.events import emit_task_event
 from app.core.redaction import Redactor
@@ -2062,6 +2062,126 @@ async def test_a_step_that_overruns_the_cleanup_grace_lets_the_lease_lapse(
     assert limit_logs(logs) == [("warning", str(task_id), "implement", True)]
     assert [e["event"] for e in logs if e["event"] == "step_cleanup_waiting"] == ["step_cleanup_waiting"]
     assert other_tasks() == []
+
+
+@pytest.mark.parametrize("status", ["queued", "draft"])
+async def test_a_step_cannot_hold_the_lease_after_the_cleanup_overrun(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    """LOW-D1 (#84): past the overrun the engine revokes its owner, so a step that goes on calling
+    ``lease.hold`` in cleanup cannot keep the lease alive: it lapses, and recovery or a new claim takes it."""
+    monkeypatch.setattr(lease_module, "_LEASE", timedelta(seconds=2))
+    step = "implement" if status == "queued" else "intake"
+    task_id = await make_task(status)
+    stop = asyncio.Event()
+    holds: list[tuple[bool, str]] = []  # (the overrun was already logged, "held" | "lost")
+    updates: list[str] = []
+    sessions = make_sessionmaker(engine)
+
+    def count(conn, cursor, statement, *args):  # type: ignore[no-untyped-def]
+        if statement.lstrip().upper().startswith("UPDATE TASKS"):
+            updates.append(statement)
+
+    async def holds_in_cleanup(context: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            while not stop.is_set():
+                logged = any(e["event"] == "step_cleanup_overrun" for e in logs)
+                try:
+                    async with asyncio.timeout(2):
+                        async with sessions() as db:
+                            await bound_transaction(db)
+                            await context.lease.hold(db)
+                            await db.commit()
+                    holds.append((logged, "held"))
+                except LeaseLost:
+                    holds.append((logged, "lost"))
+                await asyncio.sleep(0.05)
+        return StepResult.done()
+
+    async def lapsed() -> bool:
+        async with engine.connect() as conn:
+            return bool(
+                await conn.scalar(
+                    text("SELECT lease_expires_at < clock_timestamp() FROM tasks WHERE id = :id"),
+                    {"id": task_id},
+                )
+            )
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        with capture_logs() as logs:
+            run = asyncio.create_task(
+                make_engine(
+                    engine,
+                    RecordingBus(),
+                    Steps(**{step: holds_in_cleanup}).registry(step),
+                    heartbeat_s=0.1,
+                    lease_safety_s=0.5,
+                    delivery_limit_s=0.3,
+                    cleanup_grace_s=0.3,
+                ).run(task_id)
+            )
+            try:
+                for _ in range(100):
+                    if any(e["event"] == "step_cleanup_overrun" for e in logs):
+                        break
+                    await asyncio.sleep(0.05)
+                assert any(e["event"] == "step_cleanup_overrun" for e in logs)
+                await asyncio.sleep(0.3)  # an UPDATE already in flight at the cancel has ended
+                after_overrun = len(updates)
+                for _ in range(100):
+                    if await lapsed():
+                        break
+                    await asyncio.sleep(0.05)
+                assert await lapsed()  # without the revocation the step's holds keep it alive
+                assert len(updates) == after_overrun  # not one UPDATE tasks since the overrun
+                if status == "queued":
+                    swept = await recover_expired(make_sessionmaker(engine), RecordingBus(), AUDIT)
+                    assert swept.recovered == 1
+                else:
+                    async with sessions() as db:
+                        assert (
+                            await claim_lease(
+                                db, task_id, "w-engine-2", max_active=5, claimable={"draft", "queued"}
+                            )
+                            is ClaimResult.ACQUIRED
+                        )
+                        await db.commit()
+                    await asyncio.sleep(0.3)  # the old step keeps trying beside the new owner
+            finally:
+                stop.set()
+            outcome = await asyncio.wait_for(run, timeout=10)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+
+    assert outcome.stopped == "lease_lost"
+    after_logged = [result for logged, result in holds if logged]
+    assert after_logged and set(after_logged) == {"lost"}
+    if status == "queued":
+        assert (await kinds(engine, task_id))[-1] == changed("running", "interrupted", "lease_expired")
+    assert other_tasks() == []
+
+
+async def test_the_heartbeat_giving_up_revokes_the_owner(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await claimed(engine, make_task)
+    task_engine = make_engine(engine, RecordingBus(), {})
+    long_ago = asyncio.get_running_loop().time() - 3600
+    with pytest.raises(LeaseLost):
+        await task_engine._heartbeat(task_id, long_ago)  # pyright: ignore[reportPrivateUsage]
+    async with make_sessionmaker(engine)() as db:
+        with pytest.raises(LeaseLost):  # the row says live (60 s), yet the owner is revoked
+            await LeaseGuard(task_id, WORKER).hold(db)
+        await db.rollback()
+    async with engine.connect() as conn:
+        live = await conn.scalar(
+            text("SELECT lease_expires_at > clock_timestamp() FROM tasks WHERE id = :id"), {"id": task_id}
+        )
+    assert live is True
 
 
 @pytest.mark.parametrize("grace", [0, -1])

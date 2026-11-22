@@ -39,6 +39,7 @@ from app.workflow.lease import (
     lease_duration,
     release_lease,
     renew_lease,
+    revoke_lease_owner,
 )
 from app.workflow.states import Actor, TaskStatus, check_error_code, fail_task, transition
 
@@ -441,6 +442,7 @@ class TaskEngine:
                     # AG-13 C1: the step hangs in its cleanup. Only the heartbeat is cancelled (never the step
                     # again): the lease lapses and recovery takes the task, so the slot is not pinned.
                     overrun = True
+                    revoke_lease_owner(self._ports.worker_id)  # first: the step's holds stop at once
                     logger.error("step_cleanup_overrun", task_id=str(task_id), step=context.step)
                     beat.cancel()
             beat_won = beat.done()
@@ -527,6 +529,7 @@ class TaskEngine:
 
     def _give_up(self, task_id: uuid.UUID, cause: Exception | None) -> NoReturn:
         """``cause`` is None only when no renewal failed before H passed (the step began past its margin)."""
+        revoke_lease_owner(self._ports.worker_id)  # first: a step's hold must not renew what we give up
         why = {"error_type": type(cause).__name__} if cause else {"reason": "lease_margin_spent"}
         logger.warning("lease_heartbeat_gave_up", task_id=str(task_id), **why)
         raise LeaseLost(f"the lease of task {task_id} could not be renewed in time") from cause

@@ -12,6 +12,10 @@ Contract for the job that runs a task (WP-3.x):
   delivery never re-runs a finished task.
 - ``renew_lease`` raises ``LeaseLost``. A worker that loses its lease must stop; the recovery sweep owns the
   task from then on.
+- ``revoke_lease_owner`` makes every later ``renew_lease`` of that owner, in this process, raise
+  ``LeaseLost`` without SQL (spec §16.6.2 #84). The engine revokes its delivery's owner when a step hangs in
+  its cleanup past the grace, or when its heartbeat gives up; ``claim_lease`` and ``release_lease`` are not
+  gated.
 """
 
 from __future__ import annotations
@@ -36,6 +40,8 @@ LEASE_SAFETY_SECONDS = 10
 CLAIM_LOCK_TIMEOUT = "5s"
 _LEASE = timedelta(seconds=LEASE_SECONDS)
 LEASE_OWNER_LENGTH = 120  # tasks.lease_owner
+# Owners the engine gave up on in this process; see ``revoke_lease_owner``. Never emptied by app code.
+_REVOKED_OWNERS: set[str] = set()
 # Serialises claims so the MAX_ACTIVE_TASKS count and the claim cannot interleave.
 _CLAIM_LOCK = "kodekantor.claim_lease"
 _LOCK_NOT_AVAILABLE = "55P03"
@@ -74,6 +80,24 @@ def lease_duration() -> timedelta:
 def _check_worker(worker_id: str) -> None:
     if not 1 <= len(worker_id) <= LEASE_OWNER_LENGTH:
         raise ValueError(f"worker id must be 1-{LEASE_OWNER_LENGTH} characters")
+
+
+def revoke_lease_owner(owner: str) -> None:
+    """Refuse every later ``renew_lease`` of ``owner`` in this process (``LeaseLost``, no SQL).
+
+    The set is module-private and process-local, and app code never empties it:
+
+    - one delivery runs per prefork child (``worker_prefetch_multiplier=1``, one ``asyncio.run`` per
+      delivery), and its owner is unique to the delivery (#80), so a revoked owner never serves a later one;
+    - it grows by one entry per revocation, which is accepted (an overrun or a give-up is rare, and a child
+      is recycled);
+    - a renewal already sent to the database before the revocation can still land; the lease then ends at
+      most one lease period (``LEASE_SECONDS``) after the revocation.
+
+    Tests clear the set with a fixture (``tests/conftest.py``).
+    """
+    _check_worker(owner)
+    _REVOKED_OWNERS.add(owner)
 
 
 async def claim_lease(
@@ -150,6 +174,8 @@ async def claim_lease(
 async def renew_lease(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> None:
     """Heartbeat: extend the lease, or raise ``LeaseLost`` if this worker no longer holds a live one."""
     _check_worker(worker_id)
+    if worker_id in _REVOKED_OWNERS:
+        raise LeaseLost(f"the lease owner of task {task_id} was revoked in this process")
     now = func.clock_timestamp()
     renewed = (
         await db.execute(
@@ -170,7 +196,7 @@ class LeaseGuard:
 
     ``hold(db)`` renews the lease in the caller's transaction and raises ``LeaseLost`` when this worker no
     longer holds a live one, so a write that follows cannot land after a takeover. It does not check the
-    task's status. Four rules:
+    task's status. Five rules:
 
     1. Call ``hold`` first in the transaction: the renewal locks the task row until commit, which is what
        makes the writes after it safe against a takeover.
@@ -178,6 +204,8 @@ class LeaseGuard:
     3. The caller opens the transaction with ``bound_transaction`` (and its own wall-clock timeout); ``hold``
        sets no bound.
     4. ``hold`` does not advance the heartbeat's ``last_ok``: the heartbeat still renews on its own schedule.
+    5. After the engine revokes the owner (cleanup overrun, or the heartbeat gives up), ``hold`` raises
+       ``LeaseLost`` without SQL. The step must stop and write nothing more.
     """
 
     task_id: uuid.UUID

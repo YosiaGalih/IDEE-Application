@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.agents.runtime import AgentRunUnfinished, RunEnd, RunScope, RunStart
+from app.agents.runtime import AgentRunUnfinished, LeaseLostError, RunEnd, RunScope, RunStart
 from app.core.audit import AuditWriter
 from app.core.config import Settings
 from app.core.redaction import Redactor
@@ -32,6 +32,7 @@ from app.models.agents import AgentRun
 from app.services import usage as usage_module
 from app.services.agent_runtime import AgentRunWriter, LeaseHeartbeat, TaskRunEvents
 from app.services.usage import UsageCallContext, UsageLedger
+from app.workflow.lease import revoke_lease_owner
 from tests.conftest import reset_data
 from tests.integration.test_task_schema import make_project, make_task
 from tests.runtime_fakes import (
@@ -285,3 +286,26 @@ async def test_the_ledger_bounds_its_statements(
     finally:
         usage_module._check_context = original  # type: ignore[assignment]
     assert seen == {"lock": "5s", "statement": "10s"}
+
+
+async def test_the_runtime_heartbeat_renews_through_renew_lease_so_a_revoked_owner_is_refused(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], engine: AsyncEngine, settings: Settings
+) -> None:
+    """Every renewal path shares one gate (spec §16.6.2 #84): the engine's revocation reaches the runtime."""
+    from sqlalchemy import event
+
+    _, task_id = await a_task(session, settings)
+    updates: list[str] = []
+
+    def count(conn, cursor, statement, *args):  # type: ignore[no-untyped-def]
+        if statement.lstrip().upper().startswith("UPDATE TASKS"):
+            updates.append(statement)
+
+    revoke_lease_owner(WORKER_ID)
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        with pytest.raises(LeaseLostError):
+            await LeaseHeartbeat(sessions, WORKER_ID).beat(task_id)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+    assert updates == []

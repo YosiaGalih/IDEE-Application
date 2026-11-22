@@ -7,7 +7,7 @@ import time
 import uuid
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -18,11 +18,13 @@ from app.models.projects import Project
 from app.models.tasks import Task
 from app.workflow.lease import (
     ClaimResult,
+    LeaseGuard,
     LeaseLost,
     _is_lock_timeout,
     claim_lease,
     release_lease,
     renew_lease,
+    revoke_lease_owner,
 )
 from tests.conftest import reset_data
 
@@ -214,3 +216,42 @@ def test_is_lock_timeout_tells_55p03_from_a_statement_timeout() -> None:
     assert not _is_lock_timeout(error("23505", "duplicate"))
     # The message alone never makes a BUSY: only the sqlstate does (review L1).
     assert not _is_lock_timeout(error("40001", "canceling statement due to lock timeout"))
+
+
+async def test_a_revoked_owner_cannot_renew_and_its_lease_is_left_to_lapse(
+    engine: AsyncEngine, task_ids: list[uuid.UUID]
+) -> None:
+    await claim(engine, task_ids[0], "w1")
+    await claim(engine, task_ids[1], "w2")
+    sessions = make_sessionmaker(engine)
+
+    async def expiry(task_id: uuid.UUID) -> object:
+        async with engine.connect() as conn:
+            return await conn.scalar(
+                text("SELECT lease_expires_at FROM tasks WHERE id = :id"), {"id": task_id}
+            )
+
+    before = await expiry(task_ids[0])
+    updates: list[str] = []
+
+    def count(conn, cursor, statement, *args):  # type: ignore[no-untyped-def]
+        if statement.lstrip().upper().startswith("UPDATE TASKS"):
+            updates.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        revoke_lease_owner("w1")
+        async with sessions() as session:
+            with pytest.raises(LeaseLost):
+                await renew_lease(session, task_ids[0], "w1")
+            with pytest.raises(LeaseLost):
+                await LeaseGuard(task_ids[0], "w1").hold(session)
+            await session.rollback()
+        assert updates == []  # no SQL at all for the revoked owner
+        async with sessions() as session:
+            await renew_lease(session, task_ids[1], "w2")  # another owner is untouched
+            await session.commit()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+    assert await expiry(task_ids[0]) == before
+    assert len(updates) == 1
