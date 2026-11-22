@@ -27,6 +27,7 @@ from app.worker.platform_jobs import (
     PROJECTS_PURGE_TASK,
 )
 from app.worker.pricing import PRICING_PATH_CONF, PricingStep
+from app.worker.registry import REGISTRY_PATH_CONF, RegistryStep
 
 RECOVERY_SWEEP_SECONDS = 30.0  # ARCHITECTURE §5.3
 DISPATCH_SWEEP_SECONDS = 30.0  # spec WP-3.2 §14 #41
@@ -57,7 +58,7 @@ def create_celery(settings: Settings) -> Celery:
             "visibility_timeout": VISIBILITY_TIMEOUT_SECONDS,
         },
         timezone="UTC",
-        **{PRICING_PATH_CONF: settings.pricing_path},
+        **{PRICING_PATH_CONF: settings.pricing_path, REGISTRY_PATH_CONF: settings.agent_registry_path},
         beat_schedule={
             "recovery-sweep": {
                 "task": "app.worker.jobs.recovery_sweep",
@@ -86,6 +87,7 @@ def create_celery(settings: Settings) -> Celery:
     if app.steps is None:  # typed optional; Celery always builds it, and a worker must never skip the step
         raise RuntimeError("Celery app has no bootstep registry")
     app.steps["worker"].add(PricingStep)  # worker processes only: beat and the api never load prices
+    app.steps["worker"].add(RegistryStep)  # likewise the agent registry (spec WP-3.2 §16.3 #68)
     return app
 
 

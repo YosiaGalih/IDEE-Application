@@ -85,3 +85,67 @@ def test_worker_process_with_a_good_pricing_file_gets_past_pricing() -> None:
     assert "PricingError" not in output
     assert "pricing_loaded" in output and "2026-11-05" in output
     assert "Cannot connect to" in output
+
+
+def _registry_env(registry_path: Path) -> dict[str, str]:
+    return {
+        **os.environ,
+        **make_test_env(
+            PRICING_PATH=str(BACKEND / "config" / "pricing.yaml"),
+            AGENT_REGISTRY_PATH=str(registry_path),
+            REDIS_URL=UNREACHABLE_BROKER,
+        ),
+    }
+
+
+def test_worker_process_refuses_to_start_with_a_broken_registry_file(tmp_path: Path) -> None:
+    """Only the registry is broken (pricing is valid), so the exit is the registry step's."""
+    path = tmp_path / "registry.yaml"
+    path.write_text("agents: [unclosed", encoding="utf-8")
+    try:
+        done = subprocess.run(  # noqa: S603 - a fixed command line, the test's own interpreter
+            COMMAND,
+            cwd=BACKEND,
+            env=_registry_env(path),
+            timeout=LIMIT_S,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("the worker did not exit: it went on towards the broker with no agent registry")
+    output = done.stdout + done.stderr
+    assert done.returncode != 0
+    assert "RegistryError" in output
+    assert "PricingError" not in output
+    assert "ready" not in output
+
+
+def test_worker_process_with_a_good_registry_loads_it() -> None:
+    process = subprocess.Popen(  # noqa: S603 - a fixed command line, the test's own interpreter
+        COMMAND,
+        cwd=BACKEND,
+        env=_registry_env(BACKEND.parent / "agents" / "registry.v2.yaml"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert process.stdout is not None
+    seen: list[str] = []
+    deadline = time.monotonic() + LIMIT_S
+    try:
+        while time.monotonic() < deadline and process.poll() is None:
+            readable, _, _ = select.select([process.stdout], [], [], 0.5)
+            if readable:
+                line = process.stdout.readline()
+                seen.append(line)
+                if "Cannot connect to" in line:
+                    break
+        still_running = process.poll() is None
+    finally:
+        process.kill()
+        rest, _ = process.communicate(timeout=10)
+    output = "".join(seen) + (rest or "")
+    assert still_running, output
+    assert "RegistryError" not in output
+    assert "agent_registry_loaded" in output
