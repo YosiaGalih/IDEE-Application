@@ -2062,7 +2062,36 @@ async def test_a_step_that_returns_no_result_fails_the_task_step_result_invalid(
     assert (after.status, after.error_code, after.lease_owner) == ("failed", "step_result_invalid", None)
     assert "completed_steps" not in after.checkpoint
     invalid = [e for e in logs if e["event"] == "step_result_invalid"]
-    assert [(e["task_id"], e["step"], e["kind"]) for e in invalid] == [(str(task_id), "intake", "NoneType")]
+    assert [(e["task_id"], e["step"], e["kind"]) for e in invalid] == [
+        (str(task_id), "intake", "foreign:NoneType")
+    ]
+
+
+@pytest.mark.parametrize("name", ["done", "interrupt"])
+async def test_a_foreign_value_named_like_a_kind_is_still_refused(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    name: str,
+) -> None:
+    """AG-13 delta INFO-D4: the kind of a value that is not a StepResult never comes from its class name, or a
+    class called ``done`` would finish the step and one called ``interrupt`` would skip the reason check."""
+    task_id = await make_task("draft")
+    foreign = type(name, (), {"kind": name, "reason": "Not A Code", "to": None})
+
+    async def returns_a_lookalike(_: StepContext) -> Any:
+        return foreign()
+
+    with capture_logs() as logs:
+        outcome = await make_engine(
+            engine, RecordingBus(), Steps(intake=returns_a_lookalike).registry(*PLANNING)
+        ).run(task_id)
+
+    assert outcome.stopped == "step_result_invalid"
+    after = await row(engine, task_id)
+    assert (after.status, after.error_code) == ("failed", "step_result_invalid")
+    assert "completed_steps" not in after.checkpoint
+    invalid = [e for e in logs if e["event"] == "step_result_invalid"]
+    assert [e["kind"] for e in invalid] == [f"foreign:{name}"]
 
 
 async def test_a_result_with_an_unknown_kind_fails_the_task_step_result_invalid(

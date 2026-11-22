@@ -457,7 +457,11 @@ class TaskEngine:
                     "step_result_dropped",
                     task_id=str(task_id),
                     step=context.step,
-                    kind=getattr(work.result(), "kind", type(work.result()).__name__),
+                    kind=(
+                        returned.kind
+                        if isinstance(returned := work.result(), StepResult)
+                        else f"foreign:{type(returned).__name__}"
+                    ),
                 )
             raise _DeliveryLimit
         return work.result()
@@ -513,7 +517,9 @@ class TaskEngine:
             allowed = ALLOWED_STEP_TARGETS.get(status, frozenset())
             # A step may hand back anything: a value that is not a StepResult, or a kind past __post_init__,
             # falls to ``case _`` and fails the task (L2, M5). The type name stands for a foreign value.
-            kind: str = result.kind if isinstance(result, StepResult) else type(result).__name__
+            # A foreign value's kind is never read from it, nor from its class name: "foreign:<type>" matches
+            # no case, so a lookalike class named ``done`` or ``interrupt`` is refused too (AG-13 INFO-D4).
+            kind: str = result.kind if isinstance(result, StepResult) else f"foreign:{type(result).__name__}"
             target = TaskStatus.INTERRUPTED if kind == "interrupt" else getattr(result, "to", None)
             # One savepoint: a refused transition or fail_task also undoes the step's finish (ruling R-T3f).
             async with db.begin_nested():

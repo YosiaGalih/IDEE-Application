@@ -31,8 +31,12 @@ through the ORM). Outside the two writers no module:
 The SQL scan is literal-aware for standard, E- and dollar-quoted literals (a comment marker inside one is not
 a comment). It reads what a module spells, not what runs. Out of scope: a loaded row handed to a helper in a
 module that never imports the model, a string built at run time (``join`` of a variable list, ``str.replace``,
-``bytes``), ``flag_modified`` and other ORM state APIs, a ``U&`` identifier with ``UESCAPE``, and a table
-reached through ``reflect``/``automap`` under a name the AST cannot spell.
+``bytes``), ``flag_modified`` and other ORM state APIs, a ``U&`` identifier with ``UESCAPE``, a table
+reached through ``reflect``/``automap`` under a name the AST cannot spell, and a table bound to a local name
+first (``T = AgentRun.__table__; T.update()``, the same with ``__mapper__.local_table``,
+``sa.inspect(AgentRun).local_table.update()``, ``AgentRun.__mapper__.tables[0].update()``; AG-13 delta
+INFO-D5). A dollar-quoted literal that only reads like a write (``SELECT $$UPDATE agent_runs$$``) is flagged:
+a conservative false positive.
 """
 
 from __future__ import annotations
