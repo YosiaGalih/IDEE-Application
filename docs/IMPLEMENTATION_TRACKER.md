@@ -3509,3 +3509,7 @@ Ran 114 tests … OK
   - invarian #11;
   - planning `provider_not_ready` → `fail`.
 - **3.2c2b2:** N25/N19 topologi antrean, yaitu sisi antrean L4 (butuh PO). Juga aturan volume `/app` dan N38/N44/N45/N46/N48.
+
+**Sesudah PR #41 (fakta, 22 Nov 2026) [Pasti]:**
+- PR #41 (WP-3.2c2b1) mencapai 8/9 job CI di 436433b. Job `security-scan` merah karena CVE di image upstream: web nginx 1.30.6/libxml2 dan postgres libxml2. Workflow `security` di base `main` ca80a39 juga merah karena temuan yang sama, dan penjelasannya sudah dikomentari di PR.
+- PO menandai PR #41 ready, lalu me-merge-nya pada 22 Nov 2026 ±11:05 UTC (8b36d82).
