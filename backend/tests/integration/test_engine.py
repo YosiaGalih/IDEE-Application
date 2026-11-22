@@ -1783,6 +1783,41 @@ async def test_the_step_is_cancelled_once_at_the_limit(engine: AsyncEngine, make
     assert "completed_steps" not in after.checkpoint
 
 
+async def test_an_outer_cancel_during_the_limit_cleanup_does_not_cancel_the_step_again(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    """The ``finally`` of ``_run_step`` must skip its cancel once the limit has cancelled the step: an outer
+    cancel (worker shutdown) during the cleanup would otherwise cancel it twice (review T5)."""
+    task_id = await make_task("queued")
+    cancels: list[str] = []
+    cleaning = asyncio.Event()
+
+    async def cleans_up_slowly(_: StepContext) -> StepResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancels.append("limit")
+            cleaning.set()
+            try:
+                await asyncio.sleep(0.5)  # a second cancel would end this sleep
+            except asyncio.CancelledError:
+                cancels.append("second")
+            raise
+        return StepResult.done()
+
+    steps = Steps(implement=cleans_up_slowly)
+    run = asyncio.create_task(
+        make_engine(engine, RecordingBus(), steps.registry("implement"), delivery_limit_s=0.2).run(task_id)
+    )
+    await asyncio.wait_for(cleaning.wait(), timeout=5)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, timeout=5)
+    assert cancels == ["limit"]
+    assert (await row(engine, task_id)).lease_owner is None  # the cancel path still released the lease
+
+
 async def test_a_step_error_during_the_limit_cleanup_is_logged_by_type(
     engine: AsyncEngine,
     make_task,  # type: ignore[no-untyped-def]
@@ -1818,7 +1853,7 @@ async def test_losing_the_lease_during_the_limit_cleanup_wins(engine: AsyncEngin
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             await take_over_lease(engine, task_id)
-            await asyncio.sleep(5)  # the heartbeat finds the lease gone and ends the wait
+            await asyncio.sleep(1.5)  # the heartbeat finds the lease gone first; no second cancel ends this
             raise
         return StepResult.done()
 
