@@ -51,6 +51,8 @@ ENGINE_WRITE_TIMEOUT_S = 15
 # the lease lapses and recovery takes the task. Margin (tested in test_celery_app):
 # GRACE + LEASE_SECONDS + RECOVERY_SWEEP_SECONDS + ENGINE_WRITE_TIMEOUT_S < DELIVERY_MARGIN_SECONDS.
 STEP_CLEANUP_GRACE_S = 300
+# A step still cleaning up this long after its cancel is logged (step_cleanup_waiting); quicker ones are not.
+CLEANUP_NOTICE_S = 1.0
 # Spec §16.4 #74, §16.5a #3: what a task that ran past the delivery limit says. Fixed; it holds no values.
 DURATION_EXCEEDED = "duration_exceeded"
 DURATION_EXCEEDED_MESSAGE = "The task ran past its delivery time limit"
@@ -425,8 +427,11 @@ class TaskEngine:
                 work.cancel()
             beat.cancel()
             if not work.done():
-                # The wait for the step stays unbounded by design (it must end before this returns).
-                logger.warning("step_cleanup_waiting", task_id=str(task_id), step=context.step)
+                # The wait for the step stays unbounded by design (it must end before this returns); one that
+                # outlasts CLEANUP_NOTICE_S leaves a line, so a hung cleanup is never silent.
+                await asyncio.wait((work,), timeout=CLEANUP_NOTICE_S)
+                if not work.done():
+                    logger.warning("step_cleanup_waiting", task_id=str(task_id), step=context.step)
             await asyncio.gather(work, beat, return_exceptions=True)
             if (
                 (beat_won or work_cancelled)

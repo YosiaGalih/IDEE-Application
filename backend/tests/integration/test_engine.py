@@ -654,11 +654,13 @@ async def test_lease_lost_stops_without_writes(engine: AsyncEngine, make_task, h
     # after_step: no beat may come first, so the loss is found by the guard before the finish write.
     beat = 30 if how == "after_step" else 0.1
     task_engine = make_engine(engine, RecordingBus(), steps.registry(*PLANNING), heartbeat_s=beat)
-    outcome = await asyncio.wait_for(task_engine.run(task_id), timeout=5)
+    with capture_logs() as logs:
+        outcome = await asyncio.wait_for(task_engine.run(task_id), timeout=5)
 
     assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["intake"], "lease_lost")
     assert steps.names == ["intake"]
     assert cancelled == ([True] if how == "heartbeat" else [])
+    assert [e for e in logs if e["event"] == "step_cleanup_waiting"] == []  # a quick cleanup leaves no line
     after = await row(engine, task_id)
     assert (after.status, after.current_step, after.lease_owner) == ("draft", "intake", "w-other")
     assert "completed_steps" not in after.checkpoint
