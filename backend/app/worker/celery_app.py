@@ -36,7 +36,7 @@ DISPATCH_SWEEP_SECONDS = 30.0  # spec WP-3.2 §14 #41
 VISIBILITY_TIMEOUT_SECONDS = 7200
 # A delivery must end this long before the broker redelivers it (spec §16.5a #4): the delivery limit may
 # not exceed VISIBILITY_TIMEOUT_SECONDS - DELIVERY_MARGIN_SECONDS (110 minutes).
-DELIVERY_MARGIN_SECONDS = 600
+DELIVERY_MARGIN_SECONDS = 600  # must cover STEP_CLEANUP_GRACE_S + lease + recovery sweep + one engine write
 
 
 def create_celery(settings: Settings) -> Celery:

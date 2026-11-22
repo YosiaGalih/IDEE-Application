@@ -65,3 +65,14 @@ def test_the_allowlist_is_narrower_than_the_state_machine() -> None:
     for status, targets in ALLOWED_STEP_TARGETS.items():
         assert targets <= ALLOWED[S(status)]
         assert not targets & {S.COMPLETED, S.CANCELLED, S.FAILED}  # failed only through StepResult.fail
+
+
+def test_a_target_is_coerced_to_a_task_status() -> None:
+    assert StepResult("transition", to="planned").to is S.PLANNED  # type: ignore[arg-type]
+    assert StepResult.transition(S.PLANNED, None).to is S.PLANNED
+    assert StepResult.done().to is None
+
+
+def test_an_invalid_target_string_is_refused() -> None:
+    with pytest.raises(ValueError):
+        StepResult("transition", to="not_a_status")  # type: ignore[arg-type]

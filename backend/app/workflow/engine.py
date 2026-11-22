@@ -47,6 +47,10 @@ MAX_PLANNING_ATTEMPTS = 3
 # Spec §16.4 #76: a wall-clock bound on every engine transaction, over the server-side lock and statement
 # timeouts (a black-holed connection never answers either). Read at call time.
 ENGINE_WRITE_TIMEOUT_S = 15
+# AG-13 C1: how long a step may keep cleaning up after the delivery-limit cancel. Past it the heartbeat stops,
+# the lease lapses and recovery takes the task. Margin (tested in test_celery_app):
+# GRACE + LEASE_SECONDS + RECOVERY_SWEEP_SECONDS + ENGINE_WRITE_TIMEOUT_S < DELIVERY_MARGIN_SECONDS.
+STEP_CLEANUP_GRACE_S = 300
 # Spec §16.4 #74, §16.5a #3: what a task that ran past the delivery limit says. Fixed; it holds no values.
 DURATION_EXCEEDED = "duration_exceeded"
 DURATION_EXCEEDED_MESSAGE = "The task ran past its delivery time limit"
@@ -109,6 +113,8 @@ class StepResult:
     def __post_init__(self) -> None:
         if self.kind not in ("done", "fail", "transition", "interrupt"):
             raise ValueError("kind must be done, fail, transition or interrupt")
+        if self.to is not None:
+            object.__setattr__(self, "to", TaskStatus(self.to))  # a bad string raises ValueError here
         if self.kind == "transition" and self.to is None:
             raise ValueError("a transition needs a target status (to)")
         if self.kind == "fail":
@@ -162,6 +168,7 @@ class WorkflowPorts:
     heartbeat_s: float = HEARTBEAT_SECONDS
     lease_safety_s: float = LEASE_SAFETY_SECONDS
     delivery_limit_s: float = 3600.0  # per delivery, on the loop clock, from the claim (spec §16.4 #74)
+    cleanup_grace_s: float = STEP_CLEANUP_GRACE_S  # a step's cleanup after the limit cancel (AG-13 C1)
 
 
 @dataclass
@@ -196,6 +203,8 @@ class TaskEngine:
             raise ValueError("heartbeat_s and lease_safety_s must be > 0 and sum to less than the lease")
         if not ports.delivery_limit_s > 0:
             raise ValueError("delivery_limit_s must be > 0")
+        if not ports.cleanup_grace_s > 0:
+            raise ValueError("cleanup_grace_s must be > 0")
         self._ports = ports
 
     @asynccontextmanager
@@ -284,6 +293,7 @@ class TaskEngine:
         loop = asyncio.get_running_loop()
         for step in todo:
             if loop.time() >= deadline:  # no step starts: an honest status, no step_finished (§16.5a #2)
+                self._log_limit(task_id, None, cancelled=False)
                 return await self._stop_before_step(task_id, status)
             # Before _start's renewal, so the heartbeat's H errs early.
             renewed_at = loop.time()
@@ -293,7 +303,9 @@ class TaskEngine:
             ran.append(step)
             over = loop.time() >= deadline  # past the limit after _start: finish the step honestly
             result = self._limit_result(status)
-            if not over:
+            if over:
+                self._log_limit(task_id, step, cancelled=False)
+            else:
                 try:
                     result = await self._run_step(
                         task_id, self._ports.steps[step], context, renewed_at, deadline
@@ -310,6 +322,11 @@ class TaskEngine:
             await commit_and_publish(db, self._ports.bus)
         logger.warning("pipeline_exhausted", task_id=str(task_id), status=status)
         return "pipeline_exhausted"
+
+    @staticmethod
+    def _log_limit(task_id: uuid.UUID, step: str | None, *, cancelled: bool) -> None:
+        """The delivery limit ended the task's run (M1): ids, step and a flag only, never the owner."""
+        logger.warning("task_delivery_limit", task_id=str(task_id), step=step, cancelled=cancelled)
 
     @staticmethod
     def _limit_result(status: str) -> StepResult:
@@ -384,19 +401,32 @@ class TaskEngine:
         beat = asyncio.create_task(self._heartbeat(task_id, renewed_at))
         beat_won = True  # also on an outer cancel: the step's own outcome is then dropped too
         work_cancelled = False
+        overrun = False
         try:
             await asyncio.wait(
                 (work, beat), timeout=max(deadline - loop.time(), 0), return_when=asyncio.FIRST_COMPLETED
             )
             if not work.done() and not beat.done():
                 work_cancelled = True
+                self._log_limit(task_id, context.step, cancelled=True)
                 work.cancel()
-                await asyncio.wait((work, beat), return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait(
+                    (work, beat), timeout=self._ports.cleanup_grace_s, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not work.done() and not beat.done():
+                    # AG-13 C1: the step hangs in its cleanup. Only the heartbeat is cancelled (never the step
+                    # again): the lease lapses and recovery takes the task, so the slot is not pinned.
+                    overrun = True
+                    logger.error("step_cleanup_overrun", task_id=str(task_id), step=context.step)
+                    beat.cancel()
             beat_won = beat.done()
         finally:
             if not work_cancelled:
                 work.cancel()
             beat.cancel()
+            if not work.done():
+                # The wait for the step stays unbounded by design (it must end before this returns).
+                logger.warning("step_cleanup_waiting", task_id=str(task_id), step=context.step)
             await asyncio.gather(work, beat, return_exceptions=True)
             if (
                 (beat_won or work_cancelled)
@@ -411,9 +441,19 @@ class TaskEngine:
                     step=context.step,
                     error_type=type(error).__name__,
                 )
+        if overrun:  # before beat.result(): the cancelled heartbeat would raise CancelledError there
+            raise LeaseLost("the step overran its cleanup grace; the lease was let go")
         if beat_won:
             beat.result()  # the heartbeat only ends by raising LeaseLost
         if work_cancelled:
+            if not work.cancelled() and work.exception() is None:
+                # The step absorbed the cancel and handed a result back: the limit wins.
+                logger.warning(
+                    "step_result_dropped",
+                    task_id=str(task_id),
+                    step=context.step,
+                    kind=getattr(work.result(), "kind", type(work.result()).__name__),
+                )
             raise _DeliveryLimit
         return work.result()
 
@@ -465,11 +505,14 @@ class TaskEngine:
         async with self._transaction() as db:
             task = await self._locked(db, task_id, status)
             stopped: Stopped | None = None
-            target = TaskStatus.INTERRUPTED if result.kind == "interrupt" else result.to
             allowed = ALLOWED_STEP_TARGETS.get(status, frozenset())
+            # A step may hand back anything: a value that is not a StepResult, or a kind past __post_init__,
+            # falls to ``case _`` and fails the task (L2, M5). The type name stands for a foreign value.
+            kind: str = result.kind if isinstance(result, StepResult) else type(result).__name__
+            target = TaskStatus.INTERRUPTED if kind == "interrupt" else getattr(result, "to", None)
             # One savepoint: a refused transition or fail_task also undoes the step's finish (ruling R-T3f).
             async with db.begin_nested():
-                match result.kind:
+                match kind:
                     case "done":
                         await self._step_finished(db, task_id, step, "done")
                     case "fail":
@@ -477,7 +520,7 @@ class TaskEngine:
                         await self._fail(db, task, result.error_code, result.message)
                         stopped = "failed"
                     case "transition" | "interrupt" if target not in allowed:  # before any done write
-                        stopped = await self._fail_invalid_result(db, task, status, step, result.kind, target)
+                        stopped = await self._fail_invalid_result(db, task, status, step, kind, target)
                     case "transition":
                         assert result.to is not None
                         await self._step_finished(db, task_id, step, "done")
@@ -497,6 +540,8 @@ class TaskEngine:
                             audit=ports.audit,
                         )
                         stopped = "interrupted"
+                    case _:
+                        stopped = await self._fail_invalid_result(db, task, status, step, kind, None)
             if stopped is not None:
                 await release_lease(db, task_id, ports.worker_id)
             await commit_and_publish(db, ports.bus)
@@ -509,9 +554,14 @@ class TaskEngine:
         terminally, the step unfinished. Never raised: a raise would spend a planning attempt and send the
         task again, to the same refused result."""
         shown = target.value if target is not None else None
+        if kind not in ("transition", "interrupt"):  # not a result the engine knows (L2, M5)
+            message = f"Step {step} returned a result the engine does not understand"
+        else:
+            message = (
+                f"Step {step} asked to move a {status} task to {shown or 'no status'}, which it may not do"
+            )
         logger.error("step_result_invalid", task_id=str(task.id), step=step, kind=kind, target=shown)
         await self._step_finished(db, task.id, step, "failed")
-        message = f"Step {step} asked to move a {status} task to {shown or 'no status'}, which it may not do"
         await self._fail(db, task, "step_result_invalid", message)
         return "step_result_invalid"
 

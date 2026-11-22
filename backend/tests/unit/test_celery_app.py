@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from app.core.config import ConfigError, load_settings
-from app.worker.celery_app import create_celery
+from app.worker.celery_app import DELIVERY_MARGIN_SECONDS, RECOVERY_SWEEP_SECONDS, create_celery
+from app.workflow.engine import ENGINE_WRITE_TIMEOUT_S, STEP_CLEANUP_GRACE_S
+from app.workflow.lease import LEASE_SECONDS
 from tests.conftest import make_test_env
 
 
@@ -327,3 +329,13 @@ def test_delivery_limit_past_the_visibility_margin_is_refused_without_its_value(
     text = str(refused.value)
     assert "TASK_DELIVERY_MAX_MINUTES" in text
     assert "111" not in text and "6660" not in text
+
+
+def test_the_delivery_margin_covers_a_step_cleanup_overrun_and_its_recovery() -> None:
+    """AG-13 C1: after the limit a step may clean up for the grace; then its lease lapses (LEASE_SECONDS), a
+    sweep finds it (RECOVERY_SWEEP_SECONDS) and its last write is bound (ENGINE_WRITE_TIMEOUT_S). All of that
+    must fit before the broker redelivers."""
+    assert (
+        STEP_CLEANUP_GRACE_S + LEASE_SECONDS + RECOVERY_SWEEP_SECONDS + ENGINE_WRITE_TIMEOUT_S
+        < DELIVERY_MARGIN_SECONDS
+    )
