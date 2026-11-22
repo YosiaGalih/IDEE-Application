@@ -322,6 +322,50 @@ async def test_no_capacity_runs_no_candidate_query_and_sends_nothing(engine: Asy
     assert "LIMIT" not in statements[0].upper()
 
 
+async def test_starved_orphans_are_a_warning_with_counts(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("running", lease_seconds=60)
+    await make_task("draft", {"dispatch": {"at": at(OLD)}})
+    await make_task("draft", {"dispatch": {"at": at(OLD * 2)}})
+
+    with capture_logs() as logs:
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=1)
+
+    [event_] = [e for e in logs if e["event"] == "task_dispatch_no_capacity"]
+    assert event_["log_level"] == "warning"
+    assert (event_["live"], event_["in_flight"], event_["max_active"], event_["orphans"]) == (1, 0, 1, 2)
+
+
+async def test_no_capacity_without_orphans_is_not_a_warning(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("running", lease_seconds=60)
+
+    with capture_logs() as logs:
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=1)
+
+    assert [e for e in logs if e["log_level"] in ("warning", "error")] == []
+
+
+async def test_capped_sweep_logs_capacity_and_orphans(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("running", lease_seconds=60)
+    for age in (OLD * 3, OLD * 2, OLD):
+        await make_task("draft", {"dispatch": {"at": at(age)}})
+
+    with capture_logs() as logs:
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=3)
+
+    [event_] = [e for e in logs if e["event"] == "task_dispatch_capped"]
+    assert event_["log_level"] == "info"
+    assert (event_["capacity"], event_["orphans"]) == (2, 3)
+
+
+async def test_uncapped_sweep_logs_no_capacity_event(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    await make_task("draft", {"dispatch": {"at": at(OLD)}})
+
+    with capture_logs() as logs:
+        await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher(), max_active=MAX_ACTIVE)
+
+    assert [e for e in logs if e["event"] in ("task_dispatch_capped", "task_dispatch_no_capacity")] == []
+
+
 async def test_max_active_is_required(engine: AsyncEngine) -> None:
     with pytest.raises(TypeError):
         await redispatch_orphans(make_sessionmaker(engine), RecordingDispatcher())  # type: ignore[call-arg]
