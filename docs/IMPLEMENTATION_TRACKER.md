@@ -2373,7 +2373,7 @@ Ran 112 tests · OK (skipped=1)
 **Syarat yang dibawa:**
 - **3.1f:**
   - AgentRuntime memanggil `provider_ready(row, settings, held=WorkerCredentials(key, base_url))` sebelum setiap panggilan model dan `provider_calls_allowed(project)`.
-  - Kill switch mati → task `failed` `PROVIDER_DISABLED`; belum siap → `draft` dengan banner.
+  - Kill switch mati → task `failed` `PROVIDER_DISABLED`; belum siap → `draft` dengan banner. **Digantikan #8 final** (spec induk §16.6.5, WP-3.2c2c2): pemetaan kini per pipeline. Di `draft` → task `failed` dengan kode provider huruf kecil (`provider_not_ready`/`provider_disabled`/`provider_auth`); di `running` → `interrupted` dengan `status_reason` yang sama.
   - Error `auth`/`not_found` pada panggilan nyata → readiness `unknown`.
   - `pricing_version` yang berubah sejak laporan → `unknown`.
 - **3.1e2:**
