@@ -1,9 +1,12 @@
-# ruff: noqa: F401, F811  (make_task is the fixture of test_engine, imported by name)
+# ruff: noqa: F811 - make_task, the fixture of test_engine, is imported by name and used as an argument
 """The workflow engine drives the real agent runtime (WP-3.2c2c2 Task 5; spec §16.6.5).
 
 ``build_orchestrator`` assembles the real ``AgentRuntime`` over the database; the provider is the production
 scripted one (scenario ``generic``). Every status is read from the database (tasks, agent_runs, task_events),
-never from model text. C2: the runtime renews the lease under the owner of the engine's claim.
+never from model text. C2: the runtime renews the lease under the owner of the engine's claim. The proof is
+the pair: these runs succeed, and the same wiring with another runtime owner ends ``lease_lost``
+(``test_a_runtime_with_another_owner_loses_the_lease``); the renewal count alone cannot tell the engine's
+renewals from the runtime's, since both write the same statement.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ from tests.integration.test_engine import (
     changed,
     finished,
     kinds,
-    make_task,
+    make_task,  # noqa: F401 - a fixture, used by name as an argument
     row,
     started,
 )
@@ -90,7 +93,7 @@ async def test_planning_runs_two_agents_through_the_real_runtime(
     with Renewals(engine) as renewals:
         outcome = await orch.run(task_id)
 
-    assert renewals.calls  # the runtime renewed the lease (C2: as OWNER, or the runs would be lease_lost)
+    assert renewals.calls  # the listener sees renewals (engine's and runtime's alike; C2: see the docstring)
     assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["intake", "context", "plan"], "transitioned")
     after = await row(engine, task_id)
     assert after.status == "planned"
