@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import asdict
+from typing import Final
 
 from celery import shared_task
 from redis.asyncio import Redis
 
+from app.agents.runtime import CLOSE_TIMEOUT_S
 from app.core.audit import AuditWriter
 from app.core.config import load_settings
 from app.core.db import make_engine, make_sessionmaker
@@ -19,6 +21,8 @@ from app.services.job_queue import CeleryJobQueue
 from app.services.orchestrator import build_orchestrator
 from app.services.run_recovery import RunRecoveryIncomplete, RunRecoveryResult, recover_runs
 from app.worker.identity import delivery_owner
+from app.worker.pricing import worker_pricing
+from app.worker.registry import worker_registry
 from app.workflow.dispatch import Dispatcher, DispatchIncomplete, DispatchResult, redispatch_orphans
 from app.workflow.engine import EngineOutcome
 from app.workflow.lease import ClaimResult
@@ -29,6 +33,9 @@ from app.workflow.recovery import RecoveryIncomplete, RecoveryResult, recover_ex
 SWEEP_TIMEOUT_SECONDS = 25.0
 DISPATCH_SWEEP_TIMEOUT_SECONDS = 25.0
 _MAX_LOGGED_ID = 80
+# What a delivery may wait for its own leftover tasks before it disposes the engine: ``_record_end`` of the
+# runtime is two writes and one ``fail``, each bounded by ``CLOSE_TIMEOUT_S``. Read at call time.
+RUNTIME_DRAIN_S: Final = 3 * CLOSE_TIMEOUT_S
 
 logger = get_logger(__name__)
 
@@ -146,6 +153,9 @@ def run_task(task_id: str) -> dict[str, object]:
 
 async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
     settings = load_settings()
+    registry = worker_registry()  # RegistryNotLoaded: before any connection or claim
+    pricing = worker_pricing()  # PricingNotLoaded: likewise
+    before = set(asyncio.all_tasks())
     engine = make_engine(settings.database_url)
     redis = Redis.from_url(settings.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0)
     try:
@@ -155,11 +165,28 @@ async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
             audit=AuditWriter(Redactor(settings.secret_values())),
             settings=settings,
             worker_id=delivery_owner(),
+            registry=registry,
+            pricing=pricing,
         )
         return await orchestrator.run(task_id)
     finally:
-        await redis.aclose()
-        await engine.dispose()
+        try:
+            await _drain(task_id, before)
+        finally:
+            await redis.aclose()
+            await engine.dispose()
+
+
+async def _drain(task_id: uuid.UUID, before: set[asyncio.Task[object]]) -> None:
+    """Waits for the tasks this delivery created (a run's close, for one) before the engine is disposed.
+    Never raises: a task that outlives the wait is logged by count and left to the loop (BC-17)."""
+    current = asyncio.current_task()
+    left = {t for t in asyncio.all_tasks() if t not in before and t is not current}
+    if not left:
+        return
+    _, pending = await asyncio.wait(left, timeout=RUNTIME_DRAIN_S)
+    if pending:
+        logger.warning("delivery_tasks_abandoned", task_id=str(task_id), count=len(pending))
 
 
 @shared_task(name="app.worker.jobs.dispatch_sweep")
