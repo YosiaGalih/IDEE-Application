@@ -25,7 +25,7 @@ import ast
 from collections.abc import Callable
 from pathlib import Path
 
-from tests.unit.test_agent_run_writer_guard import _string_value
+from tests.static_scan import string_value
 from tests.unit.test_guc_tripwire import violations
 
 APP = Path(__file__).resolve().parents[2] / "app"
@@ -77,7 +77,7 @@ def _inside_string_expression(node: ast.AST, parents: dict[ast.AST, ast.AST]) ->
     """Report an f-string, ``+``, ``%``, ``.format`` or ``join`` once, at its outermost node."""
     parent = parents.get(node)
     while isinstance(parent, ast.expr):
-        if isinstance(parent, ast.JoinedStr | ast.BinOp | ast.Call) and _string_value(parent) is not None:
+        if isinstance(parent, ast.JoinedStr | ast.BinOp | ast.Call) and string_value(parent) is not None:
             return True
         parent = parents.get(parent)
     return False
@@ -91,7 +91,7 @@ def marker_uses(source: str) -> list[int]:
     lines: list[int] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
-            value = _string_value(node)
+            value = string_value(node)
             if (
                 value is not None
                 and MARKER_TEXT in value.lower()

@@ -30,7 +30,7 @@ from pathlib import Path
 
 from app.models import approvals as approvals_model
 from app.models import tasks as tasks_model
-from tests.unit.test_agent_run_writer_guard import _normalise_sql, _string_value
+from tests.static_scan import normalise_sql, string_value
 from tests.unit.test_status_writer_guard import marker_refs
 
 APP = Path(__file__).resolve().parents[2] / "app"
@@ -50,7 +50,7 @@ UNREADABLE = "<unreadable>"
 
 _SET_CONFIG = re.compile(r"\bset_config\b", re.IGNORECASE)
 _SET_CONFIG_CALL = re.compile(r"\bset_config\s*\(\s*([\w.]+)\s*,", re.IGNORECASE)
-# ``SET [LOCAL|SESSION] name =|TO`` at the start of the SQL or after ``;`` (read after ``_normalise_sql``).
+# ``SET [LOCAL|SESSION] name =|TO`` at the start of the SQL or after ``;`` (read after ``normalise_sql``).
 _SET_STATEMENT = re.compile(
     r"(?:^|;)\s*set\s+(?:(?:local|session)\s+)?([\w.{}]+)\s*(?:=|\bto\b)", re.IGNORECASE
 )
@@ -82,7 +82,7 @@ def _module_constants(tree: ast.Module) -> dict[str, str]:
         else:
             continue
         for name, value in pairs:
-            if (text := _string_value(value)) is not None and "{}" not in text:
+            if (text := string_value(value)) is not None and "{}" not in text:
                 values[name] = text
     return values
 
@@ -90,7 +90,7 @@ def _module_constants(tree: ast.Module) -> dict[str, str]:
 def _guc_name(arg: ast.expr, constants: dict[str, str]) -> str | None:
     """The setting name a ``set_config`` call passes: a string literal, a module constant, or a
     ``KNOWN_GUC_CONSTANTS`` name (imported); lower case. None when the scan cannot read it."""
-    text = _string_value(arg)
+    text = string_value(arg)
     if text is not None:
         return None if "{}" in text else text.lower()
     if isinstance(arg, ast.Name):
@@ -115,7 +115,7 @@ def _concat_text(node: ast.expr) -> str | None:
             flatten(n.left)
             flatten(n.right)
         else:
-            pieces.append(_string_value(n))
+            pieces.append(string_value(n))
 
     flatten(node)
     return "".join("{}" if p is None else p for p in pieces) if any(p is not None for p in pieces) else None
@@ -123,7 +123,7 @@ def _concat_text(node: ast.expr) -> str | None:
 
 def _string_uses(value: str, line: int) -> list[_Use]:
     found: list[_Use] = []
-    sql = _normalise_sql(value)
+    sql = normalise_sql(value)
     for hit in _SET_CONFIG.finditer(sql):
         call = _SET_CONFIG_CALL.match(sql, hit.start())
         found.append((line, "set_config", call.group(1).lower() if call else None))
@@ -149,7 +149,7 @@ def guc_uses(source: str) -> list[_Use]:
         parent = parents.get(node)
         if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
             docstring = isinstance(parent, ast.Expr) and isinstance(node, ast.Constant)
-            value = None if docstring else _string_value(node)
+            value = None if docstring else string_value(node)
             if value is None and not docstring:
                 value = _concat_text(node)
             if value is not None:

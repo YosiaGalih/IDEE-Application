@@ -47,9 +47,8 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 
-# The string reader and SQL normaliser of the agent_runs guard: one copy of the lexer (BC-19 moves both into
-# tests/static_scan.py in Task 8a; this import then follows them).
-from tests.unit.test_agent_run_writer_guard import _normalise_sql, _string_value
+# The string reader and SQL normaliser shared by the writer guards: one copy of the lexer.
+from tests.static_scan import normalise_sql, string_value
 
 APP = Path(__file__).resolve().parents[2] / "app"
 ALLOWED_WRITER = APP / "workflow" / "states.py"
@@ -65,7 +64,7 @@ TRANSITION_WRITERS = frozenset(
 MARKER_HOLDERS = frozenset({"workflow/states.py", "models/tasks.py"})
 WRITER_NAMES = frozenset({"transition", "fail_task"})
 MARKER_NAMES = frozenset({"STATUS_WRITER_SETTING", "STATUS_WRITER"})
-# Raw SQL is read after ``_normalise_sql``: no comments, one space between words and none around ``.``.
+# Raw SQL is read after ``normalise_sql``: no comments, one space between words and none around ``.``.
 _TASKS = r"(?:\w+\.)?tasks\b"
 _UPDATE_TASKS = rf"\bupdate\s+(?:only\s+)?{_TASKS}(?:\s*\*)?(?:\s+(?:as\s+)?\w+)?\s+set\b"
 _MERGE_UPDATE = rf"\bmerge\s+into\s+(?:only\s+)?{_TASKS}[^;]*?\bupdate\s+set\b"
@@ -99,10 +98,10 @@ def _imports_task(tree: ast.Module) -> bool:
 def _is_raw_status_update(node: ast.expr) -> bool:
     if not isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
         return False
-    value = _string_value(node)
+    value = string_value(node)
     if value is None:
         return False
-    sql = _normalise_sql(value)
+    sql = normalise_sql(value)
     # A dynamic column ("{}") after UPDATE tasks SET could be status too.
     return any(p.search(sql) for p in (*RAW_SQL, *DYNAMIC_COLUMN_SQL))
 
@@ -113,7 +112,7 @@ def _is_tasks_table_call(node: ast.Call) -> bool:
     named_table = (isinstance(func, ast.Name) and func.id == "table") or (
         isinstance(func, ast.Attribute) and func.attr == "table"
     )
-    first = _string_value(node.args[0]) if node.args else None
+    first = string_value(node.args[0]) if node.args else None
     return named_table and first is not None and first.strip().strip('"').lower() == "tasks"
 
 
@@ -154,7 +153,7 @@ def _inside_string_expression(node: ast.AST, parents: dict[ast.AST, ast.AST]) ->
     again for each part: some enclosing expression already reads as one string."""
     parent = parents.get(node)
     while isinstance(parent, ast.expr):
-        if isinstance(parent, ast.JoinedStr | ast.BinOp | ast.Call) and _string_value(parent) is not None:
+        if isinstance(parent, ast.JoinedStr | ast.BinOp | ast.Call) and string_value(parent) is not None:
             return True
         parent = parents.get(parent)
     return False
@@ -424,7 +423,7 @@ def _constant_names(tree: ast.Module) -> dict[str, set[str]]:
         else:
             continue
         for name, value in pairs:
-            if (text := _string_value(value)) is not None:
+            if (text := string_value(value)) is not None:
                 values.setdefault(name, set()).add(text)
     return values
 
@@ -432,7 +431,7 @@ def _constant_names(tree: ast.Module) -> dict[str, set[str]]:
 def _names_a_writer(arg: ast.expr, constants: dict[str, set[str]]) -> bool:
     if isinstance(arg, ast.Name):
         return bool(constants.get(arg.id, set()) & WRITER_NAMES)
-    return _string_value(arg) in WRITER_NAMES
+    return string_value(arg) in WRITER_NAMES
 
 
 def _is_reflective_writer_lookup(call: ast.Call, aliases: set[str], constants: dict[str, set[str]]) -> bool:
@@ -448,7 +447,7 @@ def _is_eval_of_a_writer(call: ast.Call) -> bool:
     func = call.func
     if not (isinstance(func, ast.Name) and func.id in {"eval", "exec"} and call.args):
         return False
-    text = _string_value(call.args[0])
+    text = string_value(call.args[0])
     return text is not None and bool(_WRITER_WORD.search(text))
 
 
@@ -495,7 +494,7 @@ def marker_refs(source: str) -> list[str]:
     for node in ast.walk(tree):
         line = getattr(node, "lineno", 0)
         if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
-            value = _string_value(node)
+            value = string_value(node)
             if (
                 value is not None
                 and MARKER_WORD.search(value)
