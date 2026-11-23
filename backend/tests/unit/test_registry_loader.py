@@ -267,3 +267,21 @@ def test_canonical_hash_changes_with_content(raw: Raw) -> None:
     assert before is not None and after is not None
     assert before.canonical_hash() != after.canonical_hash()
     assert before.canonical_hash() == parse_registry(copy.deepcopy(raw)).by_id("A02").canonical_hash()  # type: ignore[union-attr]
+
+
+def test_runtime_id_follows_the_mode_and_is_not_part_of_the_hash(raw: Raw) -> None:
+    registry = parse_registry(copy.deepcopy(raw))
+
+    def runtime_id(agent_id: str) -> str | None:
+        spec = registry.by_id(agent_id)
+        assert spec is not None
+        return spec.runtime_id
+
+    assert runtime_id("A02") == "A02"  # llm
+    assert runtime_id("B09") == "B14"  # profile
+    assert runtime_id("A04") is None  # tool
+    planned = next(a for a in registry.agents if a.mvp_mode == "planned")
+    assert planned.runtime_id is None
+    again = parse_registry(copy.deepcopy(raw))
+    assert [a.canonical_hash() for a in registry.agents] == [a.canonical_hash() for a in again.agents]
+    assert "runtime_id" not in registry.agents[0].model_dump()

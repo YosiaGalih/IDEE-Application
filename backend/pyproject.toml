@@ -123,7 +123,8 @@ name = "The api process never builds a provider or reads its key (spec 3.1e Lead
 type = "forbidden"
 source_modules = ["app.main", "app.api"]
 forbidden_modules = ["app.llm.factory", "app.llm.anthropic_provider", "app.services.provider_smoke", "app.worker",
-                     "app.services.agent_runtime", "app.agents.runtime", "app.services.agent_run_rows"]
+                     "app.services.agent_runtime", "app.agents.runtime", "app.services.agent_run_rows",
+                     "app.services.orchestrator", "app.services.agent_step"]
 
 [[tool.importlinter.contracts]]
 name = "Routes reach the workflow only through services (thin routes, ARCHITECTURE §3.2; WP-3.1f1 review)"
@@ -154,9 +155,26 @@ allow_indirect_imports = true
 [[tool.importlinter.contracts]]
 name = "The runtime ends agent runs; it never moves a task (spec 3.1f #15, #30; WP-3.2 #67)"
 type = "forbidden"
-source_modules = ["app.agents.runtime", "app.services.agent_runtime", "app.services.agent_run_rows"]
+source_modules = ["app.agents.runtime", "app.services.agent_runtime", "app.services.agent_run_rows",
+                  "app.services.agent_step"]
 forbidden_modules = ["app.workflow.states", "app.models.tasks"]
 allow_indirect_imports = true   # emit_task_event and the lease functions touch Task on their own
+
+# app.services.steps.** matches nothing until WP-3.2d adds the step package; 3.2d then adds the explicit
+# app.services.steps next to it (an explicit name with no module makes lint-imports fail).
+[[tool.importlinter.contracts]]
+name = "Steps never reach the indirect status writers (spec WP-3.2 N60)"
+type = "forbidden"
+source_modules = ["app.services.agent_step", "app.services.steps.**"]
+forbidden_modules = ["app.services.project_tasks", "app.services.tool_r3", "app.workflow.recovery"]
+# Strict: indirect imports count too. app.services.run_recovery imports app.workflow.recovery.
+
+[[tool.importlinter.contracts]]
+name = "Steps take TaskStatus and LeaseLost from the engine, never from states or lease (AG-13 3.2c2c1)"
+type = "forbidden"
+source_modules = ["app.services.agent_step", "app.services.steps.**"]
+forbidden_modules = ["app.workflow.states", "app.workflow.lease"]
+allow_indirect_imports = true   # the engine itself imports both
 
 [tool.ruff.lint.isort]
 known-third-party = ["alembic"]

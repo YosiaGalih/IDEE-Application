@@ -43,6 +43,8 @@ from app.workflow.lease import (
 )
 from app.workflow.states import Actor, TaskStatus, check_error_code, fail_task, transition
 
+# LeaseLost and TaskStatus are also what a step takes from this module (spec §16.6.6 R-D3): the step packages
+# never import app.workflow.lease or app.workflow.states (import-linter contract); a test pins the identity.
 ACTOR = Actor("system", "engine")
 MAX_PLANNING_ATTEMPTS = 3
 # Spec §16.4 #76: a wall-clock bound on every engine transaction, over the server-side lock and statement

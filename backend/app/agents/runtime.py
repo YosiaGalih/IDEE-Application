@@ -1140,11 +1140,8 @@ class AgentRuntime:
         grant = grant_for(self._registry, request.agent_id)  # AgentNotRunnable: unknown or not enabled
         spec = self._registry.by_id(request.agent_id)
         assert spec is not None
-        if spec.mvp_mode == "llm":
-            runtime_id = spec.agent_id
-        elif spec.mvp_mode == "profile" and spec.runtime_agent is not None:
-            runtime_id = spec.runtime_agent
-        else:
+        runtime_id = spec.runtime_id
+        if runtime_id is None:
             raise AgentNotRunnable(f"{spec.agent_id} is not run by the agent runtime ({spec.mvp_mode})")
         if spec.agent_id in ABSORBED_PROFILES:
             raise AgentNotRunnable(f"{spec.agent_id} is absorbed into its runtime agent's run")

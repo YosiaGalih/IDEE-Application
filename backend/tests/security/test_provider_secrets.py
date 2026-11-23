@@ -108,6 +108,8 @@ def test_no_module_the_api_imports_reads_the_key() -> None:
         "app.services.provider_smoke",
         "app.services.agent_runtime",  # the worker's runtime assembly (plan WP-3.1f2a Task 3)
         "app.agents.runtime",
+        "app.services.orchestrator",  # the worker's engine assembly (WP-3.2c2c2)
+        "app.services.agent_step",  # the adapter that runs the runtime (WP-3.2c2c2)
     }
     assert forbidden.isdisjoint(loaded), forbidden & set(loaded)
     readers = []
