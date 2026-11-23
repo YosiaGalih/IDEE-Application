@@ -430,6 +430,7 @@ class TaskEngine:
         beat_won = True  # also on an outer cancel: the step's own outcome is then dropped too
         work_cancelled = False
         overrun = False
+        outer = False  # an outer cancel landed in a wait of the body (not held in ``_settle``)
         try:
             await asyncio.wait(
                 (work, beat), timeout=max(deadline - loop.time(), 0), return_when=asyncio.FIRST_COMPLETED
@@ -450,6 +451,7 @@ class TaskEngine:
                     beat.cancel()
             beat_won = beat.done()
         except asyncio.CancelledError:
+            outer = True
             if not work.done():
                 # R-C1: the step may swallow the cancel and is awaited below; its holds and the runtime
                 # heartbeat of this owner must not keep renewing the lease meanwhile.
@@ -473,7 +475,7 @@ class TaskEngine:
                     step=context.step,
                     error_type=type(error).__name__,
                 )
-            if held:
+            if held or outer:
                 self._log_held_drops(task_id, context.step, work, beat)
         if held:  # an outer cancel was held until the step ended; it wins over every outcome below
             # A bare re-raise on purpose: the cancel's message is not kept, and ``cancelling()`` stays
@@ -503,7 +505,8 @@ class TaskEngine:
     def _log_held_drops(
         task_id: uuid.UUID, step: str, work: asyncio.Future[StepResult], beat: asyncio.Task[NoReturn]
     ) -> None:
-        """An outer cancel was held and wins: log what it dropped besides a step error (ids, kinds only)."""
+        """An outer cancel wins (held in ``_settle``, or caught in the first wait): log what it dropped
+        besides a step error (ids, kinds only)."""
         if not beat.cancelled() and isinstance(beat.exception(), LeaseLost):
             logger.warning("lease_lost_dropped", task_id=str(task_id), step=step)
         if not work.cancelled() and work.exception() is None:
