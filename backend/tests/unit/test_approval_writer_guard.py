@@ -12,8 +12,11 @@ way to set a GUC in ``app/`` outside the exact ``GUC_WRITERS`` allowlist.
 
 Still out of scope, accepted: a ``decide`` or marker name computed at run time, ``operator.methodcaller``,
 ``inspect.getmembers``, ``getattr`` aliases for ``decide`` (only the direct ``getattr(x, "decide")`` is read),
-``ALTER ROLE|DATABASE ... SET``, ``sys.modules`` / ``globals()`` lookups, and an indirect writer through a
-module of the allowlist (anything that calls ``approvals.decide``). The DB backstop is a backlog item.
+``ALTER ROLE|DATABASE ... SET``, ``ALTER SYSTEM SET``, a ``lambda`` wrapper around ``getattr``
+(``g = lambda *a: getattr(*a)``), a driver connection setting under a key other than ``server_settings`` or
+``options``, SQL held as ``bytes`` literals, ``sys.modules`` / ``globals()`` lookups, and an indirect writer
+through a module of the allowlist (anything that calls ``approvals.decide``). The DB backstop is a backlog
+item.
 """
 
 from __future__ import annotations

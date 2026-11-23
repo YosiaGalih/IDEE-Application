@@ -28,8 +28,10 @@ pair or ``functools.partial``, ``<ref>.__call__``, a name held in a constant, an
 constant that names a writer. ``redis.eval`` is not a finding.
 
 Still out of scope, accepted: ``operator.methodcaller`` and ``inspect.getmembers`` (the name is a run-time
-value), ``ALTER ROLE|DATABASE ... SET``, and the indirect writers listed below. The import-linter contract N60
-sees imports only, never strings or SQL. A DB backstop is a backlog item.
+value), ``ALTER ROLE|DATABASE ... SET``, ``ALTER SYSTEM SET``, a ``lambda`` wrapper around ``getattr``
+(``g = lambda *a: getattr(*a)``), a driver connection setting under a key other than ``server_settings`` or
+``options``, SQL held as ``bytes`` literals, and the indirect writers listed below. The import-linter
+contract N60 sees imports only, never strings or SQL. A DB backstop is a backlog item.
 
 Limits that a static scan cannot decide: ``getattr`` with a computed string, ``importlib``,
 ``operator.attrgetter``, ``vars()`` / ``__dict__`` (and ``globals()`` / ``sys.modules`` lookups),
@@ -42,6 +44,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 # The string reader and SQL normaliser of the agent_runs guard: one copy of the lexer (BC-19 moves both into
@@ -399,14 +402,30 @@ def _getattr_aliases(tree: ast.Module) -> set[str]:
             return aliases
 
 
+def _paired_names(target: ast.expr, value: ast.expr) -> Iterator[tuple[str, ast.expr]]:
+    """(name, value) for ``NAME = value``; a tuple target pairs with a tuple value (``N, M = 'a', 'b'``)."""
+    if isinstance(target, ast.Tuple | ast.List) and isinstance(value, ast.Tuple | ast.List):
+        if len(target.elts) == len(value.elts):
+            for t, v in zip(target.elts, value.elts, strict=True):
+                yield from _paired_names(t, v)
+    elif isinstance(target, ast.Name):
+        yield target.id, value
+
+
 def _constant_names(tree: ast.Module) -> dict[str, set[str]]:
-    """Every string a name is assigned (``NAME = 'transition'``): ``getattr(m, NAME)`` reads as its values."""
+    """Every string a name is assigned (``NAME = 'transition'``, ``NAME: str = ...``, ``N, M = 'a', 'b'``):
+    ``getattr(m, NAME)`` reads as its values."""
     values: dict[str, set[str]] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and (text := _string_value(node.value)) is not None:
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    values.setdefault(target.id, set()).add(text)
+        if isinstance(node, ast.Assign):
+            pairs = [p for t in node.targets for p in _paired_names(t, node.value)]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            pairs = list(_paired_names(node.target, node.value))
+        else:
+            continue
+        for name, value in pairs:
+            if (text := _string_value(value)) is not None:
+                values.setdefault(name, set()).add(text)
     return values
 
 
@@ -573,6 +592,8 @@ WRITER_SAMPLES = [
     "from app.workflow import states\nw = eval('states.transition')\n",
     "exec('from app.workflow.states import transition')\n",
     "from app.workflow import states\nNAME = 'transition'\nw = getattr(states, NAME)\n",
+    "from app.workflow import states\nN: str = 'transition'\nw = getattr(states, N)\n",
+    "from app.workflow import states\nN, M = 'transition', 'x'\nw = getattr(states, N)\n",
 ]
 MARKER_SAMPLES = [
     "X = 'kk.' + 'status_writer'\n",
@@ -678,6 +699,10 @@ def test_docstring_names_the_static_limits() -> None:
         "operator.methodcaller",
         "inspect.getmembers",
         "ALTER ROLE",
+        "ALTER SYSTEM SET",
+        "lambda",
+        "bytes",
+        "connection setting",
         "cancel_open_tasks",
         "tool_r3",
         "recover_expired",

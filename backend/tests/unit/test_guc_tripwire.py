@@ -6,15 +6,18 @@ PostgreSQL reads a setting name without regard to case. Matching the marker text
 (``'kk.status' || '_writer'``, ``concat``, ``U&'...'``).
 This tripwire does not look for the marker: it flags the *ways to set a GUC* in ``app/``: a ``set_config``
 call, name or string (any case), ``SET [LOCAL|SESSION] <name> =`` at the start of a string or after ``;``,
-``server_settings`` and ``options -c name=``. Outside ``GUC_WRITERS`` each is a violation; inside it the
-name must be a constant that the module's entry lists (a literal, a module constant, or a
-``KNOWN_GUC_CONSTANTS`` name).
-A name the scan cannot read (``||``, ``concat``, a variable, ``U&``) is always a violation.
+``server_settings`` and ``options`` (``-c name=``, or ``--name=`` for a dotted name). Outside
+``GUC_WRITERS`` each is a violation; inside it the name must be a constant that the module's entry lists (a
+literal, a module constant, or a ``KNOWN_GUC_CONSTANTS`` name).
+A name the scan cannot read (``||``, ``concat``, a variable, ``U&``, a computed piece of ``SET LOCAL``) is
+always a violation.
 
 Not decided by a static scan, accepted: a name computed at run time (``getattr`` / ``eval`` of data, a string
 read from a file or the DB), ``operator.methodcaller``, ``inspect.getmembers``,
-``ALTER ROLE|DATABASE ... SET``, ``sys.modules`` / ``globals()`` lookups, and an indirect writer through a
-module of ``GUC_WRITERS``
+``ALTER ROLE|DATABASE ... SET``, ``ALTER SYSTEM SET``, a ``lambda`` wrapper around ``getattr``
+(``g = lambda *a: getattr(*a)``), a driver connection setting under a key other than ``server_settings`` or
+``options``, SQL held as ``bytes`` literals, ``sys.modules`` / ``globals()`` lookups, and an indirect writer
+through a module of ``GUC_WRITERS``
 (``workflow.states.transition`` sets the marker for any caller). The DB backstop is a backlog item.
 """
 
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 from app.models import approvals as approvals_model
@@ -48,22 +52,38 @@ _SET_CONFIG = re.compile(r"\bset_config\b", re.IGNORECASE)
 _SET_CONFIG_CALL = re.compile(r"\bset_config\s*\(\s*([\w.]+)\s*,", re.IGNORECASE)
 # ``SET [LOCAL|SESSION] name =|TO`` at the start of the SQL or after ``;`` (read after ``_normalise_sql``).
 _SET_STATEMENT = re.compile(
-    r"(?:^|;)\s*set\s+(?:(?:local|session)\s+)?([\w.]+)\s*(?:=|\bto\b)", re.IGNORECASE
+    r"(?:^|;)\s*set\s+(?:(?:local|session)\s+)?([\w.{}]+)\s*(?:=|\bto\b)", re.IGNORECASE
 )
-_OPTIONS_C = re.compile(r"(?:^|\s)-c\s*([\w.]+)\s*=", re.IGNORECASE)
+# libpq ``options`` takes ``-c name=value`` and ``--name=value``. The ``--`` form needs a dotted name (the
+# marker GUCs are ``kk.*``): app/ has flags of ``git`` and ``prlimit`` (``--format=``, ``--as=``).
+_OPTIONS_C = re.compile(r"(?:^|\s)(?:-c\s*([\w.]+)|--(\w+\.[\w.]+))\s*=", re.IGNORECASE)
 _Use = tuple[int, str, str | None]
 
 
+def _paired_names(target: ast.expr, value: ast.expr) -> Iterator[tuple[str, ast.expr]]:
+    """(name, value) for ``NAME = value``; a tuple target pairs with a tuple value (``N, M = 'a', 'b'``)."""
+    if isinstance(target, ast.Tuple | ast.List) and isinstance(value, ast.Tuple | ast.List):
+        if len(target.elts) == len(value.elts):
+            for t, v in zip(target.elts, value.elts, strict=True):
+                yield from _paired_names(t, v)
+    elif isinstance(target, ast.Name):
+        yield target.id, value
+
+
 def _module_constants(tree: ast.Module) -> dict[str, str]:
-    """``NAME = 'literal'`` assigned in the module: a name argument that is such a constant reads as it."""
+    """``NAME = 'literal'`` (also ``NAME: str = ...`` and ``N, M = 'a', 'b'``) assigned in the module: a name
+    argument that is such a constant reads as it."""
     values: dict[str, str] = {}
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and (text := _string_value(node.value)) is not None
-            and "{}" not in text
-        ):
-            values |= {t.id: text for t in node.targets if isinstance(t, ast.Name)}
+        if isinstance(node, ast.Assign):
+            pairs = [p for t in node.targets for p in _paired_names(t, node.value)]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            pairs = list(_paired_names(node.target, node.value))
+        else:
+            continue
+        for name, value in pairs:
+            if (text := _string_value(value)) is not None and "{}" not in text:
+                values[name] = text
     return values
 
 
@@ -83,14 +103,36 @@ def _guc_name(arg: ast.expr, constants: dict[str, str]) -> str | None:
     return None
 
 
+def _concat_text(node: ast.expr) -> str | None:
+    """``'SET LOCAL ' + n + ' = 1'``: a ``+`` chain with a piece the scan cannot read (it reads as ``{}``)
+    when at least one piece is a string; None otherwise."""
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)):
+        return None
+    pieces: list[str | None] = []
+
+    def flatten(n: ast.expr) -> None:
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
+            flatten(n.left)
+            flatten(n.right)
+        else:
+            pieces.append(_string_value(n))
+
+    flatten(node)
+    return "".join("{}" if p is None else p for p in pieces) if any(p is not None for p in pieces) else None
+
+
 def _string_uses(value: str, line: int) -> list[_Use]:
     found: list[_Use] = []
     sql = _normalise_sql(value)
     for hit in _SET_CONFIG.finditer(sql):
         call = _SET_CONFIG_CALL.match(sql, hit.start())
         found.append((line, "set_config", call.group(1).lower() if call else None))
-    found += [(line, "SET", m.group(1).lower()) for m in _SET_STATEMENT.finditer(sql)]
-    found += [(line, "options -c", m.group(1).lower()) for m in _OPTIONS_C.finditer(value)]
+    # A ``{}`` in the token is a piece the scan cannot read (``f'SET LOCAL {n} = 1'``): an unreadable name.
+    found += [
+        (line, "SET", None if "{}" in m.group(1) else m.group(1).lower())
+        for m in _SET_STATEMENT.finditer(sql)
+    ]
+    found += [(line, "options -c", (m.group(1) or m.group(2)).lower()) for m in _OPTIONS_C.finditer(value)]
     if "server_settings" in value.lower():
         found.append((line, "server_settings", None))
     return found
@@ -108,6 +150,8 @@ def guc_uses(source: str) -> list[_Use]:
         if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
             docstring = isinstance(parent, ast.Expr) and isinstance(node, ast.Constant)
             value = None if docstring else _string_value(node)
+            if value is None and not docstring:
+                value = _concat_text(node)
             if value is not None:
                 found.update(_string_uses(value, line))
         if isinstance(node, ast.Call):
@@ -187,6 +231,9 @@ TRIPWIRE_SAMPLES = [
     "from sqlalchemy.sql.functions import set_config as sc\n",
     "from sqlalchemy import func\nq = func.set_config(name, 'x', True)\n",
     'q = "SET LOCAL app.x = 1"\n',
+    "q = f'SET LOCAL {n} = 1'\n",
+    "q = f'SET LOCAL kk.{n} = 1'\n",
+    "q = 'SET LOCAL ' + n + ' = 1'\n",
     'q = "set session app.x to 1"\n',
     "q = \"SELECT 1; SET LOCAL kk.status_writer = 'transition'\"\n",
     'q = "SELECT 1;  /* c */ SET app.x = 1"\n',
@@ -201,6 +248,8 @@ TRIPWIRE_SAMPLES = [
         "from sqlalchemy.ext.asyncio import create_async_engine\n"
         "e = create_async_engine(u, connect_args={'options': '-c kk.status_writer=transition'})\n"
     ),
+    "e = create_async_engine(u, connect_args={'options': '--kk.status_writer=x'})\n",
+    "O = '--kk.other=1'\n",
 ]
 TRIPWIRE_CLEAN = [
     "x = 'set the value'\n",
@@ -232,6 +281,26 @@ def test_an_unreadable_name_is_flagged_even_in_an_allowlisted_module() -> None:
         assert violations("workflow/states.py", source), source
     assert violations("workflow/states.py", "q = func.set_config('kk.Status_Writer', 'x', True)\n") == []
     assert violations("workflow/states.py", "q = func.set_config('lock_timeout', 'x', True)\n")
+
+
+def test_an_annotated_or_paired_constant_name_reads_as_its_value() -> None:
+    for source in (
+        "NAME: str = 'lock_timeout'\nq = func.set_config(NAME, '1s', True)\n",
+        "NAME, OTHER = 'lock_timeout', 'x'\nq = func.set_config(NAME, '1s', True)\n",
+    ):
+        assert violations("workflow/lease.py", source) == [], source
+        assert violations("services/other.py", source), source
+        assert violations("workflow/states.py", source), source
+
+
+def test_set_with_a_computed_name_is_unreadable_in_every_module() -> None:
+    for source in (
+        "q = f'SET LOCAL {n} = 1'\n",
+        "q = f'SET LOCAL kk.{n} = 1'\n",
+        "q = 'SET LOCAL ' + n + ' = 1'\n",
+    ):
+        assert violations("workflow/states.py", source), source
+        assert violations("core/db.py", source), source
 
 
 def test_known_constants_read_as_their_model_value() -> None:
