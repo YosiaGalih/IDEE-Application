@@ -96,6 +96,17 @@ Field `StepContext` (`draft` atau `running`) yang diisi engine dari status claim
 **StepAbandoned**:
 Exception yang dilempar langkah yang menyerah tanpa hasil. Engine tidak menulis status, event, maupun checkpoint, melepas lease, dan `run_task` kembali normal; task `draft` dikirim ulang sweep dispatch (dihitung satu percobaan planning), task `running` diambil recovery.
 
+**AgentStep (adapter langkah agent)**:
+Pendaftaran satu langkah engine yang dijalankan sebuah runtime agent (`app/services/agent_step.py`): `AgentStep(agent_id, build_input, on_success)`. Adapter membangun input, meminta satu run dengan id baru untuk tiap panggilan, lalu mengembalikan arti akhir run itu kepada engine sebagai `StepResult` atau melempar `StepAbandoned`/`LeaseLost`; ia tidak pernah menulis status task. `on_success` (async, bawaannya `done`) menerima `AgentSuccess(agent_run_id, agent_id, output)`. Engine tidak memanggil runtime lewat port sendiri; runtime masuk lewat langkah ini, dirakit `build_orchestrator` per delivery dengan owner lease delivery.
+_Avoid_: menyebutnya "runtime agent" (itu `AgentRuntime`, yang menjalankan run) atau "langkah" tanpa kualifikasi
+
+**Pemetaan hasil run**:
+Fungsi murni `app/workflow/run_outcomes.py` yang mengubah akhir sebuah agent run (hasil yang dikembalikan, atau baris `agent_runs` bila `run()` tidak mengembalikan hasil) menjadi satu verdict: `fail`, `interrupt`, `StepAbandoned`, `LeaseLost`, atau lanjut ke `on_success`. Pilihan `fail` atau `interrupt` bergantung pada `StepContext.pipeline`; kode run huruf besar ditulis huruf kecil di sisi task; kombinasi di luar kosakata menjadi `StepAbandoned("run_outcome_unknown")`. Tabelnya: API_CONTRACTS §5 (WP-3.2c2c2) dan spec WP-3.2 §16.6.5 A. Himpunan `tasks.error_code` yang ia hasilkan tertutup (19 kode, DATA_MODEL).
+_Avoid_: "status run" (itu `agent_runs.status`) dan "status task" (milik `workflow.states.transition`)
+
+**Drain delivery**:
+Penantian di akhir job `run_task` (`execute_task`, `app/worker/jobs.py`) terhadap task asyncio yang lahir di delivery itu, misalnya penutupan baris run oleh runtime, paling lama `RUNTIME_DRAIN_S` (3 × `CLOSE_TIMEOUT_S` = 15 dtk), sebelum koneksi database dan Redis ditutup. Task milik delivery lain atau milik test tidak ditunggu. Yang melewati batas di-log `delivery_tasks_abandoned` (jumlah saja), tanpa raise; recovery menutup baris yang masih `running`.
+
 **Sweep dispatch**:
 Job beat (`dispatch_sweep`, tiap 30 dtk) yang mengirim ulang task `draft|queued` yang pernah di-dispatch (`checkpoint.dispatch.at`) tetapi lease-nya mati dan sudah lewat masa tunggu 60 dtk, karena job `run_task`-nya hilang; berbeda dari sweep recovery, yang memulihkan task `running|validating` yang lease-nya kedaluwarsa.
 
