@@ -172,12 +172,13 @@ class SwallowingProvider:
 
 
 class StreamThenFail:
-    """Streams a marker text, then fails like a refusal."""
+    """Streams a marker, then fails like a refusal; ``streamed`` records what reached ``on_text_delta``."""
 
     name = "scripted"
 
     def __init__(self, marker: str) -> None:
         self.marker = marker
+        self.streamed: list[str] = []
 
     async def create_message(
         self,
@@ -188,6 +189,7 @@ class StreamThenFail:
     ) -> LLMResponse:
         if on_text_delta is not None:
             await on_text_delta(self.marker)
+            self.streamed.append(self.marker)
         raise LLMError("refusal")
 
     async def aclose(self) -> None:

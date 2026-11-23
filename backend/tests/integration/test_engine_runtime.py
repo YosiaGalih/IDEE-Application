@@ -584,9 +584,15 @@ async def test_run_text_never_reaches_a_log_the_task_or_its_events(
 ) -> None:
     """RD-6 (BC-26): the model's error text and what it streamed are held; only the fixed sentence shows."""
     marker = "rd6-" + "held-0123"
+    provider = StreamThenFail(marker)
     task_id, _, logs, _ = await drive(
-        engine, make_task, pricing, "running", providers=FakeProviders(StreamThenFail(marker))
+        engine, make_task, pricing, "running", providers=FakeProviders(provider)
     )
+
+    # Positive controls: the marker really went through the stream, and the delivery's logs were captured.
+    assert provider.streamed == [marker]
+    ended = [e for e in logs if e["event"] == "agent_step_run_ended"]
+    assert [(e["run_status"], e["run_error_code"]) for e in ended] == [("failed", "model_error")]
 
     after = await assert_failed(engine, task_id, "model_error", "B14")
     assert after.error_message == "Agent B14 stopped: the model call failed"
