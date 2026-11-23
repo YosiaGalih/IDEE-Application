@@ -38,12 +38,31 @@ from app.core.logging import get_logger
 from app.models.agents import AgentProfile
 from app.services.agent_runtime import RunOutcome, read_run_outcome
 from app.workflow.engine import LeaseLost, Step, StepAbandoned, StepContext, StepResult
-from app.workflow.run_outcomes import RunVerdict, refused, verdict_for_end, verdict_for_row
+from app.workflow.run_outcomes import (
+    RUN_ERROR_CODES,
+    RUN_STATUSES,
+    RunVerdict,
+    refused,
+    verdict_for_end,
+    verdict_for_row,
+)
 
 # A database read of the adapter (profile row, run row) is bounded by this wall-clock time; read at call time.
 AGENT_STEP_READ_TIMEOUT_S: Final = 15.0
 
+# A status or a code read from a database row is logged only when it is in the closed vocabulary; any other
+# value is cut to a fixed word (a row may hold anything, and a log line is outside redaction). A row that is
+# still ``running`` has the status ``running``, which a run's end never has.
+_LOGGED_STATUSES: Final = RUN_STATUSES | {"running"}
+_UNRECOGNISED: Final = "unrecognised"
+
 logger = get_logger(__name__)
+
+
+def _bounded(value: str | None, vocabulary: frozenset[str]) -> str | None:
+    if value is None or value in vocabulary:
+        return value
+    return _UNRECOGNISED
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,20 +126,23 @@ class DbAgentStepReads:
                 return await read_run_outcome(session, agent_run_id, task_id=task_id, agent_id=agent_id)
 
 
-def bind_agent_steps(
-    steps: Mapping[str, AgentStep], *, runtime: AgentRunner, reads: AgentStepReads, registry: AgentRegistry
-) -> dict[str, Step]:
-    """The engine steps of the registered agent steps. Refuses, without any SQL, an agent the runtime cannot
-    run as that step (a bad wiring is a bug, found at assembly). A disabled agent registers: it fails at run
-    time with ``agent_unavailable``, so an operator can switch an agent off."""
-    bound: dict[str, Step] = {}
+def validate_agent_steps(steps: Mapping[str, AgentStep], registry: AgentRegistry) -> None:
+    """Refuses, without any SQL or file read, an agent the runtime cannot run as that step (a bad wiring is a
+    bug, found at assembly). A disabled agent is accepted: it fails at run time with ``agent_unavailable``,
+    so an operator can switch an agent off."""
     for name, spec in steps.items():
         entry = registry.by_id(spec.agent_id)
         runtime_id = None if entry is None else entry.runtime_id
         if runtime_id is None or spec.agent_id in ABSORBED_PROFILES or STEPS.get(runtime_id) != name:
             raise ValueError(f"step {name} cannot run agent {spec.agent_id}")
-        bound[name] = _bind(name, spec, runtime, reads)
-    return bound
+
+
+def bind_agent_steps(
+    steps: Mapping[str, AgentStep], *, runtime: AgentRunner, reads: AgentStepReads, registry: AgentRegistry
+) -> dict[str, Step]:
+    """The engine steps of the registered agent steps, after ``validate_agent_steps``."""
+    validate_agent_steps(steps, registry)
+    return {name: _bind(name, spec, runtime, reads) for name, spec in steps.items()}
 
 
 def _log_ended(
@@ -140,8 +162,8 @@ def _log_ended(
         agent_id=agent_id,
         agent_run_id=str(run_id),
         source=source,
-        run_status=run_status,
-        run_error_code=run_error_code,
+        run_status=_bounded(run_status, _LOGGED_STATUSES),
+        run_error_code=_bounded(run_error_code, RUN_ERROR_CODES),
         verdict=verdict,
     )
 
@@ -154,12 +176,27 @@ def _verdict_name(verdict: RunVerdict) -> str:
     return "lease_lost"
 
 
-def _deliver(ctx: StepContext, verdict: RunVerdict) -> StepResult:
+def _deliver(
+    ctx: StepContext,
+    verdict: RunVerdict,
+    agent_id: str,
+    run_id: uuid.UUID,
+    run_status: str | None,
+    run_error_code: str | None,
+) -> StepResult:
     """A returned result is returned, a verdict that is an exception is raised (and logged when unknown)."""
     if isinstance(verdict, StepResult):
         return verdict
     if isinstance(verdict, StepAbandoned) and verdict.reason == "run_outcome_unknown":
-        logger.error("run_outcome_unknown", task_id=str(ctx.task_id), step=ctx.step)
+        logger.error(
+            "run_outcome_unknown",
+            task_id=str(ctx.task_id),
+            step=ctx.step,
+            agent_id=agent_id,
+            agent_run_id=str(run_id),
+            run_status=_bounded(run_status, _LOGGED_STATUSES),
+            run_error_code=_bounded(run_error_code, RUN_ERROR_CODES),
+        )
     raise verdict
 
 
@@ -230,7 +267,19 @@ def _bind(name: str, spec: AgentStep, runtime: AgentRunner, reads: AgentStepRead
                 run_error_code=outcome.error_code,
                 verdict=_verdict_name(verdict),
             )
-            return _deliver(ctx, verdict)
+            return _deliver(ctx, verdict, agent_id, run_id, outcome.status, outcome.error_code)
+        if result.agent_run_id != run_id:  # a result of another run is never trusted (N59)
+            verdict = StepAbandoned("run_outcome_unknown")
+            _log_ended(
+                ctx,
+                agent_id,
+                run_id,
+                source="result",
+                run_status=result.status,
+                run_error_code=result.error_code,
+                verdict=_verdict_name(verdict),
+            )
+            return _deliver(ctx, verdict, agent_id, run_id, result.status, result.error_code)
         if result.status == "succeeded" and result.error_code is None and result.output is not None:
             _log_ended(
                 ctx,
@@ -241,7 +290,7 @@ def _bind(name: str, spec: AgentStep, runtime: AgentRunner, reads: AgentStepRead
                 run_error_code=None,
                 verdict="on_success",
             )
-            return await spec.on_success(ctx, AgentSuccess(result.agent_run_id, agent_id, result.output))
+            return await spec.on_success(ctx, AgentSuccess(run_id, agent_id, result.output))
         verdict = verdict_for_end(result.status, result.error_code, pipeline=ctx.pipeline, agent_id=agent_id)
         _log_ended(
             ctx,
@@ -252,7 +301,7 @@ def _bind(name: str, spec: AgentStep, runtime: AgentRunner, reads: AgentStepRead
             run_error_code=result.error_code,
             verdict=_verdict_name(verdict),
         )
-        return _deliver(ctx, verdict)
+        return _deliver(ctx, verdict, agent_id, run_id, result.status, result.error_code)
 
     step.__name__ = f"agent_step_{name}"
     return step

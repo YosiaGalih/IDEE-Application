@@ -23,7 +23,7 @@ from app.agents.runtime import (
 )
 from app.core.cancel import CancelToken
 from app.services.agent_runtime import RunOutcome
-from app.services.agent_step import AgentStep, AgentSuccess, bind_agent_steps, done
+from app.services.agent_step import AgentStep, AgentSuccess, bind_agent_steps, done, validate_agent_steps
 from app.workflow import engine, lease, states
 from app.workflow.engine import Pipeline, StepAbandoned, StepContext, StepResult
 from app.workflow.lease import LeaseGuard, LeaseLost
@@ -323,6 +323,107 @@ async def test_unknown_outcome_logs_an_error_then_abandons() -> None:
     assert SENTINEL not in repr(logs)
 
 
+ABANDONS: list[tuple[str, Any]] = [
+    ("run_outcome_missing", RunOutcome("missing", None, None)),
+    ("run_outcome_running", RunOutcome("running", "running", None)),
+    ("run_output_unread", RunOutcome("finished", "succeeded", None)),
+    ("run_worker_cancelled", RunOutcome("finished", "failed", "worker_cancelled")),
+    ("run_interrupted", RunOutcome("finished", "failed", "interrupted")),
+    ("run_cancelled", RunOutcome("finished", "cancelled", None)),
+    ("run_outcome_unknown", RunOutcome("finished", "failed", None)),
+]
+
+
+@pytest.mark.parametrize(("reason", "outcome"), ABANDONS, ids=[a[0] for a in ABANDONS])
+async def test_an_abandon_from_the_row_logs_one_end_with_the_ids(reason: str, outcome: RunOutcome) -> None:
+    runtime, reads = FakeRuntime(lambda _r: RuntimeError()), FakeReads(outcome=outcome)
+    with capture_logs() as logs, pytest.raises(StepAbandoned) as info:
+        await bound(runtime, reads)(make_ctx())
+    assert info.value.reason == reason
+    ended = [log for log in logs if log["event"] == "agent_step_run_ended"]
+    assert len(ended) == 1
+    assert ended[0]["verdict"] == "abandoned"
+    assert ended[0]["task_id"] == str(TASK_ID) and ended[0]["step"] == "plan"
+    assert ended[0]["agent_id"] == "A03"
+    assert ended[0]["agent_run_id"] == str(runtime.requests[0].agent_run_id)
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "reason"),
+    [
+        ("cancelled", None, "run_cancelled"),
+        ("failed", "worker_cancelled", "run_worker_cancelled"),
+        ("failed", "interrupted", "run_interrupted"),
+        ("failed", None, "run_outcome_unknown"),
+        ("succeeded", None, "run_outcome_unknown"),
+    ],
+)
+async def test_an_abandon_from_a_result_logs_one_end_with_the_ids(
+    status: str, code: str | None, reason: str
+) -> None:
+    runtime = FakeRuntime(lambda r: make_result(r.agent_run_id, status, code, output=None))
+    with capture_logs() as logs, pytest.raises(StepAbandoned) as info:
+        await bound(runtime, FakeReads())(make_ctx())
+    assert info.value.reason == reason
+    ended = [log for log in logs if log["event"] == "agent_step_run_ended"]
+    assert len(ended) == 1 and ended[0]["verdict"] == "abandoned"
+    assert (ended[0]["task_id"], ended[0]["agent_id"]) == (str(TASK_ID), "A03")
+    assert ended[0]["agent_run_id"] == str(runtime.requests[0].agent_run_id)
+
+
+async def test_the_unknown_outcome_error_carries_the_run_ids_and_its_bounded_end() -> None:
+    runtime = FakeRuntime(lambda _r: RuntimeError(SENTINEL))
+    reads = FakeReads(outcome=RunOutcome("finished", "failed", None))
+    with capture_logs() as logs, pytest.raises(StepAbandoned):
+        await bound(runtime, reads)(make_ctx())
+    (error,) = [log for log in logs if log["event"] == "run_outcome_unknown"]
+    assert error["log_level"] == "error"
+    assert error["task_id"] == str(TASK_ID) and error["step"] == "plan" and error["agent_id"] == "A03"
+    assert error["agent_run_id"] == str(runtime.requests[0].agent_run_id)
+    assert (error["run_status"], error["run_error_code"]) == ("failed", None)
+
+
+async def test_a_foreign_value_from_the_row_is_never_logged() -> None:
+    raw_status, raw_code = "st-" + SENTINEL, "code-" + SENTINEL
+    runtime = FakeRuntime(lambda _r: RuntimeError())
+    reads = FakeReads(outcome=RunOutcome("finished", raw_status, raw_code))
+    with capture_logs() as logs, pytest.raises(StepAbandoned) as info:
+        await bound(runtime, reads)(make_ctx())
+    assert info.value.reason == "run_outcome_unknown"
+    assert SENTINEL not in repr(logs)
+    for event in ("agent_step_run_ended", "run_outcome_unknown"):
+        (line,) = [log for log in logs if log["event"] == event]
+        assert (line["run_status"], line["run_error_code"]) == ("unrecognised", "unrecognised")
+
+
+async def test_a_result_of_another_run_is_an_unknown_outcome() -> None:
+    called: list[AgentSuccess] = []
+
+    async def on_success(ctx: StepContext, success: AgentSuccess) -> StepResult:
+        called.append(success)
+        return StepResult.done()
+
+    foreign = uuid.uuid4()
+    runtime = FakeRuntime(lambda _r: make_result(foreign))
+    with capture_logs() as logs, pytest.raises(StepAbandoned) as info:
+        await bound(runtime, FakeReads(), on_success=on_success)(make_ctx())
+    assert info.value.reason == "run_outcome_unknown" and called == []
+    assert [log["log_level"] for log in logs if log["event"] == "run_outcome_unknown"] == ["error"]
+    assert str(foreign) not in repr([log for log in logs if log["event"] == "run_outcome_unknown"])
+
+
+async def test_the_success_carries_the_requests_run_id() -> None:
+    seen: list[AgentSuccess] = []
+
+    async def on_success(ctx: StepContext, success: AgentSuccess) -> StepResult:
+        seen.append(success)
+        return StepResult.done()
+
+    runtime = FakeRuntime(ok)
+    await bound(runtime, FakeReads(), on_success=on_success)(make_ctx())
+    assert seen[0].agent_run_id == runtime.requests[0].agent_run_id
+
+
 # --- fresh id (N59), N56, BC-9, request ---------------------------------------------------------------------
 
 
@@ -405,6 +506,12 @@ def test_a_disabled_agent_still_registers() -> None:
 def test_registration_refuses_the_wrong_agent(name: str, agent_id: str) -> None:
     with pytest.raises(ValueError, match="cannot run agent"):
         make_binding({name: AgentStep(agent_id, build_payload)})
+
+
+def test_the_pure_validation_refuses_what_binding_refuses() -> None:
+    validate_agent_steps({"plan": AgentStep("A03", build_payload)}, REGISTRY)
+    with pytest.raises(ValueError, match="cannot run agent"):
+        validate_agent_steps({"plan": AgentStep("A02", build_payload)}, REGISTRY)
 
 
 def test_the_engine_reexports_what_a_step_may_use() -> None:
