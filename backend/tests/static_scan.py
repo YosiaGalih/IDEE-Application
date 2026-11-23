@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 TableNames = Callable[[ast.expr], str | None]
 
@@ -90,7 +90,7 @@ def string_value(node: ast.expr, *, table_names: TableNames | None = None) -> st
     ):  # ``" ".join([...])``
         sep = string_value(node.func.value, table_names=table_names)
         parts = [string_value(e, table_names=table_names) for e in node.args[0].elts]
-        if sep is not None and None not in parts:
+        if sep is not None and any(p is not None for p in parts):  # an unreadable part reads as ``{}``
             return sep.join(hole(p) for p in parts)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
         template = string_value(node.func.value, table_names=table_names)
@@ -104,6 +104,34 @@ def string_value(node: ast.expr, *, table_names: TableNames | None = None) -> st
             except (AttributeError, IndexError, KeyError, TypeError, ValueError):
                 return template
     return None
+
+
+def paired_names(target: ast.expr, value: ast.expr) -> Iterator[tuple[str, ast.expr]]:
+    """(name, value) for ``NAME = value``; a tuple target pairs with a tuple value (``N, M = 'a', 'b'``)."""
+    if isinstance(target, ast.Tuple | ast.List) and isinstance(value, ast.Tuple | ast.List):
+        if len(target.elts) == len(value.elts):
+            for t, v in zip(target.elts, value.elts, strict=True):
+                yield from paired_names(t, v)
+    elif isinstance(target, ast.Name):
+        yield target.id, value
+
+
+def concat_text(node: ast.expr) -> str | None:
+    """``'SET LOCAL ' + n + ' = 1'``: a ``+`` chain with a piece the scan cannot read (it reads as ``{}``)
+    when at least one piece is a string; None otherwise."""
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)):
+        return None
+    pieces: list[str | None] = []
+
+    def flatten(n: ast.expr) -> None:
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
+            flatten(n.left)
+            flatten(n.right)
+        else:
+            pieces.append(string_value(n))
+
+    flatten(node)
+    return "".join("{}" if p is None else p for p in pieces) if any(p is not None for p in pieces) else None
 
 
 def percent(template: str, right: ast.expr, *, table_names: TableNames | None) -> str:

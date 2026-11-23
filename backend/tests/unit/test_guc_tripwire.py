@@ -6,11 +6,13 @@ PostgreSQL reads a setting name without regard to case. Matching the marker text
 (``'kk.status' || '_writer'``, ``concat``, ``U&'...'``).
 This tripwire does not look for the marker: it flags the *ways to set a GUC* in ``app/``: a ``set_config``
 call, name or string (any case), ``SET [LOCAL|SESSION] <name> =`` at the start of a string or after ``;``,
-``server_settings`` and ``options`` (``-c name=``, or ``--name=`` for a dotted name). Outside
+``server_settings`` and libpq ``options``: ``-c name=`` anywhere, ``--name=`` anywhere for a dotted name, and
+any ``--name=`` in the value of an ``options=`` argument or ``'options'`` key (a value there that is not a
+dict or list and that the scan cannot read is a violation too). Outside
 ``GUC_WRITERS`` each is a violation; inside it the name must be a constant that the module's entry lists (a
 literal, a module constant, or a ``KNOWN_GUC_CONSTANTS`` name).
-A name the scan cannot read (``||``, ``concat``, a variable, ``U&``, a computed piece of ``SET LOCAL``) is
-always a violation.
+A name the scan cannot read (``||``, ``concat``, a variable, ``U&``, a computed piece of ``SET LOCAL`` by
+f-string, ``+``, ``%``, ``.format`` or ``join``) is always a violation.
 
 Not decided by a static scan, accepted: a name computed at run time (``getattr`` / ``eval`` of data, a string
 read from a file or the DB), ``operator.methodcaller``, ``inspect.getmembers``,
@@ -25,12 +27,11 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterator
 from pathlib import Path
 
 from app.models import approvals as approvals_model
 from app.models import tasks as tasks_model
-from tests.static_scan import normalise_sql, string_value
+from tests.static_scan import concat_text, normalise_sql, paired_names, string_value
 from tests.unit.test_status_writer_guard import marker_refs
 
 APP = Path(__file__).resolve().parents[2] / "app"
@@ -57,17 +58,10 @@ _SET_STATEMENT = re.compile(
 # libpq ``options`` takes ``-c name=value`` and ``--name=value``. The ``--`` form needs a dotted name (the
 # marker GUCs are ``kk.*``): app/ has flags of ``git`` and ``prlimit`` (``--format=``, ``--as=``).
 _OPTIONS_C = re.compile(r"(?:^|\s)(?:-c\s*([\w.]+)|--(\w+\.[\w.]+))\s*=", re.IGNORECASE)
+# The value of an ``options`` argument or ``'options'`` key is libpq's: there ``--name=`` sets any GUC, dotted
+# or not (``--lock_timeout=1``), and a ``{}`` in the name is a piece the scan cannot read.
+_OPTIONS_ARG = re.compile(r"(?:^|\s)(?:-c\s*|--)([\w.{}]+)\s*=", re.IGNORECASE)
 _Use = tuple[int, str, str | None]
-
-
-def _paired_names(target: ast.expr, value: ast.expr) -> Iterator[tuple[str, ast.expr]]:
-    """(name, value) for ``NAME = value``; a tuple target pairs with a tuple value (``N, M = 'a', 'b'``)."""
-    if isinstance(target, ast.Tuple | ast.List) and isinstance(value, ast.Tuple | ast.List):
-        if len(target.elts) == len(value.elts):
-            for t, v in zip(target.elts, value.elts, strict=True):
-                yield from _paired_names(t, v)
-    elif isinstance(target, ast.Name):
-        yield target.id, value
 
 
 def _module_constants(tree: ast.Module) -> dict[str, str]:
@@ -76,9 +70,9 @@ def _module_constants(tree: ast.Module) -> dict[str, str]:
     values: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
-            pairs = [p for t in node.targets for p in _paired_names(t, node.value)]
+            pairs = [p for t in node.targets for p in paired_names(t, node.value)]
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            pairs = list(_paired_names(node.target, node.value))
+            pairs = list(paired_names(node.target, node.value))
         else:
             continue
         for name, value in pairs:
@@ -103,22 +97,35 @@ def _guc_name(arg: ast.expr, constants: dict[str, str]) -> str | None:
     return None
 
 
-def _concat_text(node: ast.expr) -> str | None:
-    """``'SET LOCAL ' + n + ' = 1'``: a ``+`` chain with a piece the scan cannot read (it reads as ``{}``)
-    when at least one piece is a string; None otherwise."""
-    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)):
-        return None
-    pieces: list[str | None] = []
+def _option_values(node: ast.expr) -> list[ast.expr]:
+    """The values passed as libpq ``options``: an ``options=`` keyword, or an ``'options'`` dict key."""
+    if isinstance(node, ast.Call):
+        return [k.value for k in node.keywords if k.arg == "options"]
+    if isinstance(node, ast.Dict):
+        return [
+            v
+            for k, v in zip(node.keys, node.values, strict=True)
+            if k is not None and string_value(k) == "options"
+        ]
+    return []
 
-    def flatten(n: ast.expr) -> None:
-        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
-            flatten(n.left)
-            flatten(n.right)
-        else:
-            pieces.append(string_value(n))
 
-    flatten(node)
-    return "".join("{}" if p is None else p for p in pieces) if any(p is not None for p in pieces) else None
+def _option_uses(value: ast.expr, line: int) -> list[_Use]:
+    """A dict or list value is another library's options (Celery ``{'expires': ...}``); a string is read with
+    ``_OPTIONS_ARG``; anything else (a variable, a call) is an options string the scan cannot read."""
+    if isinstance(value, ast.Dict | ast.List | ast.Tuple | ast.Set) or (
+        isinstance(value, ast.Constant) and not isinstance(value.value, str)
+    ):
+        return []
+    text = string_value(value)
+    if text is None:
+        text = concat_text(value)
+    if text is None:
+        return [(line, "options", None)]
+    return [
+        (line, "options", None if "{}" in m.group(1) else m.group(1).lower())
+        for m in _OPTIONS_ARG.finditer(text)
+    ]
 
 
 def _string_uses(value: str, line: int) -> list[_Use]:
@@ -151,9 +158,11 @@ def guc_uses(source: str) -> list[_Use]:
             docstring = isinstance(parent, ast.Expr) and isinstance(node, ast.Constant)
             value = None if docstring else string_value(node)
             if value is None and not docstring:
-                value = _concat_text(node)
+                value = concat_text(node)
             if value is not None:
                 found.update(_string_uses(value, line))
+        for option in _option_values(node) if isinstance(node, ast.Call | ast.Dict) else []:
+            found.update(_option_uses(option, getattr(option, "lineno", line)))
         if isinstance(node, ast.Call):
             func = node.func
             called = (
@@ -234,6 +243,7 @@ TRIPWIRE_SAMPLES = [
     "q = f'SET LOCAL {n} = 1'\n",
     "q = f'SET LOCAL kk.{n} = 1'\n",
     "q = 'SET LOCAL ' + n + ' = 1'\n",
+    "q = ' '.join(['SET LOCAL', n, '= 1'])\n",
     'q = "set session app.x to 1"\n',
     "q = \"SELECT 1; SET LOCAL kk.status_writer = 'transition'\"\n",
     'q = "SELECT 1;  /* c */ SET app.x = 1"\n',
@@ -249,6 +259,11 @@ TRIPWIRE_SAMPLES = [
         "e = create_async_engine(u, connect_args={'options': '-c kk.status_writer=transition'})\n"
     ),
     "e = create_async_engine(u, connect_args={'options': '--kk.status_writer=x'})\n",
+    "e = create_async_engine(u, connect_args={'options': '--lock_timeout=1'})\n",
+    "c = connect(dsn, options='--session_replication_role=replica')\n",
+    "c = connect(dsn, options=f'--{name}=1')\n",
+    "c = connect(dsn, options=opts)\n",
+    "e = create_async_engine(u, connect_args={'options': opts})\n",
     "O = '--kk.other=1'\n",
 ]
 TRIPWIRE_CLEAN = [
@@ -258,6 +273,10 @@ TRIPWIRE_CLEAN = [
     "q = 'UPDATE tasks SET event_seq = event_seq + 1'\n",
     "q = 'INSERT INTO t (a) VALUES (1) ON CONFLICT DO UPDATE SET a = 2'\n",
     "r = redis.set('k', 'v')\n",
+    "argv = ['git', 'log', '--format=%H', '--as=x']\n",
+    "beat = {'sweep': {'task': 't', 'options': {'expires': 5}}}\n",
+    "q = select(Task).options(selectinload(Task.events))\n",
+    "s = ', '.join([a, b])\n",
 ]
 
 
@@ -298,6 +317,8 @@ def test_set_with_a_computed_name_is_unreadable_in_every_module() -> None:
         "q = f'SET LOCAL {n} = 1'\n",
         "q = f'SET LOCAL kk.{n} = 1'\n",
         "q = 'SET LOCAL ' + n + ' = 1'\n",
+        "q = ' '.join(['SET LOCAL', n, '= 1'])\n",
+        "c = connect(dsn, options=f'--{name}=1')\n",
     ):
         assert violations("workflow/states.py", source), source
         assert violations("core/db.py", source), source

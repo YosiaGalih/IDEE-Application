@@ -44,11 +44,10 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterator
 from pathlib import Path
 
 # The string reader and SQL normaliser shared by the writer guards: one copy of the lexer.
-from tests.static_scan import normalise_sql, string_value
+from tests.static_scan import normalise_sql, paired_names, string_value
 
 APP = Path(__file__).resolve().parents[2] / "app"
 ALLOWED_WRITER = APP / "workflow" / "states.py"
@@ -401,25 +400,15 @@ def _getattr_aliases(tree: ast.Module) -> set[str]:
             return aliases
 
 
-def _paired_names(target: ast.expr, value: ast.expr) -> Iterator[tuple[str, ast.expr]]:
-    """(name, value) for ``NAME = value``; a tuple target pairs with a tuple value (``N, M = 'a', 'b'``)."""
-    if isinstance(target, ast.Tuple | ast.List) and isinstance(value, ast.Tuple | ast.List):
-        if len(target.elts) == len(value.elts):
-            for t, v in zip(target.elts, value.elts, strict=True):
-                yield from _paired_names(t, v)
-    elif isinstance(target, ast.Name):
-        yield target.id, value
-
-
 def _constant_names(tree: ast.Module) -> dict[str, set[str]]:
     """Every string a name is assigned (``NAME = 'transition'``, ``NAME: str = ...``, ``N, M = 'a', 'b'``):
     ``getattr(m, NAME)`` reads as its values."""
     values: dict[str, set[str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
-            pairs = [p for t in node.targets for p in _paired_names(t, node.value)]
+            pairs = [p for t in node.targets for p in paired_names(t, node.value)]
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            pairs = list(_paired_names(node.target, node.value))
+            pairs = list(paired_names(node.target, node.value))
         else:
             continue
         for name, value in pairs:
