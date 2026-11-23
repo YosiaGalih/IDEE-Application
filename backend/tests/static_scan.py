@@ -1,11 +1,21 @@
 """The static scan helpers the writer guards share (BC-19; moved from test_agent_run_writer_guard.py).
 
 ``string_value`` reads the text a string expression builds as far as the AST spells it, with ``{}`` for a
-piece it cannot read (the tripwire, the status guard's dynamic-column regexes and ``_constant_names`` depend
-on that placeholder). ``normalise_sql`` reads SQL the way a matcher needs it: no comments, one space between
-words, none around ``.``, no quotes, ``U&"..."`` identifiers unescaped. ``bindings`` and ``bound`` list what
-a module binds to which names. The model-specific part, the name a ``__tablename__`` attribute reads as, is
-the optional ``table_names`` argument; by default ``AgentRun.__tablename__`` reads as ``agent_runs``.
+piece it cannot read, in every construct it reads: an f-string field, a ``+`` side (``'UPDATE tasks SET ' +
+col + ' = 1'`` reads ``UPDATE tasks SET {} = 1``; fix wave B, silent-failure M3; before it, ``+`` read as
+nothing when one side was unreadable), a ``%`` or ``.format`` argument, a ``join`` part. It is None only
+when no piece of the expression is a string the AST can read. The tripwire, the status guard's
+dynamic-column regexes and ``_constant_names`` depend on the ``{}`` placeholder.
+
+``normalise_sql`` reads SQL the way a matcher needs it: no comments, one space between words, none around
+``.``, no quotes, ``U&"..."`` identifiers unescaped. ``bindings`` and ``bound`` list what a module binds to
+which names. The model-specific part, the name a ``__tablename__`` attribute reads as, is the optional
+``table_names`` argument; by default ``AgentRun.__tablename__`` reads as ``agent_runs``.
+
+Accepted limits: a string built at run time (a name read from data, ``str.replace``, ``bytes``) reads as
+nothing, and a piece the AST does not spell (a variable, a call, an attribute) is only a ``{}`` hole, so a
+guard whose regex needs the hole's text (a table name held in a variable) cannot match it. ``{}`` also
+stands for a literal ``{}`` in the source; a guard that reads it as a hole may flag it, never the reverse.
 """
 
 from __future__ import annotations
@@ -40,10 +50,15 @@ def unescape_unicode(name: str) -> str:
     return UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), name)
 
 
+def strip_comments(text: str) -> str:
+    """``/*...*/`` and ``--...`` comments become a space; a literal or quoted name keeps its text."""
+    return LEXEME.sub(lambda m: " " if m.group().startswith(("--", "/*")) else m.group(), text)
+
+
 def normalise_sql(text: str) -> str:
     """The SQL as the matcher reads it: ``/*...*/`` and ``--...`` comments (each a space), whitespace
     collapsed, no space around ``.``, no quotes (``"``, ``'``, backtick)."""
-    text = LEXEME.sub(lambda m: " " if m.group().startswith(("--", "/*")) else m.group(), text)
+    text = strip_comments(text)
     text = UNICODE_IDENT.sub(lambda m: f'"{unescape_unicode(m.group(1))}"', text)
     return QUOTES.sub("", AROUND_DOT.sub(".", " ".join(text.split())))
 
@@ -75,8 +90,8 @@ def string_value(node: ast.expr, *, table_names: TableNames | None = None) -> st
             string_value(node.left, table_names=table_names),
             string_value(node.right, table_names=table_names),
         )
-        if left is not None and right is not None:
-            return left + right
+        if left is not None or right is not None:  # a side the scan cannot read is a ``{}`` hole (M3)
+            return hole(left) + hole(right)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
         template = string_value(node.left, table_names=table_names)
         if template is not None:

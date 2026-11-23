@@ -8,7 +8,10 @@ Closed by the hardening owed before 3.2d (AG-13 3.2c2c1 delta; spec §16.6): the
 regard to case (``'kk.Approval_Status_Writer'``, ``SET LOCAL kk.APPROVAL_STATUS_WRITER``), also when it is
 joined from pieces by ``+``, an f-string, ``%``, ``.format`` or ``join``; a name split inside the word by SQL
 ``||``, ``concat`` or ``U&`` is caught by the GUC tripwire (``test_guc_tripwire.py``), which flags every
-way to set a GUC in ``app/`` outside the exact ``GUC_WRITERS`` allowlist.
+way to set a GUC in ``app/`` outside the exact ``GUC_WRITERS`` allowlist. Fix wave B (AG-13 3.2c2c2 LOW-1)
+closes the forms the tripwire did not read: a ``DO $...$`` block that ``EXECUTE``s a split ``SET LOCAL``, a
+``UESCAPE`` function name, ``CREATE FUNCTION|PROCEDURE``, ``ALTER TABLE|FUNCTION|PROCEDURE``, ``DISABLE`` or
+``DROP TRIGGER``, ``pg_settings`` and ``SET LOCAL|SESSION`` at any position, in every module.
 
 Still out of scope, accepted: a ``decide`` or marker name computed at run time, ``operator.methodcaller``,
 ``inspect.getmembers``, ``getattr`` aliases for ``decide`` (only the direct ``getattr(x, "decide")`` is read),
@@ -169,11 +172,17 @@ def test_other_spellings_of_the_marker_are_caught_by_the_tripwire() -> None:
         "q = \"SELECT set_config(U&'kk.approval_status\\\\005fwriter', 'approval_store', true)\"\n",
         "q = \"SELECT SET_CONFIG('kk.Approval_Status_Writer', 'approval_store', true)\"\n",
         "q = \"SET SESSION kk.Approval_Status_Writer TO 'approval_store'\"\n",
+        # Fix wave B (AG-13 LOW-1): a DO block that EXECUTEs a split SET, and a UESCAPE function name.
+        ("q = \"DO $$ BEGIN EXECUTE 'SET LOCAL kk.approval_status' || '_writer = 1'; END $$\"\n"),
+        (
+            'q = "SELECT U&\\"set!005fconfig\\" UESCAPE \'!\''
+            "('kk.approval' || '_status_writer', 'x', true)\"\n"
+        ),
     ]
     for source in sources:
         assert violations("services/other.py", source), source
         # and not even the approval store may set it through a name the scan cannot read
-        if "U&" in source or "||" in source or "concat" in source:
+        if any(m in source for m in ("U&", "||", "concat", "DO $$")):
             assert violations("services/approval_store.py", source), source
 
 

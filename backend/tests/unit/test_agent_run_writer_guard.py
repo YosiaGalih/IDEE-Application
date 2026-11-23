@@ -409,6 +409,10 @@ SQL_FORMS = {
     "normalised after concatenation": "Q = 'UPDATE ' + '/* x */ ' + 'public . ' + 'agent_runs SET a = 1'\n",
     "normalised after tablename": "from app.models.agents import AgentRun\n"
     "Q = f'TRUNCATE TABLE ONLY {AgentRun.__tablename__}'\n",
+    # Fix wave B (silent-failure M3): a piece ``+`` cannot read is a ``{}`` hole, not a clean string.
+    "unreadable column after +": "Q = 'UPDATE agent_runs SET ' + col + ' = 1'\n",
+    "unreadable tail after +": "Q = 'DELETE FROM agent_runs WHERE ' + cond\n",
+    "unreadable head before +": "Q = prefix + ' INSERT INTO agent_runs (id) VALUES (1)'\n",
 }
 # ``session.delete(row)`` and ``session.merge(row)`` of a row loaded from the model write it too.
 LOADED_ROW_WRITES = {
@@ -484,6 +488,8 @@ READS = {
     "another table by metadata": "from app.models.agents import AgentRun\n"
     "q = AgentRun.metadata.tables['agent_profiles'].update()\n",
     "join of a read": "Q = ' '.join(['SELECT', 'status', 'FROM', 'agent_runs'])\n",
+    "unreadable column of a read after +": "Q = 'SELECT ' + cols + ' FROM agent_runs'\n",
+    "unreadable column of the archive after +": "Q = 'UPDATE agent_runs_archive SET ' + col + ' = 1'\n",
 }
 
 

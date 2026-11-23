@@ -27,6 +27,22 @@ a ``getattr`` alias bound by ``from builtins import getattr as g``, an annotated
 pair or ``functools.partial``, ``<ref>.__call__``, a name held in a constant, and ``eval``/``exec`` of a
 constant that names a writer. ``redis.eval`` is not a finding.
 
+Closed by fix wave B (AG-13 3.2c2c2 LOW-1; silent-failure M3): the Task model counts however it is reached,
+by an ``ImportFrom`` of the name ``Task`` from any module (the engine re-exports it; under any alias, and
+``Task(status=...)`` under the alias) and by an attribute ``<x>.Task`` (``e.Task.__table__.update()``);
+only ``asyncio.Task`` is not the model. A ``Table(...)`` or ``table(...)`` call in any case (a name or an
+attribute) and a ``<x>.tables['tasks']`` lookup are the tasks table with no model. ``test_guc_tripwire.py``
+flags ``UESCAPE`` (a column or a function name written ``U&"st!0061tus" UESCAPE '!'``). A ``+`` with a
+piece the scan cannot read reads as ``{}`` (``'UPDATE tasks SET ' + col + ' = 1'``), and a ``{}`` where the
+table is (``'UPDATE ' + t + ' SET status = 1'``) may be tasks: both are findings. ``status_attribute_writes``
+reads every module of ``app/`` as if it reached the Task model (a Task object a helper returned, so
+``t.status = ...`` has no ``Task`` in sight, S2): only the modules of ``STATUS_ATTRIBUTE_WRITERS`` may set a
+``status`` (six, each a model other than Task: ToolCall, Approval, Project, AgentRun), and that list is exact.
+
+Accepted limits of fix wave B: S2 inside a module of ``STATUS_ATTRIBUTE_WRITERS`` (a Task a helper returned,
+set there, is not seen) and a ``status`` set by ``setattr`` with a computed name; a ``Table`` or
+``tables[...]`` name the scan cannot read (a variable); the DB trigger backstop is a backlog item.
+
 Still out of scope, accepted: ``operator.methodcaller`` and ``inspect.getmembers`` (the name is a run-time
 value), ``ALTER ROLE|DATABASE ... SET``, ``ALTER SYSTEM SET``, a ``lambda`` wrapper around ``getattr``
 (``g = lambda *a: getattr(*a)``), a driver connection setting under a key other than ``server_settings`` or
@@ -60,11 +76,26 @@ TRANSITION_WRITERS = frozenset(
         "services/tool_r3.py",
     }
 )
+# Modules that set ``status`` on a model other than Task (S2, ``status_attribute_writes``): a ToolCall, an
+# Approval, a Project, an AgentRun. A module is listed here by a review that read its writes. The list is
+# exact (the anti-bitrot test below), and it does not see a Task a listed module reaches through a helper.
+STATUS_ATTRIBUTE_WRITERS = frozenset(
+    {
+        "services/agent_run_rows.py",
+        "services/agent_runtime.py",
+        "services/approval_store.py",
+        "services/project_delete.py",
+        "services/projects.py",
+        "tools/gateway.py",
+    }
+)
 MARKER_HOLDERS = frozenset({"workflow/states.py", "models/tasks.py"})
 WRITER_NAMES = frozenset({"transition", "fail_task"})
 MARKER_NAMES = frozenset({"STATUS_WRITER_SETTING", "STATUS_WRITER"})
 # Raw SQL is read after ``normalise_sql``: no comments, one space between words and none around ``.``.
-_TASKS = r"(?:\w+\.)?tasks\b"
+# A ``{}`` where the table is (``'UPDATE ' + t + ' SET status = 1'``) is a table the scan cannot read: it may
+# be tasks.
+_TASKS = r"(?:\w+\.)?(?:tasks\b|\{\})"
 _UPDATE_TASKS = rf"\bupdate\s+(?:only\s+)?{_TASKS}(?:\s*\*)?(?:\s+(?:as\s+)?\w+)?\s+set\b"
 _MERGE_UPDATE = rf"\bmerge\s+into\s+(?:only\s+)?{_TASKS}[^;]*?\bupdate\s+set\b"
 _UPSERT_UPDATE = rf"\binsert\s+into\s+{_TASKS}[^;]*?\bon\s+conflict\b[^;]*?\bdo\s+update\s+set\b"
@@ -81,16 +112,37 @@ DYNAMIC_COLUMN_SQL = tuple(
 MARKER_WORD = re.compile(r"\bstatus_writer\b", re.IGNORECASE)
 
 
+ASYNCIO_MODULES = frozenset({"asyncio", "asyncio.tasks"})
+
+
+def _task_names(tree: ast.Module) -> set[str]:
+    """``Task`` and each name it is imported as (``from x import Task as T``)."""
+    names = {"Task"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module not in ASYNCIO_MODULES:
+            names |= {a.asname or a.name for a in node.names if a.name == "Task"}
+    return names
+
+
 def _imports_task(tree: ast.Module) -> bool:
-    """Any way of reaching the Task model: from-import, module import, or package attribute."""
+    """Any way of reaching the Task model: from-import of the model module, a module import, a package
+    attribute, or (fix wave B, AG-13 LOW-1: ``app.workflow.engine`` re-exports ``Task``) the name ``Task``
+    imported from any module, under any alias, or an attribute ``<x>.Task``. ``asyncio.Task`` is not the
+    model: ``from asyncio import Task`` and ``asyncio.Task`` read as clean."""
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             if node.module == "app.models.tasks":
                 return True
             if node.module == "app.models" and any(alias.name == "tasks" for alias in node.names):
                 return True
+            if node.module not in ASYNCIO_MODULES and any(alias.name == "Task" for alias in node.names):
+                return True
         if isinstance(node, ast.Import) and any(alias.name == "app.models.tasks" for alias in node.names):
             return True
+        if isinstance(node, ast.Attribute) and node.attr == "Task":
+            receiver = node.value
+            if not (isinstance(receiver, ast.Name) and receiver.id == "asyncio"):
+                return True
     return False
 
 
@@ -106,13 +158,24 @@ def _is_raw_status_update(node: ast.expr) -> bool:
 
 
 def _is_tasks_table_call(node: ast.Call) -> bool:
-    """``sqlalchemy.table("tasks", ...)``: a table ``update()`` can write without the model."""
+    """``sqlalchemy.table("tasks", ...)`` or ``Table("tasks", ...)`` (any case, a name or an attribute): a
+    table ``update()`` can write without the model."""
     func = node.func
-    named_table = (isinstance(func, ast.Name) and func.id == "table") or (
-        isinstance(func, ast.Attribute) and func.attr == "table"
-    )
+    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
     first = string_value(node.args[0]) if node.args else None
-    return named_table and first is not None and first.strip().strip('"').lower() == "tasks"
+    return name.lower() == "table" and first is not None and first.strip().strip('"').lower() == "tasks"
+
+
+def _is_tasks_metadata_lookup(node: ast.Subscript) -> bool:
+    """``Base.metadata.tables['tasks']``: the table without the model (fix wave B, S4)."""
+    value = node.value
+    key = string_value(node.slice)
+    return (
+        isinstance(value, ast.Attribute)
+        and value.attr == "tables"
+        and key is not None
+        and key.strip().strip('"').lower() == "tasks"
+    )
 
 
 def _is_status_key(key: ast.expr | None) -> bool:
@@ -122,6 +185,8 @@ def _is_status_key(key: ast.expr | None) -> bool:
 
 
 def _has_status_key(node: ast.expr | None) -> bool:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
+        return any(k.arg == "status" for k in node.keywords)  # ``values(dict(status=...))``
     return isinstance(node, ast.Dict) and any(_is_status_key(key) for key in node.keys)
 
 
@@ -158,10 +223,13 @@ def _inside_string_expression(node: ast.AST, parents: dict[ast.AST, ast.AST]) ->
     return False
 
 
-def status_writes(source: str) -> list[str]:
+def status_writes(source: str, *, any_model: bool = False) -> list[str]:
+    """What writes ``tasks.status`` in one module. ``any_model`` reads the module as if it reached the Task
+    model (the import-independent check of ``status_attribute_writes``)."""
     tree = ast.parse(source)
     found: list[str] = []
-    uses_task = _imports_task(tree)
+    uses_task = any_model or _imports_task(tree)
+    task_names = _task_names(tree)
     status_dicts = _dicts_with_status(tree)
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
@@ -173,6 +241,8 @@ def status_writes(source: str) -> list[str]:
             found.append(f"line {node.lineno}: raw SQL updates tasks.status")
         if isinstance(node, ast.Call) and _is_tasks_table_call(node):
             found.append(f"line {node.lineno}: table('tasks') can be written without the model")
+        if isinstance(node, ast.Subscript) and _is_tasks_metadata_lookup(node):
+            found.append(f"line {node.lineno}: metadata.tables['tasks'] can be written without the model")
         if not uses_task:
             continue
         targets: list[ast.expr] = []
@@ -190,7 +260,7 @@ def status_writes(source: str) -> list[str]:
                     found.append(f"line {node.lineno}: .values(status=...)")
             if (
                 isinstance(func, ast.Name)
-                and func.id == "Task"
+                and func.id in task_names
                 and any(k.arg == "status" for k in node.keywords)
             ):
                 found.append(f"line {node.lineno}: Task(status=...)")
@@ -205,6 +275,14 @@ def status_writes(source: str) -> list[str]:
     return found
 
 
+def status_attribute_writes(source: str) -> list[str]:
+    """Import-independent (fix wave B, S2): ``<expr>.status = ...``, ``.values(status=...)`` or
+    ``{'status': ...}`` in a ``.values()``, ``setattr(x, 'status', ...)`` whatever the object is, so a Task
+    object a helper returned (``t = await load(db, i); t.status = 'failed'``) is seen with no ``Task`` in
+    sight. A module that sets ``status`` on another model is listed in ``STATUS_ATTRIBUTE_WRITERS``."""
+    return status_writes(source, any_model=True)
+
+
 def test_only_states_module_writes_task_status() -> None:
     violations = {
         str(path.relative_to(APP)): hits
@@ -212,6 +290,33 @@ def test_only_states_module_writes_task_status() -> None:
         if path != ALLOWED_WRITER and (hits := status_writes(path.read_text()))
     }
     assert violations == {}
+
+
+def _attribute_writers() -> dict[str, list[str]]:
+    return {
+        str(path.relative_to(APP)): hits
+        for path in APP.rglob("*.py")
+        if path != ALLOWED_WRITER and (hits := status_attribute_writes(path.read_text()))
+    }
+
+
+def test_only_listed_modules_set_a_status_attribute() -> None:
+    """S2: a Task object a helper returned has no ``Task`` in its module; any module that sets a ``status``
+    outside the exact list is a finding to read, whichever model it is."""
+    assert {
+        rel: hits for rel, hits in _attribute_writers().items() if rel not in STATUS_ATTRIBUTE_WRITERS
+    } == {}
+
+
+def test_status_attribute_writers_is_exactly_the_modules_that_set_a_status() -> None:
+    """Anti-bitrot: a listed module that no longer sets a status fails too."""
+    assert set(_attribute_writers()) == STATUS_ATTRIBUTE_WRITERS
+
+
+def test_status_attribute_scan_flags_a_task_with_no_task_in_sight() -> None:
+    for source in ATTRIBUTE_WRITE_SAMPLES:
+        assert status_attribute_writes(source), source
+        assert status_writes(source) == [], source  # the per-module guard cannot see these
 
 
 def test_guard_sees_the_allowed_writer() -> None:
@@ -626,6 +731,35 @@ STATUS_SQL_SAMPLES = [
     "Q = 'insert into tasks (id) values (1) on conflict do update set \"status\" = excluded.status'\n",
     "Q = 'UPDATE tasks SET {col} = :s'.format(col='status')\n",
     "Q = 'UPDATE tasks SET {} = :s'\n",
+    # Fix wave B (silent-failure M3): a piece the scan cannot read reads as ``{}`` through ``+`` too.
+    "Q = 'UPDATE tasks SET ' + col + ' = 1'\n",
+    "Q = 'UPDATE ' + t + ' SET status = 1'\n",
+    "Q = 'UPDATE tasks SET ' + col\n",
+    # Fix wave B (AG-13 LOW-1): the Task model however it is reached, and a tasks table without ``table(``.
+    (
+        "from sqlalchemy import update\nfrom app.workflow.engine import Task\n"
+        "q = update(Task).values(status='x')\n"
+    ),
+    "from other import Task as T\nT(status='x')\n",
+    "from app.workflow import engine as e\nq = e.Task.__table__.update().values({'status': 'failed'})\n",
+    "import sqlalchemy as sa\nt = sa.Table('tasks', sa.MetaData(), sa.Column('status'))\n",
+    "from sqlalchemy import Table\nt = Table('tasks', md, autoload_with=e)\n",
+    "from sqlalchemy import table\nt = TABLE('Tasks')\n",
+    "from app.models.base import Base\nt = Base.metadata.tables['tasks']\n",
+    "t = md.tables['tasks']\n",
+    (
+        "from sqlalchemy import update\nfrom app.workflow.lease import Task\n"
+        "q = update(Task).values(dict(status='failed'))\n"
+    ),
+]
+# What the status guard cannot see from one module alone, read across ``app/`` instead (S2): a Task object a
+# helper returned, so ``t.status = ...`` has no ``Task`` in sight.
+ATTRIBUTE_WRITE_SAMPLES = [
+    "async def f(db, i):\n    t = await load(db, i)\n    t.status = 'failed'\n",
+    "t.status += 'x'\n",
+    "from sqlalchemy import update\nq = update(tbl).values(status='failed')\n",
+    "q = tbl.update().values({'status': 'failed'})\n",
+    "setattr(t, 'status', 'failed')\n",
 ]
 CLEAN_SAMPLES = [
     "from app.workflow.engine import StepResult\n\nStepResult.transition(TaskStatus.PLANNED, 'r')\n",
@@ -648,6 +782,12 @@ CLEAN_SAMPLES = [
     "Q = 'UPDATE tasks SET event_seq = event_seq + 1 WHERE id = :id'\n",
     'Q = "INSERT INTO tasks (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET event_seq = excluded.event_seq"\n',
     "v = eval('1 + 1')\n",
+    "import asyncio\n\nasync def f(w: list[asyncio.Task[None]]) -> None: ...\n",
+    "from asyncio import Task\n\nclass A:\n    t: Task[None]\n",
+    "from sqlalchemy import table\nt = table('projects')\nm = md.tables['projects']\n",
+    "Q = 'SELECT ' + cols + ' FROM tasks'\n",
+    "Q = 'UPDATE projects SET ' + col + ' = 1'\n",
+    "Q = 'UPDATE tasks SET event_seq = 1' + extra\n",
 ]
 
 
@@ -674,7 +814,7 @@ def test_guards_do_not_flag_reads_and_docs() -> None:
 
 
 def test_docstring_names_the_static_limits() -> None:
-    doc = __doc__ or ""
+    doc = " ".join((__doc__ or "").split())  # a phrase may wrap
     limits = (
         "getattr",
         "importlib",
@@ -695,6 +835,11 @@ def test_docstring_names_the_static_limits() -> None:
         "tool_r3",
         "recover_expired",
         "TaskEngine._fail",
+        "STATUS_ATTRIBUTE_WRITERS",
+        "a Task a helper returned",
+        "a ``Table`` or ``tables[...]`` name the scan cannot read",
+        "a ``status`` set by ``setattr`` with a computed name",
+        "DB trigger backstop",
     )
     missing = [limit for limit in limits if limit not in doc]
     assert missing == []

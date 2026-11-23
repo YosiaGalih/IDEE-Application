@@ -12,7 +12,18 @@ dict or list and that the scan cannot read is a violation too). Outside
 ``GUC_WRITERS`` each is a violation; inside it the name must be a constant that the module's entry lists (a
 literal, a module constant, or a ``KNOWN_GUC_CONSTANTS`` name).
 A name the scan cannot read (``||``, ``concat``, a variable, ``U&``, a computed piece of ``SET LOCAL`` by
-f-string, ``+``, ``%``, ``.format`` or ``join``) is always a violation.
+f-string, ``+``, ``%``, ``.format`` or ``join``) is always a violation when it is the name of a way listed
+above; a ``||`` inside a SQL string is read only through the forms below (before fix wave B, ``||`` inside a
+``DO`` body passed).
+
+Closed by fix wave B (AG-13 3.2c2c2 LOW-1): a SQL string is also a violation, in every module and with no
+name that makes it allowed, when it holds a ``DO $...$`` block (any tag), ``UESCAPE``, an SQL ``EXECUTE`` of a
+string or ``format(``, ``CREATE [OR REPLACE] FUNCTION|PROCEDURE``, ``ALTER FUNCTION|PROCEDURE|TABLE``,
+``DISABLE TRIGGER`` or ``DROP TRIGGER``, ``pg_settings``, or ``SET LOCAL|SESSION <x>`` at any position (not
+only at the start or after ``;``). ``||`` inside a ``DO`` body, a ``UESCAPE`` function name
+(``U&"set!005fconfig" UESCAPE '!'(...)``) and a ``SET`` clause of ``CREATE FUNCTION`` are those forms. A plain
+``UPDATE t SET col =`` is ordinary SQL and is not flagged. ``app/`` holds none of these as SQL strings (only
+Python ``.execute(`` calls; the privilege name ``'EXECUTE'`` in ``core/audit.py`` is not the statement).
 
 Not decided by a static scan, accepted: a name computed at run time (``getattr`` / ``eval`` of data, a string
 read from a file or the DB), ``operator.methodcaller``, ``inspect.getmembers``,
@@ -31,7 +42,7 @@ from pathlib import Path
 
 from app.models import approvals as approvals_model
 from app.models import tasks as tasks_model
-from tests.static_scan import concat_text, normalise_sql, paired_names, string_value
+from tests.static_scan import concat_text, normalise_sql, paired_names, string_value, strip_comments
 from tests.unit.test_status_writer_guard import marker_refs
 
 APP = Path(__file__).resolve().parents[2] / "app"
@@ -57,6 +68,25 @@ _SET_STATEMENT = re.compile(
 )
 # libpq ``options`` takes ``-c name=value`` and ``--name=value``. The ``--`` form needs a dotted name (the
 # marker GUCs are ``kk.*``): app/ has flags of ``git`` and ``prlimit`` (``--format=``, ``--as=``).
+# SQL that sets or hides a GUC in a form no name can make readable (fix wave B, AG-13 LOW-1): a ``DO`` block
+# (its body ``EXECUTE``s text built at run time), ``UESCAPE`` (``U&"set!005fconfig" UESCAPE '!'(...)`` is
+# ``set_config``), SQL ``EXECUTE`` of a string, function and procedure DDL (a ``SET`` clause or a body of its
+# own), ``ALTER TABLE`` (``DISABLE TRIGGER``), ``DROP|DISABLE TRIGGER``, ``pg_settings`` (``UPDATE`` of it
+# is a ``SET``) and ``SET LOCAL|SESSION`` at any position. Read on the text with comments removed; the
+# ``EXECUTE`` form on the text before quotes are removed. A plain ``UPDATE t SET col =`` is ordinary SQL.
+_FORBIDDEN_NORMALISED = {
+    "DO block": re.compile(r"\bdo\s+\$\w*\$", re.IGNORECASE),
+    "UESCAPE": re.compile(r"\buescape\b", re.IGNORECASE),
+    "function or procedure DDL": re.compile(
+        r"\b(?:create\s+(?:or\s+replace\s+)?(?:function|procedure)|alter\s+(?:function|procedure))\b",
+        re.IGNORECASE,
+    ),
+    "ALTER TABLE": re.compile(r"\balter\s+table\b", re.IGNORECASE),
+    "DISABLE|DROP TRIGGER": re.compile(r"\b(?:disable|drop)\s+trigger\b", re.IGNORECASE),
+    "pg_settings": re.compile(r"\bpg_settings\b", re.IGNORECASE),
+    "SET LOCAL|SESSION": re.compile(r"\bset\s+(?:local|session)\s+[\w.{}\"]", re.IGNORECASE),
+}
+_FORBIDDEN_EXECUTE = re.compile(r"(?<![\'\"])\bexecute\s*(?:format\s*\(|[eEuU]?&?['\"$])", re.IGNORECASE)
 _OPTIONS_C = re.compile(r"(?:^|\s)(?:-c\s*([\w.]+)|--(\w+\.[\w.]+))\s*=", re.IGNORECASE)
 # The value of an ``options`` argument or ``'options'`` key is libpq's: there ``--name=`` sets any GUC, dotted
 # or not (``--lock_timeout=1``), and a ``{}`` in the name is a piece the scan cannot read.
@@ -139,6 +169,13 @@ def _string_uses(value: str, line: int) -> list[_Use]:
         (line, "SET", None if "{}" in m.group(1) else m.group(1).lower())
         for m in _SET_STATEMENT.finditer(sql)
     ]
+    found += [
+        (line, f"forbidden SQL ({label})", None)
+        for label, p in _FORBIDDEN_NORMALISED.items()
+        if p.search(sql)
+    ]
+    if _FORBIDDEN_EXECUTE.search(strip_comments(value)):
+        found.append((line, "forbidden SQL (EXECUTE)", None))
     found += [(line, "options -c", (m.group(1) or m.group(2)).lower()) for m in _OPTIONS_C.finditer(value)]
     if "server_settings" in value.lower():
         found.append((line, "server_settings", None))
@@ -266,6 +303,50 @@ TRIPWIRE_SAMPLES = [
     "e = create_async_engine(u, connect_args={'options': opts})\n",
     "O = '--kk.other=1'\n",
 ]
+# Fix wave B (AG-13 LOW-1): SQL that sets or hides a GUC without ``set_config(`` at the start of a statement.
+# None of these is ever allowed, in any module (``GUC_WRITERS`` too).
+FORBIDDEN_SQL_SAMPLES = {
+    "N1 DO block, EXECUTE of a split SET": (
+        "Q = \"DO $$ BEGIN EXECUTE 'SET LOCAL kk.status' || '_writer = ''transition'''; END $$\"\n"
+    ),
+    "N1 DO block, tagged dollar quote": (
+        "Q = \"DO $kk$ BEGIN EXECUTE 'SET LOCAL kk.status' || '_writer = 1'; END $kk$\"\n"
+    ),
+    "N1 DO block, comment before the quote": "Q = 'DO /* x */ $$ BEGIN NULL; END $$'\n",
+    "A1 DO block, approval marker": (
+        "Q = \"DO $$ BEGIN EXECUTE 'SET LOCAL kk.approval_status' || '_writer = ''approval_store'''; "
+        'END $$"\n'
+    ),
+    "N3 U&identifier UESCAPE": (
+        "Q = \"SELECT U&\\\"set!005fconfig\\\" UESCAPE '!'('kk.status' || '_writer', 'transition', true)\"\n"
+    ),
+    "A3 U&identifier UESCAPE, approval": (
+        "Q = \"SELECT U&\\\"set!005fconfig\\\" UESCAPE '!'('kk.approval' || '_status_writer', 'x', true)\"\n"
+    ),
+    "N4 CREATE FUNCTION ... SET U&name": (
+        'Q = "CREATE FUNCTION f() RETURNS void LANGUAGE sql '
+        "SET U&\\\"kk.status\\\\005fwriter\\\" = 'transition' AS 'SELECT 1'\"\n"
+    ),
+    "S5 UESCAPE on a column": "Q = \"UPDATE tasks SET U&\\\"st!0061tus\\\" UESCAPE '!' = 'failed'\"\n",
+    "EXECUTE of a string": "Q = \"EXECUTE 'SET LOCAL x = 1'\"\n",
+    "EXECUTE format(": "Q = \"EXECUTE format('SET LOCAL %I = 1', n)\"\n",
+    "EXECUTE, comment before the quote": "Q = \"EXECUTE/**/'SELECT 1'\"\n",
+    "EXECUTE of a dollar quote": "Q = 'EXECUTE $$SELECT 1$$'\n",
+    "CREATE FUNCTION": "Q = 'CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql'\n",
+    "CREATE OR REPLACE FUNCTION": "Q = 'create or replace function f() returns int as $$ select 1 $$'\n",
+    "CREATE PROCEDURE": "Q = 'CREATE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$'\n",
+    "CREATE OR REPLACE PROCEDURE": "Q = 'CREATE OR REPLACE PROCEDURE p() AS $$ SELECT 1 $$'\n",
+    "ALTER TABLE": "Q = 'ALTER TABLE tasks ADD COLUMN x int'\n",
+    "ALTER FUNCTION ... SET": "Q = 'ALTER FUNCTION f() SET kk.x = 1'\n",
+    "ALTER PROCEDURE": "Q = 'ALTER PROCEDURE p() RENAME TO q'\n",
+    "DISABLE TRIGGER": "Q = 'ALTER TABLE tasks DISABLE TRIGGER USER'\n",
+    "DISABLE TRIGGER alone": "Q = 'disable trigger tasks_status_guard'\n",
+    "DROP TRIGGER": "Q = 'DROP TRIGGER tasks_status_guard ON tasks'\n",
+    "SET LOCAL after a keyword": "Q = 'SELECT 1 FROM t SET LOCAL app.x = 1'\n",
+    "SET SESSION mid-string": "Q = 'x SET SESSION app.x TO 1'\n",
+    "SET LOCAL in a fragment": "Q = 'BEGIN; SELECT 1 ' + ' SET LOCAL a.b = 1'\n",
+    "UPDATE pg_settings": "Q = \"UPDATE pg_settings SET setting = 'x' WHERE name = 'kk.' || 'x'\"\n",
+}
 TRIPWIRE_CLEAN = [
     "x = 'set the value'\n",
     '"""Docs mention set_config( and SET LOCAL x = 1 and server_settings."""\n',
@@ -277,12 +358,29 @@ TRIPWIRE_CLEAN = [
     "beat = {'sweep': {'task': 't', 'options': {'expires': 5}}}\n",
     "q = select(Task).options(selectinload(Task.events))\n",
     "s = ', '.join([a, b])\n",
+    "q = 'UPDATE tasks SET status = :s WHERE id = :i'\n",
+    "q = 'UPDATE projects SET name = :n, updated_at = now()'\n",
+    "q = 'INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = excluded.a'\n",
+    "q = 'SELECT * FROM t WHERE x = :x FOR UPDATE'\n",
+    "r = await session.execute(stmt)\n",
+    "q = \"SELECT has_function_privilege(current_user, p.oid, 'EXECUTE')\"\n",
+    "m = 'cannot execute the step; do not drop the table'\n",
+    "m = 'the table was altered; create a function later'\n",
+    "m = 'reset the session; set the local value'\n",
 ]
 
 
 def test_tripwire_flags_every_known_way_to_set_a_guc() -> None:
     for source in TRIPWIRE_SAMPLES:
         assert violations("services/other.py", source), source
+
+
+def test_tripwire_flags_sql_that_sets_a_guc_without_set_config() -> None:
+    for label, source in FORBIDDEN_SQL_SAMPLES.items():
+        assert violations("services/other.py", source), label
+        # never allowed, not even where a GUC is set: no name makes these readable
+        for module in ("workflow/states.py", "services/approval_store.py", "core/db.py"):
+            assert violations(module, source), (module, label)
 
 
 def test_tripwire_ignores_prose_and_other_statements() -> None:
