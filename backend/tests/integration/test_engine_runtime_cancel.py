@@ -1,4 +1,4 @@
-# ruff: noqa: F401, F811  (make_task is the fixture of test_engine, imported by name)
+# ruff: noqa: F811 - make_task, the fixture of test_engine, is imported by name and used as an argument
 """The engine over the real agent runtime when things go wrong (WP-3.2c2c2 Task 7; spec §16.6.5, §16.6.6).
 
 Cancel and lease loss (N34, C2 ``CancelledError``), lost acks of the run writer (BC-24, N59), the lease that
@@ -48,11 +48,10 @@ from app.worker import registry as registry_module
 from app.worker.identity import delivery_owner
 from app.workflow import engine as engine_module
 from app.workflow import lease as lease_module
-from app.workflow.engine import EngineOutcome, TaskEngine
+from app.workflow.engine import TaskEngine
 from app.workflow.recovery import recover_expired
 from tests.conftest import make_test_env
 from tests.engine_runtime_fakes import (
-    OWNER,
     Renewals,
     SwallowingProvider,
     implement_input,
@@ -69,7 +68,7 @@ from tests.integration.test_engine import (
     events,
     finished,
     kinds,
-    make_task,
+    make_task,  # noqa: F401 - a fixture, used by name as an argument
     other_tasks,
     row,
     started,
@@ -471,7 +470,11 @@ async def test_a_step_that_does_not_stop_cannot_keep_the_lease_alive(
                     assert time.monotonic() - first <= 2.5, "the lease did not lapse within 2.5 s"
                     await asyncio.sleep(0.05)
                 assert time.monotonic() - first <= 2.5  # the check that ends the loop may be its first
-                assert renewals.after(first) == []  # not one renewal since the revocation
+                # Not one renewal since the revocation. Exact zero holds because both heartbeats open
+                # bound_transaction (the connection is checked out) before renew_lease, so no await sits
+                # between the revoke gate and before_cursor_execute: a renewal is either counted before
+                # ``first`` or refused. A refactor that defers the checkout must allow gate-passed renewals.
+                assert renewals.after(first) == []
                 swept = await recover_expired(sessions, bus, AuditWriter(Redactor()))
                 assert swept.recovered == 1
             else:
