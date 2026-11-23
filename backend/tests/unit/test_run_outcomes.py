@@ -103,6 +103,38 @@ def test_run_vocabulary_matches_runtime_and_db() -> None:
 def test_closed_sets_have_the_designed_size() -> None:
     assert len(TASK_ERROR_CODES) == 19
     assert len(ABANDON_REASONS) == 8
+    # Pinned literally (review T1): a typo that keeps the size must turn this red (spec §16.6.2 #92, R-D5).
+    assert TASK_ERROR_CODES == {
+        "provider_not_ready",
+        "provider_disabled",
+        "provider_auth",
+        "usage_unrecorded",
+        "invalid_output",
+        "iteration_limit",
+        "timeout",
+        "model_error",
+        "internal_error",
+        "planning_interrupted",
+        "step_unavailable",
+        "step_result_invalid",
+        "duration_exceeded",
+        "budget_exceeded",
+        "approval_unsupported",
+        "agent_unavailable",
+        "agent_input_invalid",
+        "worktree_failed",
+        "commit_failed",
+    }
+    assert ABANDON_REASONS == {
+        "run_outcome_missing",
+        "run_outcome_running",
+        "run_output_unread",
+        "run_worker_cancelled",
+        "run_interrupted",
+        "run_cancelled",
+        "run_outcome_unknown",
+        "agent_profile_missing",
+    }
     assert len(FAIL_MESSAGES) == 13
     assert STEP_INTERRUPT_REASONS == {"provider_not_ready", "provider_disabled", "provider_auth"}
 
