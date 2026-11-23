@@ -92,7 +92,9 @@ def migrated_database() -> str:
 
 @pytest.fixture
 async def engine(migrated_database: str) -> AsyncIterator[AsyncEngine]:
-    engine = create_async_engine(migrated_database)
+    # pool_pre_ping as in production make_engine: a record whose terminate a cancel interrupted keeps its
+    # closed connection, and only the checkout ping replaces it (tests/integration/test_db_pool.py).
+    engine = create_async_engine(migrated_database, pool_pre_ping=True)
     yield engine
     await engine.dispose()
 
