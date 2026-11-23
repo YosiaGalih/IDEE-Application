@@ -158,10 +158,8 @@ def _deliver(ctx: StepContext, verdict: RunVerdict) -> StepResult:
     """A returned result is returned, a verdict that is an exception is raised (and logged when unknown)."""
     if isinstance(verdict, StepResult):
         return verdict
-    if isinstance(verdict, StepAbandoned):
-        if verdict.reason == "run_outcome_unknown":
-            logger.error("run_outcome_unknown", task_id=str(ctx.task_id), step=ctx.step)
-        raise verdict
+    if isinstance(verdict, StepAbandoned) and verdict.reason == "run_outcome_unknown":
+        logger.error("run_outcome_unknown", task_id=str(ctx.task_id), step=ctx.step)
     raise verdict
 
 

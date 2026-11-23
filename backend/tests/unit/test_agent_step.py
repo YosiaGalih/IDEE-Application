@@ -239,6 +239,36 @@ async def test_default_on_success_is_done() -> None:
     assert result.kind == "done"
 
 
+@pytest.mark.parametrize(
+    ("output", "code"),
+    [(None, None), (Payload(task_id=TASK_ID), "model_error")],
+    ids=["no_output", "error_code"],
+)
+async def test_a_succeeded_result_without_a_clean_output_abandons(output: Any, code: str | None) -> None:
+    handed: list[AgentSuccess] = []
+
+    async def on_success(ctx: StepContext, success: AgentSuccess) -> StepResult:
+        handed.append(success)
+        return StepResult.done()
+
+    runtime = FakeRuntime(lambda r: make_result(r.agent_run_id, "succeeded", code, output=output))
+    with capture_logs() as logs, pytest.raises(StepAbandoned) as info:
+        await bound(runtime, FakeReads(), on_success=on_success)(make_ctx())
+    assert info.value.reason == "run_outcome_unknown"
+    assert handed == []  # evidence over claims: no success without an output
+    assert [log["log_level"] for log in logs if log["event"] == "run_outcome_unknown"] == ["error"]
+
+
+async def test_an_on_success_error_propagates_without_a_row_read() -> None:
+    async def on_success(ctx: StepContext, success: AgentSuccess) -> StepResult:
+        raise RuntimeError("step bug")
+
+    runtime, reads = FakeRuntime(ok), FakeReads()
+    with pytest.raises(RuntimeError, match="step bug"):
+        await bound(runtime, reads, on_success=on_success)(make_ctx())
+    assert reads.outcome_calls == []
+
+
 @pytest.mark.parametrize(("pipeline", "kind"), [("draft", "fail"), ("running", "interrupt")])
 async def test_provider_stop_follows_the_pipeline(pipeline: Pipeline, kind: str) -> None:
     runtime = FakeRuntime(lambda r: make_result(r.agent_run_id, "failed", "provider_not_ready", output=None))
