@@ -75,7 +75,8 @@ _SET_STATEMENT = re.compile(
 # is a ``SET``) and ``SET LOCAL|SESSION`` at any position. Read on the text with comments removed; the
 # ``EXECUTE`` form on the text before quotes are removed. A plain ``UPDATE t SET col =`` is ordinary SQL.
 _FORBIDDEN_NORMALISED = {
-    "DO block": re.compile(r"\bdo\s+(?:language\b|\$\w*\$)", re.IGNORECASE),
+    # A body the scan cannot read (``'DO ' + BODY``, ``f'DO {body}'``) reads as ``DO {}`` (delta V13/V14).
+    "DO block": re.compile(r"\bdo\s+(?:language\b|\$\w*\$|\{\})", re.IGNORECASE),
     "UESCAPE": re.compile(r"\buescape\b", re.IGNORECASE),
     "function or procedure DDL": re.compile(
         r"\b(?:create\s+(?:or\s+replace\s+)?(?:function|procedure)|(?:alter|drop)\s+(?:function|procedure|routine))\b",
@@ -326,6 +327,8 @@ FORBIDDEN_SQL_SAMPLES = {
         "Q = \"DO LANGUAGE plpgsql $$DECLARE q text := 'SE' || 'T LOCAL kk.approval' || '_status_writer = a';"
         ' BEGIN EXECUTE q; END$$"\n'
     ),
+    "V13 DO with a body held in a variable": "Q = 'DO ' + BODY\n",
+    "V14 DO with an f-string body": "Q = f'DO {body}'\n",
     "G6 ALTER ROUTINE ... SET": "Q = \"ALTER ROUTINE tasks_status_guard() SET x.y = '1'\"\n",
     "G7 DROP FUNCTION ... CASCADE": "Q = 'DROP FUNCTION tasks_status_guard() CASCADE'\n",
     "G8 DROP ROUTINE ... CASCADE": "Q = 'DROP ROUTINE approvals_status_guard CASCADE'\n",
