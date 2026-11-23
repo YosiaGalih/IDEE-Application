@@ -501,6 +501,31 @@ async def test_a_wrong_registration_fails_before_the_claim(
     assert (spy.disposed, spy.closed) == (1, 1)
 
 
+def test_a_wrong_registration_is_refused_before_the_runtime_is_built(
+    held: tuple[AgentRegistry, PricingTable], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check is pure; the runtime build reads the prompt book from disk, so it must come after."""
+    built: list[object] = []
+
+    def spy(**kwargs: Any) -> None:
+        built.append(kwargs)
+        raise AssertionError("the runtime must not be built for a wrong registration")
+
+    monkeypatch.setattr(orchestrator_module, "build_agent_runtime", spy)
+    with pytest.raises(ValueError, match="cannot run agent"):
+        orchestrator_module.build_orchestrator(
+            sessions=None,  # type: ignore[arg-type]
+            bus=None,  # type: ignore[arg-type]
+            audit=None,  # type: ignore[arg-type]
+            settings=load_settings(),
+            worker_id="w1",
+            registry=held[0],
+            pricing=held[1],
+            agent_steps={"plan": AgentStep("A02", build_input)},
+        )
+    assert built == []
+
+
 def test_no_agent_step_is_registered_and_the_engine_stays_off() -> None:
     """N27: a later work package registers the steps and flips the flag."""
     assert dict(orchestrator_module.AGENT_STEPS) == {}

@@ -152,8 +152,10 @@ def run_task(task_id: str) -> dict[str, object]:
 
 
 async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
+    """One delivery. The registry and the pricing are required on every delivery, also while no agent step
+    is registered: a worker without them fails here, before any connection or claim, not on its first step."""
     settings = load_settings()
-    registry = worker_registry()  # RegistryNotLoaded: before any connection or claim
+    registry = worker_registry()  # RegistryNotLoaded: before any connection or claim (deliberate, see above)
     pricing = worker_pricing()  # PricingNotLoaded: likewise
     before = set(asyncio.all_tasks())
     engine = make_engine(settings.database_url)

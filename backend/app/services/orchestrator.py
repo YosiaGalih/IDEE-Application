@@ -14,7 +14,7 @@ from app.core.config import Settings
 from app.core.events import EventBus
 from app.llm.pricing import PricingTable
 from app.services.agent_runtime import ProviderFactory, build_agent_runtime
-from app.services.agent_step import AgentStep, DbAgentStepReads, bind_agent_steps
+from app.services.agent_step import AgentStep, DbAgentStepReads, bind_agent_steps, validate_agent_steps
 from app.workflow.engine import Step, TaskEngine, WorkflowPorts
 
 # The agent steps of the production engine. Empty until a later work package registers its steps and flips
@@ -38,12 +38,18 @@ def build_orchestrator(
 ) -> TaskEngine:
     """``steps``, ``agent_steps``, ``providers`` and ``tools`` are test seams: production passes ``None``
     (the registry of agent steps is ``AGENT_STEPS``). The agent runtime is built only when there is an agent
-    step, with the same ``worker_id`` the engine claims with, so its heartbeat renews that owner's lease."""
+    step, with the same ``worker_id`` the engine claims with, so its heartbeat renews that owner's lease.
+
+    ``registry`` and ``pricing`` are required on every delivery, even while ``AGENT_STEPS`` is empty: a worker
+    that has not loaded them fails at once, before any connection or claim, rather than on the first agent
+    step. The registration is validated (pure, no SQL) before the runtime is built, because that build reads
+    the prompt book from disk."""
     agent_specs = AGENT_STEPS if agent_steps is None else agent_steps
     plain: dict[str, Step] = dict(steps) if steps is not None else {}
     clash = sorted(set(plain) & set(agent_specs))
     if clash:
         raise ValueError("step registered twice: " + ", ".join(clash))
+    validate_agent_steps(agent_specs, registry)
     if agent_specs:
         runtime = build_agent_runtime(
             sessions=sessions,
