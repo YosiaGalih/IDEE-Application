@@ -3626,9 +3626,147 @@ AG-13 PoC (scratchpad `ag13poc-3.2c2c1`):
 - Perbaiki guard penanda approval pada pass yang sama, atau catat setiap celah sebagai batas yang diterima.
 - N60 tidak memenuhi syarat ini, karena hanya melihat impor.
 - Backstop DB (fungsi `SECURITY DEFINER`, cabut `UPDATE(status)` dari role worker) tetap backlog.
+- → Dikerjakan di WP-3.2c2c2 (Task 8, gelombang B, perbaikan delta). Statusnya lihat § WP-3.2c2c2; backstop DB menjadi usul WP-3.2c2b3.
 
 **Sesudah PR #42 (fakta, 23 Nov 2026) [Pasti]:**
 - CI PR #42 (WP-3.2c2c1) di af4d5ce: 8/9 job hijau.
   - `sandbox-isolation` sempat gagal satu kali di `test_memory_limit`: hasilnya `('failed', 137, None)`, padahal seharusnya `OOM_KILLED`. Ini kelas race late-OOM yang sama dengan PR #23. Job itu lulus setelah satu kali re-run. PR ini tidak menyentuh kode sandbox.
   - `security-scan` merah karena CVE di image web/postgres upstream, sama seperti di `main`.
 - PO menandai PR #42 ready, lalu me-merge-nya pada 23 Nov 2026 ±07:28 UTC (cd3b138).
+
+### WP-3.2c2c2 (🔒 wiring runtime) — pemetaan hasil run, adapter `AgentStep`, perakitan runtime per delivery dengan owner lease delivery, drain sebelum `dispose`, kontrak import N60, e2e runtime asli, pengerasan guard (sub-WP ketujuh WP-3.2; Keputusan Lead #89–#99, ruling R-D1–R-D5; AG-13 3.2c2c1 C2 dan syarat guard sebelum 3.2d; RD-6)
+
+**Dokumen kerja:**
+- Spec induk §16.6.5 (rancangan rinci A–H) dan §16.6.6 (builder check BC-1–BC-30, ruling Lead R-D1–R-D5, catatan realisasi).
+- Plan `docs/superpowers/plans/2026-11-23-wp-3.2c2c2-runtime-wiring.md` (9 task).
+- Rancangan rinci dan builder check ada di scratchpad (`design-3.2c2c2.md`, `builder-check-3.2c2c2.md`).
+
+**Cara dikerjakan:**
+- Subagent-driven-development. Implementer per task, lalu review per task (spec + kualitas). Kesembilan task di-Approve. Temuan Important dari review per task ditutup controller dengan test merah lebih dulu:
+  - T2: guard `succeeded` tanpa output dan propagasi galat `on_success` dipatok. Mutan "hapus guard" kini gagal di 2 test.
+  - T3: `engine.dispose()` tetap jalan bila `redis.aclose()` melempar.
+  - T5: assertion hitungan perpanjangan dijujurkan, karena engine dan runtime menulis statement yang sama. Bukti C2 adalah pasangan run yang berhasil dan kontrol `lease_lost`.
+  - T6: test RD-6 diberi kontrol positif. Mutan "tidak ada stream" kini gagal.
+  - T8: re-review menutup `SET` dengan nama terhitung, `join` dengan potongan tak terbaca, dan `--nama=` di `options` libpq.
+- T7, T8, dan gelombang perbaikan B dikerjakan di worktree terpisah dengan DB sendiri, lalu di-cherry-pick.
+- Review akhir lima kursi atas `cd3b138..b2dc812`:
+  - kk-backend-reviewer: **APPROVE WITH CHANGES** (1 MEDIUM, 4 LOW);
+  - kk-silent-failure-hunter: 0 CRITICAL/HIGH, 3 MEDIUM, 4 LOW;
+  - AG-13: **SIGNED OFF WITH CONDITIONS 🔒** (1 LOW, 5 INFO);
+  - `/code-review` Standards: tanpa pelanggaran keras;
+  - `/code-review` Spec: tanpa requirement yang hilang.
+- Gelombang perbaikan dikerjakan dua fixer paralel di file terpisah:
+  - A: kode app (`3a2df93`, `1c3de03`, `46c3eca`, `369da63`);
+  - B: guard (`0859777`, `78fc42d`).
+  Re-review terlingkup A: **Approved**, A1–A7 ADDRESSED. Re-review B: **Approved**, keempat temuan ADDRESSED. Sisa dua LOW yang dibuat-buat: modul yang di-alias `asyncio`, dan konstruktor `x.Task(status=…)` (insert). Lalu delta AG-13.
+
+**Yang dibangun:**
+- **`app/workflow/run_outcomes.py`** (murni, T1):
+  - `verdict_for_end`/`verdict_for_row` memetakan akhir run ke `StepResult` atau `StepAbandoned`;
+  - himpunan tertutup `TASK_ERROR_CODES` (19) dan `ABANDON_REASONS` (8);
+  - 13 kalimat tetap `FAIL_MESSAGES`;
+  - kode provider di `draft` → `fail`, di `running` → `interrupt` (#8 final).
+- **Adapter `app/services/agent_step.py`** (T2, R-D1/R-D3/R-D4/R-D5):
+  - `AgentStep(agent_id, build_input, on_success)` dan `bind_agent_steps`;
+  - urutan tangkap N57: `CancelledError`/`AgentRunIdConflict`/`LeaseLost` diteruskan, penolakan → `fail` dengan kalimat tetap, selain itu baca baris run lalu petakan;
+  - `agent_run_id` baru per panggilan (N59);
+  - pemeriksaan `AgentProfile` (N56);
+  - `on_success` hanya bila `succeeded`, tanpa kode, dengan output, dan id run sama dengan yang diminta;
+  - `validate_agent_steps` murni;
+  - log hanya id, tipe galat, dan kosakata terbatas (`unrecognised` bila di luar).
+- **Perakitan** (T3, #91, C2): `build_orchestrator` membangun runtime hanya bila ada `AgentStep`, dengan `worker_id` yang sama dengan `WorkflowPorts` (`delivery_owner()` per delivery). Registrasi divalidasi sebelum runtime dibangun. Registry dan tarif wajib dimuat sebelum koneksi atau claim.
+- **Drain N54** (T3):
+  - `RUNTIME_DRAIN_S = 3 * CLOSE_TIMEOUT_S` (15 dtk), hanya untuk task milik delivery;
+  - task sisa yang gagal di-log menurut tipe (`delivery_task_failed`); yang tertinggal di-log dengan nama coroutine (`delivery_tasks_abandoned`);
+  - tidak pernah melempar;
+  - `dispose` tetap jalan.
+- **Engine** (T4, R-D2): cancel luar di wait pertama me-log apa yang dibuang.
+- **Kontrak import-linter: 12 kontrak** (N60 + larangan `states`/`lease` langsung untuk paket langkah). `app.services.orchestrator`/`agent_step` dilarang di proses api dan di himpunan terlarang `test_provider_secrets`.
+- **`AGENT_STEPS` kosong di produksi** (N27). `RUNTIMES_AVAILABLE["workflow_engine"]` tetap `False`, jadi wiring belum aktif sampai 3.2d.
+- **E2E runtime asli** (T5–T7):
+  - `test_engine_runtime.py` (22): jalur bahagia, C2 dengan owner lain, dan setiap baris tabel #8 termasuk RD-6, S20, N33/N62 dan N56;
+  - `test_engine_runtime_cancel.py` (13): cancel per pipeline, N34, ack hilang, N53 × 3 × {asli, kontrol}, N54 nyala/mati.
+- **Pengerasan guard** (T8 + gelombang B):
+  - `tests/static_scan.py` bersama;
+  - penanda tanpa beda huruf;
+  - tripwire GUC (`set_config`, `SET [LOCAL|SESSION]` di posisi mana pun, `server_settings`, opsi libpq, `DO $…$`, `UESCAPE`, `EXECUTE` SQL, DDL fungsi/prosedur, `ALTER TABLE`, `DISABLE/DROP TRIGGER`, `pg_settings`), dengan allowlist tepat `GUC_WRITERS`;
+  - SQL status setelah normalisasi (komentar, spasi, kutip, `*`, MERGE, ON CONFLICT, potongan tak terbaca `{}`);
+  - `Task` dikenali bagaimana pun diimpor;
+  - `Table`/`tables['tasks']`;
+  - pemindaian `.status =` lintas modul dengan allowlist tepat 6 modul;
+  - bentuk alias `getattr`.
+- **Dokumen:** API §5, DATA_MODEL `tasks.error_code`, ARCHITECTURE §6.1/§5.4, SECURITY_MODEL §13 (RD-6, C2, INFO-1, N62, LOW-3), TEST_STRATEGY §2.7, GLOSSARY, spec induk, #72.
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ p32-pytest.sh -q -rw            # suite backend penuh @ 23dc0b0 (sesudahnya: test guard unit, satu docstring jobs.py, dokumen)
+6465 passed in 768.98s            (tanpa warning)
+$ uv run pytest -q <lima file guard>   # @ HEAD
+59 passed
+$ p32-pytest.sh -q -rw            # suite backend penuh @ b2dc812 (sebelum gelombang perbaikan)
+6438 passed in 747.81s            (tanpa warning)
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 382 files already formatted · 0 errors · Contracts: 12 kept, 0 broken
+```
+
+- **C2/N53** (`test_engine_runtime_cancel.py`):
+  - jalur asli: lease lepas 1,95–2,02 dtk sesudah pencabutan pertama, dengan 0 perpanjangan sesudahnya; recovery mengambil task, dan run `failed lease_lost`;
+  - kontrol: 57–58 perpanjangan dalam 6 dtk;
+  - mutan revoke no-op: ketiga kasus asli gagal.
+- **Mutan owner AG-13** (`orchestrator.py`, `worker_id + "-mutant"`): 9 test gagal (spy, dua e2e jalur bahagia, N53).
+
+**Review akhir AG-13 (@ b2dc812): SIGNED OFF WITH CONDITIONS 🔒** [Pasti]:
+- C2 **MET**.
+- N60 **MET** untuk WP ini. Mutan a/b/c BROKEN. Mutan d (`app/services/steps/__init__.py`) lolos, jadi paket itu harus eksplisit di 3.2d (INFO-1).
+- Pengerasan guard **PARTIAL**:
+  - PoC delta 3.2c2c1 tertutup penuh;
+  - ejaan baru lolos (LOW-1): N1 `DO $$ EXECUTE …`, N3/N4/S5 `UESCAPE`, S1 `Task` lewat `app.workflow.engine`, S2–S4, S7, serta A1/A3 untuk approval. Ditutup gelombang B.
+- INFO-2 (drain di ketaksamaan margin) dan INFO-3 (id run asing) ditutup gelombang A.
+- INFO-4: approval `pending` tertinggal (N62), dibawa ke 3.2g.
+- INFO-5: urutan tangkap di bawah pembungkusan aman, karena masuk ke cabang baca baris.
+
+**Delta AG-13 atas gelombang perbaikan (`b2dc812..78fc42d`): SIGNED OFF WITH CONDITIONS 🔒 (3 LOW, 2 INFO)** [Pasti]:
+- 14 ejaan PoC sebelumnya tertutup. INFO-2 dan INFO-3 **CLOSED**. C2, N53, dan N60 bertahan.
+- **D3 (regresi gelombang B):** lubang `{}` yang membuka komentar (`'/*' + x + " UPDATE tasks SET status …"`) menyembunyikan SQL sesudahnya. Syarat C1: tutup sebelum PR ini merge. **Ditutup di 1e36f0f**: setiap node string dibaca sekali per baris, H1/H2/H6 RED lebih dulu. AG-13 memeriksa ulang di 1e36f0f: **C1 MET**. Dari 15 varian dekat, 13 tertangkap; dua sisanya (`'DO ' + BODY`, `f'DO {body}'`) ditutup di 1939864.
+- **D1:** bentuk `DO` lain, built-in SPI (`query_to_xml`, `ts_stat`), dan DDL routine. AG-13 membuktikan dengan DB nyata bahwa bentuk itu menyetel penanda, termasuk approval `pending` → `approved` di modul yang tidak memicu satu scanner pun. Ejaan murah ditutup di 1e36f0f (G1–G8, G11, X1–X4). Kelas sisi SQL tetap terbuka: denylist statis tidak dapat menutupnya.
+- **D2:** 16 ejaan tulisan ORM `status` yang tidak dibaca kedua scan (W1–W16). **Terbuka**, wajib sebelum merge 3.2d. Dicatat sebagai terbuka, bukan sebagai batas yang diterima.
+- **D4:** `_drain` hanya mengambil task sisa yang masih hidup saat drain dimulai. Docstring sudah dipersempit; exception handler loop menyusul di 3.2d.
+- **D5:** baris INFO-1 SECURITY_MODEL sebelumnya mengklaim berlebih. Sudah diperbaiki.
+
+**Flake yang ditemukan dan akar masalahnya (systematic-debugging) [Pasti]:**
+- Suite penuh sesudah gelombang perbaikan gagal sekali di `test_engine.py::test_the_step_is_cancelled_once_at_the_limit` dengan `InterfaceError: connection is closed`. Test itu lulus 0/25 gagal bila dijalankan sendirian.
+- Akar masalah ada di SQLAlchemy 2.1.4: `_ConnectionRecord.invalidate()` baru mengosongkan `dbapi_connection` sesudah `__close(terminate=True)`. Fungsi `_close_connection` melempar ulang `CancelledError`, sehingga cancel yang jatuh saat koneksi heartbeat diputus meninggalkan koneksi tertutup di record pool.
+- Produksi (`make_engine`) memakai `pool_pre_ping=True`, yang mengganti koneksi itu saat checkout. Fixture test bersama `engine` tidak memakainya.
+- Reproduksi: `scratchpad/pooldebug/repro.py` (tanpa pre-ping gagal, dengan pre-ping pulih).
+- Perbaikan (23dc0b0): fixture memakai `pool_pre_ping=True`. `tests/integration/test_db_pool.py` merah untuk fixture lama, hijau untuk `make_engine` dan fixture baru.
+- Delta AG-13: perubahan ini infrastruktur test saja, tanpa dampak keamanan.
+
+**Keputusan Lead selama eksekusi:**
+- T8 dikerjakan di WP ini, tidak diangkat menjadi PR sendiri.
+- LOW-1 AG-13 ditutup sekarang, padahal tenggatnya "sebelum merge 3.2d". Alasannya, S1 adalah pola impor yang dianjurkan R-D3 untuk langkah 3.2d.
+- Status C2 di SECURITY_MODEL baru ditulis "ditutup" setelah regresi N53 dan sign-off AG-13 (3384c6d).
+- Pola menambal guard statis tidak dijadikan kontrol utama. Kelas sisi SQL terbuka, sehingga backstop DB diusulkan sebagai WP sendiri (WP-3.2c2b3) sebelum 3.2d, lewat #72.
+- Catatan realisasi spec dibatasi pada drift yang tercatat.
+
+**Ditunda (bukan blocker):**
+- **Silent-failure:**
+  - L2: `planning_interrupted` tidak menyebut alasan abandon terakhir;
+  - L3: tipe exception tak dikenal di-log pada level warning.
+- **Smell Standards:**
+  - blok penolakan ganda dan `_log_ended` di `_bind`;
+  - data clump `(ctx, agent_id, run_id)`;
+  - nama `done`/`_unknown`/`outer`.
+- **Backend NIT:** sleep nyata 3–6 dtk di test cancel; `make_task` sebaiknya ke conftest.
+- **Re-review T5/T6/T7 Minor:** assertion `usage.updated`, run row pada test penghentian provider, dan memperpendek kontrol N53.
+
+**Syarat yang dibawa ke 3.2d (AG-13 3.2c2c2 delta):**
+- **C3, sebelum 3.2d dimulai:** backstop DB (cabut `UPDATE(status)` dari role runtime; tulisan status lewat fungsi definer milik role migrasi; perlu pengecualian sengaja di `audit_guard_problems`) mendapat ID WP, pemilik, dan tenggat. **Usul Lead: WP-3.2c2b3 (🔒 backstop DB penulis status dan approval)**, dikerjakan sebelum 3.2d. Dilaporkan ke #72 untuk keputusan PO soal urutan gate.
+- **C2, sebelum 3.2d merge:** tutup D2, plus sisa D1 bila ada, atau catat masing-masing sebagai batas yang diterima di docstring guard dan SECURITY_MODEL.
+- **C4, paling lambat 3.2d:** exception handler loop per delivery (D4).
+- `app.services.steps` eksplisit di kedua kontrak N60, di PR yang membuat paket itu (AG-13 INFO-1).
+- Penulis `AgentSuccess.output` meredaksi.
+- 3.2c2b2 (N25, butuh PO) tetap syarat masuk 3.2d.
+- Backstop DB (`SECURITY DEFINER`, cabut `UPDATE(status)` dari role worker) tetap backlog. Guard statis tetap pagar kode first-party.
+
+**Syarat yang dibawa ke 3.2g:** approval `pending` pada task `failed approval_unsupported` (N62, AG-13 INFO-4).
