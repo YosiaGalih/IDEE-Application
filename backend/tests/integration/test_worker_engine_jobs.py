@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import logging
 import pickle
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -580,6 +583,7 @@ class Leftovers:
 
     def __init__(self) -> None:
         self.tasks: list[asyncio.Future[None]] = []
+        self.weak: list[weakref.ref[asyncio.Future[None]]] = []
 
     def spawn(self, order: Order, seconds: float) -> None:
         async def slow() -> None:
@@ -588,14 +592,24 @@ class Leftovers:
 
         self.tasks.append(asyncio.ensure_future(slow()))
 
+    def spawn_failing(self, seconds: float, message: str) -> None:
+        """A leftover that fails; the loop alone holds it, as for a run's close that nobody awaits."""
+
+        async def close_fails() -> None:
+            await asyncio.sleep(seconds)
+            raise RuntimeError(message)
+
+        self.weak.append(weakref.ref(asyncio.ensure_future(close_fails())))  # held by the loop alone
+
 
 @pytest.fixture
 async def leftovers() -> Any:
     holder = Leftovers()
     yield holder
-    for t in holder.tasks:
+    alive = [t for t in holder.tasks + [r() for r in holder.weak] if t is not None]
+    for t in alive:
         t.cancel()
-    await asyncio.gather(*holder.tasks, return_exceptions=True)
+    await asyncio.gather(*alive, return_exceptions=True)
 
 
 def leaving(order: Order, leftovers: Leftovers, seconds: float, *, raises: bool = False) -> Any:
@@ -665,3 +679,61 @@ async def test_the_drain_runs_when_the_engine_raises(
 
 def test_the_drain_covers_the_three_bounded_writes_of_a_run_end() -> None:
     assert jobs.RUNTIME_DRAIN_S == 3 * CLOSE_TIMEOUT_S == 15.0
+
+
+LEAK = "sk-test-" + "leak-9876"
+
+
+async def test_a_failed_leftover_is_logged_by_type_and_never_left_unretrieved(
+    draft_task: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+    leftovers: Leftovers,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Leaves:
+        async def run(self, task_id: uuid.UUID) -> EngineOutcome:
+            leftovers.spawn_failing(0.05, LEAK)
+            return EngineOutcome(ClaimResult.ACQUIRED, [], "done")
+
+    monkeypatch.setattr(jobs, "build_orchestrator", lambda **_: Leaves())
+    with caplog.at_level(logging.ERROR, logger="asyncio"), capture_logs() as logs:
+        await jobs.execute_task(draft_task)
+        gc.collect()
+    failed = [e for e in logs if e["event"] == "delivery_task_failed"]
+    assert [(e["log_level"], e["task_id"], e["error_type"]) for e in failed] == [
+        ("warning", str(draft_task), "RuntimeError")
+    ]
+    assert failed[0]["task"].endswith("close_fails")
+    assert LEAK not in repr(logs) and all("exc_info" not in e for e in logs)
+    assert LEAK not in caplog.text and "never retrieved" not in caplog.text
+
+
+async def test_the_abandoned_log_names_the_pending_tasks(
+    draft_task: uuid.UUID, monkeypatch: pytest.MonkeyPatch, leftovers: Leftovers
+) -> None:
+    order = Order(monkeypatch)
+    monkeypatch.setattr(jobs, "RUNTIME_DRAIN_S", 0.05)
+    monkeypatch.setattr(jobs, "build_orchestrator", leaving(order, leftovers, 1.0))
+    with capture_logs() as logs:
+        await jobs.execute_task(draft_task)
+    abandoned = [e for e in logs if e["event"] == "delivery_tasks_abandoned"]
+    assert [e["tasks"] for e in abandoned] == [[leftovers.spawn.__qualname__ + ".<locals>.slow"]]
+
+
+async def test_the_delivery_owner_is_the_worker_id_of_the_engine(
+    draft_task: uuid.UUID, monkeypatch: pytest.MonkeyPatch, test_env: None
+) -> None:
+    seen: dict[str, Any] = {}
+
+    class Noop:
+        async def run(self, task_id: uuid.UUID) -> EngineOutcome:
+            return EngineOutcome(ClaimResult.ACQUIRED, [], "done")
+
+    def fake_build(**kwargs: Any) -> Noop:
+        seen.update(kwargs)
+        return Noop()
+
+    monkeypatch.setattr(jobs, "delivery_owner", lambda: "owner-fixed-for-the-test")
+    monkeypatch.setattr(jobs, "build_orchestrator", fake_build)
+    await jobs.execute_task(draft_task)
+    assert seen["worker_id"] == "owner-fixed-for-the-test"

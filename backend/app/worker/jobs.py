@@ -179,16 +179,41 @@ async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
                 await engine.dispose()  # also when the Redis close raises
 
 
+def _task_name(task: asyncio.Task[object]) -> str:
+    """The qualified name of what a task runs (a code name, never a value), else the task's own name."""
+    coro = task.get_coro()
+    name = getattr(coro, "__qualname__", None)
+    return name if isinstance(name, str) else task.get_name()
+
+
 async def _drain(task_id: uuid.UUID, before: set[asyncio.Task[object]]) -> None:
     """Waits for the tasks this delivery created (a run's close, for one) before the engine is disposed.
-    Never raises: a task that outlives the wait is logged by count and left to the loop (BC-17)."""
+    Never raises (BC-17). A finished leftover that failed has its exception retrieved here, so asyncio does
+    not log it later with its text and traceback, outside redaction: it is logged by task and error type. A
+    task that outlives the wait is logged by name and left to the loop."""
     current = asyncio.current_task()
     left = {t for t in asyncio.all_tasks() if t not in before and t is not current}
     if not left:
         return
-    _, pending = await asyncio.wait(left, timeout=RUNTIME_DRAIN_S)
+    done, pending = await asyncio.wait(left, timeout=RUNTIME_DRAIN_S)
+    for task in sorted(done, key=_task_name):
+        if task.cancelled():
+            continue
+        error = task.exception()
+        if error is not None:
+            logger.warning(
+                "delivery_task_failed",
+                task_id=str(task_id),
+                task=_task_name(task),
+                error_type=type(error).__name__,
+            )
     if pending:
-        logger.warning("delivery_tasks_abandoned", task_id=str(task_id), count=len(pending))
+        logger.warning(
+            "delivery_tasks_abandoned",
+            task_id=str(task_id),
+            count=len(pending),
+            tasks=sorted(_task_name(t) for t in pending),
+        )
 
 
 @shared_task(name="app.worker.jobs.dispatch_sweep")
