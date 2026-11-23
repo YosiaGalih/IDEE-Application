@@ -39,6 +39,18 @@ reads every module of ``app/`` as if it reached the Task model (a Task object a 
 ``t.status = ...`` has no ``Task`` in sight, S2): only the modules of ``STATUS_ATTRIBUTE_WRITERS`` may set a
 ``status`` (six, each a model other than Task: ToolCall, Approval, Project, AgentRun), and that list is exact.
 
+Closed after the AG-13 3.2c2c2 delta (D3): every string node is read once per line, so a ``{}`` hole that
+opens a comment (``'/*' + x + " UPDATE tasks SET status ..."``, ``'--' + x + ...``) no longer hides the SQL
+part after it.
+
+OPEN, owed before WP-3.2d merges (AG-13 3.2c2c2 delta D2; NOT an accepted limit): writes of ``status`` that
+neither scan reads yet: ``set_attribute(t, 'status', ...)``, ``object.__setattr__`` / ``t.__setattr__``,
+``builtins.setattr`` and its alias, tuple / list / ``for`` targets, an ORM bulk update by primary key
+(``execute(update(Task), [{'status': ...}])``, ``bulk_update_mappings``), ``ordered_values``,
+``on_conflict_do_update(set_=...)``, a key held in a constant or built by ``+``, ``literal_column('status')``,
+``merge(type(t)(..., status=...))``, an aliased ``table`` or ``tables.get('tasks')`` with a params dict. Each
+also needs the marker set, so the DB backstop owed before 3.2d starts is the control that closes the class.
+
 Accepted limits of fix wave B: S2 inside a module of ``STATUS_ATTRIBUTE_WRITERS`` (a Task a helper returned,
 set there, is not seen) and a ``status`` set by ``setattr`` with a computed name; a ``Table`` or
 ``tables[...]`` name the scan cannot read (a variable); the DB trigger backstop is a backlog item.
@@ -231,13 +243,12 @@ def status_writes(source: str, *, any_model: bool = False) -> list[str]:
     uses_task = any_model or _imports_task(tree)
     task_names = _task_names(tree)
     status_dicts = _dicts_with_status(tree)
-    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    raw_lines: set[int] = set()
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.expr)
-            and _is_raw_status_update(node)
-            and not _inside_string_expression(node, parents)
-        ):
+        # Every string node is read, once per line: the outer expression may hide its parts' SQL behind a
+        # {} hole that opens a comment ('/*' + x + " UPDATE tasks SET status ..."; AG-13 3.2c2c2 delta D3).
+        if isinstance(node, ast.expr) and node.lineno not in raw_lines and _is_raw_status_update(node):
+            raw_lines.add(node.lineno)
             found.append(f"line {node.lineno}: raw SQL updates tasks.status")
         if isinstance(node, ast.Call) and _is_tasks_table_call(node):
             found.append(f"line {node.lineno}: table('tasks') can be written without the model")
@@ -709,6 +720,10 @@ MARKER_SAMPLES = [
     "Q = \"SELECT set_config(concat_ws('.', 'kk', 'status_writer'), 'transition', true)\"\n",
 ]
 STATUS_SQL_SAMPLES = [
+    # AG-13 delta D3: a {} hole inside a comment opener must not hide the SQL after it (x is "*/" or "\\n").
+    "q = '/*' + x + \" UPDATE tasks SET status = 'failed' WHERE id = 1 -- */\"\n",
+    "q = '/*' + x + \" UPDATE tasks SET status = 'failed' /* */\"\n",
+    "q = '--' + x + \" UPDATE tasks SET status = 'failed'\"\n",
     "Q = 'UPDATE public.tasks SET status = :s WHERE id = :id'\n",
     "Q = 'UPDATE tasks t SET status = :s WHERE t.id = :id'\n",
     "Q = 'UPDATE tasks AS t SET status = :s WHERE t.id = :id'\n",

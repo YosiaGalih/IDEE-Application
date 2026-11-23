@@ -190,9 +190,11 @@ def _task_name(task: asyncio.Task[object]) -> str:
 
 async def _drain(task_id: uuid.UUID, before: set[asyncio.Task[object]]) -> None:
     """Waits for the tasks this delivery created (a run's close, for one) before the engine is disposed.
-    Never raises (BC-17). A finished leftover that failed has its exception retrieved here, so asyncio does
-    not log it later with its text and traceback, outside redaction: it is logged by task and error type. A
-    task that outlives the wait is logged by name and left to the loop."""
+    Never raises (BC-17). A leftover that is still running when the drain starts and then fails has its
+    exception retrieved here and is logged by task and error type only. A leftover that already failed before
+    the drain starts is not in ``all_tasks()``: if nothing retrieved it, asyncio logs it through the stdlib
+    logger, whose ``RedactingFilter`` applies (AG-13 3.2c2c2 delta D4; a loop exception handler is owed by
+    3.2d). A task that outlives the wait is logged by name and left to the loop."""
     current = asyncio.current_task()
     left = {t for t in asyncio.all_tasks() if t not in before and t is not current}
     if not left:

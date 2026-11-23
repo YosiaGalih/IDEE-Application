@@ -75,18 +75,25 @@ _SET_STATEMENT = re.compile(
 # is a ``SET``) and ``SET LOCAL|SESSION`` at any position. Read on the text with comments removed; the
 # ``EXECUTE`` form on the text before quotes are removed. A plain ``UPDATE t SET col =`` is ordinary SQL.
 _FORBIDDEN_NORMALISED = {
-    "DO block": re.compile(r"\bdo\s+\$\w*\$", re.IGNORECASE),
+    "DO block": re.compile(r"\bdo\s+(?:language\b|\$\w*\$)", re.IGNORECASE),
     "UESCAPE": re.compile(r"\buescape\b", re.IGNORECASE),
     "function or procedure DDL": re.compile(
-        r"\b(?:create\s+(?:or\s+replace\s+)?(?:function|procedure)|alter\s+(?:function|procedure))\b",
+        r"\b(?:create\s+(?:or\s+replace\s+)?(?:function|procedure)|(?:alter|drop)\s+(?:function|procedure|routine))\b",
         re.IGNORECASE,
     ),
     "ALTER TABLE": re.compile(r"\balter\s+table\b", re.IGNORECASE),
     "DISABLE|DROP TRIGGER": re.compile(r"\b(?:disable|drop)\s+trigger\b", re.IGNORECASE),
     "pg_settings": re.compile(r"\bpg_settings\b", re.IGNORECASE),
+    # Built-ins that run a query string through SPI, for any role (AG-13 3.2c2c2 delta D1: X1, X2).
+    "SPI query built-in": re.compile(
+        r"\b(?:query_to_xml\w*|cursor_to_xml\w*|ts_stat|ts_rewrite)\s*\(", re.IGNORECASE
+    ),
     "SET LOCAL|SESSION": re.compile(r"\bset\s+(?:local|session)\s+[\w.{}\"]", re.IGNORECASE),
 }
 _FORBIDDEN_EXECUTE = re.compile(r"(?<![\'\"])\bexecute\s*(?:format\s*\(|[eEuU]?&?['\"$])", re.IGNORECASE)
+# DO with a body in any string constant ('...', E'...', U&'...'), read before quotes are removed
+# (AG-13 3.2c2c2 delta D1: G2, G3).
+_FORBIDDEN_DO_QUOTED = re.compile(r"(?<![\w'\"])do\s+[eEuU]?&?'", re.IGNORECASE)
 _OPTIONS_C = re.compile(r"(?:^|\s)(?:-c\s*([\w.]+)|--(\w+\.[\w.]+))\s*=", re.IGNORECASE)
 # The value of an ``options`` argument or ``'options'`` key is libpq's: there ``--name=`` sets any GUC, dotted
 # or not (``--lock_timeout=1``), and a ``{}`` in the name is a piece the scan cannot read.
@@ -176,6 +183,8 @@ def _string_uses(value: str, line: int) -> list[_Use]:
     ]
     if _FORBIDDEN_EXECUTE.search(strip_comments(value)):
         found.append((line, "forbidden SQL (EXECUTE)", None))
+    if _FORBIDDEN_DO_QUOTED.search(strip_comments(value)):
+        found.append((line, "forbidden SQL (DO block)", None))
     found += [(line, "options -c", (m.group(1) or m.group(2)).lower()) for m in _OPTIONS_C.finditer(value)]
     if "server_settings" in value.lower():
         found.append((line, "server_settings", None))
@@ -306,6 +315,27 @@ TRIPWIRE_SAMPLES = [
 # Fix wave B (AG-13 LOW-1): SQL that sets or hides a GUC without ``set_config(`` at the start of a statement.
 # None of these is ever allowed, in any module (``GUC_WRITERS`` too).
 FORBIDDEN_SQL_SAMPLES = {
+    # AG-13 3.2c2c2 delta D1: other DO forms, SPI built-ins that run a query string, routine DDL siblings.
+    "G1 DO LANGUAGE plpgsql $$ ... EXECUTE q $$": (
+        "Q = \"DO LANGUAGE plpgsql $$DECLARE q text := 'SE' || 'T LOCAL kk.status' || '_writer = transition';"
+        ' BEGIN EXECUTE q; END$$"\n'
+    ),
+    "G2 DO '<body>'": "Q = \"DO 'DECLARE q text := ''SE'' || ''T LOCAL x''; BEGIN EXECUTE q; END'\"\n",
+    "G3 DO E'<body>'": "Q = \"DO E'BEGIN EXECUTE q; END'\"\n",
+    "G4 DO LANGUAGE (approval)": (
+        "Q = \"DO LANGUAGE plpgsql $$DECLARE q text := 'SE' || 'T LOCAL kk.approval' || '_status_writer = a';"
+        ' BEGIN EXECUTE q; END$$"\n'
+    ),
+    "G6 ALTER ROUTINE ... SET": "Q = \"ALTER ROUTINE tasks_status_guard() SET x.y = '1'\"\n",
+    "G7 DROP FUNCTION ... CASCADE": "Q = 'DROP FUNCTION tasks_status_guard() CASCADE'\n",
+    "G8 DROP ROUTINE ... CASCADE": "Q = 'DROP ROUTINE approvals_status_guard CASCADE'\n",
+    "X1 query_to_xml runs a query string": (
+        "Q = \"SELECT query_to_xml('SELECT set_con' || 'fig(''kk.status' || '_writer'', ''t'', true)',"
+        " true, true, '')\"\n"
+    ),
+    "X2 ts_stat runs a query string": "Q = \"SELECT * FROM ts_stat('SELECT set_con' || 'fig(1)')\"\n",
+    "X3 cursor_to_xml": "Q = 'SELECT cursor_to_xml(c, 1, true, true, \\'\\')'\n",
+    "X4 ts_rewrite": "Q = \"SELECT ts_rewrite('a'::tsquery, 'SELECT x, y FROM t')\"\n",
     "N1 DO block, EXECUTE of a split SET": (
         "Q = \"DO $$ BEGIN EXECUTE 'SET LOCAL kk.status' || '_writer = ''transition'''; END $$\"\n"
     ),
