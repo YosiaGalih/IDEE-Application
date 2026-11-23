@@ -3626,3 +3626,9 @@ AG-13 PoC (scratchpad `ag13poc-3.2c2c1`):
 - Perbaiki guard penanda approval pada pass yang sama, atau catat setiap celah sebagai batas yang diterima.
 - N60 tidak memenuhi syarat ini, karena hanya melihat impor.
 - Backstop DB (fungsi `SECURITY DEFINER`, cabut `UPDATE(status)` dari role worker) tetap backlog.
+
+**Sesudah PR #42 (fakta, 23 Nov 2026) [Pasti]:**
+- CI PR #42 (WP-3.2c2c1) di af4d5ce: 8/9 job hijau.
+  - `sandbox-isolation` sempat gagal satu kali di `test_memory_limit`: hasilnya `('failed', 137, None)`, padahal seharusnya `OOM_KILLED`. Ini kelas race late-OOM yang sama dengan PR #23. Job itu lulus setelah satu kali re-run. PR ini tidak menyentuh kode sandbox.
+  - `security-scan` merah karena CVE di image web/postgres upstream, sama seperti di `main`.
+- PO menandai PR #42 ready, lalu me-merge-nya pada 23 Nov 2026 ±07:28 UTC (cd3b138).
