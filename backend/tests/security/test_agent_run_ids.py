@@ -53,6 +53,7 @@ from tests.runtime_fakes import (
     RecordingBus,
     config,
     make_runtime,
+    owner_of,
     run_request,
     scripted,
     submit_turn,
@@ -438,7 +439,7 @@ async def test_a_retried_start_of_another_token_is_a_conflict_before_its_status(
     writer_b = AgentRunWriter(sessions, bus, AUDIT)
     await writer_b.start(b, retry=False)
     if ended:
-        await writer_b.finish(b.agent_run_id, RunEnd("succeeded", 1, output={"summary": "b"}))
+        await writer_b.finish(b.agent_run_id, RunEnd("succeeded", 1, output={"summary": "b"}), **owner_of(b))
     if row_token == "null":
         await session.execute(
             text("UPDATE agent_runs SET start_token = NULL WHERE id = :id"), {"id": b.agent_run_id}
@@ -476,7 +477,7 @@ async def test_a_retried_start_of_the_same_token_is_idempotent_until_the_run_end
     assert await task_event_types(session, task_id) == ["agent.run_started"]
     with pytest.raises(AgentRunIdConflict):
         await writer.start(run, retry=False)
-    await writer.finish(run.agent_run_id, RunEnd("cancelled", 0))
+    await writer.finish(run.agent_run_id, RunEnd("cancelled", 0), **owner_of(run))
     with pytest.raises(AgentRunAlreadyFinished):
         await writer.start(run, retry=True)
     assert await task_event_types(session, task_id) == ["agent.run_started", "agent.run_finished"]
@@ -592,3 +593,36 @@ async def test_the_minimal_end_with_a_none_token_ends_no_row(
         row = await session.get(AgentRun, run_id)
         assert row is not None and (row.status, row.error_code, row.finished_at) == ("running", None, None)
     assert bus.of_type("agent.run_finished") == []
+
+
+async def test_finish_of_another_request_with_the_same_id_closes_nothing(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Spec WP-3.2 §16.6.2 #88: two requests with one id (B started after A's first start died): A's
+    ``finish`` names A's token, so it cannot close B's row, whatever task and agent; B's own still does."""
+    project_id, task_id = await a_task_of(session)
+    bus = RecordingBus()
+    request = run_request("B14", task_id=task_id, project_id=project_id)
+    b = run_start_of(request)
+    writer_b = AgentRunWriter(sessions, bus, AUDIT)
+    await writer_b.start(b, retry=False)
+    token_a = uuid.uuid4()  # A's request: the same id, task and agent, another start token
+    writer_a = AgentRunWriter(sessions, bus, AUDIT)
+    with pytest.raises(AgentRunAlreadyFinished) as raised:
+        await writer_a.finish(
+            b.agent_run_id,
+            RunEnd("succeeded", 1, output={"summary": "a"}),
+            task_id=task_id,
+            agent_id="B14",
+            start_token=token_a,
+        )
+    assert str(token_a) not in str(raised.value) and str(b.start_token) not in str(raised.value)
+    session.expire_all()
+    row = await session.get(AgentRun, b.agent_run_id)
+    assert row is not None and (row.status, row.output) == ("running", None)
+    assert await task_event_types(session, task_id) == ["agent.run_started"]
+    await writer_b.finish(b.agent_run_id, RunEnd("succeeded", 1, output={"summary": "b"}), **owner_of(b))
+    session.expire_all()
+    row = await session.get(AgentRun, b.agent_run_id)
+    assert row is not None and (row.status, row.output) == ("succeeded", {"summary": "b"})
+    assert await task_event_types(session, task_id) == ["agent.run_started", "agent.run_finished"]

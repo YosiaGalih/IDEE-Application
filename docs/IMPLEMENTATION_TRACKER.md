@@ -3509,3 +3509,120 @@ Ran 114 tests … OK
   - invarian #11;
   - planning `provider_not_ready` → `fail`.
 - **3.2c2b2:** N25/N19 topologi antrean, yaitu sisi antrean L4 (butuh PO). Juga aturan volume `/app` dan N38/N44/N45/N46/N48.
+
+**Sesudah PR #41 (fakta, 22 Nov 2026) [Pasti]:**
+- PR #41 (WP-3.2c2b1) mencapai 8/9 job CI di 436433b. Job `security-scan` merah karena CVE di image upstream: web nginx 1.30.6/libxml2 dan postgres libxml2. Workflow `security` di base `main` ca80a39 juga merah karena temuan yang sama, dan penjelasannya sudah dikomentari di PR.
+- PO menandai PR #41 ready, lalu me-merge-nya pada 22 Nov 2026 ±11:05 UTC (8b36d82).
+
+### WP-3.2c2c1 (🔒 pagar engine sebelum pemanggil pertama) — `StepContext.pipeline`, pencabutan owner lease, cancel luar ditahan, batas transaksi menganggur, guard statis penulis status, `finish` terikat token (sub-WP keenam WP-3.2; AG-13 3.2c2b1 delta LOW-D1/LOW-D2/LOW-D3/INFO-1; AG-13 3.2c2a INFO-1; dasar N53)
+
+**Dokumen kerja:**
+- Spec induk §16.6:
+  - pemecahan 3.2c2c menjadi c1 dan c2;
+  - konflik N50–N63 dan Keputusan Lead #82–#99, dengan c1 mencakup #83–#88;
+  - rancangan rinci §16.6.3;
+  - builder check §16.6.4, termasuk ruling R-C1: cancel luar ikut mencabut owner.
+- Plan `docs/superpowers/plans/2026-11-22-wp-3.2c2c1-engine-fences.md` (6 task).
+- Discovery dan builder check ada di scratchpad (`discovery-3.2c2c.md`, `builder-check-3.2c2c1.md`).
+
+**Cara dikerjakan:**
+- Subagent-driven-development, dengan implementer dan review per task. Keenam task di-Approve. Minor dari review ditutup controller, misalnya busy spin `_settle` di 0e6bb3d.
+- Review akhir lima kursi:
+  - kk-backend-reviewer: **APPROVE**;
+  - kk-silent-failure-hunter: pass with fixes (M2, L4);
+  - AG-13: **SIGNED OFF WITH CONDITIONS 🔒** (1 LOW, 4 INFO);
+  - `/code-review` Standards: tanpa pelanggaran keras;
+  - `/code-review` Spec: tanpa kekurangan kode.
+- Fix wave dikerjakan dua fixer paralel di file terpisah (A: engine/lease/recovery; B: guard/runtime). Re-review terlingkup: **APPROVE**, semua temuan ADDRESSED. Lalu delta AG-13.
+
+**Yang dibangun:**
+- **`StepContext.pipeline`** (`draft`/`running`, #83): dasar adapter c2 memilih `fail` atau `interrupt`.
+- **Pencabutan owner** (#84, R-C1):
+  - `revoke_lease_owner` mengisi himpunan proses-lokal. `renew_lease` menolak owner yang dicabut sebelum SQL, dan `claim_lease` juga menolaknya (`HELD`, tanpa SQL).
+  - Engine mencabut owner pada tiga kejadian: overrun pembersihan (sebelum `beat.cancel()`), heartbeat menyerah, dan cancel luar pertama selama langkah hidup.
+  - Pencabutan ini menjangkau `LeaseGuard.hold`, `_locked`, heartbeat engine, dan `LeaseHeartbeat` runtime (N53).
+  - Fixture autouse mengosongkan himpunan itu antar-test.
+- **Cancel luar ditahan** (#85):
+  - `_settle` menggantikan `gather`. Langkah dibatalkan sekali, cancel berikutnya ditahan sampai langkah selesai, lalu `CancelledError` dilempar.
+  - Yang dibuang di-log: `step_error_dropped`, `lease_lost_dropped`, `step_result_dropped`.
+  - Heartbeat yang tidak kunjung tertutup di-log sekali (`heartbeat_close_waiting`).
+- **`idle_in_transaction_session_timeout` 30 dtk** (#86) sebagai GUC ketiga `bound_transaction`. Urutan 15 < 30 < 60 dijaga test. Batas BC-12 (transaksi aborted) tercatat.
+- **Guard statis** (#87, fix wave AG-13 LOW; **sebagian**, lihat delta AG-13):
+  - `transition`/`fail_task` hanya boleh dirujuk lima modul allowlist, termasuk lewat ekspor ulang, alias, getattr konstan/alias, `__getattribute__`, `getattr_static`, `match`, dan impor `*` relatif.
+  - Penanda `status_writer` dicari sebagai kata utuh di setiap string. Juga dicek `UPDATE [ONLY] [schema.]tasks [AS a] SET` dan `table("tasks")`.
+  - Batas runtime yang diterima tercatat di docstring.
+- **`RunStore.finish` terikat** `task_id`/`agent_id`/`start_token` lewat `RowOwner` (#88), sama seperti `fail`. Pesan `AgentRunUnfinished` kini hanya menyatakan "not closed by this call".
+- **Owner lease dikeluarkan** dari log dan teks `LeaseLost` (AG-13 INFO-3).
+- **Dokumen:** SECURITY_MODEL §13, API §5, ARCHITECTURE §5.3, DATA_MODEL `agent_runs`, TEST_STRATEGY §2.6, GLOSSARY, spec induk.
+
+**Bukti (lokal, PostgreSQL 16 + Redis):**
+
+```text
+$ p32-pytest.sh -q -rw            # suite backend penuh @ 80e0312 (head kode final; sesudahnya hanya dokumen)
+5964 passed in 710.87s            (tanpa warning)
+$ p32-pytest.sh -q -rw            # suite backend penuh @ da6357c (sebelum fix wave)
+5954 passed in 662.85s
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports
+All checks passed! · 372 files already formatted · 0 errors · Contracts: 10 kept, 0 broken
+```
+
+AG-13 PoC (scratchpad `ag13poc-3.2c2c1`):
+- **N53:** `LeaseHeartbeat` dan `_keep_alive` asli berhenti tanpa `UPDATE tasks` sesudah pencabutan, sedangkan kontrol tanpa pencabutan menghasilkan 60 perpanjangan dan lease tidak pernah lepas. Pada overrun dan cancel luar, lease lepas sekitar 2 dtk dan recovery mengambil task.
+- **LOW-D2, jendela `notice`/`wait`/22 cancel:** langkah dibatalkan sekali, lease tidak dilepas selama langkah hidup, dan nol tulisan sesudah overrun.
+- **LOW-D3, partisi:** dengan batas 2 dtk, recovery mengambil task pada 3,01 dtk. Kontrol `0` tetap terkunci.
+- **Prefork:** 2 child × 500 delivery tanpa kebocoran owner.
+- **Mutan M1–M6 mati.**
+- **Scanner:**
+  - pip-audit: bersih.
+  - semgrep offline: tanpa temuan baru.
+  - gitleaks/trivy tidak terpasang di container dan dijalankan CI.
+
+**Delta AG-13 atas fix wave (`da6357c..80e0312`): SIGNED OFF WITH CONDITIONS (delta)** [Pasti]:
+- INFO-1b (claim gate), INFO-2 (batas perpanjangan) dan INFO-3 (owner keluar dari log dan teks) **CLOSED**. Probe: owner yang dicabut mendapat `held` dengan `statements=[]`, owner baru `acquired`.
+- LOW-D1/D2/D3 tanpa regresi: lapse 2,00/2,01/2,04 dtk; tulisan engine dan langkah sesudah overrun = 0; recovery pada 3,02 dtk dengan batas 2 dtk; N53 tanpa pencabutan menghasilkan 59 perpanjangan, dengan pencabutan 0.
+- Guard LOW **SEBAGIAN**:
+  - ejaan PoC kini tertangkap (penulis 9/10, penanda 5/5, SQL 6/7), dan serangan gabungan PoC tertangkap;
+  - ejaan lain lolos lagi. Contohnya penanda `'kk.Status_Writer'` (PostgreSQL membaca nama GUC tanpa membedakan huruf) atau penanda yang dipecah di dalam kata; SQL dengan komentar atau spasi; MERGE/ON CONFLICT; bentuk alias `getattr` lain.
+  - Gabungan `'kk.Status_Writer'` + `UPDATE public . tasks SET status` lolos semua scanner dan diterima trigger.
+  - Celah ini dicatat di docstring guard dan di baris INFO-1 SECURITY_MODEL §13 sebagai "sebagian".
+  - Guard penanda approval (3.1d) punya celah yang sama.
+
+**Keputusan Lead selama eksekusi:**
+- **R-C1 (BC-7):** cancel luar pertama mencabut owner.
+- **BC-6:** fixture autouse.
+- **Gelombang perbaikan:**
+  - `claim_lease` dipagari, karena murah dan tanpa false positive (owner unik per delivery);
+  - guard Fix 1–4 dikerjakan sekarang, tidak dibawa ke 3.2d;
+  - teks `AgentRunUnfinished` dijujurkan, dengan atribusi lewat `read_run_outcome` di adapter c2.
+
+**Ditunda (bukan blocker):**
+- **Smell Standards:**
+  - triple owner sebagai data clump (tipe port netral, pertimbangkan di c2);
+  - validasi `pipeline` ditulis dua kali (dijaga test kesamaan);
+  - `held` berupa int yang dipakai sebagai bool.
+- **Silent-failure:** sisa di luar cakupan. Cancel luar yang jatuh di wait pertama (`held == 0`) membuang hasil langkah tanpa log sendiri (`task_engine_cancelled` tetap ada). Ditangani di jalur adapter c2.
+- **BC-21:** `_projects.pop` pada `finish` asing.
+- **Test berbasis waktu:** black hole ±13 dtk.
+
+**Syarat yang dibawa ke 3.2c2c2:**
+- **AG-13 C2:**
+  - `build_agent_runtime` memakai owner delivery yang sama, dibuktikan test;
+  - adapter meneruskan `CancelledError` (F11/N52) dan `LeaseLost` (N57 #5);
+  - regresi N53 lewat `build_agent_runtime` di dalam langkah engine untuk overrun, give-up, dan cancel luar, plus kontrol tanpa pencabutan (templat `test_poc_n53_runtime_heartbeat.py`).
+- **N60:** import-linter, yaitu paket langkah tidak mengimpor `project_tasks`/`tool_r3`/`recovery`, ditambah usul AG-13 bahwa paket langkah juga tidak mengimpor `app.workflow.states`/`app.workflow.lease` secara langsung.
+- **Keputusan #89–#99 c2** dan syarat 3.2c2a yang tersisa:
+  - test e2e ack hilang;
+  - invarian #11 dan N56 (pemeriksaan `AgentProfile`);
+  - planning `provider_not_ready` → `fail`;
+  - RD-6.
+- **3.2c2b2 (N25, butuh PO)** tetap menjadi syarat masuk 3.2d.
+
+**Syarat sebelum 3.2d (delta AG-13 3.2c2c1):**
+- Perkeras guard penulis status:
+  - penanda tanpa beda huruf;
+  - tripwire `set_config`/`SET [LOCAL] x`/`server_settings` di luar allowlist, dengan nama GUC konstan yang dikenal;
+  - RAW_SQL toleran komentar dan spasi, alias berkutip, `*`, MERGE, ON CONFLICT;
+  - bentuk alias `getattr` lain (`ImportFrom asname`, anotasi, walrus, tuple, `partial`).
+- Perbaiki guard penanda approval pada pass yang sama, atau catat setiap celah sebagai batas yang diterima.
+- N60 tidak memenuhi syarat ini, karena hanya melihat impor.
+- Backstop DB (fungsi `SECURITY DEFINER`, cabut `UPDATE(status)` dari role worker) tetap backlog.

@@ -3,9 +3,11 @@ and the per-pipeline allowlist is narrower than the state machine."""
 
 from __future__ import annotations
 
+from typing import get_args
+
 import pytest
 
-from app.workflow.engine import ALLOWED_STEP_TARGETS, PIPELINE, StepAbandoned, StepResult
+from app.workflow.engine import ALLOWED_STEP_TARGETS, PIPELINE, Pipeline, StepAbandoned, StepResult
 from app.workflow.states import ALLOWED, TaskStatus, check_error_code
 
 S = TaskStatus
@@ -76,3 +78,7 @@ def test_a_target_is_coerced_to_a_task_status() -> None:
 def test_an_invalid_target_string_is_refused() -> None:
     with pytest.raises(ValueError):
         StepResult("transition", to="not_a_status")  # type: ignore[arg-type]
+
+
+def test_the_pipeline_names_agree_everywhere() -> None:
+    assert set(get_args(Pipeline)) == set(PIPELINE) == set(ALLOWED_STEP_TARGETS)

@@ -352,7 +352,8 @@ async def read_run_outcome(
 
 class AgentRunWriter:
     """``RunStore``: the only creator of ``agent_runs`` rows (``start``'s INSERT); ``finish`` and ``fail``
-    close a row only through ``app.services.agent_run_rows.close_run_row``, which the run recovery also uses
+    close the row of their run's task, agent and start token only, and only through
+    ``app.services.agent_run_rows.close_run_row``, which the run recovery also uses
     (tests/unit/test_agent_run_writer_guard.py, tests/unit/test_close_run_row_guard.py). Everything stored
     goes through the audit's redactor, which knows the configured secret literals (3.1b C4)."""
 
@@ -443,12 +444,24 @@ class AgentRunWriter:
                 await publish_pending(session, self._bus)
         self._projects[run_id] = run.project_id
 
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
+    async def finish(
+        self,
+        agent_run_id: uuid.UUID,
+        end: RunEnd,
+        *,
+        task_id: uuid.UUID,
+        agent_id: str,
+        start_token: uuid.UUID,
+    ) -> RunUsage:
         """Totals from the run's ledger rows (known to be incomplete when ``end`` says so); the row closed by
         ``close_run_row`` with status, code, redacted error (cut) and output, iterations, tokens, cost,
         ``finished_at`` (DB clock) and ``duration_ms``, and ``agent.run_finished``; for ``budget_exceeded``
-        also ``usage.budget_exceeded`` and the audit ``budget.exceeded``. One transaction. Only a row still
-        ``running`` is finished (``AgentRunAlreadyFinished``)."""
+        also ``usage.budget_exceeded`` and the audit ``budget.exceeded``. One transaction.
+        Only a row of this id, task, agent **and start token** that is still ``running`` is finished
+        (``AgentRunAlreadyFinished``
+        for any other: a duplicate request's row of the same id, another task's or agent's, one with no
+        token; spec WP-3.2 §16.6.2 #88). The token is compared, never logged, emitted or put in an
+        exception's text."""
         redactor = self._audit.redactor
         async with self._sessions() as session:
             await bound_transaction(session)
@@ -466,6 +479,7 @@ class AgentRunWriter:
                 totals=run_totals,
                 output=end.output,
                 iterations=end.iterations,
+                owner=RowOwner(task_id, agent_id, start_token),
             )
             if closed is None:
                 self._projects.pop(agent_run_id, None)  # finished elsewhere: nothing more to audit

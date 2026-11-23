@@ -27,6 +27,17 @@ TEST_SECRET_KEY = "test-secret-key-" + "k" * 32
 TEST_SANDBOX_TOKEN = "test-sandbox-token-" + "s" * 32
 
 
+@pytest.fixture(autouse=True)
+def _forget_revoked_lease_owners() -> Iterator[None]:
+    """lease._REVOKED_OWNERS is per process; tests reuse owner ids (WORKER, "w-blackhole"), so a test
+    that overruns or gives up must not revoke the next test's owner (builder check BC-6)."""
+    from app.workflow import lease
+
+    lease._REVOKED_OWNERS.clear()  # pyright: ignore[reportPrivateUsage]
+    yield
+    lease._REVOKED_OWNERS.clear()  # pyright: ignore[reportPrivateUsage]
+
+
 def make_test_env(**overrides: str) -> dict[str, str]:
     env = {
         "APP_ENV": "test",

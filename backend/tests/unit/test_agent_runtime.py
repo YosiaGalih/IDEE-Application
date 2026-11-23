@@ -947,9 +947,9 @@ class HangingRuns(FakeRuns):
         super().__init__()
         self.release = release
 
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd, **owner: Any) -> Any:
         await self.release.wait()
-        return await super().finish(agent_run_id, end)
+        return await super().finish(agent_run_id, end, **owner)
 
 
 async def test_a_hanging_close_is_bounded() -> None:
@@ -1033,11 +1033,11 @@ class FlakyRuns(FakeRuns):
         self.failures = failures
         self.failed: list[uuid.UUID] = []
 
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd, **owner: Any) -> Any:
         if self.failures > 0:
             self.failures -= 1
             raise RuntimeError("database blip")
-        return await super().finish(agent_run_id, end)
+        return await super().finish(agent_run_id, end, **owner)
 
     async def fail(
         self,
@@ -1106,9 +1106,9 @@ async def test_a_failing_watcher_is_logged_not_discarded() -> None:
 
 
 class SlowRuns(FakeRuns):
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd, **owner: Any) -> Any:
         await asyncio.sleep(0.3)
-        return await super().finish(agent_run_id, end)
+        return await super().finish(agent_run_id, end, **owner)
 
 
 async def test_a_second_cancel_during_the_close_still_records_the_end() -> None:
@@ -1426,9 +1426,9 @@ async def test_an_attempt_stopped_during_its_restart_is_not_counted_as_sent() ->
 class AckLostRuns(FakeRuns):
     """The first finish commits, then its ack is lost; the retry finds the run already finished."""
 
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd, **owner: Any) -> Any:
         if not self.finishes:
-            await super().finish(agent_run_id, end)
+            await super().finish(agent_run_id, end, **owner)
             raise ConnectionError("the commit's ack was lost")
         raise RunAlreadyFinished(f"agent run {agent_run_id} is not running")
 
@@ -1443,8 +1443,12 @@ async def test_a_retried_finish_that_finds_the_run_finished_is_not_unfinished() 
     fakes.runs = AckLostRuns()
     request = run_request("B14")
     with capture_logs() as logs:
-        with pytest.raises(AgentRunUnfinished):
+        with pytest.raises(AgentRunUnfinished) as raised:
             await make_runtime(fakes).run(request)
+    (run_id,) = fakes.runs.ids
+    # Only what this call knows: it did not close the row. Whose write closed it is not claimed (silent M2).
+    assert str(raised.value) == f"agent run {run_id} was not closed by this call"
+    assert "recorded" not in str(raised.value)
     assert fakes.runs.failed_runs == []
     assert len(fakes.runs.finishes) == 1 and fakes.runs.finishes[0][1].status == "succeeded"
     lines = [log for log in logs if log["event"].startswith("agent_run_")]
@@ -1452,7 +1456,6 @@ async def test_a_retried_finish_that_finds_the_run_finished_is_not_unfinished() 
         ("agent_run_unfinished", 1),
         ("agent_run_already_finished", 2),
     ]
-    (run_id,) = fakes.runs.ids
     assert lines[1]["task_id"] == str(request.task_id)
     assert lines[1]["correlation_id"] == f"agent_run:{run_id}"
 
@@ -1552,8 +1555,9 @@ class DownRuns(FakeRuns):
         super().__init__()
         self.writes = 0
 
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> Any:
+    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd, **owner: Any) -> Any:
         self.writes += 1
+        self.finish_tokens.append(owner["start_token"])  # the attempt is recorded, though it never lands
         raise RuntimeError("database down")
 
 
@@ -1824,6 +1828,28 @@ async def test_the_minimal_end_carries_the_runs_start_token() -> None:
     (start,) = runs.starts
     assert runs.fail_tokens == [start.start_token]
     assert runs.fail_owners == [(request.task_id, "B14")]
+
+
+async def test_the_end_carries_the_runs_task_agent_and_start_token() -> None:
+    """Spec WP-3.2 §16.6.2 #88: ``finish`` is bound like ``fail``: the run's task, agent and start token."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    request = run_request("B14")
+    await make_runtime(fakes).run(request)
+    (start,) = fakes.runs.starts
+    assert fakes.runs.finish_tokens == [start.start_token]
+    assert fakes.runs.finish_owners == [(request.task_id, "B14")]
+
+
+async def test_a_lost_ack_ends_under_the_same_token_as_the_minimal_end() -> None:
+    """Every ``finish`` attempt and the minimal ``fail`` after them name the one token of the run's start."""
+    fakes = Fakes(scripted(submit_turn(VALID_IMPLEMENT)))
+    runs = DownRuns()
+    fakes.runs = runs
+    with pytest.raises(AgentRunUnfinished):
+        await make_runtime(fakes, runtime_config=config(close_timeout_s=0.2)).run(run_request("B14"))
+    (start,) = runs.starts
+    assert runs.finish_tokens and set(runs.finish_tokens) == {start.start_token}
+    assert runs.fail_tokens == runs.finish_tokens[:1]
 
 
 class ConflictRuns(FakeRuns):

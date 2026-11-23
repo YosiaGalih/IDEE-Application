@@ -883,8 +883,17 @@ class RunStore(Protocol):
         AG-13-reviewed writer path. The token is never logged or emitted."""
         ...
 
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
-        """Raises ``RunAlreadyFinished`` for a row that is not ``running``."""
+    async def finish(
+        self,
+        agent_run_id: uuid.UUID,
+        end: RunEnd,
+        *,
+        task_id: uuid.UUID,
+        agent_id: str,
+        start_token: uuid.UUID,
+    ) -> RunUsage:
+        """Raises ``RunAlreadyFinished`` for a row that is not ``running``, or not this run's (task, agent and
+        start token; a NULL token never is). The token is compared only, never logged, emitted or raised."""
         ...
 
     async def fail(
@@ -1564,9 +1573,10 @@ class AgentRuntime:
         """The end, written shielded and bounded by ``close_timeout_s``, with one retry (review M5): a write
         still running is waited for once more, a write that failed is tried again. Then, if the row exists,
         a minimal ``failed internal_error`` that names the run's task, agent and start token (the store ends
-        no other row: ruling R6, spec WP-3.2 §16.3a #1), and ``AgentRunUnfinished``. Every failure is logged
-        with the run's ids. ``AgentRunIdConflict`` is the exception: the id is another run's (or another
-        request's), or spent, so it is raised at once, with no retry and no ``fail``."""
+        no other row: ruling R6, spec WP-3.2 §16.3a #1), and ``AgentRunUnfinished``. ``finish`` names the same
+        three, so neither end can close a row that is not this run's (spec WP-3.2 §16.6.2 #88). Every failure
+        is logged with the run's ids. ``AgentRunIdConflict`` is the exception: the id is another run's (or
+        another request's), or spent, so it is raised at once, with no retry and no ``fail``."""
         failure: BaseException | None = None
         write = self._write(run, end)
         for attempt in (1, 2):
@@ -1580,10 +1590,11 @@ class AgentRuntime:
             except RunAlreadyFinished as error:
                 # The row is terminal: an earlier write committed and its ack was lost (review N4), or a
                 # retried start found the run ended elsewhere (recovery). Nothing is written over it; the
-                # caller still does not know the end.
+                # caller still does not know the end. The message claims only that this call did not close
+                # the row; the c2 adapter reads ``read_run_outcome`` for attribution (spec #94 item 6).
                 _log.warning("agent_run_already_finished", **_ctx(run), attempt=attempt)
                 raise AgentRunUnfinished(
-                    f"the end of agent run {_id(run.agent_run_id)} was already recorded",
+                    f"agent run {_id(run.agent_run_id)} was not closed by this call",
                     agent_run_id=run.agent_run_id,
                     task_id=run.request.task_id,
                 ) from error
@@ -1623,7 +1634,13 @@ class AgentRuntime:
         if not run.started:  # refused before the provider existed (or the ack was lost): idempotent
             await self._start(run, self._run_start(run, None, None))
             run.started = True
-        return await self._ports.runs.finish(run.agent_run_id, end)
+        return await self._ports.runs.finish(
+            run.agent_run_id,
+            end,
+            task_id=run.request.task_id,
+            agent_id=run.spec.agent_id,
+            start_token=run.start_token,
+        )
 
     async def _call_model(
         self,

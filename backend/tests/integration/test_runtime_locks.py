@@ -17,11 +17,11 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.agents.runtime import AgentRunUnfinished, RunEnd, RunScope, RunStart
+from app.agents.runtime import AgentRunUnfinished, LeaseLostError, RunEnd, RunScope, RunStart
 from app.core.audit import AuditWriter
 from app.core.config import Settings
 from app.core.redaction import Redactor
@@ -32,6 +32,7 @@ from app.models.agents import AgentRun
 from app.services import usage as usage_module
 from app.services.agent_runtime import AgentRunWriter, LeaseHeartbeat, TaskRunEvents
 from app.services.usage import UsageCallContext, UsageLedger
+from app.workflow.lease import revoke_lease_owner
 from tests.conftest import reset_data
 from tests.integration.test_task_schema import make_project, make_task
 from tests.runtime_fakes import (
@@ -158,7 +159,16 @@ async def _usage_event(sessions: async_sessionmaker[AsyncSession], scope: RunSco
 
 
 async def _finish_run(sessions: async_sessionmaker[AsyncSession], scope: RunScope) -> None:
-    await AgentRunWriter(sessions, None, AUDIT).finish(scope.agent_run_id, RunEnd("cancelled", 0))
+    async with sessions() as session:  # the token of the row ``start`` wrote (spec WP-3.2 §16.6.2 #88)
+        token = await session.scalar(select(AgentRun.start_token).where(AgentRun.id == scope.agent_run_id))
+    assert token is not None
+    await AgentRunWriter(sessions, None, AUDIT).finish(
+        scope.agent_run_id,
+        RunEnd("cancelled", 0),
+        task_id=scope.task_id,
+        agent_id=scope.agent_id,
+        start_token=token,
+    )
 
 
 PORTS: dict[str, Callable[[async_sessionmaker[AsyncSession], RunScope], Awaitable[None]]] = {
@@ -210,6 +220,7 @@ async def test_ports_bound_their_statements(
     async def spy(db: AsyncSession, task: uuid.UUID, worker_id: str) -> None:
         seen["lock"] = await db.scalar(text("SELECT current_setting('lock_timeout')"))
         seen["statement"] = await db.scalar(text("SELECT current_setting('statement_timeout')"))
+        seen["idle"] = await db.scalar(text("SELECT current_setting('idle_in_transaction_session_timeout')"))
         await original(db, task, worker_id)
 
     module.renew_lease = spy  # type: ignore[assignment]
@@ -217,7 +228,7 @@ async def test_ports_bound_their_statements(
         await LeaseHeartbeat(sessions, WORKER_ID).beat(task_id)
     finally:
         module.renew_lease = original  # type: ignore[assignment]
-    assert seen == {"lock": "5s", "statement": "10s"}
+    assert seen == {"lock": "5s", "statement": "10s", "idle": "30s"}
 
 
 def _paid_attempt(scope: RunScope) -> tuple[UsageCallContext, AttemptRecord]:
@@ -277,6 +288,7 @@ async def test_the_ledger_bounds_its_statements(
     async def spy(db: AsyncSession, call: UsageCallContext) -> None:
         seen["lock"] = await db.scalar(text("SELECT current_setting('lock_timeout')"))
         seen["statement"] = await db.scalar(text("SELECT current_setting('statement_timeout')"))
+        seen["idle"] = await db.scalar(text("SELECT current_setting('idle_in_transaction_session_timeout')"))
         await original(db, call)
 
     usage_module._check_context = spy  # type: ignore[assignment]
@@ -284,4 +296,27 @@ async def test_the_ledger_bounds_its_statements(
         await UsageLedger(sessions, pricing).record(ctx, attempt)
     finally:
         usage_module._check_context = original  # type: ignore[assignment]
-    assert seen == {"lock": "5s", "statement": "10s"}
+    assert seen == {"lock": "5s", "statement": "10s", "idle": "30s"}
+
+
+async def test_the_runtime_heartbeat_renews_through_renew_lease_so_a_revoked_owner_is_refused(
+    session: AsyncSession, sessions: async_sessionmaker[AsyncSession], engine: AsyncEngine, settings: Settings
+) -> None:
+    """Every renewal path shares one gate (spec §16.6.2 #84): the engine's revocation reaches the runtime."""
+    from sqlalchemy import event
+
+    _, task_id = await a_task(session, settings)
+    updates: list[str] = []
+
+    def count(conn, cursor, statement, *args):  # type: ignore[no-untyped-def]
+        if statement.lstrip().upper().startswith("UPDATE TASKS"):
+            updates.append(statement)
+
+    revoke_lease_owner(WORKER_ID)
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        with pytest.raises(LeaseLostError):
+            await LeaseHeartbeat(sessions, WORKER_ID).beat(task_id)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+    assert updates == []

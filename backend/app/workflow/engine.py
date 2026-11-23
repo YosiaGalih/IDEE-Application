@@ -39,6 +39,7 @@ from app.workflow.lease import (
     lease_duration,
     release_lease,
     renew_lease,
+    revoke_lease_owner,
 )
 from app.workflow.states import Actor, TaskStatus, check_error_code, fail_task, transition
 
@@ -66,6 +67,18 @@ ALLOWED_STEP_TARGETS: Mapping[str, frozenset[TaskStatus]] = {
     "running": frozenset({TaskStatus.INTERRUPTED}),
 }
 
+Pipeline = Literal["draft", "running"]  # the keys of PIPELINE; an adapter picks fail or interrupt from it
+
+
+def _pipeline_of(status: str) -> Pipeline:
+    """The pipeline a claim's status runs; never guesses (``_claim`` hands over only these two)."""
+    if status == "draft":
+        return "draft"
+    if status == "running":
+        return "running"
+    raise ValueError("pipeline must be draft or running")
+
+
 Stopped = Literal[
     "transitioned",
     "failed",
@@ -90,6 +103,11 @@ class StepContext:
     step: str
     checkpoint: Mapping[str, Any]
     lease: LeaseGuard  # for a write of the step's own (§16.5a #8); read its rules before use
+    pipeline: Pipeline  # which pipeline runs the step: draft (planning) or running (§16.6.2 #83)
+
+    def __post_init__(self) -> None:
+        if self.pipeline not in ("draft", "running"):
+            raise ValueError("pipeline must be draft or running")
 
 
 @dataclass(frozen=True)
@@ -235,7 +253,7 @@ class TaskEngine:
         try:
             outcome.stopped = await self._drive(task_id, claim.status, claim.todo, outcome.ran, deadline)
         except LeaseLost:
-            logger.warning("task_lease_lost", task_id=str(task_id), worker_id=self._ports.worker_id)
+            logger.warning("task_lease_lost", task_id=str(task_id))
             outcome.stopped = "lease_lost"
         except _StatusChanged:
             outcome.stopped = "status_changed"
@@ -255,7 +273,6 @@ class TaskEngine:
             logger.error(
                 "task_engine_failed",
                 task_id=str(task_id),
-                worker_id=self._ports.worker_id,
                 step=outcome.ran[-1] if outcome.ran else None,
                 error_type=type(exc).__name__,
             )
@@ -387,10 +404,19 @@ class TaskEngine:
                 db, None, task_id, "task.step_started", {"step": step}, redactor=ports.audit.redactor
             )
             context = StepContext(
-                task_id, task.project_id, step, task.checkpoint, LeaseGuard(task_id, ports.worker_id)
+                task_id=task_id,
+                project_id=task.project_id,
+                step=step,
+                checkpoint=task.checkpoint,
+                lease=LeaseGuard(task_id, ports.worker_id),
+                pipeline=_pipeline_of(status),
             )
             await commit_and_publish(db, ports.bus)
         return context
+
+    def _revoke(self) -> None:
+        """Refuse every later renewal of this delivery's owner in this process (spec §16.6.2 #84)."""
+        revoke_lease_owner(self._ports.worker_id)
 
     async def _run_step(
         self, task_id: uuid.UUID, step: Step, context: StepContext, renewed_at: float, deadline: float
@@ -419,22 +445,23 @@ class TaskEngine:
                     # AG-13 C1: the step hangs in its cleanup. Only the heartbeat is cancelled (never the step
                     # again): the lease lapses and recovery takes the task, so the slot is not pinned.
                     overrun = True
+                    self._revoke()  # first: the step's holds stop at once
                     logger.error("step_cleanup_overrun", task_id=str(task_id), step=context.step)
                     beat.cancel()
             beat_won = beat.done()
+        except asyncio.CancelledError:
+            if not work.done():
+                # R-C1: the step may swallow the cancel and is awaited below; its holds and the runtime
+                # heartbeat of this owner must not keep renewing the lease meanwhile.
+                self._revoke()
+            raise
         finally:
             if not work_cancelled:
-                work.cancel()
+                work.cancel()  # the engine's only cancel of the step on this exit
             beat.cancel()
-            if not work.done():
-                # The wait for the step stays unbounded by design (it must end before this returns); one that
-                # outlasts CLEANUP_NOTICE_S leaves a line, so a hung cleanup is never silent.
-                await asyncio.wait((work,), timeout=CLEANUP_NOTICE_S)
-                if not work.done():
-                    logger.warning("step_cleanup_waiting", task_id=str(task_id), step=context.step)
-            await asyncio.gather(work, beat, return_exceptions=True)
+            held = await self._settle(task_id, context.step, work, beat)
             if (
-                (beat_won or work_cancelled)
+                (held or beat_won or work_cancelled)
                 and work.done()
                 and not work.cancelled()
                 and (error := work.exception())
@@ -446,6 +473,12 @@ class TaskEngine:
                     step=context.step,
                     error_type=type(error).__name__,
                 )
+            if held:
+                self._log_held_drops(task_id, context.step, work, beat)
+        if held:  # an outer cancel was held until the step ended; it wins over every outcome below
+            # A bare re-raise on purpose: the cancel's message is not kept, and ``cancelling()`` stays
+            # above 0, so an enclosing ``asyncio.timeout`` still converts it.
+            raise asyncio.CancelledError
         if overrun:  # before beat.result(): the cancelled heartbeat would raise CancelledError there
             raise LeaseLost("the step overran its cleanup grace; the lease was let go")
         if beat_won:
@@ -465,6 +498,66 @@ class TaskEngine:
                 )
             raise _DeliveryLimit
         return work.result()
+
+    @staticmethod
+    def _log_held_drops(
+        task_id: uuid.UUID, step: str, work: asyncio.Future[StepResult], beat: asyncio.Task[NoReturn]
+    ) -> None:
+        """An outer cancel was held and wins: log what it dropped besides a step error (ids, kinds only)."""
+        if not beat.cancelled() and isinstance(beat.exception(), LeaseLost):
+            logger.warning("lease_lost_dropped", task_id=str(task_id), step=step)
+        if not work.cancelled() and work.exception() is None:
+            logger.warning(
+                "step_result_dropped",
+                task_id=str(task_id),
+                step=step,
+                kind=(
+                    returned.kind
+                    if isinstance(returned := work.result(), StepResult)
+                    else f"foreign:{type(returned).__name__}"
+                ),
+            )
+
+    async def _settle(
+        self, task_id: uuid.UUID, step: str, work: asyncio.Future[StepResult], beat: asyncio.Task[NoReturn]
+    ) -> int:
+        """Wait until the step and the heartbeat have ended and return how many outer cancels were held.
+
+        The wait for the step is unbounded by design (it must end before ``_run_step`` returns). Each outer
+        ``CancelledError`` is counted and held, never passed on to the step: ``asyncio.wait`` does not cancel
+        what it waits for (``gather`` did, a second cancel of the step: LOW-D2). The first one revokes the
+        owner (R-C1), so no hold of the step renews the lease while it is awaited. A cleanup that outlasts
+        ``CLEANUP_NOTICE_S`` leaves one line (so does a heartbeat that will not close): no hang is silent.
+        """
+        loop = asyncio.get_running_loop()
+        notice_at = loop.time() + CLEANUP_NOTICE_S
+        step_noticed = beat_noticed = False  # one line each: a step, then a heartbeat, that will not end
+        held = 0
+        while not (work.done() and beat.done()):
+            noticing = not (beat_noticed if work.done() else step_noticed)
+            try:
+                await asyncio.wait(
+                    (work, beat),
+                    # Timed only until the notice due is logged; after it the wait is untimed (no spin).
+                    timeout=max(notice_at - loop.time(), 0) if noticing else None,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                held += 1
+                if not work.done():
+                    self._revoke()
+            if loop.time() < notice_at:
+                continue
+            if not work.done() and not step_noticed:
+                step_noticed = True
+                logger.warning("step_cleanup_waiting", task_id=str(task_id), step=step)
+            elif work.done() and not beat.done() and not beat_noticed:
+                beat_noticed = True
+                logger.warning("heartbeat_close_waiting", task_id=str(task_id), step=step)
+        for finished in (work, beat):
+            if not finished.cancelled():
+                finished.exception()  # retrieved here: nobody else reads a dropped error
+        return held
 
     async def _heartbeat(self, task_id: uuid.UUID, last_ok: float) -> NoReturn:
         """Renew the lease every ``heartbeat_s``; give up ``lease_safety_s`` early (R-T3h, §16.5a #5).
@@ -505,6 +598,7 @@ class TaskEngine:
 
     def _give_up(self, task_id: uuid.UUID, cause: Exception | None) -> NoReturn:
         """``cause`` is None only when no renewal failed before H passed (the step began past its margin)."""
+        self._revoke()  # first: a step's hold must not renew what we give up
         why = {"error_type": type(cause).__name__} if cause else {"reason": "lease_margin_spent"}
         logger.warning("lease_heartbeat_gave_up", task_id=str(task_id), **why)
         raise LeaseLost(f"the lease of task {task_id} could not be renewed in time") from cause

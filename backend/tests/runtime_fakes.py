@@ -158,6 +158,11 @@ async def begin(store: RunStore, run: RunStart) -> uuid.UUID:
     return run.agent_run_id
 
 
+def owner_of(run: RunStart) -> dict[str, Any]:
+    """The keyword arguments with which ``RunStore.finish`` names ``run``'s row (spec WP-3.2 §16.6.2 #88)."""
+    return {"task_id": run.task_id, "agent_id": run.agent_id, "start_token": run.start_token}
+
+
 class FakeRuns:
     def __init__(self) -> None:
         self.starts: list[RunStart] = []
@@ -166,6 +171,8 @@ class FakeRuns:
         self.failed_runs: list[tuple[uuid.UUID, BudgetBreach | None]] = []
         self.fail_owners: list[tuple[uuid.UUID, str]] = []  # the (task_id, agent_id) each fail names
         self.fail_tokens: list[uuid.UUID] = []  # the start token each fail carries
+        self.finish_owners: list[tuple[uuid.UUID, str]] = []  # the (task_id, agent_id) each finish names
+        self.finish_tokens: list[uuid.UUID] = []  # the start token each finish carries
         self.retries: list[bool] = []  # the ``retry`` flag of each start
 
     async def start(self, run: RunStart, *, retry: bool) -> None:
@@ -173,8 +180,18 @@ class FakeRuns:
         self.ids.append(run.agent_run_id)
         self.retries.append(retry)
 
-    async def finish(self, agent_run_id: uuid.UUID, end: RunEnd) -> RunUsage:
+    async def finish(
+        self,
+        agent_run_id: uuid.UUID,
+        end: RunEnd,
+        *,
+        task_id: uuid.UUID,
+        agent_id: str,
+        start_token: uuid.UUID,
+    ) -> RunUsage:
         self.finishes.append((agent_run_id, end))
+        self.finish_owners.append((task_id, agent_id))
+        self.finish_tokens.append(start_token)
         return ZERO_USAGE
 
     async def fail(
