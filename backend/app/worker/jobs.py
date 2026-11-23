@@ -173,8 +173,10 @@ async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
         try:
             await _drain(task_id, before)
         finally:
-            await redis.aclose()
-            await engine.dispose()
+            try:
+                await redis.aclose()
+            finally:
+                await engine.dispose()  # also when the Redis close raises
 
 
 async def _drain(task_id: uuid.UUID, before: set[asyncio.Task[object]]) -> None:

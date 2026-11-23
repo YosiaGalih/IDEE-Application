@@ -146,6 +146,27 @@ async def test_resources_are_closed_when_the_engine_raises(
     assert (spy.disposed, spy.closed) == (1, 1)
 
 
+async def test_the_engine_is_disposed_when_the_redis_close_raises(
+    draft_task: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spy = Spy(monkeypatch)
+
+    async def broken_close(redis: Redis, *args: Any, **kwargs: Any) -> None:
+        spy.closed += 1
+        raise ConnectionError("redis gone")
+
+    monkeypatch.setattr(Redis, "aclose", broken_close)
+
+    class Noop:
+        async def run(self, task_id: uuid.UUID) -> EngineOutcome:
+            return EngineOutcome(ClaimResult.ACQUIRED, [], "done")
+
+    monkeypatch.setattr(jobs, "build_orchestrator", lambda **_: Noop())
+    with pytest.raises(ConnectionError):
+        await jobs.execute_task(draft_task)
+    assert (spy.disposed, spy.closed) == (1, 1)
+
+
 def test_run_task_runs_the_engine_and_summarises(engine: AsyncEngine, draft_task: uuid.UUID) -> None:
     result = jobs.run_task.apply(args=[str(draft_task)]).get()
     assert result == {
