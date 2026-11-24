@@ -2875,6 +2875,109 @@ async def test_an_abandon_without_the_flag_only_releases(engine: AsyncEngine, ma
     assert await kinds(engine, task_id) == [started("intake")]
 
 
+# R-F4: the StepAbandoned handler releases through the locked helper of R-F3; its other three branches.
+
+
+async def test_an_abandon_after_the_lease_was_lost_writes_nothing(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """R-F4: ``LeaseLost`` in the helper writes nothing (not even the flag's ``cancelled``) and is logged as
+    everywhere else; the lease's new owner keeps the task."""
+    task_id = await make_task("queued")
+
+    async def loses_lease_then_abandons(_: StepContext) -> StepResult:
+        await set_cancel_flag(engine, task_id)
+        await take_over_lease(engine, task_id)
+        raise StepAbandoned("run_cancelled")
+
+    steps = Steps(implement=loses_lease_then_abandons)
+    with capture_logs() as logs:
+        outcome = await make_engine(engine, RecordingBus(), steps.registry("implement"), heartbeat_s=30).run(
+            task_id
+        )
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "lease_lost")
+    after = await row(engine, task_id)
+    assert (after.status, after.lease_owner) == ("running", "w-other")
+    assert await kinds(engine, task_id) == [changed("queued", "running", None), started("implement")]
+    lost = [e for e in logs if e["event"] == "task_lease_lost"]
+    assert [(e["log_level"], e["task_id"]) for e in lost] == [("warning", str(task_id))]
+    assert [e for e in logs if e["event"] == "lease_release_failed"] == []
+    assert other_tasks() == []
+
+
+async def test_an_abandon_after_a_status_change_outside_only_releases(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    """R-F4: ``_StatusChanged`` in the helper releases the lease and writes no status of its own."""
+    task_id = await make_task("queued")
+
+    async def cancelled_outside_then_abandons(_: StepContext) -> StepResult:
+        await cancel_as_user(engine, task_id)
+        raise StepAbandoned("run_cancelled")
+
+    steps = Steps(implement=cancelled_outside_then_abandons)
+    with capture_logs() as logs:
+        outcome = await make_engine(engine, RecordingBus(), steps.registry("implement"), heartbeat_s=30).run(
+            task_id
+        )
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "status_changed")
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.lease_owner, after.lease_expires_at) == (
+        "cancelled",
+        "user",
+        None,
+        None,
+    )
+    assert await kinds(engine, task_id) == [
+        changed("queued", "running", None),
+        started("implement"),
+        changed("running", "cancelled", "user"),  # the other writer's; the engine adds none
+    ]
+    outside = [e for e in logs if e["event"] == "task_status_changed_outside"]
+    assert [(e["task_id"], e["expected"], e["found"]) for e in outside] == [
+        (str(task_id), "running", "cancelled")
+    ]
+    assert other_tasks() == []
+
+
+@pytest.mark.parametrize("flagged", [False, True])
+async def test_an_abandon_whose_release_fails_is_logged_and_left_to_recovery(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+    flagged: bool,
+) -> None:
+    """``_release_after_abandon``: a failed release is logged by type only; the delivery ends ``abandoned``.
+    Nothing commits, the flag's ``cancelled`` neither: the lease lapses and recovery reads the flag."""
+    task_id = await make_task("queued")
+    secret = "sk-test-" + "abandon-0123"
+
+    async def broken_release(*_: Any, **__: Any) -> None:
+        raise OSError("cannot release " + secret)
+
+    async def abandons_with_a_broken_release(_: StepContext) -> StepResult:
+        if flagged:
+            await set_cancel_flag(engine, task_id)
+        monkeypatch.setattr(engine_module, "release_lease", broken_release)
+        raise StepAbandoned("run_cancelled")
+
+    steps = Steps(implement=abandons_with_a_broken_release)
+    with capture_logs() as logs:
+        outcome = await make_engine(engine, RecordingBus(), steps.registry("implement"), heartbeat_s=30).run(
+            task_id
+        )
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "abandoned")
+    after = await row(engine, task_id)
+    assert (after.status, after.lease_owner) == ("running", WORKER)
+    assert await kinds(engine, task_id) == [changed("queued", "running", None), started("implement")]
+    failed = [e for e in logs if e["event"] == "lease_release_failed"]
+    assert [(e["log_level"], e["task_id"], e["error_type"]) for e in failed] == [
+        ("error", str(task_id), "OSError")
+    ]
+    assert "exc_info" not in failed[0]
+    assert secret not in repr(logs)
+    assert other_tasks() == []
+
+
 @pytest.mark.parametrize("where", ["between_steps", "during_step"])
 async def test_the_flag_wins_over_the_delivery_limit(
     engine: AsyncEngine,

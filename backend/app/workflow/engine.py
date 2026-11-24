@@ -43,13 +43,13 @@ from app.workflow.lease import (
     renew_lease_flags,
     revoke_lease_owner,
 )
-from app.workflow.states import Actor, TaskStatus, check_error_code, fail_task, transition
+from app.workflow.states import CANCEL_REASON, Actor, TaskStatus, check_error_code, fail_task, transition
 
 # LeaseLost and TaskStatus are also what a step takes from this module (spec §16.6.6 R-D3): the step packages
 # never import app.workflow.lease or app.workflow.states (import-linter contract); a test pins the identity.
+# CANCEL_REASON, the reason of every cancelled write (the API's and recovery's too, #105), comes from states.
 ACTOR = Actor("system", "engine")
 MAX_PLANNING_ATTEMPTS = 3
-CANCEL_REASON = "cancel_requested"  # the reason of every cancelled write (the API's is the same, #105)
 # Spec §16.4 #76: a wall-clock bound on every engine transaction, over the server-side lock and statement
 # timeouts (a black-holed connection never answers either). Read at call time.
 ENGINE_WRITE_TIMEOUT_S = 15
@@ -309,10 +309,7 @@ class TaskEngine:
             stopped: Stopped | None = None
             if task.cancel_requested:
                 # Read before the planning attempt is counted and before queued -> running (R-F6).
-                await transition(
-                    db, task, TaskStatus.CANCELLED, reason=CANCEL_REASON, actor=ACTOR, audit=ports.audit
-                )
-                await release_lease(db, task_id, ports.worker_id)
+                await self._write_cancelled(db, task)
                 status, stopped = None, "cancelled"
             elif task.status == TaskStatus.QUEUED:
                 await transition(db, task, TaskStatus.RUNNING, reason=None, actor=ACTOR, audit=ports.audit)
@@ -441,13 +438,18 @@ class TaskEngine:
                 step, kind = finishing
                 logger.warning("step_result_dropped", task_id=str(task_id), step=step, kind=kind)
                 await self._step_finished(db, task_id, step, "cancelled")
-            await transition(
-                db, task, TaskStatus.CANCELLED, reason=CANCEL_REASON, actor=ACTOR, audit=self._ports.audit
-            )
-            await release_lease(db, task_id, self._ports.worker_id)
+            await self._write_cancelled(db, task)
             await commit_and_publish(db, self._ports.bus)
             raise _Cancelled
         return task
+
+    async def _write_cancelled(self, db: AsyncSession, task: Task) -> None:
+        """The engine's one write of a set cancel flag (spec §16.7.2 #105): ``cancelled`` with
+        ``CANCEL_REASON`` and the lease released, in the caller's transaction (the caller commits)."""
+        await transition(
+            db, task, TaskStatus.CANCELLED, reason=CANCEL_REASON, actor=ACTOR, audit=self._ports.audit
+        )
+        await release_lease(db, task.id, self._ports.worker_id)
 
     async def _start(self, task_id: uuid.UUID, status: str, step: str) -> StepContext | None:
         ports = self._ports

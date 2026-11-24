@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal, NoReturn
+from typing import Any, Final, Literal, NoReturn
 
 from sqlalchemy import func, inspect, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,6 +62,9 @@ ALLOWED: dict[TaskStatus, frozenset[TaskStatus]] = {
 TERMINAL = frozenset(status for status, targets in ALLOWED.items() if not targets)
 # Statuses that end a run; completed_at is stamped on entry. Also what a person calls "not open".
 FINISHED = frozenset({S.COMPLETED, S.FAILED, S.CANCELLED, S.REJECTED})
+# The ``status_reason`` of every ``cancelled`` written for a cancel request: by the API (``request_cancel``),
+# the engine and recovery (spec #105). One definition, because all three read the same flag.
+CANCEL_REASON: Final = "cancel_requested"
 # Remediation and reopen start a new iteration (DATA_MODEL tasks.iteration).
 _NEW_ITERATION_FROM = frozenset({S.COMPLETED, S.NEEDS_CHANGES})
 
