@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
 from app.core.audit import AuditWriter
+from app.core.cancel import CancelToken
 from app.core.db import bound_transaction, make_sessionmaker
 from app.core.errors import AppError
 from app.core.events import emit_task_event
@@ -1572,7 +1573,7 @@ async def test_heartbeat_past_its_margin_gives_up_with_a_reason(
     task_engine = make_engine(engine, RecordingBus(), {})
     long_ago = asyncio.get_running_loop().time() - 3600
     with capture_logs() as logs, pytest.raises(LeaseLost):
-        await task_engine._heartbeat(task_id, long_ago)  # pyright: ignore[reportPrivateUsage]
+        await task_engine._heartbeat(task_id, long_ago, CancelToken(), "intake")  # pyright: ignore[reportPrivateUsage]
     gave_up = [e for e in logs if e["event"] == "lease_heartbeat_gave_up"]
     assert [(e["task_id"], e.get("reason"), "error_type" in e) for e in gave_up] == [
         (str(task_id), "lease_margin_spent", False)
@@ -2292,7 +2293,7 @@ async def test_the_heartbeat_giving_up_revokes_the_owner(engine: AsyncEngine, ma
     task_engine = make_engine(engine, RecordingBus(), {})
     long_ago = asyncio.get_running_loop().time() - 3600
     with pytest.raises(LeaseLost):
-        await task_engine._heartbeat(task_id, long_ago)  # pyright: ignore[reportPrivateUsage]
+        await task_engine._heartbeat(task_id, long_ago, CancelToken(), "intake")  # pyright: ignore[reportPrivateUsage]
     async with make_sessionmaker(engine)() as db:
         with pytest.raises(LeaseLost):  # the row says live (60 s), yet the owner is revoked
             await LeaseGuard(task_id, WORKER).hold(db)
@@ -2395,7 +2396,7 @@ def slow_heartbeat(
     cancelled) and takes ``close_s`` to end once cancelled. Returns an event set when the cancel arrives."""
     cancelled = asyncio.Event()
 
-    async def beat(self: TaskEngine, task_id: uuid.UUID, last_ok: float) -> Any:
+    async def beat(self: TaskEngine, task_id: uuid.UUID, last_ok: float, cancel: Any, step: str) -> Any:
         try:
             if ends_with is not None:
                 await asyncio.sleep(after)
@@ -2639,7 +2640,7 @@ async def test_an_outer_cancel_in_the_first_wait_logs_what_it_drops(
         await asyncio.sleep(30)
         return StepResult.done()
 
-    async def beat(self: object, task_id: uuid.UUID, last_ok: float) -> None:
+    async def beat(self: object, task_id: uuid.UUID, last_ok: float, cancel: Any, step: str) -> None:
         ready.set()
         raise LeaseLost("gone")
 
@@ -2673,3 +2674,46 @@ async def test_an_outer_cancel_in_the_first_wait_logs_what_it_drops(
     assert events.count("task_engine_cancelled") == 1
     assert WORKER not in repr(logs)
     assert other_tasks() == []
+
+
+async def set_cancel_flag(engine: AsyncEngine, task_id: uuid.UUID) -> None:
+    async with make_sessionmaker(engine)() as session:
+        await session.execute(
+            text("UPDATE tasks SET cancel_requested = true WHERE id = :id"), {"id": task_id}
+        )
+        await session.commit()
+
+
+async def test_heartbeat_fires_the_step_token_on_a_cancel_flag(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("draft")
+    seen: dict[str, float] = {}
+
+    async def waits_for_the_token(ctx: StepContext) -> StepResult:
+        assert not ctx.cancel.cancelled
+        await set_cancel_flag(engine, task_id)
+        started_at = time.monotonic()
+        await asyncio.wait_for(ctx.cancel.wait(), timeout=1.0)
+        seen["after"] = time.monotonic() - started_at
+        return StepResult.done()
+
+    steps = Steps(intake=waits_for_the_token)
+    with capture_logs() as logs:
+        await make_engine(engine, RecordingBus(), steps.registry(*PLANNING), heartbeat_s=0.05).run(task_id)
+
+    assert seen["after"] <= 1.0
+    assert steps.calls[0].cancel.cancelled
+    signalled = [log for log in logs if log["event"] == "task_cancel_signalled"]
+    assert len(signalled) == 1
+    assert signalled[0]["task_id"] == str(task_id) and signalled[0]["step"] == "intake"
+    assert set(signalled[0]) <= {"event", "log_level", "task_id", "step"}
+
+
+async def test_a_new_token_per_step(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("draft")
+    steps = Steps()
+    await make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id)
+
+    tokens = [call.cancel for call in steps.calls]
+    assert len(tokens) >= 2
+    assert len({id(token) for token in tokens}) == len(tokens)
+    assert not any(token.cancelled for token in tokens)

@@ -24,6 +24,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
+from app.core.cancel import CancelToken
 from app.core.db import bound_transaction
 from app.core.events import EventBus, commit_and_publish, emit_task_event
 from app.core.logging import get_logger
@@ -39,6 +40,7 @@ from app.workflow.lease import (
     lease_duration,
     release_lease,
     renew_lease,
+    renew_lease_flags,
     revoke_lease_owner,
 )
 from app.workflow.states import Actor, TaskStatus, check_error_code, fail_task, transition
@@ -106,6 +108,8 @@ class StepContext:
     checkpoint: Mapping[str, Any]
     lease: LeaseGuard  # for a write of the step's own (§16.5a #8); read its rules before use
     pipeline: Pipeline  # which pipeline runs the step: draft (planning) or running (§16.6.2 #83)
+    # Engine-owned, new for each step attempt; the heartbeat fires it when the cancel flag is set (#102).
+    cancel: CancelToken = field(default_factory=CancelToken)
 
     def __post_init__(self) -> None:
         if self.pipeline not in ("draft", "running"):
@@ -412,6 +416,7 @@ class TaskEngine:
                 checkpoint=task.checkpoint,
                 lease=LeaseGuard(task_id, ports.worker_id),
                 pipeline=_pipeline_of(status),
+                cancel=CancelToken(),
             )
             await commit_and_publish(db, ports.bus)
         return context
@@ -428,7 +433,7 @@ class TaskEngine:
         cleans up; ``LeaseLost`` wins over the limit (spec §16.5a #3)."""
         loop = asyncio.get_running_loop()
         work = asyncio.ensure_future(step(context))
-        beat = asyncio.create_task(self._heartbeat(task_id, renewed_at))
+        beat = asyncio.create_task(self._heartbeat(task_id, renewed_at, context.cancel, context.step))
         beat_won = True  # also on an outer cancel: the step's own outcome is then dropped too
         work_cancelled = False
         overrun = False
@@ -564,7 +569,9 @@ class TaskEngine:
                 finished.exception()  # retrieved here: nobody else reads a dropped error
         return held
 
-    async def _heartbeat(self, task_id: uuid.UUID, last_ok: float) -> NoReturn:
+    async def _heartbeat(
+        self, task_id: uuid.UUID, last_ok: float, cancel: CancelToken, step: str
+    ) -> NoReturn:
         """Renew the lease every ``heartbeat_s``; give up ``lease_safety_s`` early (R-T3h, §16.5a #5).
 
         ``H = last_ok + lease - lease_safety_s``, on the loop clock (``timeout_at`` reads it). Each try is
@@ -588,7 +595,7 @@ class TaskEngine:
             try:
                 async with bounded:
                     async with self._transaction() as db:
-                        await renew_lease(db, task_id, self._ports.worker_id)
+                        flags = await renew_lease_flags(db, task_id, self._ports.worker_id)
                         await commit_and_publish(db, self._ports.bus)
             except LeaseLost:
                 raise
@@ -600,6 +607,9 @@ class TaskEngine:
             else:
                 last_ok = attempt
                 last_error = None
+                if flags.cancel_requested and not cancel.cancelled:
+                    cancel.cancel()
+                    logger.info("task_cancel_signalled", task_id=str(task_id), step=step)
 
     def _give_up(self, task_id: uuid.UUID, cause: Exception | None) -> NoReturn:
         """``cause`` is None only when no renewal failed before H passed (the step began past its margin)."""
