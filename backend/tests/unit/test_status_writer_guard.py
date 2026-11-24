@@ -65,7 +65,8 @@ Limits that a static scan cannot decide: ``getattr`` with a computed string, ``i
 ``operator.attrgetter``, ``vars()`` / ``__dict__`` (and ``globals()`` / ``sys.modules`` lookups),
 a string built at run time (``%`` or ``.format`` of SQL, a name read from data); and the indirect writers,
 which reach ``transition`` through an allowlisted module: ``project_tasks.cancel_open_tasks``, the
-``tool_r3`` functions, ``recovery.recover_expired`` and ``TaskEngine._fail``.
+``tool_r3`` functions, ``recovery.recover_expired``, ``TaskEngine._fail`` and ``request_cancel``
+(``app/workflow/control.py``).
 """
 
 from __future__ import annotations
