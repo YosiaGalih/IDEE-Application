@@ -240,4 +240,5 @@ async def test_a_cancel_needs_the_csrf_token(
     await place(engine, task_id, "queued")
     response = await owner.post(CANCEL.format(task_id))
     assert response.status_code == 403
+    assert response.json()["error"]["code"] == "CSRF_FAILED"
     assert await actions(engine, task_id) == []
