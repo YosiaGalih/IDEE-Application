@@ -2617,3 +2617,59 @@ async def test_a_lost_lease_is_logged_with_the_task_and_never_the_owner(
     [lost] = [e for e in logs if e["event"] == "task_lease_lost"]
     assert lost["task_id"] == str(task_id)
     assert WORKER not in repr(logs)
+
+
+@pytest.mark.parametrize("dropped", ["result", "lease_lost"])
+async def test_an_outer_cancel_in_the_first_wait_logs_what_it_drops(
+    dropped: str,
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R-D2 (BC-7): the outer cancel lands in the first wait while a result (or a heartbeat LeaseLost) is
+    already there, so nothing is held in ``_settle``. What it drops is still logged, once (ids, kinds)."""
+    task_id = await make_task("queued")
+    ready = asyncio.Event()
+
+    async def finishes(_: StepContext) -> StepResult:
+        ready.set()  # wakes the canceller before the wait's completion callback runs
+        return StepResult.done()
+
+    async def sleeps(_: StepContext) -> StepResult:
+        await asyncio.sleep(30)
+        return StepResult.done()
+
+    async def beat(self: object, task_id: uuid.UUID, last_ok: float) -> None:
+        ready.set()
+        raise LeaseLost("gone")
+
+    if dropped == "lease_lost":
+        monkeypatch.setattr(TaskEngine, "_heartbeat", beat)
+    step = finishes if dropped == "result" else sleeps
+
+    with capture_logs() as logs:
+        run = asyncio.create_task(
+            make_engine(engine, RecordingBus(), Steps(implement=step).registry("implement")).run(task_id)
+        )
+
+        async def canceller() -> None:
+            await ready.wait()
+            run.cancel()
+
+        c = asyncio.create_task(canceller())
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=5)
+        await c
+
+    events = [e["event"] for e in logs]
+    if dropped == "result":
+        [drop] = [e for e in logs if e["event"] == "step_result_dropped"]
+        assert (drop["task_id"], drop["step"], drop["kind"]) == (str(task_id), "implement", "done")
+        assert "lease_lost_dropped" not in events
+    else:
+        [drop] = [e for e in logs if e["event"] == "lease_lost_dropped"]
+        assert (drop["task_id"], drop["step"]) == (str(task_id), "implement")
+        assert "step_result_dropped" not in events
+    assert events.count("task_engine_cancelled") == 1
+    assert WORKER not in repr(logs)
+    assert other_tasks() == []

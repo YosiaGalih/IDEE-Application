@@ -283,6 +283,9 @@ class SlowProvider:
         self.delay = delay
         self.name = inner.name
 
+    async def aclose(self) -> None:
+        return None
+
     async def create_message(
         self,
         req: LLMRequest,

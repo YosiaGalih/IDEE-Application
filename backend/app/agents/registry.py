@@ -177,6 +177,17 @@ class AgentSpec(BaseModel):
         """``mvp_mode`` for active agents, ``target_mode`` for planned ones."""
         return self.target_mode if self.mvp_mode == "planned" else self.mvp_mode
 
+    @property
+    def runtime_id(self) -> str | None:
+        """The agent whose contracts and prompt a run of this entry uses: itself for ``llm``, its
+        ``runtime_agent`` for ``profile``, ``None`` for any other mode. A property, not a field: the canonical
+        hash does not change."""
+        if self.mvp_mode == "llm":
+            return self.agent_id
+        if self.mvp_mode == "profile" and self.runtime_agent is not None:
+            return self.runtime_agent
+        return None
+
 
 class AgentRegistry(BaseModel):
     model_config = ConfigDict(frozen=True)

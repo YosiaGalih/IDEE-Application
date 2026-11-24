@@ -16,13 +16,50 @@ import StepResult``. The plain string ``"transition"`` (``kind``) is not flagged
 ``UPDATE [ONLY] [schema.]tasks [[AS] alias] SET ... status`` (case-insensitive, plain or quoted names) and
 ``table("tasks", ...)``.
 
-Known gaps, open until the hardening owed before 3.2d (AG-13 3.2c2c1 delta LOW; spec §16.6): the marker in
-another letter case (PostgreSQL reads GUC names case-insensitively: ``'kk.Status_Writer'``) or split inside
-the word (``'kk.status' || '_writer'``, ``concat``, a ``%``/``.format``/``join`` of pieces); SQL with comments
-or spacing inside ``UPDATE``/``tasks``/``.``, a quoted alias, ``tasks *``, ``MERGE ... UPDATE SET`` and ``ON
-CONFLICT DO UPDATE SET``; a ``getattr`` alias bound by ``from builtins import getattr as g``, an annotated or
-walrus assignment, a tuple target or ``functools.partial``; ``operator.methodcaller`` and
-``inspect.getmembers``. The import-linter contract N60 sees imports only, never strings or SQL.
+Closed by the hardening owed before 3.2d (AG-13 3.2c2c1 delta; spec §16.6): the marker is matched without
+regard to case (PostgreSQL reads a GUC name that way: ``'kk.Status_Writer'``, ``SET LOCAL kk.Status_Writer``),
+and a marker split into pieces by ``||``, ``concat`` or ``U&`` is caught by ``test_guc_tripwire.py``, which
+flags every way to set a GUC outside ``GUC_WRITERS``, whatever the name; raw SQL is read after comments,
+whitespace, quotes and spaces around the dot are removed (``UPDATE/**/public . tasks AS "t" SET``) and also
+covers ``tasks *``,
+``MERGE ... UPDATE SET`` and ``INSERT ... ON CONFLICT DO UPDATE SET`` on ``status`` (or on a ``{}`` column);
+a ``getattr`` alias bound by ``from builtins import getattr as g``, an annotated or walrus assignment, a tuple
+pair or ``functools.partial``, ``<ref>.__call__``, a name held in a constant, and ``eval``/``exec`` of a
+constant that names a writer. ``redis.eval`` is not a finding.
+
+Closed by fix wave B (AG-13 3.2c2c2 LOW-1; silent-failure M3): the Task model counts however it is reached,
+by an ``ImportFrom`` of the name ``Task`` from any module (the engine re-exports it; under any alias, and
+``Task(status=...)`` under the alias) and by an attribute ``<x>.Task`` (``e.Task.__table__.update()``);
+only ``asyncio.Task`` is not the model. A ``Table(...)`` or ``table(...)`` call in any case (a name or an
+attribute) and a ``<x>.tables['tasks']`` lookup are the tasks table with no model. ``test_guc_tripwire.py``
+flags ``UESCAPE`` (a column or a function name written ``U&"st!0061tus" UESCAPE '!'``). A ``+`` with a
+piece the scan cannot read reads as ``{}`` (``'UPDATE tasks SET ' + col + ' = 1'``), and a ``{}`` where the
+table is (``'UPDATE ' + t + ' SET status = 1'``) may be tasks: both are findings. ``status_attribute_writes``
+reads every module of ``app/`` as if it reached the Task model (a Task object a helper returned, so
+``t.status = ...`` has no ``Task`` in sight, S2): only the modules of ``STATUS_ATTRIBUTE_WRITERS`` may set a
+``status`` (six, each a model other than Task: ToolCall, Approval, Project, AgentRun), and that list is exact.
+
+Closed after the AG-13 3.2c2c2 delta (D3): every string node is read once per line, so a ``{}`` hole that
+opens a comment (``'/*' + x + " UPDATE tasks SET status ..."``, ``'--' + x + ...``) no longer hides the SQL
+part after it.
+
+OPEN, owed before WP-3.2d merges (AG-13 3.2c2c2 delta D2; NOT an accepted limit): writes of ``status`` that
+neither scan reads yet: ``set_attribute(t, 'status', ...)``, ``object.__setattr__`` / ``t.__setattr__``,
+``builtins.setattr`` and its alias, tuple / list / ``for`` targets, an ORM bulk update by primary key
+(``execute(update(Task), [{'status': ...}])``, ``bulk_update_mappings``), ``ordered_values``,
+``on_conflict_do_update(set_=...)``, a key held in a constant or built by ``+``, ``literal_column('status')``,
+``merge(type(t)(..., status=...))``, an aliased ``table`` or ``tables.get('tasks')`` with a params dict. Each
+also needs the marker set, so the DB backstop owed before 3.2d starts is the control that closes the class.
+
+Accepted limits of fix wave B: S2 inside a module of ``STATUS_ATTRIBUTE_WRITERS`` (a Task a helper returned,
+set there, is not seen) and a ``status`` set by ``setattr`` with a computed name; a ``Table`` or
+``tables[...]`` name the scan cannot read (a variable); the DB trigger backstop is a backlog item.
+
+Still out of scope, accepted: ``operator.methodcaller`` and ``inspect.getmembers`` (the name is a run-time
+value), ``ALTER ROLE|DATABASE ... SET``, ``ALTER SYSTEM SET``, a ``lambda`` wrapper around ``getattr``
+(``g = lambda *a: getattr(*a)``), a driver connection setting under a key other than ``server_settings`` or
+``options``, SQL held as ``bytes`` literals, and the indirect writers listed below. The import-linter
+contract N60 sees imports only, never strings or SQL. A DB backstop is a backlog item.
 
 Limits that a static scan cannot decide: ``getattr`` with a computed string, ``importlib``,
 ``operator.attrgetter``, ``vars()`` / ``__dict__`` (and ``globals()`` / ``sys.modules`` lookups),
@@ -37,6 +74,9 @@ import ast
 import re
 from pathlib import Path
 
+# The string reader and SQL normaliser shared by the writer guards: one copy of the lexer.
+from tests.static_scan import normalise_sql, paired_names, string_value
+
 APP = Path(__file__).resolve().parents[2] / "app"
 ALLOWED_WRITER = APP / "workflow" / "states.py"
 TRANSITION_WRITERS = frozenset(
@@ -48,61 +88,106 @@ TRANSITION_WRITERS = frozenset(
         "services/tool_r3.py",
     }
 )
+# Modules that set ``status`` on a model other than Task (S2, ``status_attribute_writes``): a ToolCall, an
+# Approval, a Project, an AgentRun. A module is listed here by a review that read its writes. The list is
+# exact (the anti-bitrot test below), and it does not see a Task a listed module reaches through a helper.
+STATUS_ATTRIBUTE_WRITERS = frozenset(
+    {
+        "services/agent_run_rows.py",
+        "services/agent_runtime.py",
+        "services/approval_store.py",
+        "services/project_delete.py",
+        "services/projects.py",
+        "tools/gateway.py",
+    }
+)
 MARKER_HOLDERS = frozenset({"workflow/states.py", "models/tasks.py"})
 WRITER_NAMES = frozenset({"transition", "fail_task"})
 MARKER_NAMES = frozenset({"STATUS_WRITER_SETTING", "STATUS_WRITER"})
-_TASKS_UPDATE = r'update\s+(only\s+)?("?\w+"?\.)?"?tasks"?(\s+(as\s+)?\w+)?\s+set\b'
-RAW_SQL = re.compile(_TASKS_UPDATE + r"[^;]*\bstatus\b", re.IGNORECASE | re.DOTALL)
-DYNAMIC_COLUMN_SQL = re.compile(_TASKS_UPDATE + r"\s+\{\}", re.IGNORECASE)
-MARKER_WORD = re.compile(r"\bstatus_writer\b")
+# Raw SQL is read after ``normalise_sql``: no comments, one space between words and none around ``.``.
+# A ``{}`` where the table is (``'UPDATE ' + t + ' SET status = 1'``) is a table the scan cannot read: it may
+# be tasks.
+_TASKS = r"(?:\w+\.)?(?:tasks\b|\{\})"
+_UPDATE_TASKS = rf"\bupdate\s+(?:only\s+)?{_TASKS}(?:\s*\*)?(?:\s+(?:as\s+)?\w+)?\s+set\b"
+_MERGE_UPDATE = rf"\bmerge\s+into\s+(?:only\s+)?{_TASKS}[^;]*?\bupdate\s+set\b"
+_UPSERT_UPDATE = rf"\binsert\s+into\s+{_TASKS}[^;]*?\bon\s+conflict\b[^;]*?\bdo\s+update\s+set\b"
+RAW_SQL = tuple(
+    re.compile(prefix + r"[^;]*?\bstatus\b", re.IGNORECASE)
+    for prefix in (_UPDATE_TASKS, _MERGE_UPDATE, _UPSERT_UPDATE)
+)
+DYNAMIC_COLUMN_SQL = tuple(
+    re.compile(prefix + r"\s+\{\}", re.IGNORECASE)
+    for prefix in (_UPDATE_TASKS, _MERGE_UPDATE, _UPSERT_UPDATE)
+)
+# PostgreSQL reads a GUC name without regard to case: ``kk.Status_Writer`` is the marker. The word boundary
+# stays: three docstrings name ``test_status_writer_guard.py``.
+MARKER_WORD = re.compile(r"\bstatus_writer\b", re.IGNORECASE)
+
+
+ASYNCIO_MODULES = frozenset({"asyncio", "asyncio.tasks"})
+
+
+def _task_names(tree: ast.Module) -> set[str]:
+    """``Task`` and each name it is imported as (``from x import Task as T``)."""
+    names = {"Task"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module not in ASYNCIO_MODULES:
+            names |= {a.asname or a.name for a in node.names if a.name == "Task"}
+    return names
 
 
 def _imports_task(tree: ast.Module) -> bool:
-    """Any way of reaching the Task model: from-import, module import, or package attribute."""
+    """Any way of reaching the Task model: from-import of the model module, a module import, a package
+    attribute, or (fix wave B, AG-13 LOW-1: ``app.workflow.engine`` re-exports ``Task``) the name ``Task``
+    imported from any module, under any alias, or an attribute ``<x>.Task``. ``asyncio.Task`` is not the
+    model: ``from asyncio import Task`` and ``asyncio.Task`` read as clean."""
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             if node.module == "app.models.tasks":
                 return True
             if node.module == "app.models" and any(alias.name == "tasks" for alias in node.names):
                 return True
+            if node.module not in ASYNCIO_MODULES and any(alias.name == "Task" for alias in node.names):
+                return True
         if isinstance(node, ast.Import) and any(alias.name == "app.models.tasks" for alias in node.names):
             return True
+        if isinstance(node, ast.Attribute) and node.attr == "Task":
+            receiver = node.value
+            if not (isinstance(receiver, ast.Name) and receiver.id == "asyncio"):
+                return True
     return False
 
 
-def _string_value(node: ast.expr) -> str | None:
-    """Text of a string constant, f-string (placeholders as {}), or a + concatenation of those."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.JoinedStr):
-        return "".join(
-            v.value if isinstance(v, ast.Constant) and isinstance(v.value, str) else "{}" for v in node.values
-        )
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _string_value(node.left), _string_value(node.right)
-        if left is not None and right is not None:
-            return left + right
-    return None
-
-
 def _is_raw_status_update(node: ast.expr) -> bool:
-    if not isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp):
+    if not isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
         return False
-    value = _string_value(node)
+    value = string_value(node)
     if value is None:
         return False
+    sql = normalise_sql(value)
     # A dynamic column ("{}") after UPDATE tasks SET could be status too.
-    return bool(RAW_SQL.search(value) or DYNAMIC_COLUMN_SQL.search(value))
+    return any(p.search(sql) for p in (*RAW_SQL, *DYNAMIC_COLUMN_SQL))
 
 
 def _is_tasks_table_call(node: ast.Call) -> bool:
-    """``sqlalchemy.table("tasks", ...)``: a table ``update()`` can write without the model."""
+    """``sqlalchemy.table("tasks", ...)`` or ``Table("tasks", ...)`` (any case, a name or an attribute): a
+    table ``update()`` can write without the model."""
     func = node.func
-    named_table = (isinstance(func, ast.Name) and func.id == "table") or (
-        isinstance(func, ast.Attribute) and func.attr == "table"
+    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+    first = string_value(node.args[0]) if node.args else None
+    return name.lower() == "table" and first is not None and first.strip().strip('"').lower() == "tasks"
+
+
+def _is_tasks_metadata_lookup(node: ast.Subscript) -> bool:
+    """``Base.metadata.tables['tasks']``: the table without the model (fix wave B, S4)."""
+    value = node.value
+    key = string_value(node.slice)
+    return (
+        isinstance(value, ast.Attribute)
+        and value.attr == "tables"
+        and key is not None
+        and key.strip().strip('"').lower() == "tasks"
     )
-    first = _string_value(node.args[0]) if node.args else None
-    return named_table and first is not None and first.strip().strip('"').lower() == "tasks"
 
 
 def _is_status_key(key: ast.expr | None) -> bool:
@@ -112,6 +197,8 @@ def _is_status_key(key: ast.expr | None) -> bool:
 
 
 def _has_status_key(node: ast.expr | None) -> bool:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
+        return any(k.arg == "status" for k in node.keywords)  # ``values(dict(status=...))``
     return isinstance(node, ast.Dict) and any(_is_status_key(key) for key in node.keys)
 
 
@@ -138,28 +225,35 @@ def _values_sets_status(call: ast.Call, status_dicts: set[str]) -> bool:
 
 
 def _inside_string_expression(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
-    """Report a concatenation or f-string once, at its outermost node, not again for each part."""
+    """Report a concatenation, f-string, ``%``, ``.format`` or ``join`` once, at its outermost node, not
+    again for each part: some enclosing expression already reads as one string."""
     parent = parents.get(node)
-    return isinstance(parent, ast.JoinedStr) or (
-        isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Add) and _string_value(parent) is not None
-    )
+    while isinstance(parent, ast.expr):
+        if isinstance(parent, ast.JoinedStr | ast.BinOp | ast.Call) and string_value(parent) is not None:
+            return True
+        parent = parents.get(parent)
+    return False
 
 
-def status_writes(source: str) -> list[str]:
+def status_writes(source: str, *, any_model: bool = False) -> list[str]:
+    """What writes ``tasks.status`` in one module. ``any_model`` reads the module as if it reached the Task
+    model (the import-independent check of ``status_attribute_writes``)."""
     tree = ast.parse(source)
     found: list[str] = []
-    uses_task = _imports_task(tree)
+    uses_task = any_model or _imports_task(tree)
+    task_names = _task_names(tree)
     status_dicts = _dicts_with_status(tree)
-    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    raw_lines: set[int] = set()
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.expr)
-            and _is_raw_status_update(node)
-            and not _inside_string_expression(node, parents)
-        ):
+        # Every string node is read, once per line: the outer expression may hide its parts' SQL behind a
+        # {} hole that opens a comment ('/*' + x + " UPDATE tasks SET status ..."; AG-13 3.2c2c2 delta D3).
+        if isinstance(node, ast.expr) and node.lineno not in raw_lines and _is_raw_status_update(node):
+            raw_lines.add(node.lineno)
             found.append(f"line {node.lineno}: raw SQL updates tasks.status")
         if isinstance(node, ast.Call) and _is_tasks_table_call(node):
             found.append(f"line {node.lineno}: table('tasks') can be written without the model")
+        if isinstance(node, ast.Subscript) and _is_tasks_metadata_lookup(node):
+            found.append(f"line {node.lineno}: metadata.tables['tasks'] can be written without the model")
         if not uses_task:
             continue
         targets: list[ast.expr] = []
@@ -177,7 +271,7 @@ def status_writes(source: str) -> list[str]:
                     found.append(f"line {node.lineno}: .values(status=...)")
             if (
                 isinstance(func, ast.Name)
-                and func.id == "Task"
+                and func.id in task_names
                 and any(k.arg == "status" for k in node.keywords)
             ):
                 found.append(f"line {node.lineno}: Task(status=...)")
@@ -192,6 +286,14 @@ def status_writes(source: str) -> list[str]:
     return found
 
 
+def status_attribute_writes(source: str) -> list[str]:
+    """Import-independent (fix wave B, S2): ``<expr>.status = ...``, ``.values(status=...)`` or
+    ``{'status': ...}`` in a ``.values()``, ``setattr(x, 'status', ...)`` whatever the object is, so a Task
+    object a helper returned (``t = await load(db, i); t.status = 'failed'``) is seen with no ``Task`` in
+    sight. A module that sets ``status`` on another model is listed in ``STATUS_ATTRIBUTE_WRITERS``."""
+    return status_writes(source, any_model=True)
+
+
 def test_only_states_module_writes_task_status() -> None:
     violations = {
         str(path.relative_to(APP)): hits
@@ -199,6 +301,33 @@ def test_only_states_module_writes_task_status() -> None:
         if path != ALLOWED_WRITER and (hits := status_writes(path.read_text()))
     }
     assert violations == {}
+
+
+def _attribute_writers() -> dict[str, list[str]]:
+    return {
+        str(path.relative_to(APP)): hits
+        for path in APP.rglob("*.py")
+        if path != ALLOWED_WRITER and (hits := status_attribute_writes(path.read_text()))
+    }
+
+
+def test_only_listed_modules_set_a_status_attribute() -> None:
+    """S2: a Task object a helper returned has no ``Task`` in its module; any module that sets a ``status``
+    outside the exact list is a finding to read, whichever model it is."""
+    assert {
+        rel: hits for rel, hits in _attribute_writers().items() if rel not in STATUS_ATTRIBUTE_WRITERS
+    } == {}
+
+
+def test_status_attribute_writers_is_exactly_the_modules_that_set_a_status() -> None:
+    """Anti-bitrot: a listed module that no longer sets a status fails too."""
+    assert set(_attribute_writers()) == STATUS_ATTRIBUTE_WRITERS
+
+
+def test_status_attribute_scan_flags_a_task_with_no_task_in_sight() -> None:
+    for source in ATTRIBUTE_WRITE_SAMPLES:
+        assert status_attribute_writes(source), source
+        assert status_writes(source) == [], source  # the per-module guard cannot see these
 
 
 def test_guard_sees_the_allowed_writer() -> None:
@@ -328,28 +457,103 @@ def _step_result_is_plain(tree: ast.Module) -> bool:
     return len(binds) == 1 and len(plain) == 1
 
 
-def _getattr_aliases(tree: ast.Module) -> set[str]:
-    """Names bound to ``getattr`` or ``builtins.getattr`` (``g = getattr``)."""
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and _is_getattr_ref(node.value, set()):
-            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
-    return names
+_REFLECTIVE_ATTRS = frozenset({"getattr", "__getattribute__", "getattr_static"})
+_WRITER_WORD = re.compile(r"\b(?:transition|fail_task)\b")
+
+
+def _is_partial(node: ast.expr) -> bool:
+    func = node.func if isinstance(node, ast.Call) else None
+    return (isinstance(func, ast.Name) and func.id == "partial") or (
+        isinstance(func, ast.Attribute) and func.attr == "partial"
+    )
 
 
 def _is_getattr_ref(node: ast.expr, aliases: set[str]) -> bool:
-    return (isinstance(node, ast.Name) and (node.id == "getattr" or node.id in aliases)) or (
-        isinstance(node, ast.Attribute) and node.attr == "getattr"
-    )
+    """A reference to a reflective lookup: ``getattr``, ``builtins.getattr``, ``object.__getattribute__``,
+    ``inspect.getattr_static``, an alias of one, a walrus that binds one, ``<ref>.__call__`` or
+    ``functools.partial(<ref>, ...)``."""
+    if isinstance(node, ast.Name):
+        return node.id == "getattr" or node.id in aliases
+    if isinstance(node, ast.Attribute):
+        return node.attr in _REFLECTIVE_ATTRS or (
+            node.attr == "__call__" and _is_getattr_ref(node.value, aliases)
+        )
+    if isinstance(node, ast.NamedExpr):
+        return _is_getattr_ref(node.value, aliases)
+    if isinstance(node, ast.Call) and _is_partial(node):
+        return bool(node.args) and _is_getattr_ref(node.args[0], aliases)
+    return False
 
 
-def _is_reflective_writer_lookup(call: ast.Call, aliases: set[str]) -> bool:
-    """getattr, builtins.getattr, an alias, ``__getattribute__`` or ``getattr_static`` with a writer name."""
+def _bind(target: ast.expr, value: ast.expr, aliases: set[str]) -> None:
+    """Add the names ``target = value`` binds to a reflective ref; a tuple target pairs with a tuple value."""
+    if isinstance(target, ast.Tuple | ast.List) and isinstance(value, ast.Tuple | ast.List):
+        if len(target.elts) == len(value.elts):
+            for t, v in zip(target.elts, value.elts, strict=True):
+                _bind(t, v, aliases)
+    elif isinstance(target, ast.Name) and _is_getattr_ref(value, aliases):
+        aliases.add(target.id)
+
+
+def _getattr_aliases(tree: ast.Module) -> set[str]:
+    """Names bound to a reflective lookup, by ``=``, annotated ``=``, ``:=``, a tuple pair or
+    ``from builtins import getattr as g``; repeated until no new name appears (``h = g``)."""
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "builtins":
+            aliases |= {a.asname for a in node.names if a.name == "getattr" and a.asname}
+    while True:
+        before = len(aliases)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    _bind(target, node.value, aliases)
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                _bind(node.target, node.value, aliases)
+            elif isinstance(node, ast.NamedExpr):
+                _bind(node.target, node.value, aliases)
+        if len(aliases) == before:
+            return aliases
+
+
+def _constant_names(tree: ast.Module) -> dict[str, set[str]]:
+    """Every string a name is assigned (``NAME = 'transition'``, ``NAME: str = ...``, ``N, M = 'a', 'b'``):
+    ``getattr(m, NAME)`` reads as its values."""
+    values: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            pairs = [p for t in node.targets for p in paired_names(t, node.value)]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            pairs = list(paired_names(node.target, node.value))
+        else:
+            continue
+        for name, value in pairs:
+            if (text := string_value(value)) is not None:
+                values.setdefault(name, set()).add(text)
+    return values
+
+
+def _names_a_writer(arg: ast.expr, constants: dict[str, set[str]]) -> bool:
+    if isinstance(arg, ast.Name):
+        return bool(constants.get(arg.id, set()) & WRITER_NAMES)
+    return string_value(arg) in WRITER_NAMES
+
+
+def _is_reflective_writer_lookup(call: ast.Call, aliases: set[str], constants: dict[str, set[str]]) -> bool:
+    """A reflective lookup with a writer name; for ``partial(getattr, m, 'transition')`` the name sits in the
+    partial call itself, for ``partial(getattr, m)('transition')`` in the outer call."""
+    if _is_partial(call):
+        return _is_getattr_ref(call, aliases) and any(_names_a_writer(a, constants) for a in call.args[1:3])
+    return _is_getattr_ref(call.func, aliases) and any(_names_a_writer(a, constants) for a in call.args[:2])
+
+
+def _is_eval_of_a_writer(call: ast.Call) -> bool:
+    """The builtin ``eval``/``exec`` (a Name; ``redis.eval`` is an Attribute) on a constant that names one."""
     func = call.func
-    reflective = _is_getattr_ref(func, aliases) or (
-        isinstance(func, ast.Attribute) and func.attr in {"__getattribute__", "getattr_static"}
-    )
-    return reflective and any(_string_value(arg) in WRITER_NAMES for arg in call.args[:2])
+    if not (isinstance(func, ast.Name) and func.id in {"eval", "exec"} and call.args):
+        return False
+    text = string_value(call.args[0])
+    return text is not None and bool(_WRITER_WORD.search(text))
 
 
 def writer_refs(source: str) -> list[str]:
@@ -357,6 +561,7 @@ def writer_refs(source: str) -> list[str]:
     tree = ast.parse(source)
     plain_step_result = _step_result_is_plain(tree)
     aliases = _getattr_aliases(tree)
+    constants = _constant_names(tree)
     found: list[str] = []
     for node in ast.walk(tree):
         line = getattr(node, "lineno", 0)
@@ -377,7 +582,9 @@ def writer_refs(source: str) -> list[str]:
             )
             if not is_api:
                 found.append(f"line {line}: attribute {node.attr}")
-        elif isinstance(node, ast.Call) and _is_reflective_writer_lookup(node, aliases):
+        elif isinstance(node, ast.Call) and (
+            _is_reflective_writer_lookup(node, aliases, constants) or _is_eval_of_a_writer(node)
+        ):
             found.append(f"line {line}: reflective lookup of a writer")
         elif isinstance(node, ast.MatchClass) and WRITER_NAMES & set(node.kwd_attrs):
             found.append(f"line {line}: match class pattern on a writer")
@@ -391,8 +598,8 @@ def marker_refs(source: str) -> list[str]:
     found: list[str] = []
     for node in ast.walk(tree):
         line = getattr(node, "lineno", 0)
-        if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp):
-            value = _string_value(node) if isinstance(node, ast.expr) else None
+        if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
+            value = string_value(node)
             if (
                 value is not None
                 and MARKER_WORD.search(value)
@@ -471,6 +678,26 @@ WRITER_SAMPLES = [
     "from app.workflow import states\nmatch states:\n    case object(transition=w):\n        pass\n",
     "from .states import *\n",
     "from ..workflow.states import *\n",
+    # AG-13 PoC (3.2c2c1 delta): getattr by aliases the binding scan missed, and eval/exec of a constant.
+    "from builtins import getattr as g\nfrom app.workflow import states\nw = g(states, 'transition')\n",
+    "from app.workflow import states\ng: object = getattr\nw = g(states, 'transition')\n",
+    "from app.workflow import states\nw = (g := getattr)(states, 'fail_task')\n",
+    "from app.workflow import states\ng, h = getattr, 0\nw = g(states, 'transition')\n",
+    (
+        "import functools\nfrom app.workflow import states\n"
+        "w = functools.partial(getattr, states)('fail_task')\n"
+    ),
+    (
+        "from functools import partial\nfrom app.workflow import states\n"
+        "w = partial(getattr, states, 'transition')()\n"
+    ),
+    "from app.workflow import states\np = functools.partial(getattr, states)\nw = p('transition')\n",
+    "from app.workflow import states\nw = object.__getattribute__.__call__(states, 'transition')\n",
+    "from app.workflow import states\nw = eval('states.transition')\n",
+    "exec('from app.workflow.states import transition')\n",
+    "from app.workflow import states\nNAME = 'transition'\nw = getattr(states, NAME)\n",
+    "from app.workflow import states\nN: str = 'transition'\nw = getattr(states, N)\n",
+    "from app.workflow import states\nN, M = 'transition', 'x'\nw = getattr(states, N)\n",
 ]
 MARKER_SAMPLES = [
     "X = 'kk.' + 'status_writer'\n",
@@ -482,9 +709,21 @@ MARKER_SAMPLES = [
     "M = 'kk.%s' % 'status_writer'\n",
     "M = 'kk.{}'.format('status_writer')\n",
     "M = '.'.join(['kk', 'status_writer'])\n",
+    "Q = \"SELECT set_config('kk.Status_Writer', 'transition', true)\"\n",
+    "Q = \"SET LOCAL kk.Status_Writer = 'transition'\"\n",
+    "M = 'KK.STATUS_WRITER'\n",
+    # AG-13 delta: pieces the AST can still join (constant f-string field, % / .format / join in pieces).
+    "M = f\"kk.{'status'}_writer\"\n",
+    "M = '_'.join(['kk.status', 'writer'])\n",
+    "M = 'kk.%s_writer' % 'status'\n",
+    "M = 'kk.status{}'.format('_writer')\n",
     "Q = \"SELECT set_config(concat_ws('.', 'kk', 'status_writer'), 'transition', true)\"\n",
 ]
 STATUS_SQL_SAMPLES = [
+    # AG-13 delta D3: a {} hole inside a comment opener must not hide the SQL after it (x is "*/" or "\\n").
+    "q = '/*' + x + \" UPDATE tasks SET status = 'failed' WHERE id = 1 -- */\"\n",
+    "q = '/*' + x + \" UPDATE tasks SET status = 'failed' /* */\"\n",
+    "q = '--' + x + \" UPDATE tasks SET status = 'failed'\"\n",
     "Q = 'UPDATE public.tasks SET status = :s WHERE id = :id'\n",
     "Q = 'UPDATE tasks t SET status = :s WHERE t.id = :id'\n",
     "Q = 'UPDATE tasks AS t SET status = :s WHERE t.id = :id'\n",
@@ -493,6 +732,49 @@ STATUS_SQL_SAMPLES = [
     "Q = 'update  public.\"tasks\"  as t\\n set status = 1'\n",
     "from sqlalchemy import table, column, update\nt = table('tasks', column('status'))\n",
     "import sqlalchemy as sa\nt = sa.table(\"tasks\", sa.column('status'))\n",
+    # AG-13 delta: spacing, comments and a quoted alias inside the statement; other statements that write.
+    "Q = 'UPDATE public . tasks SET status = :s WHERE id = :id'\n",
+    "Q = 'UPDATE/**/tasks SET status = :s WHERE id = :id'\n",
+    "Q = 'UPDATE tasks/**/SET status = :s WHERE id = :id'\n",
+    "Q = 'UPDATE -- why\\n tasks SET status = :s'\n",
+    'Q = \'UPDATE tasks AS "t" SET status = :s WHERE "t".id = :id\'\n',
+    "Q = 'UPDATE tasks * SET status = :s WHERE id = :id'\n",
+    "Q = 'UPDATE ONLY tasks * AS t SET status = :s'\n",
+    "Q = 'MERGE INTO tasks t USING (SELECT 1) s ON t.id = :id WHEN MATCHED THEN UPDATE SET status = :s'\n",
+    "Q = 'MERGE INTO public.tasks AS t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET status = 1'\n",
+    "Q = 'INSERT INTO tasks (id) VALUES (:id) ON CONFLICT (id) DO UPDATE SET status = :s'\n",
+    "Q = 'insert into tasks (id) values (1) on conflict do update set \"status\" = excluded.status'\n",
+    "Q = 'UPDATE tasks SET {col} = :s'.format(col='status')\n",
+    "Q = 'UPDATE tasks SET {} = :s'\n",
+    # Fix wave B (silent-failure M3): a piece the scan cannot read reads as ``{}`` through ``+`` too.
+    "Q = 'UPDATE tasks SET ' + col + ' = 1'\n",
+    "Q = 'UPDATE ' + t + ' SET status = 1'\n",
+    "Q = 'UPDATE tasks SET ' + col\n",
+    # Fix wave B (AG-13 LOW-1): the Task model however it is reached, and a tasks table without ``table(``.
+    (
+        "from sqlalchemy import update\nfrom app.workflow.engine import Task\n"
+        "q = update(Task).values(status='x')\n"
+    ),
+    "from other import Task as T\nT(status='x')\n",
+    "from app.workflow import engine as e\nq = e.Task.__table__.update().values({'status': 'failed'})\n",
+    "import sqlalchemy as sa\nt = sa.Table('tasks', sa.MetaData(), sa.Column('status'))\n",
+    "from sqlalchemy import Table\nt = Table('tasks', md, autoload_with=e)\n",
+    "from sqlalchemy import table\nt = TABLE('Tasks')\n",
+    "from app.models.base import Base\nt = Base.metadata.tables['tasks']\n",
+    "t = md.tables['tasks']\n",
+    (
+        "from sqlalchemy import update\nfrom app.workflow.lease import Task\n"
+        "q = update(Task).values(dict(status='failed'))\n"
+    ),
+]
+# What the status guard cannot see from one module alone, read across ``app/`` instead (S2): a Task object a
+# helper returned, so ``t.status = ...`` has no ``Task`` in sight.
+ATTRIBUTE_WRITE_SAMPLES = [
+    "async def f(db, i):\n    t = await load(db, i)\n    t.status = 'failed'\n",
+    "t.status += 'x'\n",
+    "from sqlalchemy import update\nq = update(tbl).values(status='failed')\n",
+    "q = tbl.update().values({'status': 'failed'})\n",
+    "setattr(t, 'status', 'failed')\n",
 ]
 CLEAN_SAMPLES = [
     "from app.workflow.engine import StepResult\n\nStepResult.transition(TaskStatus.PLANNED, 'r')\n",
@@ -507,6 +789,20 @@ CLEAN_SAMPLES = [
     "Q = 'SELECT id, status FROM tasks WHERE id = :id'\n",
     "from sqlalchemy import table\nt = table('projects')\n",
     "g = getattr\nw = g(obj, 'name')\n",
+    "r = redis.eval(_RELEASE, 1, key)\n",
+    "import functools\ncb = functools.partial(_log_if_unrecorded, x)\n",
+    "from functools import partial\nget = partial(getattr, obj)\nv = get('name')\n",
+    '"see tests/unit/test_status_writer_guard.py"\n',
+    'NOTE = "see tests/unit/test_status_writer_guard.py for the marker"\n',
+    "Q = 'UPDATE tasks SET event_seq = event_seq + 1 WHERE id = :id'\n",
+    'Q = "INSERT INTO tasks (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET event_seq = excluded.event_seq"\n',
+    "v = eval('1 + 1')\n",
+    "import asyncio\n\nasync def f(w: list[asyncio.Task[None]]) -> None: ...\n",
+    "from asyncio import Task\n\nclass A:\n    t: Task[None]\n",
+    "from sqlalchemy import table\nt = table('projects')\nm = md.tables['projects']\n",
+    "Q = 'SELECT ' + cols + ' FROM tasks'\n",
+    "Q = 'UPDATE projects SET ' + col + ' = 1'\n",
+    "Q = 'UPDATE tasks SET event_seq = 1' + extra\n",
 ]
 
 
@@ -533,7 +829,7 @@ def test_guards_do_not_flag_reads_and_docs() -> None:
 
 
 def test_docstring_names_the_static_limits() -> None:
-    doc = __doc__ or ""
+    doc = " ".join((__doc__ or "").split())  # a phrase may wrap
     limits = (
         "getattr",
         "importlib",
@@ -543,10 +839,22 @@ def test_docstring_names_the_static_limits() -> None:
         "globals()",
         "sys.modules",
         "a string built at run time",
+        "operator.methodcaller",
+        "inspect.getmembers",
+        "ALTER ROLE",
+        "ALTER SYSTEM SET",
+        "lambda",
+        "bytes",
+        "connection setting",
         "cancel_open_tasks",
         "tool_r3",
         "recover_expired",
         "TaskEngine._fail",
+        "STATUS_ATTRIBUTE_WRITERS",
+        "a Task a helper returned",
+        "a ``Table`` or ``tables[...]`` name the scan cannot read",
+        "a ``status`` set by ``setattr`` with a computed name",
+        "DB trigger backstop",
     )
     missing = [limit for limit in limits if limit not in doc]
     assert missing == []

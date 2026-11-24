@@ -6,7 +6,7 @@ safe is each caller's own context: the runtime ends the run it started (``AgentR
 ``fail`` for that id, task, agent and start token only); the run recovery ends a run whose lease is dead or
 that is stale, under its task's row lock. The pattern of tests/unit/test_close_abandoned_calls_guard.py: a
 module other than the two callers may not name the function at all (call, import, attribute, string, also
-one built by concatenation, f-string, ``%`` or ``.format``: ``_string_value`` of the writer guard), and the
+one built by concatenation, f-string, ``%`` or ``.format``: ``string_value`` of tests/static_scan.py), and the
 module that defines it never calls it.
 """
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from tests.unit.test_agent_run_writer_guard import _string_value
+from tests.static_scan import string_value
 
 APP = Path(__file__).resolve().parents[2] / "app"
 DEFINER = APP / "services" / "agent_run_rows.py"
@@ -54,7 +54,7 @@ def references(source: str) -> list[str]:
         elif (
             isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call)
             and id(node) not in prose
-            and NAME in (_string_value(node) or "")
+            and NAME in (string_value(node) or "")
         ):
             found.append(f"line {node.lineno}: string")
     return found

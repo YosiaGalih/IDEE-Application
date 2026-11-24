@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import asdict
+from typing import Final
 
 from celery import shared_task
 from redis.asyncio import Redis
 
+from app.agents.runtime import CLOSE_TIMEOUT_S
 from app.core.audit import AuditWriter
 from app.core.config import load_settings
 from app.core.db import make_engine, make_sessionmaker
@@ -19,6 +21,8 @@ from app.services.job_queue import CeleryJobQueue
 from app.services.orchestrator import build_orchestrator
 from app.services.run_recovery import RunRecoveryIncomplete, RunRecoveryResult, recover_runs
 from app.worker.identity import delivery_owner
+from app.worker.pricing import worker_pricing
+from app.worker.registry import worker_registry
 from app.workflow.dispatch import Dispatcher, DispatchIncomplete, DispatchResult, redispatch_orphans
 from app.workflow.engine import EngineOutcome
 from app.workflow.lease import ClaimResult
@@ -29,6 +33,9 @@ from app.workflow.recovery import RecoveryIncomplete, RecoveryResult, recover_ex
 SWEEP_TIMEOUT_SECONDS = 25.0
 DISPATCH_SWEEP_TIMEOUT_SECONDS = 25.0
 _MAX_LOGGED_ID = 80
+# What a delivery may wait for its own leftover tasks before it disposes the engine: ``_record_end`` of the
+# runtime is two writes and one ``fail``, each bounded by ``CLOSE_TIMEOUT_S``. Read at call time.
+RUNTIME_DRAIN_S: Final = 3 * CLOSE_TIMEOUT_S
 
 logger = get_logger(__name__)
 
@@ -145,7 +152,12 @@ def run_task(task_id: str) -> dict[str, object]:
 
 
 async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
+    """One delivery. The registry and the pricing are required on every delivery, also while no agent step
+    is registered: a worker without them fails here, before any connection or claim, not on its first step."""
     settings = load_settings()
+    registry = worker_registry()  # RegistryNotLoaded: before any connection or claim (deliberate, see above)
+    pricing = worker_pricing()  # PricingNotLoaded: likewise
+    before = set(asyncio.all_tasks())
     engine = make_engine(settings.database_url)
     redis = Redis.from_url(settings.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0)
     try:
@@ -155,11 +167,57 @@ async def execute_task(task_id: uuid.UUID) -> EngineOutcome:
             audit=AuditWriter(Redactor(settings.secret_values())),
             settings=settings,
             worker_id=delivery_owner(),
+            registry=registry,
+            pricing=pricing,
         )
         return await orchestrator.run(task_id)
     finally:
-        await redis.aclose()
-        await engine.dispose()
+        try:
+            await _drain(task_id, before)
+        finally:
+            try:
+                await redis.aclose()
+            finally:
+                await engine.dispose()  # also when the Redis close raises
+
+
+def _task_name(task: asyncio.Task[object]) -> str:
+    """The qualified name of what a task runs (a code name, never a value), else the task's own name."""
+    coro = task.get_coro()
+    name = getattr(coro, "__qualname__", None)
+    return name if isinstance(name, str) else task.get_name()
+
+
+async def _drain(task_id: uuid.UUID, before: set[asyncio.Task[object]]) -> None:
+    """Waits for the tasks this delivery created (a run's close, for one) before the engine is disposed.
+    Never raises (BC-17). A leftover that is still running when the drain starts and then fails has its
+    exception retrieved here and is logged by task and error type only. A leftover that already failed before
+    the drain starts is not in ``all_tasks()``: if nothing retrieved it, asyncio logs it through the stdlib
+    logger, whose ``RedactingFilter`` applies (AG-13 3.2c2c2 delta D4; a loop exception handler is owed by
+    3.2d). A task that outlives the wait is logged by name and left to the loop."""
+    current = asyncio.current_task()
+    left = {t for t in asyncio.all_tasks() if t not in before and t is not current}
+    if not left:
+        return
+    done, pending = await asyncio.wait(left, timeout=RUNTIME_DRAIN_S)
+    for task in sorted(done, key=_task_name):
+        if task.cancelled():
+            continue
+        error = task.exception()
+        if error is not None:
+            logger.warning(
+                "delivery_task_failed",
+                task_id=str(task_id),
+                task=_task_name(task),
+                error_type=type(error).__name__,
+            )
+    if pending:
+        logger.warning(
+            "delivery_tasks_abandoned",
+            task_id=str(task_id),
+            count=len(pending),
+            tasks=sorted(_task_name(t) for t in pending),
+        )
 
 
 @shared_task(name="app.worker.jobs.dispatch_sweep")

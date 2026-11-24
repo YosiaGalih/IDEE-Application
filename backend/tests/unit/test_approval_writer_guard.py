@@ -3,6 +3,23 @@
 A static scan of app/: only ``app/services/approvals.py`` (a signed-in person with the permissions) calls
 ``approval_store.decide``; only ``approval_store`` (and the model that names it) touches the writer marker the
 ``approvals_status_guard`` trigger requires. The trigger itself is tested in test_tool_tables.py.
+
+Closed by the hardening owed before 3.2d (AG-13 3.2c2c1 delta; spec §16.6): the marker text is matched without
+regard to case (``'kk.Approval_Status_Writer'``, ``SET LOCAL kk.APPROVAL_STATUS_WRITER``), also when it is
+joined from pieces by ``+``, an f-string, ``%``, ``.format`` or ``join``; a name split inside the word by SQL
+``||``, ``concat`` or ``U&`` is caught by the GUC tripwire (``test_guc_tripwire.py``), which flags every
+way to set a GUC in ``app/`` outside the exact ``GUC_WRITERS`` allowlist. Fix wave B (AG-13 3.2c2c2 LOW-1)
+closes the forms the tripwire did not read: a ``DO $...$`` block that ``EXECUTE``s a split ``SET LOCAL``, a
+``UESCAPE`` function name, ``CREATE FUNCTION|PROCEDURE``, ``ALTER TABLE|FUNCTION|PROCEDURE``, ``DISABLE`` or
+``DROP TRIGGER``, ``pg_settings`` and ``SET LOCAL|SESSION`` at any position, in every module.
+
+Still out of scope, accepted: a ``decide`` or marker name computed at run time, ``operator.methodcaller``,
+``inspect.getmembers``, ``getattr`` aliases for ``decide`` (only the direct ``getattr(x, "decide")`` is read),
+``ALTER ROLE|DATABASE ... SET``, ``ALTER SYSTEM SET``, a ``lambda`` wrapper around ``getattr``
+(``g = lambda *a: getattr(*a)``), a driver connection setting under a key other than ``server_settings`` or
+``options``, SQL held as ``bytes`` literals, ``sys.modules`` / ``globals()`` lookups, and an indirect writer
+through a module of the allowlist (anything that calls ``approvals.decide``). The DB backstop is a backlog
+item.
 """
 
 from __future__ import annotations
@@ -10,6 +27,9 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from pathlib import Path
+
+from tests.static_scan import string_value
+from tests.unit.test_guc_tripwire import violations
 
 APP = Path(__file__).resolve().parents[2] / "app"
 DECIDERS = {APP / "services" / "approvals.py"}
@@ -56,12 +76,31 @@ def decide_calls(source: str) -> list[int]:
     return lines
 
 
+def _inside_string_expression(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    """Report an f-string, ``+``, ``%``, ``.format`` or ``join`` once, at its outermost node."""
+    parent = parents.get(node)
+    while isinstance(parent, ast.expr):
+        if isinstance(parent, ast.JoinedStr | ast.BinOp | ast.Call) and string_value(parent) is not None:
+            return True
+        parent = parents.get(parent)
+    return False
+
+
 def marker_uses(source: str) -> list[int]:
+    """Uses of the marker. The text is matched in lower case (PostgreSQL reads a GUC name without regard to
+    case); a name split by SQL ``||``, ``concat`` or ``U&`` is the GUC tripwire's (test_guc_tripwire.py)."""
     tree = ast.parse(source)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     lines: list[int] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and MARKER_TEXT in node.value:
-            lines.append(node.lineno)
+        if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
+            value = string_value(node)
+            if (
+                value is not None
+                and MARKER_TEXT in value.lower()
+                and not _inside_string_expression(node, parents)
+            ):
+                lines.append(node.lineno)
         if isinstance(node, ast.alias) and node.name in MARKER_NAMES:
             lines.append(getattr(node, "lineno", 0))
         if isinstance(node, ast.Attribute) and node.attr in MARKER_NAMES:
@@ -112,5 +151,45 @@ def test_marker_forms_are_detected() -> None:
         "from app.models.approvals import APPROVAL_WRITER\n",
         "import app.models.approvals as m\nx = m.APPROVAL_WRITER_SETTING\n",
         "q = \"SELECT set_config('kk.approval_status_writer', 'approval_store', true)\"\n",
+        # AG-13 delta: PostgreSQL reads a GUC name without regard to case; pieces the AST can join.
+        "q = \"SELECT set_config('kk.Approval_Status_Writer', 'approval_store', true)\"\n",
+        "q = \"SET LOCAL kk.APPROVAL_STATUS_WRITER = 'approval_store'\"\n",
+        "m = 'KK.' + 'Approval_Status_Writer'\n",
+        "m = f\"kk.{'approval'}_status_writer\"\n",
+        "m = 'kk.%s_status_writer' % 'approval'\n",
+        "m = 'kk.approval{}'.format('_status_writer')\n",
+        "m = '_'.join(['kk.approval', 'status', 'writer'])\n",
     ]
     assert all(marker_uses(source) for source in sources)
+
+
+def test_other_spellings_of_the_marker_are_caught_by_the_tripwire() -> None:
+    """A name split inside the word, by SQL ``||``, ``concat`` or ``U&``, cannot be read from the text: the
+    GUC tripwire flags the call that sets it (test_guc_tripwire.py scans ``app/``; here, these forms)."""
+    sources = [
+        "q = \"SELECT set_config('kk.approval' || '_status_writer', 'approval_store', true)\"\n",
+        "q = \"SELECT set_config(concat('kk.approval', '_status_writer'), 'approval_store', true)\"\n",
+        "q = \"SELECT set_config(U&'kk.approval_status\\\\005fwriter', 'approval_store', true)\"\n",
+        "q = \"SELECT SET_CONFIG('kk.Approval_Status_Writer', 'approval_store', true)\"\n",
+        "q = \"SET SESSION kk.Approval_Status_Writer TO 'approval_store'\"\n",
+        # Fix wave B (AG-13 LOW-1): a DO block that EXECUTEs a split SET, and a UESCAPE function name.
+        ("q = \"DO $$ BEGIN EXECUTE 'SET LOCAL kk.approval_status' || '_writer = 1'; END $$\"\n"),
+        (
+            'q = "SELECT U&\\"set!005fconfig\\" UESCAPE \'!\''
+            "('kk.approval' || '_status_writer', 'x', true)\"\n"
+        ),
+    ]
+    for source in sources:
+        assert violations("services/other.py", source), source
+        # and not even the approval store may set it through a name the scan cannot read
+        if any(m in source for m in ("U&", "||", "concat", "DO $$")):
+            assert violations("services/approval_store.py", source), source
+
+
+def test_the_marker_scan_ignores_docs_that_name_the_guard() -> None:
+    sources = [
+        '"""see tests/unit/test_approval_writer_guard.py"""\n',
+        "x = 'approval_status_writer_guard'\n",
+        "q = 'UPDATE approvals SET status = :s'\n",
+    ]
+    assert not any(marker_uses(source) for source in sources)

@@ -49,6 +49,7 @@ from pathlib import Path
 import sqlalchemy as sa
 
 from app.models.agents import AgentRun
+from tests.static_scan import TableNames, bindings, bound, normalise_sql, string_value
 
 APP = Path(__file__).resolve().parents[2] / "app"
 ROW_CREATOR = APP / "services" / "agent_runtime.py"
@@ -64,7 +65,7 @@ DML_CLASSES = {"Insert", "Update", "Delete"}  # ``sa.Update(AgentRun)`` builds t
 WRITE_FUNCTIONS = WRITE_METHODS | DML_CLASSES | {"pg_insert"}
 TABLE_ATTRIBUTES = {"local_table", "persist_selectable"}  # ``Model.__mapper__.<attr>`` is the model's table
 TABLE_FUNCTIONS = {"table", "Table"}
-# Raw SQL is read after ``_normalise_sql``: no comments, one space between words, none around ``.``, no quotes
+# Raw SQL is read after ``normalise_sql``: no comments, one space between words, none around ``.``, no quotes
 # The table is bare or schema-qualified (``public.agent_runs``); ``\b`` keeps ``agent_runs_archive`` out.
 _NAME = rf"(?:\w+\.)?{TABLE}\b"
 RAW_SQL = tuple(
@@ -75,33 +76,10 @@ RAW_SQL = tuple(
         rf"\bcopy\s+{_NAME}\s*(?:\([^)]*\)\s*)?from\b",
     )
 )
-# A literal or quoted name comes first, so ``--`` or ``/*`` inside one is not taken for a comment (review T7):
-# E-strings (backslash escapes) and dollar-quoted strings before the plain ones (AG-13 LOW-2).
-_LEXEME = re.compile(
-    r"\b[eE]'(?:[^'\\]|\\.|'')*'|\$(\w*)\$.*?\$\1\$|'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|--[^\n]*|/\*.*?\*/",
-    re.DOTALL,
-)
-_UNICODE_IDENT = re.compile(r'\bU&"((?:[^"]|"")*)"', re.IGNORECASE)
-_UNICODE_ESCAPE = re.compile(r"\\(?:\+([0-9a-fA-F]{6})|([0-9a-fA-F]{4}))")
-_AROUND_DOT = re.compile(r"\s*\.\s*")
-_QUOTES = re.compile(r"[\"'`]")
-
-
-def _unescape_unicode(name: str) -> str:
-    """``U&"\\0061b"`` (the default escape character) reads as ``"ab"``."""
-    return _UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), name)
-
-
-def _normalise_sql(text: str) -> str:
-    """The SQL as the matcher reads it: ``/*...*/`` and ``--...`` comments (each a space), whitespace
-    collapsed, no space around ``.``, no quotes (``"``, ``'``, backtick)."""
-    text = _LEXEME.sub(lambda m: " " if m.group().startswith(("--", "/*")) else m.group(), text)
-    text = _UNICODE_IDENT.sub(lambda m: f'"{_unescape_unicode(m.group(1))}"', text)
-    return _QUOTES.sub("", _AROUND_DOT.sub(".", " ".join(text.split())))
 
 
 def _writes_table(value: str) -> bool:
-    text = _normalise_sql(value)
+    text = normalise_sql(value)
     return any(pattern.search(text) for pattern in RAW_SQL)
 
 
@@ -157,7 +135,7 @@ def _is_model(node: ast.expr, classes: Set[str]) -> bool:
         return (
             isinstance(node.value, ast.Attribute)
             and node.value.attr == "tables"
-            and _table_name(_string_value(node.slice, classes)) == TABLE
+            and _table_name(string_value(node.slice, table_names=_tables(classes))) == TABLE
         )
     if (
         isinstance(node, ast.Call)
@@ -165,103 +143,14 @@ def _is_model(node: ast.expr, classes: Set[str]) -> bool:
         and node.func.id == "getattr"
         and len(node.args) >= 2
     ):
-        name = _string_value(node.args[1], classes)
+        name = string_value(node.args[1], table_names=_tables(classes))
         return name == MODEL or (name == "__table__" and _is_model(node.args[0], classes))
     return False
 
 
-def _hole(value: str | None) -> str:
-    return value if value is not None else "{}"
-
-
-def _string_value(node: ast.expr, classes: Set[str] = frozenset({MODEL})) -> str | None:
-    """The text a string expression builds, as far as the AST spells it: a constant, an f-string,
-    concatenation (``+``), ``%`` and ``.format``. The model's ``__tablename__`` reads as the table's name;
-    any other value is a ``{}`` hole. None when the node builds no string the AST can tell."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.Attribute) and node.attr == "__tablename__" and _is_model(node.value, classes):
-        return TABLE
-    if isinstance(node, ast.JoinedStr):
-        return "".join(
-            v.value
-            if isinstance(v, ast.Constant) and isinstance(v.value, str)
-            else _hole(_string_value(v.value, classes) if isinstance(v, ast.FormattedValue) else None)
-            for v in node.values
-        )
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _string_value(node.left, classes), _string_value(node.right, classes)
-        if left is not None and right is not None:
-            return left + right
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
-        template = _string_value(node.left, classes)
-        if template is not None:
-            return _percent(template, node.right, classes)
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "join"
-        and len(node.args) == 1
-        and isinstance(node.args[0], ast.List | ast.Tuple)
-    ):  # ``" ".join([...])``
-        sep = _string_value(node.func.value, classes)
-        parts = [_string_value(e, classes) for e in node.args[0].elts]
-        if sep is not None and None not in parts:
-            return sep.join(_hole(p) for p in parts)
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
-        template = _string_value(node.func.value, classes)
-        if template is not None:
-            args = [_hole(_string_value(a, classes)) for a in node.args]
-            kwargs = {k.arg: _hole(_string_value(k.value, classes)) for k in node.keywords if k.arg}
-            try:
-                return template.format(*args, **kwargs)
-            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
-                return template
-    return None
-
-
-def _percent(template: str, right: ast.expr, classes: Set[str]) -> str:
-    values: tuple[str, ...] | dict[str, str]
-    if isinstance(right, ast.Tuple):
-        values = tuple(_hole(_string_value(e, classes)) for e in right.elts)
-    elif isinstance(right, ast.Dict):
-        values = {
-            key: _hole(_string_value(v, classes))
-            for k, v in zip(right.keys, right.values, strict=True)
-            if k is not None and (key := _string_value(k, classes)) is not None
-        }
-    else:
-        values = (_hole(_string_value(right, classes)),)
-    try:
-        return template % values
-    except (KeyError, TypeError, ValueError):
-        return template
-
-
-def _bound(target: ast.expr) -> set[str]:
-    """The names a binding target binds: a name, or the names it unpacks into (never the object of an
-    attribute or item it stores into)."""
-    if isinstance(target, ast.Name):
-        return {target.id}
-    if isinstance(target, ast.Tuple | ast.List):
-        return {name for element in target.elts for name in _bound(element)}
-    if isinstance(target, ast.Starred):
-        return _bound(target.value)
-    return set()
-
-
-def _bindings(tree: ast.Module) -> list[tuple[list[ast.expr], ast.expr]]:
-    pairs: list[tuple[list[ast.expr], ast.expr]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            pairs.append((node.targets, node.value))
-        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr) and node.value is not None:
-            pairs.append(([node.target], node.value))
-        elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension):
-            pairs.append(([node.target], node.iter))
-        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
-            pairs.append(([node.optional_vars], node.context_expr))
-    return pairs
+def _tables(classes: Set[str] = frozenset({MODEL})) -> TableNames:
+    """What ``__tablename__`` reads as: ``agent_runs`` on the model (under a name it is imported as)."""
+    return lambda node: TABLE if _is_model(node, classes) else None
 
 
 def _mentions(node: ast.AST, classes: Set[str], loaded: Set[str]) -> bool:
@@ -275,7 +164,7 @@ def _loaded_names(tree: ast.Module, classes: Set[str]) -> set[str]:
     """Every name the module binds from an expression that names the model or another such name: a row of
     ``get(AgentRun, ...)``, a ``select(AgentRun)``, the ``scalars`` of one, a loop variable over them.
     Flow- and scope-blind on purpose: within a module it may take too many names, never too few."""
-    pairs = _bindings(tree)
+    pairs = bindings(tree)
     loaded: set[str] = set()
     while True:
         grown = {
@@ -283,7 +172,7 @@ def _loaded_names(tree: ast.Module, classes: Set[str]) -> set[str]:
             for targets, value in pairs
             if _mentions(value, classes, loaded)
             for target in targets
-            for name in _bound(target)
+            for name in bound(target)
         }
         if grown <= loaded:
             return loaded
@@ -347,7 +236,7 @@ def run_writes(source: str) -> list[str]:
             elif (
                 name in TABLE_FUNCTIONS
                 and node.args
-                and _table_name(_string_value(node.args[0], classes)) == TABLE
+                and _table_name(string_value(node.args[0], table_names=_tables(classes))) == TABLE
             ):
                 found.append(f"line {line}: {name}({TABLE!r})")
             elif (
@@ -366,10 +255,10 @@ def run_writes(source: str) -> list[str]:
             elif name in {"setattr", "set_attribute"} and len(node.args) >= 2:
                 if _mentions(node.args[0], classes, loaded):
                     found.append(f"line {line}: setattr on a loaded {MODEL}")
-                elif imports_model and _string_value(node.args[1], classes) in COLUMNS:
+                elif imports_model and string_value(node.args[1], table_names=_tables(classes)) in COLUMNS:
                     found.append(f"line {line}: setattr of a column in a module that imports {MODEL}")
         if isinstance(node, ast.Constant | ast.JoinedStr | ast.BinOp | ast.Call):
-            value = _string_value(node, classes)
+            value = string_value(node, table_names=_tables(classes))
             if value is not None and _writes_table(value):
                 found.append(f"line {line}: raw SQL writes {TABLE}")
     return found
@@ -520,6 +409,10 @@ SQL_FORMS = {
     "normalised after concatenation": "Q = 'UPDATE ' + '/* x */ ' + 'public . ' + 'agent_runs SET a = 1'\n",
     "normalised after tablename": "from app.models.agents import AgentRun\n"
     "Q = f'TRUNCATE TABLE ONLY {AgentRun.__tablename__}'\n",
+    # Fix wave B (silent-failure M3): a piece ``+`` cannot read is a ``{}`` hole, not a clean string.
+    "unreadable column after +": "Q = 'UPDATE agent_runs SET ' + col + ' = 1'\n",
+    "unreadable tail after +": "Q = 'DELETE FROM agent_runs WHERE ' + cond\n",
+    "unreadable head before +": "Q = prefix + ' INSERT INTO agent_runs (id) VALUES (1)'\n",
 }
 # ``session.delete(row)`` and ``session.merge(row)`` of a row loaded from the model write it too.
 LOADED_ROW_WRITES = {
@@ -595,6 +488,8 @@ READS = {
     "another table by metadata": "from app.models.agents import AgentRun\n"
     "q = AgentRun.metadata.tables['agent_profiles'].update()\n",
     "join of a read": "Q = ' '.join(['SELECT', 'status', 'FROM', 'agent_runs'])\n",
+    "unreadable column of a read after +": "Q = 'SELECT ' + cols + ' FROM agent_runs'\n",
+    "unreadable column of the archive after +": "Q = 'UPDATE agent_runs_archive SET ' + col + ' = 1'\n",
 }
 
 
