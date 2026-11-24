@@ -195,3 +195,11 @@ async def test_cancel_open_tasks_sets_the_flag(engine: AsyncEngine, make_task: A
     assert (await row(engine, leased))[:2] == ("cancelled", True)
     assert (await row(engine, queued))[:2] == ("cancelled", True)
     assert (await row(engine, done))[:2] == ("completed", False)
+
+
+async def test_a_flagged_task_whose_lease_died_is_cancelled_now(engine: AsyncEngine, make_task: Any) -> None:
+    task_id = await make_task("running", "-5 seconds", flag=True)
+    decision = await cancel(engine, task_id)
+    assert decision == CancelDecision(status_before="running", cancelled_now=True, kill=True, noop=False)
+    assert (await row(engine, task_id))[:2] == ("cancelled", True)
+    assert await audits(engine, task_id, "task.cancel_requested") == []

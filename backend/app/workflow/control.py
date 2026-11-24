@@ -81,30 +81,33 @@ async def request_cancel(
             http_status=409,
             details=[{"from": source.value, "to": TaskStatus.CANCELLED.value}],
         )
-    if task.cancel_requested:
-        return CancelDecision(source.value, cancelled_now=False, kill=kill, noop=False)
-
-    # The flag is no status and no versioned change: the engine's version-checked writes stay valid (R-F8).
-    await session.execute(
-        update(Task)
-        .where(Task.id == task_id)
-        .values(cancel_requested=True)
-        .execution_options(synchronize_session=False)
-    )
-    metadata: dict[str, Any] = {}
-    if reason:
-        metadata["reason"] = audit.redactor.redact(reason)[:REASON_MAX_LENGTH]
-    await audit.write(
-        session,
-        actor_type=actor.type,
-        actor_id=actor.id,
-        action="task.cancel_requested",
-        result="success",
-        resource_type="task",
-        resource_id=str(task_id),
-        project_id=task.project_id,
-        metadata=metadata or None,
-    )
+    # Already flagged (a first call under a live lease): no second flag write and no second audit, but the
+    # lease may have died since, so the decision below still runs (spec #101).
+    already_flagged = task.cancel_requested  # read before the Core UPDATE; the object is stale after it
+    if not already_flagged:
+        # No status, no version bump: the engine's version-checked writes stay valid (R-F8).
+        # synchronize_session=False leaves task.cancel_requested stale: callers use CancelDecision,
+        # not the ORM attribute (or re-select).
+        await session.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(cancel_requested=True)
+            .execution_options(synchronize_session=False)
+        )
+        metadata: dict[str, Any] = {}
+        if reason:
+            metadata["reason"] = audit.redactor.redact(reason)[:REASON_MAX_LENGTH]
+        await audit.write(
+            session,
+            actor_type=actor.type,
+            actor_id=actor.id,
+            action="task.cancel_requested",
+            result="success",
+            resource_type="task",
+            resource_id=str(task_id),
+            project_id=task.project_id,
+            metadata=metadata or None,
+        )
     if live:
         return CancelDecision(source.value, cancelled_now=False, kill=kill, noop=False)
     await transition(session, task, TaskStatus.CANCELLED, reason=REASON, actor=actor, audit=audit)
