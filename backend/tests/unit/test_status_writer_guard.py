@@ -82,6 +82,7 @@ ALLOWED_WRITER = APP / "workflow" / "states.py"
 TRANSITION_WRITERS = frozenset(
     {
         "workflow/states.py",
+        "workflow/control.py",
         "workflow/engine.py",
         "workflow/recovery.py",
         "services/project_tasks.py",
