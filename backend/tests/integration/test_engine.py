@@ -2717,3 +2717,264 @@ async def test_a_new_token_per_step(engine: AsyncEngine, make_task) -> None:  # 
     assert len(tokens) >= 2
     assert len({id(token) for token in tokens}) == len(tokens)
     assert not any(token.cancelled for token in tokens)
+
+
+# --- WP-3.2f1 Task 3 (spec §16.7.2 #105, R-F3, R-F4, R-F6): the engine writes cancelled ---
+
+
+async def audit_changes(engine: AsyncEngine, task_id: uuid.UUID) -> int:
+    async with make_sessionmaker(engine)() as session:
+        rows = await session.scalars(
+            select(AuditEvent.id).where(
+                AuditEvent.action == "task.status_changed", AuditEvent.resource_id == str(task_id)
+            )
+        )
+        return len(rows.all())
+
+
+async def test_a_flagged_draft_is_cancelled_at_claim_without_a_planning_attempt(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+) -> None:
+    task_id = await make_task("draft", {"dispatch": DISPATCHED})
+    await set_cancel_flag(engine, task_id)
+    steps = Steps()
+
+    outcome = await make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, [], "cancelled")
+    assert steps.names == []
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.lease_owner, after.lease_expires_at) == (
+        "cancelled",
+        "cancel_requested",
+        None,
+        None,
+    )
+    assert after.checkpoint == {"dispatch": DISPATCHED}  # no planning attempt was counted
+    assert await kinds(engine, task_id) == [changed("draft", "cancelled", "cancel_requested")]
+    assert await audit_changes(engine, task_id) == 1
+
+
+async def test_a_flagged_queued_task_is_cancelled_at_claim(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("queued")
+    await set_cancel_flag(engine, task_id)
+    steps = Steps()
+
+    outcome = await make_engine(engine, RecordingBus(), steps.registry("implement")).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, [], "cancelled")
+    assert steps.names == []
+    after = await row(engine, task_id)
+    assert (after.status, after.lease_owner) == ("cancelled", None)
+    assert await kinds(engine, task_id) == [
+        changed("queued", "cancelled", "cancel_requested")  # never running
+    ]
+    assert await audit_changes(engine, task_id) == 1
+
+
+async def test_a_flag_before_the_step_starts_cancels(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = await make_task("draft")
+    start = TaskEngine._start
+
+    async def flag_then_start(self: TaskEngine, *args: Any) -> Any:
+        await set_cancel_flag(engine, task_id)
+        return await start(self, *args)
+
+    monkeypatch.setattr(TaskEngine, "_start", flag_then_start)
+    steps = Steps()
+
+    outcome = await make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, [], "cancelled")
+    assert steps.names == []
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.lease_owner) == ("cancelled", "cancel_requested", None)
+    assert await kinds(engine, task_id) == [changed("draft", "cancelled", "cancel_requested")]
+    assert other_tasks() == []
+
+
+async def test_a_done_result_with_the_flag_is_dropped_and_cancelled(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("draft")
+
+    async def flags_then_done(_: StepContext) -> StepResult:
+        await set_cancel_flag(engine, task_id)
+        return StepResult.done()
+
+    steps = Steps(intake=flags_then_done)
+    with capture_logs() as logs:
+        outcome = await make_engine(engine, RecordingBus(), steps.registry(*PLANNING), heartbeat_s=30).run(
+            task_id
+        )
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["intake"], "cancelled")
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.lease_owner) == ("cancelled", "cancel_requested", None)
+    assert "completed_steps" not in after.checkpoint  # the cancelled step is not done
+    assert await kinds(engine, task_id) == [
+        started("intake"),
+        finished("intake", "cancelled"),
+        changed("draft", "cancelled", "cancel_requested"),
+    ]
+    dropped = [e for e in logs if e["event"] == "step_result_dropped"]
+    assert [(e["task_id"], e["step"], e["kind"]) for e in dropped] == [(str(task_id), "intake", "done")]
+    assert all("exc_info" not in e for e in logs)
+    assert other_tasks() == []
+
+
+@pytest.mark.parametrize("flagged", [True, False])
+async def test_run_cancelled_with_the_flag_becomes_cancelled(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    flagged: bool,
+) -> None:
+    """Without the flag an abandon only releases (``test_an_abandon_without_the_flag_only_releases``)."""
+    task_id = await make_task("queued")
+
+    async def abandons_cancelled(_: StepContext) -> StepResult:
+        if flagged:
+            await set_cancel_flag(engine, task_id)
+        raise StepAbandoned("run_cancelled")
+
+    steps = Steps(implement=abandons_cancelled)
+    outcome = await make_engine(engine, RecordingBus(), steps.registry("implement"), heartbeat_s=30).run(
+        task_id
+    )
+
+    after = await row(engine, task_id)
+    if flagged:
+        assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "cancelled")
+        assert (after.status, after.status_reason, after.lease_owner) == (
+            "cancelled",
+            "cancel_requested",
+            None,
+        )
+        assert await kinds(engine, task_id) == [
+            changed("queued", "running", None),
+            started("implement"),
+            changed("running", "cancelled", "cancel_requested"),
+        ]
+    else:
+        assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "abandoned")
+        assert (after.status, after.lease_owner) == ("running", None)
+
+
+async def test_an_abandon_without_the_flag_only_releases(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("draft")
+    steps = Steps(intake=abandons)
+
+    outcome = await make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["intake"], "abandoned")
+    after = await row(engine, task_id)
+    assert (after.status, after.lease_owner, after.lease_expires_at) == ("draft", None, None)
+    assert await kinds(engine, task_id) == [started("intake")]
+
+
+@pytest.mark.parametrize("where", ["between_steps", "during_step"])
+async def test_the_flag_wins_over_the_delivery_limit(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+) -> None:
+    task_id = await make_task("draft")
+    finish = TaskEngine._finish
+
+    async def late_flag(self: TaskEngine, *args: Any) -> Any:
+        stopped = await finish(self, *args)
+        await asyncio.sleep(0.35)  # past the delivery limit, before the next step starts
+        await set_cancel_flag(engine, task_id)
+        return stopped
+
+    async def flags_and_hangs(_: StepContext) -> StepResult:
+        await set_cancel_flag(engine, task_id)
+        await asyncio.sleep(10)
+        return StepResult.done()
+
+    if where == "between_steps":
+        monkeypatch.setattr(TaskEngine, "_finish", late_flag)
+        steps = Steps()
+    else:
+        steps = Steps(intake=flags_and_hangs)
+    outcome = await asyncio.wait_for(
+        make_engine(
+            engine, RecordingBus(), steps.registry(*PLANNING), heartbeat_s=30, delivery_limit_s=0.3
+        ).run(task_id),
+        timeout=10,
+    )
+
+    assert outcome.stopped == "cancelled"
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.error_code, after.lease_owner) == (
+        "cancelled",
+        "cancel_requested",
+        None,
+        None,
+    )
+    assert other_tasks() == []
+
+
+async def test_the_flag_set_after_the_last_step_is_not_lost(
+    engine: AsyncEngine,
+    make_task,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R-F3: the release of an exhausted pipeline reads the flag under the lock (ruling R1: the flag lands
+    after the last step's ``_finish`` returned)."""
+    task_id = await make_task("draft", {"completed_steps": ["intake", "context"]})
+    finish = TaskEngine._finish
+
+    async def flag_after_last(self: TaskEngine, *args: Any) -> Any:
+        stopped = await finish(self, *args)
+        assert stopped is None  # nothing ended the delivery: only the exhausted release is left
+        await set_cancel_flag(engine, task_id)
+        return stopped
+
+    monkeypatch.setattr(TaskEngine, "_finish", flag_after_last)
+    steps = Steps()
+
+    outcome = await make_engine(engine, RecordingBus(), steps.registry(*PLANNING)).run(task_id)
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["plan"], "cancelled")
+    after = await row(engine, task_id)
+    assert (after.status, after.status_reason, after.lease_owner) == ("cancelled", "cancel_requested", None)
+    assert after.checkpoint["completed_steps"] == ["intake", "context", "plan"]
+    assert await kinds(engine, task_id) == [
+        started("plan"),
+        finished("plan"),
+        changed("draft", "cancelled", "cancel_requested"),
+    ]
+
+
+async def test_lease_lost_with_the_flag_writes_nothing(engine: AsyncEngine, make_task) -> None:  # type: ignore[no-untyped-def]
+    task_id = await make_task("queued")
+
+    async def flags_and_loses_lease(_: StepContext) -> StepResult:
+        await set_cancel_flag(engine, task_id)
+        await take_over_lease(engine, task_id)
+        return StepResult.done()
+
+    steps = Steps(implement=flags_and_loses_lease)
+    outcome = await make_engine(engine, RecordingBus(), steps.registry("implement"), heartbeat_s=30).run(
+        task_id
+    )
+
+    assert outcome == EngineOutcome(ClaimResult.ACQUIRED, ["implement"], "lease_lost")
+    after = await row(engine, task_id)
+    assert (after.status, after.lease_owner) == ("running", "w-other")
+    assert await kinds(engine, task_id) == [changed("queued", "running", None), started("implement")]
+
+    async with engine.begin() as conn:  # the other owner's lease runs out
+        await conn.execute(
+            text("UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = :id"),
+            {"id": task_id},
+        )
+    swept = await recover_expired(make_sessionmaker(engine), RecordingBus(), AUDIT)
+
+    assert swept.recovered == 1
+    assert (await row(engine, task_id)).status == "cancelled"
