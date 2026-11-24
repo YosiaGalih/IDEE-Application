@@ -459,6 +459,12 @@ Butir 1–4 memblokir. Butir 5–11 mengubah urutan kerja dan perlu diputuskan d
   - `HEARTBEAT_SECONDS`/`LEASE_SECONDS` tidak terdokumentasi di CONFIGURATION.
   - `sandbox.run_killed` (SECURITY_MODEL §6) belum punya penulis (ditulis di 3.2f1).
 - **Batas yang diterima dan dibawa ke WP-4.x:** race kill vs run sandbox baru (≤ 20 dtk; saat ini belum terjangkau, karena belum ada tool sandbox), dan `cancel_open_tasks` tanpa kill.
+- **Konflik yang ditemukan saat eksekusi 3.2f1 (ruling Lead, ledger SDD; rinciannya di tracker § WP-3.2f1):**
+  - **Plan vs CHECK DB.** Plan menulis audit `result="ok"`, padahal CHECK `audit_events.result` hanya menerima `success|denied|error`. Diputuskan `success`/`error` (R3), dan plan sudah dikoreksi.
+  - **Plan vs spec #101.** Plan menulis "flag sudah terpasang → `cancelled_now=False`". Diputuskan mengikuti spec: task ber-flag yang lease-nya mati langsung ditransisikan (R5).
+  - **Spec R-F1 vs implementasi.** `TaskControlEnv` tidak punya bus event, sama seperti semua penulis transisi lain di sisi API. SSE melihat event lewat replay atau ping, dengan jeda paling lama 15 dtk (R7). Dicatat sebagai deviasi di addendum spec §16.7.4.
+  - **Usul AG-13 L2 (503) vs preseden repo.** Kunci baris tertahan menjawab 409 `CONFLICT` `busy` dengan `Retry-After: 1`, mengikuti `WorkspaceBusy` (R11). AG-13 menerima ini di delta.
+  - **Kontrak respons aditif.** `meta.kill` (`not_needed|confirmed|unconfirmed`) ditambahkan di amplop respons cancel (R9) dan didokumentasikan di API_CONTRACTS.
 
 ### Celah untuk sistem pengembangan (tidak ditentukan dokumen)
 
