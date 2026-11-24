@@ -459,6 +459,9 @@ async def test_a_step_that_does_not_stop_cannot_keep_the_lease_alive(
                 async def refuses(*args: Any, **kwargs: Any) -> None:
                     raise OSError("the database is not reachable")
 
+                # The engine heartbeat renews through renew_lease_flags, and _locked (in _finish) through
+                # renew_lease: both are refused, as when the one name was patched.
+                monkeypatch.setattr(engine_module, "renew_lease_flags", refuses)
                 monkeypatch.setattr(engine_module, "renew_lease", refuses)
             elif path == "outer_cancel":
                 await asyncio.sleep(0.3)

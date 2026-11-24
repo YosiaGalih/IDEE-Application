@@ -86,7 +86,7 @@ Index `(project_id, kind)`, `(project_id, symbol)`; trigram index pada `path` bi
 | base_commit | varchar(64) null | commit default branch saat worktree dibuat |
 | iteration | int default 1 | naik pada remediation / reopen |
 | debug_attempts | int default 0 | |
-| cancel_requested | bool default false | |
+| cancel_requested | bool default false | WP-3.2f1 (spec §16.7.2 #101, #105, #112; R-F8). **Penulis:** `workflow/control.py::request_cancel` (route `POST /tasks/{id}/cancel`) dan `services/project_tasks.py::cancel_open_tasks`, keduanya dengan Core `UPDATE … SET cancel_requested = true` tanpa menaikkan `version`; tidak pernah di-reset (status akhir `cancelled`). **Pembaca:** engine (claim, `_locked`, pelepasan lease; heartbeat lewat `renew_lease_flags … RETURNING`), recovery (`cancelled` bagi lease mati), dan `Task.cancel_requested` di API. Flag menyala dengan status `running` berarti "membatalkan…" |
 | pause_requested | bool default false | ADR-031 |
 | lease_owner | varchar(120) null | |
 | lease_expires_at | timestamptz null | |

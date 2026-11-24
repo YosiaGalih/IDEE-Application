@@ -32,7 +32,7 @@ from app.core.events import EventBus, commit_and_publish
 from app.core.logging import get_logger
 from app.models.tasks import Task
 from app.workflow.lease import LEASE_SECONDS
-from app.workflow.states import Actor, TaskStatus, transition
+from app.workflow.states import CANCEL_REASON, Actor, TaskStatus, transition
 
 ACTOR = Actor("system", "recovery")
 NO_LEASE_GRACE = timedelta(seconds=LEASE_SECONDS)
@@ -135,7 +135,7 @@ async def _recover_one(
             db,
             task,
             target,
-            reason="cancel_requested" if cancel else "lease_expired",
+            reason=CANCEL_REASON if cancel else "lease_expired",
             actor=ACTOR,
             audit=audit,
         )

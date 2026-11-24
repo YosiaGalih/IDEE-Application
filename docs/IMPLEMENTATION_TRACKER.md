@@ -3770,3 +3770,153 @@ All checks passed! · 382 files already formatted · 0 errors · Contracts: 12 k
 - Backstop DB (`SECURITY DEFINER`, cabut `UPDATE(status)` dari role worker) tetap backlog. Guard statis tetap pagar kode first-party.
 
 **Syarat yang dibawa ke 3.2g:** approval `pending` pada task `failed approval_unsupported` (N62, AG-13 INFO-4).
+
+**Sesudah PR #43 (fakta, 24 Nov 2026) [Pasti]:**
+- CI PR #43 (WP-3.2c2c2) di 797dac7: 8/9 job hijau. `security-scan` merah oleh 8 CVE di image upstream: nginx dan libxml2 di `kodekantor/web`, libxml2 di `postgres:16.16-alpine`. Kedelapan temuan itu identik dengan yang muncul di `main` cd3b138 (push run 45131287429), dan sudah dikomentari sekali di PR.
+- PO menandai PR #43 ready, lalu me-merge-nya pada 24 Nov 2026 ±07:28 UTC (32816a7).
+- PO tidak memberi tanggapan atas usul WP-3.2c2b3 maupun soal base image web dan postgres.
+- **Keputusan Lead (24 Nov 2026), dicatat sesuai mandat "jalan tanpa menunggu":** WP-3.2c2b3 (🔒 backstop DB penulis status) dijadwalkan sesudah 3.2f dan sebelum 3.2d. Pemiliknya Lead, dengan sign-off AG-13. Tenggatnya sebelum 3.2d dimulai. Dengan ini syarat AG-13 C3 (ID WP, pemilik, tenggat) terpenuhi sementara, sampai PO memutuskan lain. Urutan yang diusulkan: 3.2f → 3.2c2b3 → 3.2c2b2 (N25, butuh PO) → 3.2d.
+
+### WP-3.2f1 (🔒 cancel) — `POST /tasks/{task_id}/cancel`, penulis cancel hibrida, token cancel milik engine, kill sandbox sesudah commit dengan penanda `cancel_unconfirmed`, empat test AC-14 (sub-WP kedelapan WP-3.2; Keputusan Lead #100–#114, ruling R-F1..R-F10; AC-14; FR task cancel; INFO-2 SECURITY_MODEL)
+
+**Dokumen kerja:**
+- Spec induk:
+  - §16.7.1: pecahan 3.2f1/3.2f2 (#100);
+  - §16.7.2: Keputusan Lead #101–#114 atas N64–N77;
+  - §16.7.3: rancangan rinci A–K;
+  - §16.7.4: builder check dan ruling R-F1..R-F10, plus addendum ruling SDD.
+- Plan `docs/superpowers/plans/2026-11-24-wp-3.2f1-cancel.md` (8 task).
+- Discovery di scratchpad (`discovery-3.2f.md`, N64–N77 dengan bukti file:line).
+
+**Cara dikerjakan:**
+- Subagent-driven-development: implementer per task, lalu review per task (spec + kualitas). Kedelapan task di-Approve.
+- Temuan dari review per task ditutup lewat fix loop:
+  - T2: fault injection N53 `give_up` dipindah ke `renew_lease_flags` dan `renew_lease` sekaligus (76db25e).
+  - T4: task ber-flag yang lease-nya sudah mati langsung ditransisikan (R5, d5c62dc).
+  - T5: tangkapan galat kill dilebarkan. Rekaman sesudah commit dijaga, dan `aclose` masuk Protocol `SandboxClient` (R6, b097237).
+- Ruling Lead R1–R13 dicatat di ledger SDD. Yang mengubah rancangan dimasukkan ke addendum spec §16.7.4.
+- Review akhir lima kursi atas `32816a7..6ee3a98`:
+  - kk-backend-reviewer: **APPROVE WITH CHANGES** (3 MEDIUM);
+  - kk-silent-failure-hunter: 0 CRITICAL, 2 HIGH, 4 MEDIUM, 6 LOW;
+  - AG-13: **NOT SIGNED OFF** (H1 matriks cross-project merah; M1 N60);
+  - `/code-review` Standards: tanpa pelanggaran keras;
+  - `/code-review` Spec: tanpa gap yang memblokir.
+- Suite penuh di 6ee3a98 **macet 25 menit**:
+  - `test_engine_blackhole.py` membungkus `TaskEngine._locked` dengan signature lama, tanpa `finishing=`. Wrapper itu melempar `TypeError`, lalu loop tunggu test berputar tanpa batas.
+  - Celah prosesnya: verifikasi per task hanya menjalankan file test yang disebut plan, bukan semua test yang mem-patch fungsi yang berubah.
+  - Suite ulang tanpa test itu: 1 gagal (matriks AG-13 H1), 6519 lulus.
+- Suite penuh @ e4518a7 saat delta AG-13 berjalan paralel: 1 gagal, `test_git_adapter.py::test_grep_parses_off_the_event_loop` (jeda loop 0,528 dtk > 0,5).
+  - Modul gitops tidak disentuh 3.2f1 (diff kosong).
+  - Sendirian test itu lulus 10/10.
+  - Kesimpulan: flake waktu karena CPU berebut, tidak di-skip.
+- Gelombang perbaikan dikerjakan dua fixer paralel (R12):
+  - A, kode + test: `13b13d7`, `567ab15`, `713e7b6`, `b94df67`, `52edb2f`;
+  - B, dokumen + test AC-14: `f31566d`, `e4518a7`, dikerjakan di worktree terpisah lalu di-cherry-pick.
+- Re-review terlingkup atas `6ee3a98..e4518a7`: **Approved**, A1–A12 dan B1–B9 ADDRESSED, tanpa kerusakan Critical/Important. Dua nit dokumen ditutup controller: kutip `resource_type`, kalimat H1 di SECURITY_MODEL.
+- Lalu delta AG-13 (di bawah).
+
+**Yang dibangun:**
+- **Lease** (`app/workflow/lease.py`, T1): `renew_lease_flags` mengembalikan `LeaseFlags(cancel_requested, pause_requested)` bersama perpanjangan lease. `renew_lease` dan `renew_lease_flags` berbagi `_renew`, termasuk gerbang owner yang dicabut.
+- **Token cancel milik engine** (T2, #102/#103):
+  - `StepContext.cancel` adalah `CancelToken` baru per `_start` (R2).
+  - Heartbeat engine menembakkan token itu bila flag terbaca.
+  - `AgentStep` meneruskannya ke runtime (`cancel=ctx.cancel`), dan ToolGateway memeriksanya sebelum tiap tool.
+- **Penulis `cancelled` di engine** (T3, #104–#106, R-F3/R-F4):
+  - Engine menulis `cancelled` di beberapa titik: saat claim (sebelum `count_planning_attempt` dan `queued→running`), di setiap `_locked`, sesudah `StepAbandoned`, sebelum hasil batas delivery, dan di setiap pelepasan lease tanpa transisi terminal.
+  - Kedua titik penulisan memakai satu helper `_write_cancelled` (gelombang A).
+  - `CANCEL_REASON` tunggal ada di `app/workflow/states.py`, dipakai engine, `control` dan `recovery`.
+- **Penulis API** (`app/workflow/control.py`, T4, #101, R5):
+  - `request_cancel` mengunci baris (`FOR UPDATE`), lalu membaca lease hidup dari `clock_timestamp()`.
+  - Flag selalu diset. `transition → cancelled` hanya terjadi bila tidak ada lease hidup.
+  - `reason` diredaksi dan dipotong 200 karakter. Baris yang tidak ada menjadi `LookupError` → 404 (R4).
+  - Kunci yang tertahan (55P03) menjadi 409 `CONFLICT` busy dengan `Retry-After: 1` (R11, AG-13 L2).
+  - UPDATE flag dibangun di satu helper, yang juga dipakai `cancel_open_tasks` saat project dihapus.
+- **Kill sandbox** (`app/services/task_control.py`, T5, #110, R6/R9):
+  - Kill berjalan sesudah commit, di luar sesi DB, dalam `asyncio.timeout(KILL_TIMEOUT_S=10.0)`.
+  - Bila `killed > 0`, ditulis audit `sandbox.run_killed`.
+  - Kegagalan apa pun ditulis dalam satu transaksi: event `task.log` `cancel_unconfirmed` dengan kalimat tetap, plus audit `task.cancel_unconfirmed` (`result="error"`, `{error_type}`).
+  - Setiap rekaman sesudah commit dibatasi `RECORD_TIMEOUT_S = 5.0`. Kegagalannya di-log level error lalu ditelan; `CancelledError` diteruskan.
+  - Respons membawa `meta.kill`: `not_needed`, `confirmed` atau `unconfirmed`.
+- **Route** `POST /api/v1/tasks/{task_id}/cancel` (T6):
+  - Body opsional `{reason?}`, `extra="forbid"`, maks 200 karakter.
+  - Karakter kontrol C0 (kecuali tab/LF/CR) dan DEL ditolak dengan 422 (AG-13 L1).
+  - Mengembalikan 200 `TaskOut`, dan tidak digerbangi flag engine.
+  - Ketiga audit membawa `ip` dan `correlation_id = "task:<id>"` (AG-13 L4).
+- **Test:**
+  - AC-14 (`tests/integration/test_cancellation.py`, T7 + gelombang B):
+    - `test_cancel_queued_immediate`;
+    - `test_cancel_running_kills_sandbox`, dengan `killed_tasks`;
+    - `test_cancel_during_llm_stream`, dengan sinyal stream provider sudah mulai dan usage parsial tercatat;
+    - `test_unkillable_marked`, dengan kalimat penanda dipatok.
+  - Cancel di route ditambah, juga matriks cross-project (AG-13 H1).
+  - Cabang R-F4 diuji, `test_engine_blackhole.py` gagal cepat, dan guard penulis status ikut mencakup `control.py`.
+- **Kontrak import N60** melarang paket langkah memakai `app.workflow.control` dan `app.services.task_control` (AG-13 M1). Mutan langsung maupun lewat rantai impor BROKEN.
+
+**Bukti:**
+```text
+$ p32-pytest.sh -q -rw                 # suite backend penuh @ e4518a7 (tanpa proses lain berjalan)
+6547 passed in 788.25s                (tanpa warning)
+$ uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run lint-imports   # @ e4518a7
+All checks passed! · 388 files already formatted · 0 errors · Contracts: 12 kept, 0 broken
+```
+
+**Review akhir AG-13 (@ 6ee3a98): NOT SIGNED OFF** [Pasti]:
+- **H1 (C-a):** route cancel tidak ada di matriks lintas-project, sehingga test matriks merah di HEAD. Assert CSRF tanpa-efek juga tidak bermakna untuk cancel.
+- **M1 (C-b):** N60 belum melarang `app.workflow.control` dan `app.services.task_control`. Mutan b lolos.
+- **L1, L2, L4 (C-c, tenggat 3.2f2):** dikerjakan sekarang (R10).
+- **L3 (C-d):** amplifikasi cancel berulang, tenggat 3.2h1.
+- **I2:** SLA cancel hanya berlaku untuk langkah yang menghormati `ctx.cancel`.
+- **I4:** TEST_STRATEGY salah menyebut cakupan test unkillable.
+- Race di jalur cancel dirunut lewat PoC: semuanya terserialisasi.
+
+**Delta AG-13 atas gelombang perbaikan (`6ee3a98..e4518a7`): SIGNED OFF WITH CONDITIONS 🔒** [Pasti]:
+- **C-a MET.** Mutan "scope" dan "csrf" gagal di matriks. Assert efek CSRF tetap menangkap pelanggaran walau assert status dan kode dihapus.
+- **C-b MET.** Mutan N60 a, b (yang dulu lolos), c, dan d (`app/services/steps/planner.py`) semuanya BROKEN.
+- **C-c MET:**
+  - L1: NUL, ESC, dan surrogate tunggal → 422 tanpa efek.
+  - L2: 409 busy dalam 5,01 dtk, tanpa teks SQL. Stranger tetap 404 dalam 0,01 dtk karena `authorize` berjalan sebelum `FOR UPDATE`. `Idempotency-Key` yang sama dieksekusi ulang sesudah kunci lepas. **R11 diterima.**
+  - L4: mutan L4a dan L4b gagal.
+- Sembilan mutan kode/test lain mati: `meta.kill`, `RECORD_TIMEOUT_S`, blackhole. `-W error`: 289 lulus.
+- **LOW D1:** kalimat H1 di SECURITY_MODEL mengklaim lebih dari yang dibuktikan matriks. **Ditutup** di commit tracker, dengan bukti dirinci dan "tanpa kill" diberi label `[Kemungkinan Besar]` (urutan kode).
+- **INFO:**
+  - D2 (redaksi L3): diperbaiki.
+  - D3 (`ip` opsional di `request_cancel`) dan D4 (`is` lemah karena interning): R15, dibawa ke 3.2f2.
+  - D5 (nit dokumen): ditutup.
+  - D6 (C1/bidi diterima di `reason`): UI 3.2h1 wajib merender dengan isolasi bidi.
+- **Syarat:**
+  1. Sebelum merge: job CI `security.yml` (gitleaks, pip-audit, Semgrep registry) hijau di PR, karena scanner itu tidak bisa dijalankan di container.
+  2. C-d/L3 paling lambat merge 3.2h1.
+
+**Keputusan Lead selama eksekusi (ledger SDD):**
+- R1: test (vi) T3 menyetel flag sesudah `_finish` terakhir kembali.
+- R2: `StepContext.cancel` memakai `default_factory`.
+- R3: audit `result` bernilai `success`/`error` (CHECK DB).
+- R4: `LookupError` → 404.
+- R5: task ber-flag dengan lease mati ditransisikan sekarang.
+- R6: tangkapan kill dilebarkan; rekaman sesudah commit ditelan.
+- R7: sisi API tidak punya bus event. SSE melihat event lewat replay/ping, dengan jeda paling lama 15 dtk.
+- R8: `_release_after_error` dikecualikan dari R-F3.
+- R9: `meta.kill`.
+- R10: AG-13 L1/L2/L4 dikerjakan sekarang; L3 ke 3.2h1.
+- R11: 409 busy, bukan 503.
+- R12: dua fixer paralel.
+- R13: smell gaya kode ditunda.
+- R14: 503 di R10 digantikan R11.
+- R15: AG-13 INFO D3/D4 ke 3.2f2.
+
+**Ditunda (bukan blocker):**
+- Smell Standards:
+  - field `CancelDecision` yang tidak terpakai;
+  - data clump `(env, actor, task_id, project_id)`;
+  - tuple `finishing`;
+  - dua tangga `try` serupa;
+  - rantai `audit.redactor`.
+- Backend LOW-1: helper test lintas modul sebaiknya ke `tests/cancel_fakes.py`.
+- Silent-failure M2/M3/M4/L6: log opsional, dan penanda ganda pada kegagalan berulang (tidak diwajibkan).
+- Catatan UX untuk 3.2h1: `step_finished "cancelled"` adalah nilai baru bagi frontend, dan timeline (iii) belum punya `step_finished`.
+
+**Syarat yang dibawa:**
+- **AG-13 C-d, paling lambat 3.2h1:** L3, amplifikasi cancel berulang saat sandbox-manager mati (penanda idempoten atau rate limit).
+- **3.2d:** SLA cancel hanya berlaku untuk langkah yang menghormati `ctx.cancel` (AG-13 I2). Langkah mentah wajib memeriksa atau menunggu token itu.
+- **3.2f2:** pause/resume/retry (ADR-076), memakai `LeaseFlags.pause_requested`. `ip` di `request_cancel` dijadikan keyword wajib (AG-13 D3).
+- **3.2h1:** `reason` (audit/task UI) dirender sebagai teks dengan isolasi bidi (AG-13 D6). `step_finished "cancelled"` ditangani frontend.

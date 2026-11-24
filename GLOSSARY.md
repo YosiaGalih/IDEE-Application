@@ -110,6 +110,14 @@ Penantian di akhir job `run_task` (`execute_task`, `app/worker/jobs.py`) terhada
 **Sweep dispatch**:
 Job beat (`dispatch_sweep`, tiap 30 dtk) yang mengirim ulang task `draft|queued` yang pernah di-dispatch (`checkpoint.dispatch.at`) tetapi lease-nya mati dan sudah lewat masa tunggu 60 dtk, karena job `run_task`-nya hilang; berbeda dari sweep recovery, yang memulihkan task `running|validating` yang lease-nya kedaluwarsa.
 
+**Pembatalan hibrida**:
+Pembagian penulis status `cancelled` (WP-3.2f1, spec §16.7.2 #101): di bawah kunci baris API memasang `cancel_requested` lalu men-`transition` sendiri **hanya bila task tanpa lease hidup**; dengan lease hidup, engine pemilik lease yang menulis `cancelled` (di claim, batas langkah, atau pelepasan lease), dan recovery bila worker mati. Respons API untuk task ber-lease bisa masih `running` dengan `cancel_requested=true` ("membatalkan…").
+_Avoid_: "API membatalkan task" tanpa kualifikasi, dan menyebut flag itu status
+
+**Jembatan cancel**:
+Jalur yang membawa flag `cancel_requested` dari API sampai menghentikan langkah yang sedang berjalan: heartbeat engine membaca flag lewat `renew_lease_flags` dan memicu `StepContext.cancel` (token milik engine, baru per percobaan langkah), yang diteruskan `AgentStep` ke runtime; paralelnya API memanggil `sandbox.kill_task` sesudah commit. Latensi ≤ `HEARTBEAT_SECONDS`.
+_Avoid_: mencampurnya dengan `CancelToken` runtime milik run, atau dengan `LeaseHeartbeat` runtime (tidak membaca flag)
+
 **Iterasi**:
 Putaran ke-n pengerjaan satu task (`tasks.iteration`, mulai 1), naik pada `request-changes` atau remediation; berbeda dari iterasi tool di dalam satu agent run.
 _Avoid_: mencampurnya dengan `max_tool_iterations`

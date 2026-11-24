@@ -10,6 +10,7 @@ import asyncio
 import time
 import uuid
 from datetime import timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import text
@@ -153,6 +154,19 @@ async def test_a_bounded_transaction_ends_run_when_the_database_black_holes_befo
     assert ended - hole.frozen_at <= 2 * (2 + 2.5)
 
 
+async def wait_for_freeze(hole: BlackHole, worker: asyncio.Task[Any]) -> float:
+    """``frozen_at`` once the proxy freezes. Fails at once, with the worker's own error, if the worker ends
+    first: a broken wrapper or an engine error must fail the test, never leave it waiting for a freeze that
+    cannot come."""
+    while hole.frozen_at is None:  # a plain float the proxy sets
+        if worker.done():
+            if not worker.cancelled() and (error := worker.exception()) is not None:
+                raise AssertionError("the worker ended before the freeze") from error
+            raise AssertionError("the worker ended before the freeze")
+        await asyncio.sleep(0.02)
+    return hole.frozen_at
+
+
 async def row_is_free(engine: AsyncEngine, task_id: uuid.UUID) -> bool:
     """On a direct connection: can another transaction take the task row (``FOR UPDATE SKIP LOCKED``)?"""
     async with engine.connect() as conn:
@@ -208,8 +222,7 @@ async def test_the_server_ends_a_session_that_goes_silent_inside_a_lease_guarded
 
     try:
         holder = asyncio.create_task(hold_then_freeze())
-        while hole.frozen_at is None:  # noqa: ASYNC110 - a plain float the proxy sets
-            await asyncio.sleep(0.02)
+        await wait_for_freeze(hole, holder)
         assert not await row_is_free(engine, task_id)  # right after the freeze the lock is held
         if idle == "0":
             await asyncio.sleep(4.5)
@@ -242,8 +255,15 @@ async def test_a_black_holed_finish_releases_the_row_lock_before_the_client_give
     flagged = False
     original = TaskEngine._locked
 
-    async def locked_then_arm(self: TaskEngine, db: AsyncSession, task: uuid.UUID, status: str) -> Task:
-        found = await original(self, db, task, status)
+    async def locked_then_arm(
+        self: TaskEngine,
+        db: AsyncSession,
+        task: uuid.UUID,
+        status: str,
+        *,
+        finishing: tuple[str, str] | None = None,
+    ) -> Task:
+        found = await original(self, db, task, status, finishing=finishing)
         if flagged:
             hole.arm()
         return found
@@ -259,14 +279,13 @@ async def test_a_black_holed_finish_releases_the_row_lock_before_the_client_give
     task_engine = TaskEngine(ports(eng, steps, heartbeat_s=30.0))
     runner = asyncio.create_task(task_engine.run(task_id))
     try:
-        while hole.frozen_at is None:  # noqa: ASYNC110 - a plain float the proxy sets
-            await asyncio.sleep(0.02)
+        frozen_at = await wait_for_freeze(hole, runner)
         freed = await wait_until_free(engine, task_id, hole, within=2 + 2.5)
         print(f"\nfreeze->lock released={freed:.2f}s")
         assert not runner.done()  # the client is still stuck: the server ended the lock, not the client
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(runner, timeout=45)
-        assert time.monotonic() - hole.frozen_at <= 2 * (6 + 2.5)
+        assert time.monotonic() - frozen_at <= 2 * (6 + 2.5)
     finally:
         hole.release()
         runner.cancel()

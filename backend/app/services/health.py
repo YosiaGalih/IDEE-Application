@@ -21,7 +21,7 @@ from app.core.config import Settings
 from app.core.db import make_engine, make_sessionmaker
 from app.core.logging import get_logger
 from app.gitops.adapter import GitAdapter
-from app.sandbox.client import HttpSandboxClient
+from app.sandbox.client import HttpSandboxClient, SandboxClient
 from app.services.job_queue import CeleryJobQueue, JobQueue, SmokeQueue
 from app.services.projects import CreateGate
 from app.services.task_events import StreamSlots, TaskEventHub
@@ -47,7 +47,7 @@ class Dependencies:
 
     engine: AsyncEngine
     redis: Redis
-    sandbox: HttpSandboxClient
+    sandbox: SandboxClient
     migration_heads: frozenset[str]
     sessions: async_sessionmaker[AsyncSession]
     git: GitAdapter = field(default_factory=GitAdapter)

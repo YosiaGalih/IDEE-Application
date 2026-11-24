@@ -327,8 +327,13 @@ ID_ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("GET", "/api/v1/tasks/{task_id}/events", None),  # the owner's task is finished (see ``addressed``)
     ("GET", "/api/v1/conversations/{conversation_id}/messages", None),
     ("POST", "/api/v1/conversations/{conversation_id}/messages", {"content": "x", "create_task": False}),
+    ("POST", "/api/v1/tasks/{task_id}/cancel", None),  # on the finished task a member's cancel is a no-op
 ]
-ID_WRITES = {("POST", "/api/v1/conversations/{conversation_id}/messages")}
+ID_WRITES = {
+    ("POST", "/api/v1/conversations/{conversation_id}/messages"),
+    ("POST", "/api/v1/tasks/{task_id}/cancel"),
+}
+CANCEL_ROUTE = "/api/v1/tasks/{task_id}/cancel"
 
 
 def id_routes(app: FastAPI) -> set[tuple[str, str]]:
@@ -459,11 +464,44 @@ async def test_an_id_route_write_without_the_csrf_token_is_refused(
     path: str,
     body: dict[str, object] | None,
 ) -> None:
-    owner = world["owner"]
-    assert isinstance(owner, httpx.AsyncClient)
+    project, owner = world["project"], world["owner"]
+    assert isinstance(project, dict) and isinstance(owner, httpx.AsyncClient)
+    ids = dict(addressed)
+    if path == CANCEL_ROUTE:
+        # The addressed task is finished, where a cancel changes nothing: an open draft, which a cancel
+        # that got through would flag, audit and move to ``cancelled`` (no lease holds it).
+        fresh = await call(owner, "POST", f"/api/v1/projects/{project['id']}/tasks", {"prompt": "x"})
+        assert fresh.status_code == 202, fresh.text
+        ids["task_id"] = fresh.json()["data"]["id"]
+    before = await task_effects(engine, ids["task_id"])
     sent = {"Idempotency-Key": str(uuid.uuid4())}
-    response = await owner.request(method, fill(path, addressed), json=body, headers=sent)
+    response = await owner.request(method, fill(path, ids), json=body, headers=sent)
     assert response.status_code == 403, response.text
     assert response.json()["error"]["code"] == "CSRF_FAILED"
     async with engine.connect() as conn:
         assert (await conn.execute(text("SELECT count(*) FROM messages"))).scalar_one() == 0
+    after = await task_effects(engine, ids["task_id"])
+    assert after == before
+    assert after[2] == 0  # no task.cancel_requested audit row for the task
+    if path == CANCEL_ROUTE:
+        assert after[:2] == ("draft", False)
+
+
+async def task_effects(engine: AsyncEngine, task_id: str) -> tuple[str, bool, int]:
+    """What a cancel changes: the task's status, its flag and its ``task.cancel_requested`` audit rows."""
+    async with engine.connect() as conn:
+        status, flagged = (
+            await conn.execute(
+                text("SELECT status, cancel_requested FROM tasks WHERE id = :id"), {"id": uuid.UUID(task_id)}
+            )
+        ).one()
+        audits = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM audit_events "
+                    "WHERE action = 'task.cancel_requested' AND resource_id = :id"
+                ),
+                {"id": task_id},
+            )
+        ).scalar_one()
+    return str(status), bool(flagged), int(audits)

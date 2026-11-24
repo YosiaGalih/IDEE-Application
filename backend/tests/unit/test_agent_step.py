@@ -164,6 +164,13 @@ async def test_refusals_fail_with_a_fixed_sentence(error: BaseException, code: s
     assert all("exc_info" not in log for log in logs)
 
 
+async def test_the_request_carries_the_step_token() -> None:
+    runtime = FakeRuntime(lambda r: make_result(r.agent_run_id))
+    ctx = make_ctx()
+    await bound(runtime, FakeReads())(ctx)
+    assert runtime.requests[0].cancel is ctx.cancel
+
+
 @pytest.mark.parametrize(
     "error",
     [

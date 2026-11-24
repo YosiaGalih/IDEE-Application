@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import Row, func, or_, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -179,8 +179,16 @@ async def claim_lease(
     return ClaimResult.AT_CAPACITY
 
 
-async def renew_lease(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> None:
-    """Heartbeat: extend the lease, or raise ``LeaseLost`` if this worker no longer holds a live one."""
+@dataclass(frozen=True)
+class LeaseFlags:
+    """The task's stop requests, read in the same statement that renews its lease."""
+
+    cancel_requested: bool
+    pause_requested: bool
+
+
+async def _renew(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> Row[bool, bool]:
+    """The one renewal statement and its gate (``renew_lease`` and ``renew_lease_flags`` share it)."""
     _check_worker(worker_id)
     if worker_id in _REVOKED_OWNERS:
         raise LeaseLost(f"the lease owner of task {task_id} was revoked in this process")
@@ -190,12 +198,25 @@ async def renew_lease(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> N
             update(Task)
             .where(Task.id == task_id, Task.lease_owner == worker_id, Task.lease_expires_at > now)
             .values(lease_expires_at=now + _LEASE)
-            .returning(Task.id)
+            .returning(Task.cancel_requested, Task.pause_requested)
             .execution_options(synchronize_session=False)
         )
-    ).scalar_one_or_none()
+    ).one_or_none()
     if renewed is None:
         raise LeaseLost(f"the lease of task {task_id} was lost")
+    return renewed
+
+
+async def renew_lease(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> None:
+    """Heartbeat: extend the lease, or raise ``LeaseLost`` if this worker no longer holds a live one."""
+    await _renew(db, task_id, worker_id)
+
+
+async def renew_lease_flags(db: AsyncSession, task_id: uuid.UUID, worker_id: str) -> LeaseFlags:
+    """``renew_lease`` that also returns the cancel and pause flags; it raises ``LeaseLost`` exactly when
+    ``renew_lease`` does (spec §16.7.4 R-F5) and never returns ``None``."""
+    renewed = await _renew(db, task_id, worker_id)
+    return LeaseFlags(cancel_requested=renewed.cancel_requested, pause_requested=renewed.pause_requested)
 
 
 @dataclass(frozen=True)

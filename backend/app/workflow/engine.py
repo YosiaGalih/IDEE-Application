@@ -24,6 +24,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.audit import AuditWriter
+from app.core.cancel import CancelToken
 from app.core.db import bound_transaction
 from app.core.events import EventBus, commit_and_publish, emit_task_event
 from app.core.logging import get_logger
@@ -39,12 +40,14 @@ from app.workflow.lease import (
     lease_duration,
     release_lease,
     renew_lease,
+    renew_lease_flags,
     revoke_lease_owner,
 )
-from app.workflow.states import Actor, TaskStatus, check_error_code, fail_task, transition
+from app.workflow.states import CANCEL_REASON, Actor, TaskStatus, check_error_code, fail_task, transition
 
 # LeaseLost and TaskStatus are also what a step takes from this module (spec §16.6.6 R-D3): the step packages
 # never import app.workflow.lease or app.workflow.states (import-linter contract); a test pins the identity.
+# CANCEL_REASON, the reason of every cancelled write (the API's and recovery's too, #105), comes from states.
 ACTOR = Actor("system", "engine")
 MAX_PLANNING_ATTEMPTS = 3
 # Spec §16.4 #76: a wall-clock bound on every engine transaction, over the server-side lock and statement
@@ -93,6 +96,7 @@ Stopped = Literal[
     "abandoned",
     "step_result_invalid",
     "duration_exceeded",
+    "cancelled",
 ]
 
 logger = get_logger(__name__)
@@ -106,6 +110,8 @@ class StepContext:
     checkpoint: Mapping[str, Any]
     lease: LeaseGuard  # for a write of the step's own (§16.5a #8); read its rules before use
     pipeline: Pipeline  # which pipeline runs the step: draft (planning) or running (§16.6.2 #83)
+    # Engine-owned, new for each step attempt; the heartbeat fires it when the cancel flag is set (#102).
+    cancel: CancelToken = field(default_factory=CancelToken)
 
     def __post_init__(self) -> None:
         if self.pipeline not in ("draft", "running"):
@@ -204,10 +210,15 @@ class _Claim(NamedTuple):
     result: ClaimResult
     status: str | None  # the status the pipeline runs for; None when nothing is left to run
     todo: tuple[str, ...]
+    stopped: Stopped | None = None  # why nothing runs when ``status`` is None
 
 
 class _DeliveryLimit(Exception):
     """The delivery limit passed while a step ran; the step has been cancelled once and has ended."""
+
+
+class _Cancelled(Exception):
+    """The cancel flag was set: the engine wrote ``cancelled`` and released the lease (spec §16.7.2 #105)."""
 
 
 class _StatusChanged(Exception):
@@ -248,7 +259,7 @@ class TaskEngine:
         if claim.result is not ClaimResult.ACQUIRED:
             return outcome
         if claim.status is None:
-            outcome.stopped = "planning_interrupted"
+            outcome.stopped = claim.stopped
             return outcome
         # The delivery limit runs from the committed claim (spec §16.4 #74).
         deadline = asyncio.get_running_loop().time() + self._ports.delivery_limit_s
@@ -259,6 +270,8 @@ class TaskEngine:
             outcome.stopped = "lease_lost"
         except _StatusChanged:
             outcome.stopped = "status_changed"
+        except _Cancelled:
+            outcome.stopped = "cancelled"
         except asyncio.CancelledError:
             step = outcome.ran[-1] if outcome.ran else None
             logger.warning("task_engine_cancelled", task_id=str(task_id), step=step)
@@ -268,8 +281,7 @@ class TaskEngine:
             # Spec §16.5: nothing is written for the step; the sweeps take the task over (see StepAbandoned).
             step = outcome.ran[-1] if outcome.ran else None
             logger.warning("step_abandoned", task_id=str(task_id), step=step, reason=abandoned.reason)
-            await self._release_after_error(task_id)
-            outcome.stopped = "abandoned"
+            outcome.stopped = await self._release_after_abandon(task_id, claim.status)
         except Exception as exc:
             # Spec #43: logged with the task id, then raised again. The type only: the text may carry secrets.
             logger.error(
@@ -294,19 +306,24 @@ class TaskEngine:
             assert task is not None  # the claim just locked the row
             completed = task.checkpoint.get("completed_steps", [])
             status: str | None
-            if task.status == TaskStatus.QUEUED:
+            stopped: Stopped | None = None
+            if task.cancel_requested:
+                # Read before the planning attempt is counted and before queued -> running (R-F6).
+                await self._write_cancelled(db, task)
+                status, stopped = None, "cancelled"
+            elif task.status == TaskStatus.QUEUED:
                 await transition(db, task, TaskStatus.RUNNING, reason=None, actor=ACTOR, audit=ports.audit)
                 status = TaskStatus.RUNNING.value
             elif await count_planning_attempt(db, task_id) > MAX_PLANNING_ATTEMPTS:
                 interrupted = f"Planning was interrupted {MAX_PLANNING_ATTEMPTS} times without finishing"
                 await self._fail(db, task, "planning_interrupted", interrupted)
                 await release_lease(db, task_id, ports.worker_id)
-                status = None
+                status, stopped = None, "planning_interrupted"
             else:
                 status = TaskStatus.DRAFT.value
             await commit_and_publish(db, ports.bus)
         todo = tuple(step for step in PIPELINE.get(status or "", ()) if step not in completed)
-        return _Claim(result, status, todo)
+        return _Claim(result, status, todo, stopped)
 
     async def _drive(
         self, task_id: uuid.UUID, status: str, todo: tuple[str, ...], ran: list[str], deadline: float
@@ -338,11 +355,10 @@ class TaskEngine:
                 return DURATION_EXCEEDED
             if stopped is not None:
                 return stopped
-        async with self._transaction() as db:
-            await release_lease(db, task_id, self._ports.worker_id)
-            await commit_and_publish(db, self._ports.bus)
-        logger.warning("pipeline_exhausted", task_id=str(task_id), status=status)
-        return "pipeline_exhausted"
+        stopped = await self._release_or_cancel(task_id, status, "pipeline_exhausted")
+        if stopped == "pipeline_exhausted":
+            logger.warning("pipeline_exhausted", task_id=str(task_id), status=status)
+        return stopped
 
     @staticmethod
     def _log_limit(task_id: uuid.UUID, step: str | None, *, cancelled: bool) -> None:
@@ -370,10 +386,42 @@ class TaskEngine:
             await commit_and_publish(db, ports.bus)
         return DURATION_EXCEEDED
 
-    async def _locked(self, db: AsyncSession, task_id: uuid.UUID, status: str) -> Task:
+    async def _release_or_cancel(self, task_id: uuid.UUID, status: str, released: Stopped) -> Stopped:
+        """Release the lease of a delivery that ends without a terminal write of its own, but first read the
+        cancel flag under the lock (R-F3, R-F4): ``cancelled`` when it is set, else ``released``. A lost lease
+        writes nothing (``lease_lost``); a status changed from outside only releases (``status_changed``)."""
+        try:
+            async with self._transaction() as db:
+                await self._locked(db, task_id, status)
+                await release_lease(db, task_id, self._ports.worker_id)
+                await commit_and_publish(db, self._ports.bus)
+        except _Cancelled:
+            return "cancelled"
+        except LeaseLost:
+            logger.warning("task_lease_lost", task_id=str(task_id))
+            return "lease_lost"
+        except _StatusChanged:
+            return "status_changed"
+        return released
+
+    async def _release_after_abandon(self, task_id: uuid.UUID, status: str) -> Stopped:
+        """The ``StepAbandoned`` handler's release: ``_release_or_cancel``; a failed one is only logged."""
+        try:
+            return await self._release_or_cancel(task_id, status, "abandoned")
+        except Exception as exc:
+            logger.error("lease_release_failed", task_id=str(task_id), error_type=type(exc).__name__)
+            return "abandoned"
+
+    async def _locked(
+        self, db: AsyncSession, task_id: uuid.UUID, status: str, *, finishing: tuple[str, str] | None = None
+    ) -> Task:
         """Renew the lease (raises ``LeaseLost``) and load the task, which must still be in ``status``.
 
         The renewal locks the row until the caller commits, so the status read stays true for its writes.
+        With the cancel flag set the task is written ``cancelled``, the lease released and the transaction
+        committed, then ``_Cancelled`` is raised: the flag wins over every outcome but a lost lease. A
+        ``finishing`` step (its name and the kind of its result) is then dropped in the same transaction:
+        one ``step_finished`` event ``cancelled``, never a completed step.
         """
         await renew_lease(db, task_id, self._ports.worker_id)
         task = await db.scalar(select(Task).where(Task.id == task_id))
@@ -385,7 +433,23 @@ class TaskEngine:
                 "task_status_changed_outside", task_id=str(task_id), expected=status, found=task.status
             )
             raise _StatusChanged
+        if task.cancel_requested:
+            if finishing is not None:
+                step, kind = finishing
+                logger.warning("step_result_dropped", task_id=str(task_id), step=step, kind=kind)
+                await self._step_finished(db, task_id, step, "cancelled")
+            await self._write_cancelled(db, task)
+            await commit_and_publish(db, self._ports.bus)
+            raise _Cancelled
         return task
+
+    async def _write_cancelled(self, db: AsyncSession, task: Task) -> None:
+        """The engine's one write of a set cancel flag (spec §16.7.2 #105): ``cancelled`` with
+        ``CANCEL_REASON`` and the lease released, in the caller's transaction (the caller commits)."""
+        await transition(
+            db, task, TaskStatus.CANCELLED, reason=CANCEL_REASON, actor=ACTOR, audit=self._ports.audit
+        )
+        await release_lease(db, task.id, self._ports.worker_id)
 
     async def _start(self, task_id: uuid.UUID, status: str, step: str) -> StepContext | None:
         ports = self._ports
@@ -412,6 +476,7 @@ class TaskEngine:
                 checkpoint=task.checkpoint,
                 lease=LeaseGuard(task_id, ports.worker_id),
                 pipeline=_pipeline_of(status),
+                cancel=CancelToken(),
             )
             await commit_and_publish(db, ports.bus)
         return context
@@ -428,7 +493,7 @@ class TaskEngine:
         cleans up; ``LeaseLost`` wins over the limit (spec §16.5a #3)."""
         loop = asyncio.get_running_loop()
         work = asyncio.ensure_future(step(context))
-        beat = asyncio.create_task(self._heartbeat(task_id, renewed_at))
+        beat = asyncio.create_task(self._heartbeat(task_id, renewed_at, context.cancel, context.step))
         beat_won = True  # also on an outer cancel: the step's own outcome is then dropped too
         work_cancelled = False
         overrun = False
@@ -564,7 +629,9 @@ class TaskEngine:
                 finished.exception()  # retrieved here: nobody else reads a dropped error
         return held
 
-    async def _heartbeat(self, task_id: uuid.UUID, last_ok: float) -> NoReturn:
+    async def _heartbeat(
+        self, task_id: uuid.UUID, last_ok: float, cancel: CancelToken, step: str
+    ) -> NoReturn:
         """Renew the lease every ``heartbeat_s``; give up ``lease_safety_s`` early (R-T3h, §16.5a #5).
 
         ``H = last_ok + lease - lease_safety_s``, on the loop clock (``timeout_at`` reads it). Each try is
@@ -588,7 +655,7 @@ class TaskEngine:
             try:
                 async with bounded:
                     async with self._transaction() as db:
-                        await renew_lease(db, task_id, self._ports.worker_id)
+                        flags = await renew_lease_flags(db, task_id, self._ports.worker_id)
                         await commit_and_publish(db, self._ports.bus)
             except LeaseLost:
                 raise
@@ -600,6 +667,9 @@ class TaskEngine:
             else:
                 last_ok = attempt
                 last_error = None
+                if flags.cancel_requested and not cancel.cancelled:
+                    cancel.cancel()
+                    logger.info("task_cancel_signalled", task_id=str(task_id), step=step)
 
     def _give_up(self, task_id: uuid.UUID, cause: Exception | None) -> NoReturn:
         """``cause`` is None only when no renewal failed before H passed (the step began past its margin)."""
@@ -611,14 +681,15 @@ class TaskEngine:
     async def _finish(self, task_id: uuid.UUID, status: str, step: str, result: StepResult) -> Stopped | None:
         ports = self._ports
         async with self._transaction() as db:
-            task = await self._locked(db, task_id, status)
+            # The kind is read first so a dropped result can be named (ids and kinds only in the log).
+            kind: str = result.kind if isinstance(result, StepResult) else f"foreign:{type(result).__name__}"
+            task = await self._locked(db, task_id, status, finishing=(step, kind))
             stopped: Stopped | None = None
             allowed = ALLOWED_STEP_TARGETS.get(status, frozenset())
             # A step may hand back anything: a value that is not a StepResult, or a kind past __post_init__,
             # falls to ``case _`` and fails the task (L2, M5). The type name stands for a foreign value.
             # A foreign value's kind is never read from it, nor from its class name: "foreign:<type>" matches
             # no case, so a lookalike class named ``done`` or ``interrupt`` is refused too (AG-13 INFO-D4).
-            kind: str = result.kind if isinstance(result, StepResult) else f"foreign:{type(result).__name__}"
             target = TaskStatus.INTERRUPTED if kind == "interrupt" else getattr(result, "to", None)
             # One savepoint: a refused transition or fail_task also undoes the step's finish (ruling R-T3f).
             async with db.begin_nested():
@@ -685,10 +756,10 @@ class TaskEngine:
         db: AsyncSession,
         task_id: uuid.UUID,
         step: str,
-        outcome: Literal["done", "failed", "interrupted"],
+        outcome: Literal["done", "failed", "interrupted", "cancelled"],
     ) -> None:
-        """Emit ``task.step_finished``. Only a done step joins ``completed_steps``: a failed or interrupted
-        one runs again on retry or resume."""
+        """Emit ``task.step_finished``. Only a done step joins ``completed_steps``: a failed, interrupted or
+        cancelled one only emits the event."""
         if outcome == "done":
             await add_completed_step(db, task_id, step)
         await emit_task_event(

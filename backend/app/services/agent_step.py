@@ -32,7 +32,6 @@ from app.agents.runtime import (
     AgentRunResult,
     ScenarioNotAllowed,
 )
-from app.core.cancel import CancelToken
 from app.core.db import bound_transaction
 from app.core.logging import get_logger
 from app.models.agents import AgentProfile
@@ -216,7 +215,7 @@ def _bind(name: str, spec: AgentStep, runtime: AgentRunner, reads: AgentStepRead
             task_id=ctx.task_id,
             project_id=ctx.project_id,
             agent_input=agent_input,
-            cancel=CancelToken(),
+            cancel=ctx.cancel,
             agent_run_id=run_id,
         )
         try:

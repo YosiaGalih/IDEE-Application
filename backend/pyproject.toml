@@ -166,8 +166,10 @@ allow_indirect_imports = true   # emit_task_event and the lease functions touch 
 name = "Steps never reach the indirect status writers (spec WP-3.2 N60)"
 type = "forbidden"
 source_modules = ["app.services.agent_step", "app.services.steps.**"]
-forbidden_modules = ["app.services.project_tasks", "app.services.tool_r3", "app.workflow.recovery"]
+forbidden_modules = ["app.services.project_tasks", "app.services.tool_r3", "app.workflow.recovery",
+                     "app.workflow.control", "app.services.task_control"]
 # Strict: indirect imports count too. app.services.run_recovery imports app.workflow.recovery.
+# app.workflow.control (request_cancel) and app.services.task_control write cancelled from the API (3.2f1).
 
 [[tool.importlinter.contracts]]
 name = "Steps take TaskStatus and LeaseLost from the engine, never from states or lease (AG-13 3.2c2c1)"
