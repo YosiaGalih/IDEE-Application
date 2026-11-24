@@ -3770,3 +3770,9 @@ All checks passed! · 382 files already formatted · 0 errors · Contracts: 12 k
 - Backstop DB (`SECURITY DEFINER`, cabut `UPDATE(status)` dari role worker) tetap backlog. Guard statis tetap pagar kode first-party.
 
 **Syarat yang dibawa ke 3.2g:** approval `pending` pada task `failed approval_unsupported` (N62, AG-13 INFO-4).
+
+**Sesudah PR #43 (fakta, 24 Nov 2026) [Pasti]:**
+- CI PR #43 (WP-3.2c2c2) di 797dac7: 8/9 job hijau. `security-scan` merah oleh 8 CVE di image upstream: nginx dan libxml2 di `kodekantor/web`, libxml2 di `postgres:16.16-alpine`. Kedelapan temuan itu identik dengan yang muncul di `main` cd3b138 (push run 45131287429), dan sudah dikomentari sekali di PR.
+- PO menandai PR #43 ready, lalu me-merge-nya pada 24 Nov 2026 ±07:28 UTC (32816a7).
+- PO tidak memberi tanggapan atas usul WP-3.2c2b3 maupun soal base image web dan postgres.
+- **Keputusan Lead (24 Nov 2026), dicatat sesuai mandat "jalan tanpa menunggu":** WP-3.2c2b3 (🔒 backstop DB penulis status) dijadwalkan sesudah 3.2f dan sebelum 3.2d. Pemiliknya Lead, dengan sign-off AG-13. Tenggatnya sebelum 3.2d dimulai. Dengan ini syarat AG-13 C3 (ID WP, pemilik, tenggat) terpenuhi sementara, sampai PO memutuskan lain. Urutan yang diusulkan: 3.2f → 3.2c2b3 → 3.2c2b2 (N25, butuh PO) → 3.2d.
