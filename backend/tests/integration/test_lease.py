@@ -19,12 +19,14 @@ from app.models.projects import Project
 from app.models.tasks import Task
 from app.workflow.lease import (
     ClaimResult,
+    LeaseFlags,
     LeaseGuard,
     LeaseLost,
     _is_lock_timeout,
     claim_lease,
     release_lease,
     renew_lease,
+    renew_lease_flags,
     revoke_lease_owner,
 )
 from tests.conftest import reset_data
@@ -276,3 +278,66 @@ async def test_the_lease_messages_and_logs_carry_the_task_id_and_never_the_owner
     released = [e for e in logs if e["event"] == "lease_release_not_owner"]
     assert [e["task_id"] for e in released] == [str(task_ids[0])]
     assert intruder not in repr(logs) and owner not in repr(logs)
+
+
+async def test_renew_lease_flags_returns_the_flags(engine: AsyncEngine, task_ids: list[uuid.UUID]) -> None:
+    await claim(engine, task_ids[0], "w1")
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE tasks SET cancel_requested = true, "
+                "lease_expires_at = clock_timestamp() + interval '5 seconds' WHERE id = :id"
+            ),
+            {"id": task_ids[0]},
+        )
+        before = await conn.scalar(
+            text("SELECT lease_expires_at FROM tasks WHERE id = :id"), {"id": task_ids[0]}
+        )
+    async with make_sessionmaker(engine)() as session:
+        flags = await renew_lease_flags(session, task_ids[0], "w1")
+        await session.commit()
+    assert flags == LeaseFlags(cancel_requested=True, pause_requested=False)
+    async with engine.connect() as conn:
+        after = await conn.scalar(
+            text("SELECT lease_expires_at FROM tasks WHERE id = :id"), {"id": task_ids[0]}
+        )
+    assert after > before
+
+
+async def test_renew_lease_flags_raises_like_renew_lease(
+    engine: AsyncEngine, task_ids: list[uuid.UUID]
+) -> None:
+    await claim(engine, task_ids[0], "w1")
+    await claim(engine, task_ids[1], "w2")
+    sessions = make_sessionmaker(engine)
+    async with sessions() as session:
+        with pytest.raises(LeaseLost):  # another owner
+            await renew_lease_flags(session, task_ids[0], "w-other")
+        with pytest.raises(LeaseLost):  # no such row
+            await renew_lease_flags(session, uuid.uuid4(), "w1")
+        await session.rollback()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = :id"),
+            {"id": task_ids[0]},
+        )
+    async with sessions() as session:
+        with pytest.raises(LeaseLost):  # expired
+            await renew_lease_flags(session, task_ids[0], "w1")
+        await session.rollback()
+
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, *args):  # type: ignore[no-untyped-def]
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        revoke_lease_owner("w2")
+        async with sessions() as session:
+            with pytest.raises(LeaseLost):
+                await renew_lease_flags(session, task_ids[1], "w2")
+            await session.rollback()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert statements == []  # no SQL at all for the revoked owner
