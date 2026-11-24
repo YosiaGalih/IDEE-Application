@@ -92,6 +92,7 @@ Nilai ini sengaja bukan `Settings`: mengubahnya mengubah argumen keamanan, jadi 
 | `HEARTBEAT_SECONDS` | `20` | `app/workflow/lease.py` | interval heartbeat engine dan runtime. **SLA cancel (WP-3.2f1):** flag `cancel_requested` dibaca di tiap heartbeat lewat `renew_lease_flags`, jadi langkah yang berjalan dihentikan ≤ 20 dtk (ditambah satu round trip DB) sesudah API memasang flag [Kemungkinan Besar]. Test memakai `heartbeat_s` kecil lewat `WorkflowPorts` |
 | `LEASE_SECONDS` | `60` | `app/workflow/lease.py` | umur lease; invarian `heartbeat_s + lease_safety_s < lease` (ARCHITECTURE §5.3). Worker yang mati ditutup recovery (`cancelled` bila flag menyala) dalam ≤ 60 dtk + sweep |
 | `KILL_TIMEOUT_S` | `10.0` | `app/services/task_control.py` | batas `sandbox.kill_task` pada cancel; lewat batas = `cancel_unconfirmed` |
+| `RECORD_TIMEOUT_S` | `5.0` | `app/services/task_control.py` | batas tiap penulisan rekaman sesudah commit cancel (audit `sandbox.run_killed` dan penanda `cancel_unconfirmed`); timeout di-log `task_cancel_record_failed` dan ditelan, tidak pernah menjadi galat HTTP |
 | `REASON_MAX_LENGTH` | `200` | `app/workflow/control.py` | panjang maksimum `reason` cancel (metadata audit, dipotong sesudah redaksi); route menolak > 200 dengan 422 |
 
 ## Variabel perluasan platform (ADR-036..045, Proposed)
