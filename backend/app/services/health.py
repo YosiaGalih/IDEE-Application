@@ -91,8 +91,7 @@ class Dependencies:
         try:
             if self.hub is not None:
                 await self.hub.stop()
-            if isinstance(self.sandbox, HttpSandboxClient):  # a fake or other port holds no connection
-                await self.sandbox.aclose()
+            await self.sandbox.aclose()
         finally:
             try:
                 await self.redis.aclose()

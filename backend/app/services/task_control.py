@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
 
@@ -21,7 +22,7 @@ from app.core.audit import AuditWriter
 from app.core.events import emit_task_event
 from app.core.logging import get_logger
 from app.models.tasks import Task
-from app.sandbox.client import SandboxClient, SandboxError
+from app.sandbox.client import SandboxClient
 from app.services.projects import Actor, authorize, not_found
 from app.services.tasks import TaskView, task_view
 from app.workflow.control import request_cancel
@@ -41,32 +42,60 @@ class TaskControlEnv:
 
 
 async def _kill(env: TaskControlEnv, actor: WorkflowActor, task_id: uuid.UUID, project_id: uuid.UUID) -> None:
-    """Kill the task's runs with no session open; never raises (a failure is marked, R-F10)."""
+    """Kill the task's runs with no session open; never raises (a failure is marked, R-F10).
+
+    The cancel is already committed here, so any ``Exception`` from the kill is an unconfirmed kill and any
+    from the records is logged and dropped. ``CancelledError`` is not an ``Exception`` and still propagates.
+    """
     try:
         async with asyncio.timeout(KILL_TIMEOUT_S):
             killed = await env.sandbox.kill_task(task_id)
-    except (SandboxError, TimeoutError) as exc:
-        await _mark_unconfirmed(env, actor, task_id, project_id, type(exc).__name__)
+    except Exception as exc:
+        await _record(_mark_unconfirmed, "cancel_unconfirmed", env, actor, task_id, project_id, exc)
         return
     if killed > 0:
-        async with env.sessions() as session:
-            await env.audit.write(
-                session,
-                actor_type=actor.type,
-                actor_id=actor.id,
-                action="sandbox.run_killed",
-                result="success",
-                resource_type="task",
-                resource_id=str(task_id),
-                project_id=project_id,
-                metadata={"killed": killed},
-            )
-            await session.commit()
+        await _record(_audit_killed, "run_killed", env, actor, task_id, project_id, killed)
+
+
+async def _record(
+    write: Callable[..., Awaitable[None]],
+    record: str,
+    env: TaskControlEnv,
+    actor: WorkflowActor,
+    task_id: uuid.UUID,
+    project_id: uuid.UUID,
+    detail: object,
+) -> None:
+    try:
+        await write(env, actor, task_id, project_id, detail)
+    except Exception as exc:
+        logger.warning(
+            "task_cancel_record_failed", task_id=str(task_id), record=record, error_type=type(exc).__name__
+        )
+
+
+async def _audit_killed(
+    env: TaskControlEnv, actor: WorkflowActor, task_id: uuid.UUID, project_id: uuid.UUID, killed: object
+) -> None:
+    async with env.sessions() as session:
+        await env.audit.write(
+            session,
+            actor_type=actor.type,
+            actor_id=actor.id,
+            action="sandbox.run_killed",
+            result="success",
+            resource_type="task",
+            resource_id=str(task_id),
+            project_id=project_id,
+            metadata={"killed": killed},
+        )
+        await session.commit()
 
 
 async def _mark_unconfirmed(
-    env: TaskControlEnv, actor: WorkflowActor, task_id: uuid.UUID, project_id: uuid.UUID, error_type: str
+    env: TaskControlEnv, actor: WorkflowActor, task_id: uuid.UUID, project_id: uuid.UUID, error: object
 ) -> None:
+    error_type = type(error).__name__
     async with env.sessions() as session:
         await emit_task_event(
             session,

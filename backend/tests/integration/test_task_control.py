@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import Any
@@ -363,3 +364,79 @@ async def test_reader_is_forbidden(engine: AsyncEngine, make_task: Any) -> None:
     assert caught.value.http_status == 403
     assert (await row(engine, task_id))[:2] == ("queued", False)
     assert sandbox.killed_tasks == []
+
+
+async def test_an_unexpected_kill_error_is_marked_without_leaking(
+    engine: AsyncEngine, make_task: Any
+) -> None:
+    task_id = await make_task("running", "60 seconds")
+    sandbox = FakeSandboxClient(kill_error=RuntimeError(SENTINEL))
+    with capture_logs() as logs:
+        view = await cancel_task(
+            control_env(engine, sandbox),
+            api_actor(make_task.owner_id, RoleGrant("owner", "global")),
+            task_id,
+            reason=None,
+            iteration_max=3,
+        )
+    assert view.task.status == "running" and view.cancel_requested is True
+    logged = await events_of(engine, task_id, "task.log")
+    marks = await audits(engine, task_id, "task.cancel_unconfirmed")
+    assert len(logged) == 1 and len(marks) == 1
+    assert marks[0].metadata_ == {"error_type": "RuntimeError"} and marks[0].result == "error"
+    assert SENTINEL not in repr(logged[0].payload) + repr(marks[0].metadata_) + repr(logs)
+
+
+async def test_a_cancelled_kill_propagates(engine: AsyncEngine, make_task: Any) -> None:
+    task_id = await make_task("running", "60 seconds")
+    sandbox = FakeSandboxClient(kill_error=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(
+            cancel_task(
+                control_env(engine, sandbox),
+                api_actor(make_task.owner_id, RoleGrant("owner", "global")),
+                task_id,
+                reason=None,
+                iteration_max=3,
+            ),
+            timeout=5,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kill_returns", "kill_error", "record"),
+    [(1, None, "run_killed"), (0, SandboxUnavailable("x"), "cancel_unconfirmed")],
+)
+async def test_a_record_failure_after_commit_is_logged_and_swallowed(
+    engine: AsyncEngine,
+    make_task: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    kill_returns: int,
+    kill_error: BaseException | None,
+    record: str,
+) -> None:
+    task_id = await make_task("running", "60 seconds")
+    sandbox = FakeSandboxClient(kill_returns=kill_returns, kill_error=kill_error)
+    env = control_env(engine, sandbox)
+    real_write = AUDIT.write
+
+    async def failing_write(session: Any, **fields: Any) -> int:
+        if fields["action"] in {"sandbox.run_killed", "task.cancel_unconfirmed"}:
+            raise ConnectionError(SENTINEL)
+        return await real_write(session, **fields)
+
+    monkeypatch.setattr(AUDIT, "write", failing_write)
+    with capture_logs() as logs:
+        view = await cancel_task(
+            env,
+            api_actor(make_task.owner_id, RoleGrant("owner", "global")),
+            task_id,
+            reason=None,
+            iteration_max=3,
+        )
+    assert view.cancel_requested is True and view.task.status == "running"
+    own = [log for log in logs if log["event"] == "task_cancel_record_failed"]
+    assert len(own) == 1
+    assert own[0]["task_id"] == str(task_id) and own[0]["record"] == record
+    assert own[0]["error_type"] == "ConnectionError" and "exc_info" not in own[0]
+    assert SENTINEL not in repr(logs)

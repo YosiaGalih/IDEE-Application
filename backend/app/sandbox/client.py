@@ -105,6 +105,8 @@ class SandboxClient(Protocol):
 
     async def health(self) -> bool: ...
 
+    async def aclose(self) -> None: ...
+
 
 class _Run(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -381,3 +383,6 @@ class FakeSandboxClient:
 
     async def health(self) -> bool:
         return self.healthy
+
+    async def aclose(self) -> None:
+        return None
