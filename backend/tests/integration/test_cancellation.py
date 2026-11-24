@@ -33,7 +33,7 @@ from app.llm.pricing import PricingTable
 from app.sandbox.client import FakeSandboxClient, SandboxUnavailable
 from app.services import agent_runtime as runtime_module
 from app.services.agent_step import AgentStep
-from app.services.task_control import TaskControlEnv
+from app.services.task_control import CANCEL_UNCONFIRMED_MESSAGE, TaskControlEnv
 from app.workflow.engine import EngineOutcome, Step, StepContext, StepResult, TaskEngine
 from tests.engine_runtime_fakes import implement_input, orchestrate, ready_world, retime
 from tests.integration.test_engine import make_engine
@@ -100,6 +100,18 @@ class WaitingStep:
         await asyncio.wait_for(ctx.cancel.wait(), timeout=30.0)  # the step's own limit, far above BOUND_S
         self.token_seen_at = time.monotonic()
         return StepResult.done()
+
+
+class EnteredProvider(SlowProvider):
+    """A ``SlowProvider`` that says when the stream was entered, so a test never infers it from timing."""
+
+    def __init__(self, inner: Any, delay: float) -> None:
+        super().__init__(inner, delay)
+        self.entered = asyncio.Event()
+
+    async def create_message(self, req: Any, **kwargs: Any) -> Any:
+        self.entered.set()
+        return await super().create_message(req, **kwargs)
 
 
 async def audit_rows(engine: AsyncEngine, task_id: str) -> list[tuple[str, str, dict[str, Any]]]:
@@ -239,7 +251,7 @@ async def test_cancel_during_llm_stream(
     task_id = await one_task(owner)
     await place(engine, task_id, "queued")
     await ready_world(engine, settings)
-    slow = SlowProvider(scripted(text_turn()), 30.0)
+    slow = EnteredProvider(scripted(text_turn()), 30.0)
     orch = retime(
         orchestrate(
             engine,
@@ -252,23 +264,22 @@ async def test_cancel_during_llm_stream(
     )
     runner = await deliver(orch, task_id)
     try:
-        deadline = asyncio.get_running_loop().time() + WAIT_S
-        while not await run_statuses(engine, task_id):
-            assert asyncio.get_running_loop().time() < deadline, "the run never started"
-            await asyncio.sleep(0.02)
+        await asyncio.wait_for(slow.entered.wait(), WAIT_S)  # the provider call is in flight
 
         response = await owner.post(CANCEL.format(task_id), headers=csrf(owner))
         accepted = time.monotonic()
         assert response.status_code == 200, response.text
 
-        outcome = await finish(runner, limit=1.0)
+        outcome = await finish(runner, limit=BOUND_S)
         ended = time.monotonic() - accepted
     finally:
         await stop(runner)
 
     assert outcome.stopped == "cancelled", outcome
-    assert ended <= 1.0
+    assert ended <= BOUND_S
     assert await run_statuses(engine, task_id) == ["cancelled"]
+    # the partial attempt is on the ledger: cancelled, with the prompt's tokens (10 in)
+    assert await usage_rows(engine, task_id) == [("cancelled", "cancelled", 10, 0)]
     after = await task_row(engine, task_id)
     assert (after.status, after.status_reason) == ("cancelled", "cancel_requested")
     assert (after.lease_owner, after.lease_expires_at) == (None, None)
@@ -281,6 +292,21 @@ async def run_statuses(engine: AsyncEngine, task_id: str) -> list[str]:
             {"t": uuid.UUID(task_id)},
         )
         return [r.status for r in rows]
+
+
+type UsageRow = tuple[str, str | None, int | None, int | None]
+
+
+async def usage_rows(engine: AsyncEngine, task_id: str) -> list[UsageRow]:
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            text(
+                "SELECT status, error_kind, input_tokens, output_tokens FROM usage_records "
+                "WHERE task_id = :t ORDER BY created_at, id"
+            ),
+            {"t": uuid.UUID(task_id)},
+        )
+        return [(r.status, r.error_kind, r.input_tokens, r.output_tokens) for r in rows]
 
 
 async def test_unkillable_marked(
@@ -316,7 +342,9 @@ async def test_unkillable_marked(
         ("task.cancel_unconfirmed", "error", {"error_type": "SandboxUnavailable"}),
     ]
     marks = [p for kind, p in await task_events(engine, task_id) if kind == "task.log"]
-    assert [(p["level"], p["code"]) for p in marks] == [("warning", "cancel_unconfirmed")]
+    assert [(p["level"], p["code"], p["message"]) for p in marks] == [
+        ("warning", "cancel_unconfirmed", CANCEL_UNCONFIRMED_MESSAGE)
+    ]
     assert outcome.stopped == "cancelled"
     after = await task_row(engine, task_id)
     assert (after.status, after.lease_owner) == ("cancelled", None)
