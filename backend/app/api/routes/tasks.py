@@ -23,7 +23,7 @@ from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from app.agents.contracts import WorkflowType  # == WORKFLOW_TYPES
-from app.api.deps import CurrentActor, StreamActor, dependencies, require_project_permission
+from app.api.deps import AuditDep, CurrentActor, StreamActor, dependencies, require_project_permission
 from app.api.routes.approval_out import ApprovalOut
 from app.api.routes.dashboard import UsageOut
 from app.api.routes.projects import EnvDep, _respond
@@ -32,10 +32,11 @@ from app.core.csrf import SESSION_COOKIE
 from app.core.errors import AppError, request_id_of
 from app.core.logging import get_logger
 from app.models.enums import TASK_STATUSES
-from app.services import task_events, tasks
+from app.services import task_control, task_events, tasks
 from app.services.context_refs import MAX_CONTEXT_REFS, ContextRef
 from app.services.project_budget import BudgetDefaults
 from app.services.projects import PAGE_SIZE_MAX, Actor
+from app.services.task_control import TaskControlEnv
 from app.services.task_events import HISTORY_LIMIT_MAX, STREAM_CLOSE_GRACE_S, StreamSlot, stream_frames
 from app.services.tasks import PROMPT_MAX, TITLE_MAX, TaskCreate, TaskSummary, TaskView
 
@@ -372,3 +373,33 @@ async def create_task(
         iteration_max=settings.task_max_iterations,
     )
     return _respond(request, TaskOut.of(view).model_dump(mode="json"), status_code=202, status="accepted")
+
+
+class CancelIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str | None, Field(max_length=200)] = None
+
+
+def task_control_env(request: Request, audit: AuditDep) -> TaskControlEnv:
+    deps = dependencies(request)
+    return TaskControlEnv(sessions=deps.sessions, audit=audit, sandbox=deps.sandbox)
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(
+    request: Request,
+    task_id: uuid.UUID,
+    actor: CurrentActor,
+    env: Annotated[TaskControlEnv, Depends(task_control_env)],
+    body: CancelIn | None = None,
+) -> JSONResponse:
+    """Not gated by ``ensure_engine_available``: a cancel must work whatever the engine flag (#111)."""
+    view = await task_control.cancel_task(
+        env,
+        actor,
+        task_id,
+        reason=body.reason if body is not None else None,
+        iteration_max=request.app.state.settings.task_max_iterations,
+    )
+    return _respond(request, TaskOut.of(view).model_dump(mode="json"))
