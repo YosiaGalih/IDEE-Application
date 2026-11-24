@@ -341,6 +341,9 @@ class FakeSandboxClient:
     killed_runs: list[str] = field(default_factory=list)
     killed_tasks: list[UUID] = field(default_factory=list)
     healthy: bool = True
+    kill_returns: int = 0  # what kill_task reports as stopped
+    kill_error: BaseException | None = None  # raised by kill_task, after the delay
+    kill_delay_s: float = 0.0  # kill_task sleeps this long first (a hanging manager)
 
     async def run(self, req: SandboxRunRequest, *, on_log: LogCallback | None = None) -> SandboxRunResult:
         self.requests.append(req)
@@ -370,7 +373,11 @@ class FakeSandboxClient:
 
     async def kill_task(self, task_id: UUID) -> int:
         self.killed_tasks.append(task_id)
-        return 0
+        if self.kill_delay_s:
+            await asyncio.sleep(self.kill_delay_s)
+        if self.kill_error is not None:
+            raise self.kill_error
+        return self.kill_returns
 
     async def health(self) -> bool:
         return self.healthy
