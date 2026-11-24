@@ -17,7 +17,7 @@ from typing import Annotated, Any, Literal
 import structlog
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
@@ -375,10 +375,22 @@ async def create_task(
     return _respond(request, TaskOut.of(view).model_dump(mode="json"), status_code=202, status="accepted")
 
 
+# AG-13 L1: the class of _MESSAGE_FORBIDDEN in app/gitops/adapter.py. NUL would be a 500 in the audit's JSONB;
+# the other C0 controls and DEL would reach an auditor's screen. Tab, LF and CR stay.
+_REASON_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
 class CancelIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: Annotated[str | None, Field(max_length=200)] = None
+
+    @field_validator("reason")
+    @classmethod
+    def _no_control_characters(cls, reason: str | None) -> str | None:
+        if reason is not None and _REASON_FORBIDDEN.search(reason):
+            raise ValueError("reason must not contain control characters")
+        return reason
 
 
 def task_control_env(request: Request, audit: AuditDep) -> TaskControlEnv:
@@ -394,12 +406,13 @@ async def cancel_task(
     env: Annotated[TaskControlEnv, Depends(task_control_env)],
     body: CancelIn | None = None,
 ) -> JSONResponse:
-    """Not gated by ``ensure_engine_available``: a cancel must work whatever the engine flag (#111)."""
-    view = await task_control.cancel_task(
+    """Not gated by ``ensure_engine_available``: a cancel must work whatever the engine flag (#111).
+    ``meta.kill`` says what the kill of the task's sandbox runs did (R9)."""
+    result = await task_control.cancel_task(
         env,
         actor,
         task_id,
         reason=body.reason if body is not None else None,
         iteration_max=request.app.state.settings.task_max_iterations,
     )
-    return _respond(request, TaskOut.of(view).model_dump(mode="json"))
+    return _respond(request, TaskOut.of(result.view).model_dump(mode="json"), meta={"kill": result.kill})

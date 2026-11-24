@@ -27,6 +27,8 @@ from app.services import task_control
 from app.services.project_tasks import cancel_open_tasks
 from app.services.projects import Actor as ApiActor
 from app.services.task_control import CANCEL_UNCONFIRMED_MESSAGE, TaskControlEnv, cancel_task
+from app.workflow import control, recovery, states
+from app.workflow import engine as engine_module
 from app.workflow.control import CancelDecision, request_cancel
 from app.workflow.states import Actor
 from tests.conftest import reset_data
@@ -241,7 +243,7 @@ async def events_of(engine: AsyncEngine, task_id: uuid.UUID, type: str) -> list[
 async def test_cancel_task_kills_and_audits_a_killed_run(engine: AsyncEngine, make_task: Any) -> None:
     task_id = await make_task("running", "60 seconds")
     sandbox = FakeSandboxClient(kill_returns=1)
-    view = await cancel_task(
+    result = await cancel_task(
         control_env(engine, sandbox),
         api_actor(make_task.owner_id, RoleGrant("owner", "global")),
         task_id,
@@ -251,19 +253,21 @@ async def test_cancel_task_kills_and_audits_a_killed_run(engine: AsyncEngine, ma
     assert sandbox.killed_tasks == [task_id]
     killed = await audits(engine, task_id, "sandbox.run_killed")
     assert len(killed) == 1 and killed[0].metadata_ == {"killed": 1} and killed[0].result == "success"
-    assert view.cancel_requested is True and view.task.status == "running"
+    assert result.view.cancel_requested is True and result.view.task.status == "running"
+    assert result.kill == "confirmed"
 
 
 async def test_zero_killed_writes_no_run_killed(engine: AsyncEngine, make_task: Any) -> None:
     task_id = await make_task("running", "60 seconds")
     sandbox = FakeSandboxClient(kill_returns=0)
-    await cancel_task(
+    result = await cancel_task(
         control_env(engine, sandbox),
         api_actor(make_task.owner_id, RoleGrant("owner", "global")),
         task_id,
         reason=None,
         iteration_max=3,
     )
+    assert result.kill == "confirmed"  # the kill returned: nothing was left to stop
     assert sandbox.killed_tasks == [task_id]
     assert await audits(engine, task_id, "sandbox.run_killed") == []
     assert await audits(engine, task_id, "task.cancel_unconfirmed") == []
@@ -276,14 +280,15 @@ async def test_a_failed_kill_marks_the_task(
     task_id = await make_task("running", "60 seconds")
     sandbox = FakeSandboxClient(kill_error=error(SENTINEL))
     with capture_logs() as logs:
-        view = await cancel_task(
+        result = await cancel_task(
             control_env(engine, sandbox),
             api_actor(make_task.owner_id, RoleGrant("owner", "global")),
             task_id,
             reason=None,
             iteration_max=3,
         )
-    assert view.task.status == "running" and view.cancel_requested is True
+    assert result.view.task.status == "running" and result.view.cancel_requested is True
+    assert result.kill == "unconfirmed"
     logged = await events_of(engine, task_id, "task.log")
     assert [e.payload for e in logged] == [
         {"level": "warning", "code": "cancel_unconfirmed", "message": CANCEL_UNCONFIRMED_MESSAGE}
@@ -305,7 +310,7 @@ async def test_a_hanging_kill_times_out(
     task_id = await make_task("running", "60 seconds")
     sandbox = FakeSandboxClient(kill_delay_s=5)
     started = time.monotonic()
-    view = await cancel_task(
+    result = await cancel_task(
         control_env(engine, sandbox),
         api_actor(make_task.owner_id, RoleGrant("owner", "global")),
         task_id,
@@ -313,7 +318,7 @@ async def test_a_hanging_kill_times_out(
         iteration_max=3,
     )
     assert time.monotonic() - started < 1
-    assert view.task.status == "running"
+    assert result.view.task.status == "running" and result.kill == "unconfirmed"
     marks = await audits(engine, task_id, "task.cancel_unconfirmed")
     assert len(marks) == 1 and marks[0].metadata_ == {"error_type": "TimeoutError"}
     assert len(await events_of(engine, task_id, "task.log")) == 1
@@ -322,7 +327,7 @@ async def test_a_hanging_kill_times_out(
 async def test_no_kill_for_a_queued_task(engine: AsyncEngine, make_task: Any) -> None:
     task_id = await make_task("queued")
     sandbox = FakeSandboxClient(kill_returns=1)
-    view = await cancel_task(
+    result = await cancel_task(
         control_env(engine, sandbox),
         api_actor(make_task.owner_id, RoleGrant("owner", "global")),
         task_id,
@@ -330,7 +335,8 @@ async def test_no_kill_for_a_queued_task(engine: AsyncEngine, make_task: Any) ->
         iteration_max=3,
     )
     assert sandbox.killed_tasks == []
-    assert view.task.status == "cancelled" and view.cancel_requested is True
+    assert result.view.task.status == "cancelled" and result.view.cancel_requested is True
+    assert result.kill == "not_needed"
     assert await audits(engine, task_id, "sandbox.run_killed") == []
 
 
@@ -372,14 +378,15 @@ async def test_an_unexpected_kill_error_is_marked_without_leaking(
     task_id = await make_task("running", "60 seconds")
     sandbox = FakeSandboxClient(kill_error=RuntimeError(SENTINEL))
     with capture_logs() as logs:
-        view = await cancel_task(
+        result = await cancel_task(
             control_env(engine, sandbox),
             api_actor(make_task.owner_id, RoleGrant("owner", "global")),
             task_id,
             reason=None,
             iteration_max=3,
         )
-    assert view.task.status == "running" and view.cancel_requested is True
+    assert result.view.task.status == "running" and result.view.cancel_requested is True
+    assert result.kill == "unconfirmed"
     logged = await events_of(engine, task_id, "task.log")
     marks = await audits(engine, task_id, "task.cancel_unconfirmed")
     assert len(logged) == 1 and len(marks) == 1
@@ -404,8 +411,8 @@ async def test_a_cancelled_kill_propagates(engine: AsyncEngine, make_task: Any) 
 
 
 @pytest.mark.parametrize(
-    ("kill_returns", "kill_error", "record"),
-    [(1, None, "run_killed"), (0, SandboxUnavailable("x"), "cancel_unconfirmed")],
+    ("kill_returns", "kill_error", "record", "kill"),
+    [(1, None, "run_killed", "confirmed"), (0, SandboxUnavailable("x"), "cancel_unconfirmed", "unconfirmed")],
 )
 async def test_a_record_failure_after_commit_is_logged_and_swallowed(
     engine: AsyncEngine,
@@ -414,6 +421,7 @@ async def test_a_record_failure_after_commit_is_logged_and_swallowed(
     kill_returns: int,
     kill_error: BaseException | None,
     record: str,
+    kill: str,
 ) -> None:
     task_id = await make_task("running", "60 seconds")
     sandbox = FakeSandboxClient(kill_returns=kill_returns, kill_error=kill_error)
@@ -427,16 +435,68 @@ async def test_a_record_failure_after_commit_is_logged_and_swallowed(
 
     monkeypatch.setattr(AUDIT, "write", failing_write)
     with capture_logs() as logs:
-        view = await cancel_task(
+        result = await cancel_task(
             env,
             api_actor(make_task.owner_id, RoleGrant("owner", "global")),
             task_id,
             reason=None,
             iteration_max=3,
         )
-    assert view.cancel_requested is True and view.task.status == "running"
+    assert result.view.cancel_requested is True and result.view.task.status == "running"
+    assert result.kill == kill
     own = [log for log in logs if log["event"] == "task_cancel_record_failed"]
     assert len(own) == 1
     assert own[0]["task_id"] == str(task_id) and own[0]["record"] == record
+    assert own[0]["log_level"] == "error"
     assert own[0]["error_type"] == "ConnectionError" and "exc_info" not in own[0]
+    assert own[0].get("kill_error_type") == ("SandboxUnavailable" if kill_error is not None else None)
     assert SENTINEL not in repr(logs)
+
+
+async def test_every_cancel_audit_carries_the_ip_and_the_correlation_id(
+    engine: AsyncEngine, make_task: Any
+) -> None:
+    """AG-13 L4: the three cancel audits carry the caller's ip and ``task:<id>`` as correlation id."""
+    killed = await make_task("running", "60 seconds")
+    unkillable = await make_task("running", "60 seconds")
+    actor = ApiActor(
+        make_task.owner_id, "o@example.test", "O", (RoleGrant("owner", "global"),), ip="203.0.113.7"
+    )
+    await cancel_task(
+        control_env(engine, FakeSandboxClient(kill_returns=1)), actor, killed, reason=None, iteration_max=3
+    )
+    await cancel_task(
+        control_env(engine, FakeSandboxClient(kill_error=SandboxUnavailable("x"))),
+        actor,
+        unkillable,
+        reason=None,
+        iteration_max=3,
+    )
+    async with make_sessionmaker(engine)() as session:
+        rows = (
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.resource_id.in_([str(killed), str(unkillable)]),
+                    AuditEvent.action.in_(
+                        ["task.cancel_requested", "sandbox.run_killed", "task.cancel_unconfirmed"]
+                    ),
+                )
+            )
+        ).all()
+    assert sorted((row.resource_id, row.action) for row in rows) == sorted(
+        [
+            (str(killed), "task.cancel_requested"),
+            (str(killed), "sandbox.run_killed"),
+            (str(unkillable), "task.cancel_requested"),
+            (str(unkillable), "task.cancel_unconfirmed"),
+        ]
+    )
+    assert [(row.ip, row.correlation_id) for row in rows] == [
+        ("203.0.113.7", f"task:{row.resource_id}") for row in rows
+    ]
+
+
+def test_one_cancel_reason() -> None:
+    """One definition of the reason of every ``cancelled`` a cancel request writes (API, engine, recovery)."""
+    assert control.REASON is engine_module.CANCEL_REASON is states.CANCEL_REASON
+    assert recovery.CANCEL_REASON is states.CANCEL_REASON

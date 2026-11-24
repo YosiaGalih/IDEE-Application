@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import AuditWriter
 from app.models.tasks import Task
+from app.workflow.control import flag_cancel_requested
 from app.workflow.states import ALLOWED, TaskStatus, transition
 from app.workflow.states import Actor as WorkflowActor
 
@@ -26,13 +27,8 @@ async def cancel_open_tasks(
     ).all()
     if tasks:
         # One statement for every locked id, before the transitions (spec §16.7.4 R-F8): a task a live engine
-        # still holds sees the flag at its next boundary. No version bump: the engine's own writes stay valid.
-        await session.execute(
-            update(Task)
-            .where(Task.id.in_([task.id for task in tasks]))
-            .values(cancel_requested=True)
-            .execution_options(synchronize_session=False)
-        )
+        # still holds sees the flag at its next boundary.
+        await flag_cancel_requested(session, [task.id for task in tasks])
     for task in tasks:
         await transition(session, task, TaskStatus.CANCELLED, reason=reason, actor=actor, audit=audit)
     return len(tasks)
